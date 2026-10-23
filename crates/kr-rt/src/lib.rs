@@ -144,6 +144,14 @@ impl core::fmt::Write for Stderr {
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {}
 
+/// Referenced by landing pads in the precompiled `alloc` (e.g. `format_inner`). With panic=abort
+/// no unwind ever starts, so reaching this is a bug: abort.
+#[cfg(not(any(test, feature = "host")))]
+#[no_mangle]
+pub extern "C" fn _Unwind_Resume() -> ! {
+    kr_sys::exit_group(134)
+}
+
 #[cfg(not(any(test, feature = "host")))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {

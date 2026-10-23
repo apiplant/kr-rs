@@ -79,6 +79,7 @@ mod nr {
     pub const FTRUNCATE: usize = 77;
     pub const FSYNC: usize = 74;
     pub const FCHMOD: usize = 91;
+    pub const FCHMODAT: usize = 268;
     pub const GETUID: usize = 102;
     pub const GETPID: usize = 39;
     pub const FSETXATTR: usize = 190;
@@ -103,6 +104,7 @@ mod nr {
     pub const FTRUNCATE: usize = 46;
     pub const FSYNC: usize = 82;
     pub const FCHMOD: usize = 52;
+    pub const FCHMODAT: usize = 53;
     pub const GETUID: usize = 174;
     pub const GETPID: usize = 172;
     pub const FSETXATTR: usize = 7;
@@ -506,6 +508,33 @@ const REMOVE_MAX_DEPTH: usize = 512;
 /// Recursively removes the entry `name` (one path component, NUL-terminated) of `dirfd`. A
 /// symlink is unlinked, never followed. Missing entries are not an error. Directories that the
 /// caller owns but cannot enter or write are made `0700` first.
+/// chmod of `name` (one component under `dirfd`) without following a symlink: pins the inode with
+/// an `O_PATH|O_NOFOLLOW` fd and changes it through its /proc magic link.
+fn chmod_nofollow(dirfd: i32, name: &[u8], mode: u32) -> Result<()> {
+    let how = OpenHow {
+        flags: (O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+    };
+    let p = openat2(dirfd, name, &how)?;
+    let mut path = b"/proc/self/fd/".to_vec();
+    let mut buf = [0u8; 20];
+    let mut n = p.raw() as u32;
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    path.extend_from_slice(&buf[i..]);
+    path.push(0);
+    // SAFETY: path is NUL-terminated and outlives the call.
+    check(unsafe { syscall4(nr::FCHMODAT, AT_FDCWD as usize, path.as_ptr() as usize, mode as usize, 0) }).map(|_| ())
+}
+
 pub fn remove_all(dirfd: i32, name: &[u8]) -> Result<()> {
     remove_depth(dirfd, name, 0)
 }
@@ -537,6 +566,11 @@ fn remove_depth(dirfd: i32, name: &[u8], depth: usize) -> Result<()> {
     let d = match openat2(dirfd, name, &how) {
         Ok(d) => d,
         Err(Errno(ENOENT)) => return Ok(()),
+        // Unreadable dir we own (overlayfs leaves `work/work` as mode 000): make it accessible.
+        Err(Errno(EACCES)) => {
+            chmod_nofollow(dirfd, name, 0o700)?;
+            openat2(dirfd, name, &how)?
+        }
         Err(e) => return Err(e),
     };
     let _ = fchmod(d.raw(), 0o700);

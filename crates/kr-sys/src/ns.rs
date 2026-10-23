@@ -20,6 +20,7 @@ mod n {
     pub const UNLINKAT: usize = 263;
     pub const CAPSET: usize = 126;
     pub const NANOSLEEP: usize = 35;
+    pub const IOCTL: usize = 16;
     pub const SECCOMP: usize = 317;
 }
 
@@ -41,6 +42,7 @@ mod n {
     pub const UNLINKAT: usize = 35;
     pub const CAPSET: usize = 91;
     pub const NANOSLEEP: usize = 101;
+    pub const IOCTL: usize = 29;
     pub const SECCOMP: usize = 277;
 }
 
@@ -275,4 +277,25 @@ pub fn seccomp_set_filter(prog: &[SockFilter]) -> Result<()> {
 pub fn nanosleep(ts: &super::Timespec) -> Result<()> {
     // SAFETY: ts is a valid timespec; the remaining-time pointer is NULL.
     check(unsafe { syscall2(n::NANOSLEEP, ts as *const super::Timespec as usize, 0) }).map(|_| ())
+}
+
+const SIOCGIFFLAGS: usize = 0x8913;
+const SIOCSIFFLAGS: usize = 0x8914;
+const IFF_UP: u16 = 0x1;
+
+/// Brings an interface up (SIOCGIFFLAGS/SIOCSIFFLAGS). Needs CAP_NET_ADMIN in the netns owner.
+pub fn link_up(name: &[u8]) -> Result<()> {
+    if name.is_empty() || name.len() >= 16 {
+        return Err(Errno(22));
+    }
+    // struct ifreq: char ifr_name[16]; union { short ifr_flags; ... } (40 bytes total).
+    let mut ifr = [0u8; 40];
+    ifr[..name.len()].copy_from_slice(name);
+    let sock = super::socket(super::AF_INET, 2 | super::O_CLOEXEC, 0)?; // SOCK_DGRAM
+    // SAFETY: ifr is a writable 40-byte ifreq for both ioctls.
+    check(unsafe { syscall3(n::IOCTL, sock.raw() as usize, SIOCGIFFLAGS, ifr.as_mut_ptr() as usize) })?;
+    let flags = u16::from_ne_bytes([ifr[16], ifr[17]]) | IFF_UP;
+    ifr[16..18].copy_from_slice(&flags.to_ne_bytes());
+    // SAFETY: as above.
+    check(unsafe { syscall3(n::IOCTL, sock.raw() as usize, SIOCSIFFLAGS, ifr.as_mut_ptr() as usize) }).map(|_| ())
 }

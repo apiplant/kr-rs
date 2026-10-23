@@ -1,21 +1,173 @@
 //! `kr ctr ...`: low-level container commands.
 
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use kr_fmt::quantity::Quantity;
-use kr_rt::{eprint, fmt_u64, Args};
+use kr_rt::{eprint, print, Args};
 use kr_runtime::cgroup::Limits;
 use kr_runtime::container::{self, RunSpec};
+use kr_runtime::store::Store;
 use kr_sys::ns;
 
-const USAGE: &[u8] = b"usage: kr ctr run-dir [--memory 64Mi] [--cpus 500m] [--pids 64] <rootfs> <state-dir> [--] <cmd> [args...]\n";
+const USAGE: &[u8] = b"usage:
+  kr ctr pull <image>
+  kr ctr run [--memory 64Mi] [--cpus 500m] [--pids 64] <image> [--] [cmd args...]
+  kr ctr run-dir [limits...] <rootfs> <state-dir> [--] <cmd> [args...]
+";
+
+const DEFAULT_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 pub fn main(mut args: Args) -> i32 {
     match args.next() {
+        Some(b"pull") => pull(args),
+        Some(b"run") => run(args),
         Some(b"run-dir") => run_dir(args),
         _ => {
             eprint(USAGE);
             2
         }
+    }
+}
+
+/// Parses leading limit flags and then `n` positional arguments; the rest is the command.
+fn parse(args: &mut Args, n: usize) -> Result<(Limits, Vec<&'static [u8]>, Vec<Vec<u8>>), i32> {
+    let mut limits = Limits::default();
+    let mut positional = Vec::new();
+    while positional.len() < n {
+        let Some(a) = args.next() else { break };
+        let flag = match a {
+            b"--memory" | b"--cpus" | b"--pids" => a,
+            _ => {
+                positional.push(a);
+                continue;
+            }
+        };
+        let Some(q) = args.next().and_then(|v| core::str::from_utf8(v).ok()).and_then(|v| Quantity::parse(v).ok()) else {
+            eprint(b"kr ctr: bad quantity for ");
+            eprint(flag);
+            eprint(b"\n");
+            return Err(2);
+        };
+        let as_u64 = |v: Option<i128>| v.filter(|&v| v > 0).and_then(|v| u64::try_from(v).ok());
+        match flag {
+            b"--memory" => limits.memory_bytes = as_u64(q.value()),
+            b"--cpus" => limits.cpu_milli = as_u64(q.milli_value()),
+            _ => limits.pids = as_u64(q.value()),
+        }
+    }
+    if positional.len() < n {
+        eprint(USAGE);
+        return Err(2);
+    }
+    let mut cmd: Vec<Vec<u8>> = args.map(|a| a.to_vec()).collect();
+    if cmd.first().map(|a| a.as_slice()) == Some(b"--") {
+        cmd.remove(0);
+    }
+    Ok((limits, positional, cmd))
+}
+
+fn utf8(b: &[u8]) -> Option<String> {
+    core::str::from_utf8(b).ok().map(String::from)
+}
+
+fn open_store() -> Result<Store, i32> {
+    Store::open(None).map_err(|e| fail(&format!("open store: {e:?}")))
+}
+
+fn pull(mut args: Args) -> i32 {
+    let Some(image) = args.next().and_then(utf8) else {
+        eprint(USAGE);
+        return 2;
+    };
+    let store = match open_store() {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    let r = kr_rt::exec::block_on(async move { kr_runtime::pull::pull(&store, &image).await });
+    match r {
+        Ok(id) => {
+            print(format!("{id}\n").as_bytes());
+            0
+        }
+        Err(e) => fail(&format!("pull: {e:?}")),
+    }
+}
+
+fn container_id() -> String {
+    format!("ctr-{}", kr_rt::exec::now_ns())
+}
+
+fn run(mut args: Args) -> i32 {
+    let (limits, pos, override_cmd) = match parse(&mut args, 1) {
+        Ok(v) => v,
+        Err(c) => return c,
+    };
+    let Some(image) = utf8(pos[0]) else { return fail("image reference is not UTF-8") };
+    let store = match open_store() {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    if store.image(&image).is_none() {
+        let (s, i) = (store.clone(), image.clone());
+        if let Err(e) = kr_rt::exec::block_on(async move { kr_runtime::pull::pull(&s, &i).await }) {
+            return fail(&format!("pull: {e:?}"));
+        }
+    }
+    let Some((_, cfg, mut rootfs)) = store.image(&image) else { return fail("image vanished after pull") };
+    rootfs.pop(); // store returns it NUL-terminated
+
+    // OCI semantics: entrypoint + (override or image cmd).
+    let mut argv: Vec<Vec<u8>> = cfg.entrypoint.iter().map(|s| s.as_bytes().to_vec()).collect();
+    if override_cmd.is_empty() {
+        argv.extend(cfg.cmd.iter().map(|s| s.as_bytes().to_vec()));
+    } else {
+        argv.extend(override_cmd);
+    }
+    if argv.is_empty() {
+        return fail("image has no entrypoint or cmd; pass a command");
+    }
+    let mut env: Vec<Vec<u8>> = cfg.env.iter().map(|s| s.as_bytes().to_vec()).collect();
+    if !env.iter().any(|e| e.starts_with(b"PATH=")) {
+        env.push(DEFAULT_PATH.as_bytes().to_vec());
+    }
+    if !cfg.user.is_empty() && cfg.user != "0" && cfg.user != "root" {
+        eprint(b"kr ctr: warning: image USER is ignored for now (runs as container root)\n");
+    }
+
+    let id = container_id();
+    let dirs = match store.create_container(&id) {
+        Ok(d) => d,
+        Err(e) => return fail(&format!("create container: {e:?}")),
+    };
+    let spec = RunSpec {
+        rootfs: &rootfs,
+        upper: dirs.upper.as_bytes(),
+        work: dirs.work.as_bytes(),
+        merged: dirs.merged.as_bytes(),
+        argv: &argv,
+        env: &env,
+        cwd: cfg.working_dir.as_bytes(),
+        hostname: id.as_bytes(),
+        id: id.as_bytes(),
+        limits,
+    };
+    let code = report(container::run(&spec));
+    if let Err(e) = store.delete_container(&id) {
+        eprint(format!("kr ctr: warning: cleanup {id}: {e:?}\n").as_bytes());
+    }
+    code
+}
+
+fn report(r: Result<container::Exit, container::RunError>) -> i32 {
+    match r {
+        Ok(exit) => {
+            if exit.oom_killed {
+                eprint(b"kr ctr: container was OOM-killed\n");
+            }
+            exit.code
+        }
+        Err(e) => fail(&format!("{}: errno {}", e.step, e.errno.0)),
     }
 }
 
@@ -34,52 +186,24 @@ fn nul(p: &[u8]) -> Vec<u8> {
 
 /// Dev command: run a container from a plain directory, without the image store.
 fn run_dir(mut args: Args) -> i32 {
-    let mut limits = Limits::default();
-    let mut positional = Vec::new();
-    while positional.len() < 2 {
-        let Some(a) = args.next() else { break };
-        let flag = match a {
-            b"--memory" | b"--cpus" | b"--pids" => a,
-            _ => {
-                positional.push(a);
-                continue;
-            }
-        };
-        let Some(q) = args.next().and_then(|v| core::str::from_utf8(v).ok()).and_then(|v| Quantity::parse(v).ok()) else {
-            eprint(b"kr ctr: bad quantity for ");
-            eprint(flag);
-            eprint(b"\n");
-            return 2;
-        };
-        let as_u64 = |v: Option<i128>| v.filter(|&v| v > 0).and_then(|v| u64::try_from(v).ok());
-        match flag {
-            b"--memory" => limits.memory_bytes = as_u64(q.value()),
-            b"--cpus" => limits.cpu_milli = as_u64(q.milli_value()),
-            _ => limits.pids = as_u64(q.value()),
-        }
-    }
-    let (Some(&rootfs), Some(&state)) = (positional.first(), positional.get(1)) else {
-        eprint(USAGE);
-        return 2;
+    let (limits, pos, argv) = match parse(&mut args, 2) {
+        Ok(v) => v,
+        Err(c) => return c,
     };
-    let mut argv: Vec<Vec<u8>> = args.map(|a| a.to_vec()).collect();
-    if argv.first().map(|a| a.as_slice()) == Some(b"--") {
-        argv.remove(0);
-    }
     if argv.is_empty() {
         eprint(USAGE);
         return 2;
     }
+    let (rootfs, state) = (pos[0], pos[1]);
     let (upper, work, merged) = (join(state, b"upper"), join(state, b"work"), join(state, b"merged"));
     for d in [state, &upper[..], &work[..], &merged[..]] {
         match ns::mkdir(&nul(d), 0o700) {
             Ok(()) | Err(kr_sys::Errno(17)) => {}
-            Err(e) => return fail(b"mkdir state", e.0),
+            Err(e) => return fail(&format!("mkdir state: errno {}", e.0)),
         }
     }
-    let mut id = b"ctr-".to_vec();
-    id.extend_from_slice(fmt_u64(kr_rt::exec::now_ns(), &mut [0u8; 20]));
-    let env = [b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_vec(), b"HOME=/root".to_vec()];
+    let id = container_id();
+    let env = [DEFAULT_PATH.as_bytes().to_vec(), b"HOME=/root".to_vec()];
     let spec = RunSpec {
         rootfs,
         upper: &upper,
@@ -89,25 +213,15 @@ fn run_dir(mut args: Args) -> i32 {
         env: &env,
         cwd: b"/",
         hostname: b"kr",
-        id: &id,
+        id: id.as_bytes(),
         limits,
     };
-    match container::run(&spec) {
-        Ok(exit) => {
-            if exit.oom_killed {
-                eprint(b"kr ctr: container was OOM-killed\n");
-            }
-            exit.code
-        }
-        Err(e) => fail(e.step.as_bytes(), e.errno.0),
-    }
+    report(container::run(&spec))
 }
 
-fn fail(step: &[u8], errno: i32) -> i32 {
+fn fail(msg: &str) -> i32 {
     eprint(b"kr ctr: ");
-    eprint(step);
-    eprint(b": errno ");
-    eprint(fmt_u64(errno as u64, &mut [0u8; 20]));
+    eprint(msg.as_bytes());
     eprint(b"\n");
     125
 }

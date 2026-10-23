@@ -78,6 +78,7 @@ const STEPS: &[&str] = &[
     "drop capabilities",
     "seccomp",
     "join cgroup",
+    "loopback up",
 ];
 
 /// NUL-terminated concatenation of `parts`.
@@ -283,6 +284,8 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool) -> (u8, Errno) {
 
     step!(10, ns::umount2(b"/.oldroot\0", ns::MNT_DETACH));
     let _ = ns::rmdir(b"/.oldroot\0");
+
+    step!(19, ns::link_up(b"lo"));
 
     if !spec.hostname.is_empty() {
         step!(11, ns::sethostname(spec.hostname));
