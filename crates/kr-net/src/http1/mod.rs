@@ -1,4 +1,4 @@
-//! HTTP/1.1: strict head parser, chunked coding, URL handling and a keep-alive client.
+//! HTTP/1.1: strict head parser, chunked coding, URL handling, a keep-alive client and a server.
 //!
 //! The client is generic over [`Connector`]/[`Transport`], so a TLS connector can be added
 //! later (ADR-013, ADR-015) without touching the protocol code.
@@ -6,6 +6,7 @@
 pub mod body;
 pub mod client;
 pub mod head;
+pub mod server;
 pub mod url;
 
 pub use client::{Client, Config, Response};

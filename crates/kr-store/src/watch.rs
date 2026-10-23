@@ -34,18 +34,21 @@ impl Watcher {
     /// Next event, waiting if none is queued. `None` once the store was dropped (after the queue
     /// drained) or the watcher overflowed.
     pub async fn next(&mut self) -> Option<Event> {
-        poll_fn(|cx| {
-            let mut s = self.state.borrow_mut();
-            if let Some(e) = s.queue.pop_front() {
-                return Poll::Ready(Some(e));
-            }
-            if s.closed {
-                return Poll::Ready(None);
-            }
-            s.waker = Some(cx.waker().clone());
-            Poll::Pending
-        })
-        .await
+        poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// Poll form of `next` (for hand-written futures/streams): registers `cx`'s waker when no
+    /// event is queued.
+    pub fn poll_next(&mut self, cx: &mut core::task::Context<'_>) -> Poll<Option<Event>> {
+        let mut s = self.state.borrow_mut();
+        if let Some(e) = s.queue.pop_front() {
+            return Poll::Ready(Some(e));
+        }
+        if s.closed {
+            return Poll::Ready(None);
+        }
+        s.waker = Some(cx.waker().clone());
+        Poll::Pending
     }
 
     pub fn try_next(&mut self) -> Option<Event> {

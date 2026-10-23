@@ -9,7 +9,11 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod api;
 pub mod discovery;
 pub mod object;
+pub mod openapi;
 pub mod patch;
+pub mod printers;
 pub mod resources;
+pub mod server;

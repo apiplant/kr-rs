@@ -56,6 +56,11 @@ impl<T: Transport> TlsStream<T> {
         &self.conn
     }
 
+    /// The underlying transport (e.g. to reach the socket for a lingering close).
+    pub fn get_ref(&self) -> &T {
+        &self.inner
+    }
+
     async fn flush(&mut self) -> Result<()> {
         self.pending.extend_from_slice(&self.conn.take_output());
         if !self.pending.is_empty() {

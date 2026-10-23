@@ -6,10 +6,12 @@ version = 4
 name = "kr"
 version = "0.0.1"
 dependencies = [
+ "kr-apiserver",
  "kr-crypto",
  "kr-fmt",
  "kr-rt",
  "kr-runtime",
+ "kr-store",
  "kr-sys",
 ]
 
@@ -19,7 +21,9 @@ version = "0.0.1"
 dependencies = [
  "kr-crypto",
  "kr-fmt",
+ "kr-net",
  "kr-rt",
+ "kr-store",
  "kr-sys",
 ]
 

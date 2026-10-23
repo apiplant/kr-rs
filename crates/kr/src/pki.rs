@@ -38,18 +38,18 @@ fn utf8(b: &[u8]) -> Result<String, String> {
     core::str::from_utf8(b).map(String::from).map_err(|_| String::from("argument is not UTF-8"))
 }
 
-fn now() -> i64 {
+pub fn now() -> i64 {
     kr_sys::clock_gettime(0).map(|t| t.tv_sec).unwrap_or(0)
 }
 
-fn path(dir: &str, file: &str) -> Vec<u8> {
+pub fn path(dir: &str, file: &str) -> Vec<u8> {
     let mut p = format!("{dir}/{file}").into_bytes();
     p.push(0);
     p
 }
 
 /// Creates a file that must not exist yet (O_EXCL) with `mode`.
-fn write_new(p: &[u8], data: &[u8], mode: u32) -> Result<(), String> {
+pub fn write_new(p: &[u8], data: &[u8], mode: u32) -> Result<(), String> {
     const O_EXCL: i32 = 0o200;
     let fd = ns::open(p, ns::O_WRONLY | ns::O_CREAT | O_EXCL, mode).map_err(|e| match e {
         Errno(17) => format!("{} already exists", core::str::from_utf8(&p[..p.len() - 1]).unwrap_or("?")),
@@ -62,7 +62,7 @@ fn write_new(p: &[u8], data: &[u8], mode: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn new_key() -> SigningKey {
+pub fn new_key() -> SigningKey {
     let mut seed = [0u8; 48];
     kr_sys::getrandom(&mut seed);
     let k = SigningKey::P256(p256::SecretKey::from_seed(&seed));
@@ -70,7 +70,7 @@ fn new_key() -> SigningKey {
     k
 }
 
-fn serial() -> [u8; 16] {
+pub fn serial() -> [u8; 16] {
     let mut s = [0u8; 16];
     kr_sys::getrandom(&mut s);
     s
@@ -92,7 +92,12 @@ fn ca(mut args: Args) -> Result<(), String> {
             _ => return Err(format!("unknown flag {}", utf8(a)?)),
         }
     }
-    match ns::mkdir(&path(&dir, ""), 0o700) {
+    create_ca(&dir, cn, d)
+}
+
+/// Creates `<dir>/ca.pem` + `ca.key` (fails if they exist).
+pub fn create_ca(dir: &str, cn: String, d: i64) -> Result<(), String> {
+    match ns::mkdir(&path(dir, ""), 0o700) {
         Ok(()) | Err(Errno(17)) => {}
         Err(e) => return Err(format!("mkdir: errno {}", e.0)),
     }
@@ -112,13 +117,13 @@ fn ca(mut args: Args) -> Result<(), String> {
         public_key: key.public(),
     };
     let cert = x509::issue(&p, &name, &key);
-    write_new(&path(&dir, "ca.key"), x509::pem_encode("PRIVATE KEY", &x509::private_key_to_pkcs8(&key)).as_bytes(), 0o600)?;
-    write_new(&path(&dir, "ca.pem"), x509::pem_encode("CERTIFICATE", &cert).as_bytes(), 0o644)?;
+    write_new(&path(dir, "ca.key"), x509::pem_encode("PRIVATE KEY", &x509::private_key_to_pkcs8(&key)).as_bytes(), 0o600)?;
+    write_new(&path(dir, "ca.pem"), x509::pem_encode("CERTIFICATE", &cert).as_bytes(), 0o644)?;
     print(format!("{dir}/ca.pem\n").as_bytes());
     Ok(())
 }
 
-fn load_ca(dir: &str) -> Result<(Name, SigningKey, Vec<u8>), String> {
+pub fn load_ca(dir: &str) -> Result<(Name, SigningKey, Vec<u8>), String> {
     let read = |f: &str| fs::read_file(&path(dir, f), 1 << 20).map_err(|e| format!("read {dir}/{f}: errno {}", e.0));
     let pem = read("ca.pem")?;
     let cert = x509::pem_decode_all(core::str::from_utf8(&pem).map_err(|_| "ca.pem not UTF-8")?, "CERTIFICATE")

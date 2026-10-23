@@ -416,6 +416,10 @@ impl FieldSelector {
         Ok(FieldSelector(out))
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub fn matches(&self, o: &Value) -> bool {
         self.0.iter().all(|(path, neg, v)| {
             let refs: Vec<&str> = path.iter().map(String::as_str).collect();

@@ -9,7 +9,8 @@ kr-sys = { path = "../kr-sys" }
 kr-rt = { path = "../kr-rt" }
 kr-fmt = { path = "../kr-fmt" }
 kr-crypto = { path = "../kr-crypto" }
-# kr-net (re-added once the HTTP server lands)
+kr-net = { path = "../kr-net" }
+kr-store = { path = "../kr-store" }
 
 [dev-dependencies]
 kr-rt = { path = "../kr-rt", features = ["host"] }
