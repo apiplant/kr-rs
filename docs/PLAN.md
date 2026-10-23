@@ -51,6 +51,22 @@ Host requirements: Linux ≥ 5.10 with cgroup v2, overlayfs, nf_tables, vxlan an
 6. **Hardening**: `exec`/`logs`/`port-forward`, RBAC, SA tokens, fuzzing (cargo-fuzz runs in a separate dev-only harness; the dev tooling may use deps, the shipped code may not), and conformance tests.
 7. **HA** (later): kr-raft for 3-server clusters.
 
+## Conformance target (definition of done)
+"Certified Kubernetes" means passing the CNCF conformance suite (the upstream e2e tests tagged `[Conformance]`, run with Sonobuoy or Hydrophone) for a supported minor version, submitting the results to `cncf/k8s-conformance`, and signing the CNCF participation agreement. This must be redone for each version claimed. The name stays "kr" (trademark rules); "Certified Kubernetes" is used only after passing.
+
+Required beyond phases 0–6:
+- **C1 CustomResourceDefinitions:** apiextensions.k8s.io/v1, structural schemas, pruning, status/scale subresources, watch, and conversion (None strategy first).
+- **C2 Admission webhooks:** Validating/MutatingWebhookConfiguration called over TLS; failurePolicy, namespaceSelector/objectSelector, timeouts.
+- **C3 Protobuf responses:** e2e clients negotiate protobuf. Encode responses with the generated schema table (request decoding already exists).
+- **C4 Typed schemas:** generated from the upstream OpenAPI. Covers published `/openapi/v2` and `/openapi/v3`, defaulting, strict field validation and kind-specific validation.
+- **C5 Server-side apply with managedFields** and field-ownership conflicts.
+- **C6 Pod surface:** ServiceAccount token projection, downward API, exec/logs/attach/port-forward, probes, lifecycle hooks, init containers, resource limits, securityContext, hostPath/emptyDir/configMap/secret/projected volumes.
+- **C7 Networking:** Services (ClusterIP/NodePort), EndpointSlices, cluster DNS, pod-to-pod connectivity across at least 2 nodes.
+- **C8 Controllers:** GC by ownerReferences, Deployment/ReplicaSet/StatefulSet/DaemonSet/Job/CronJob, namespace lifecycle, ServiceAccount, ResourceQuota/LimitRange admission.
+- **C9 RBAC, aggregated discovery, Events, Leases.**
+
+Milestone: once the kubelet runs pods (phase 4), run Sonobuoy in CI and track the pass count.
+
 ## Key design rules
 - `#![no_std]` + `#![forbid(unsafe_code)]` in every crate except kr-sys, kr-rt and the kr-crypto asm. Unsafe code is audited and kept in those crates.
 - No `std`, no libc, no crates.io deps in `Cargo.lock`, enforced by a CI check (`cargo metadata` must show only workspace members).

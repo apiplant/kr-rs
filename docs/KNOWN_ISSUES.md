@@ -211,4 +211,6 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
 68. **Namespace deletion is synchronous** — *accepted*
     Contents are deleted inline rather than by a namespace controller, and finalizers inside the namespace are not honoured during this cascade.
 69. **No garbage collection by ownerReferences** — *open (controllers, phase 4)*
+70. **Conformance gaps** — *open; tracked as C1–C9 in PLAN.md*
+    The missing pieces are CRDs, admission webhooks, protobuf responses, typed schemas/OpenAPI, SSA managedFields, and the pod, network and controller surface the e2e suite exercises.
 
