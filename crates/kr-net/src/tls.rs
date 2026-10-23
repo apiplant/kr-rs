@@ -4,7 +4,8 @@
 //! [`TlsConnector`] picks plain TCP or TLS per URL scheme.
 
 use crate::http1::{Connector, Scheme, Transport, Url};
-use crate::tcp::{self, HostsResolver, Resolver};
+use crate::dns::SystemResolver;
+use crate::tcp::{self, Resolver};
 use crate::{Error, Result};
 use alloc::rc::Rc;
 use alloc::vec::Vec;
@@ -129,7 +130,7 @@ impl Transport for MaybeTls {
 }
 
 /// Connects with TLS for `https` URLs and plain TCP otherwise.
-pub struct TlsConnector<R: Resolver = HostsResolver> {
+pub struct TlsConnector<R: Resolver = SystemResolver> {
     resolver: R,
     cfg: Rc<ClientConfig>,
 }
@@ -141,11 +142,11 @@ impl<R: Resolver> TlsConnector<R> {
 }
 
 impl TlsConnector {
-    /// System resolver, trust anchors from the given PEM bundle (e.g. the cluster CA).
+    /// System resolver (hosts + DNS), trust anchors from the given PEM bundle.
     pub fn with_roots_pem(pem: &str) -> Result<Self> {
         let roots = kr_crypto::x509::pem_decode_all(pem, "CERTIFICATE").map_err(|_| Error::BadRef("bad CA bundle"))?;
         Ok(TlsConnector {
-            resolver: HostsResolver::system(),
+            resolver: SystemResolver::system(),
             cfg: Rc::new(ClientConfig { roots, client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()] }),
         })
     }

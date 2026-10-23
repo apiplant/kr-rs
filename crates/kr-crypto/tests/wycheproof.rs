@@ -163,3 +163,26 @@ fn rsa_pkcs1_and_pss_suites() {
     }
     assert_eq!(n, 1275);
 }
+
+#[test]
+fn ecdsa_p384_and_p256_sha512_suites() {
+    use kr_crypto::ecc;
+    use kr_crypto::rsa::HashAlg;
+    let mut n = 0;
+    for c in cases(include_str!("wycheproof/ecdsa_more.txt")) {
+        let h = if c.f[1] == "SHA-384" { HashAlg::Sha384 } else { HashAlg::Sha512 };
+        let (pk, msg, sig) = (unhex(c.f[2]), unhex(c.f[3]), unhex(c.f[4]));
+        let digest = h.digest(&[&msg]);
+        let ok = ecc::sig_from_der(&sig).is_some_and(|(r, s)| match c.f[0] {
+            "p384" => ecc::P384.verify_digest(&pk, &digest, r, s),
+            _ => ecc::P256.verify_digest(&pk, &digest, r, s),
+        });
+        match c.result {
+            "valid" => assert!(ok, "tc {} ({} {}) should verify", c.id, c.f[0], c.f[1]),
+            "invalid" => assert!(!ok, "tc {} ({} {}) should be rejected", c.id, c.f[0], c.f[1]),
+            _ => {}
+        }
+        n += 1;
+    }
+    assert!(n > 1000);
+}

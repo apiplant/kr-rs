@@ -163,15 +163,20 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
 
 ## kr-crypto / TLS (ADR-020)
 
-54. **Constant-time AES-GCM is slow (~3.5 MB/s)** — *accepted for now*
-    Bitsliced and table-free; TLS prefers ChaCha20-Poly1305 (~260 MB/s), so AES is only used when a peer offers nothing else.
-    Fix: process 4 CTR blocks per pass in `u64` planes (about 4x faster). AES-NI would need `unsafe`, which kr-crypto forbids.
-55. **No RSA signature verification** — *open, blocks public registries*
-    Docker Hub and most public CAs use RSA chains, so `kr ctr pull docker.io/...` fails certificate verification even with the system bundle.
-    Plan: PKCS#1 v1.5 and PSS verification (public-key operations only, so variable time is acceptable).
-56. **No DNS resolver** — *open, blocks public registries*
-    `tcp::HostsResolver` only knows IP literals and `/etc/hosts`.
-    Plan: a small async stub resolver (A/AAAA over UDP, falling back to TCP) reading `/etc/resolv.conf`. It is also the base for cluster DNS.
+54. **Constant-time AES-GCM is slow** — *fixed: 3.5 → 51 MB/s*
+    - **AES:** 4 counter blocks per bitsliced pass (`u64` planes) and the Boyar–Peralta S-box circuit, exhaustively checked.
+    - **GHASH:** BearSSL's ctmul64 carry-less multiply, cross-checked against the bit-serial reference.
+    - **Why it matters:** AWS ELB (registry-1.docker.io) picks AES-128-GCM regardless of client preference.
+55. **No RSA signature verification** — *fixed*
+    - **RSA:** PKCS#1 v1.5 and PSS (SHA-256/384/512), 2048–8192-bit keys. Wycheproof 1275/1275.
+    - **P-384:** ECDSA verification (generic `ecc` module shared with P-256). Wycheproof P-384/SHA-384/512 and P-256/SHA-512 suites all pass.
+    - **TLS:** rsa_pss_rsae_* and ecdsa_secp384r1_sha384 for CertificateVerify; PKCS#1 schemes are advertised for certificate signatures only.
+    - **Verified:** `kr ctr pull docker.io/library/alpine:3.20` (Let's Encrypt P-384 chain for auth, Amazon RSA chain for the registry, CloudFront blobs) and an OpenSSL RSA-chain server.
+56. **No DNS resolver** — *fixed*
+    - `dns::SystemResolver`: `/etc/hosts`, then A/AAAA over UDP with TCP fallback on truncation.
+    - Honours resolv.conf `nameserver`, `search`, `ndots`, `timeout` and `attempts`.
+    - Spoofing defences: random ids, connected sockets and question echo checks. Name decompression is strict, with backward-only pointers.
+    - No caching yet.
 57. **TLS feature gaps** — *accepted*
     - As a server, no HelloRetryRequest: clients must offer an X25519 or P-256 key share up front. Go, OpenSSL and curl all do.
     - No TLS 1.2, no PSK/resumption, no 0-RTT, and no NewSessionTicket sent.
@@ -183,4 +188,9 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
     `wipe` plus `black_box` zeroes keys on drop, but copies made by moves and by register spills are not tracked (no `unsafe`/volatile).
 60. **P-256 scalar multiplication is a plain ladder (~0.8 ms sign, ~1.5 ms verify)** — *watch*
     That is fine per handshake. Fixed-base tables would speed up the apiserver when there are many clients.
+61. **No TLS 1.2 client** — *open*
+    Some CDNs only speak TLS 1.2: `production.cloudflare.docker.com` answers TLS 1.3 with `protocol_version`. Docker Hub currently redirects blobs here to CloudFront (TLS 1.3), but registries or regions that land on such a CDN will fail.
+    Plan: a client-only TLS 1.2 with ECDHE plus AEAD suites, Extended Master Secret required, and no renegotiation or resumption.
+62. **Pull speed is network-bound** — *note*
+    kr's HTTPS download matches curl on the same file (2.5 s vs 2.2 s for 3.5 MB on this link). Layers are fetched sequentially; parallel layer downloads would help on high-latency links.
 

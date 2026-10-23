@@ -48,6 +48,7 @@ const GROUP_X25519: u16 = 0x001d;
 const GROUP_P256: u16 = 0x0017;
 const SIG_ECDSA_P256_SHA256: u16 = 0x0403;
 const SIG_ED25519: u16 = 0x0807;
+const SIG_ECDSA_P384_SHA384: u16 = 0x0503;
 const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
 const SIG_RSA_PSS_RSAE_SHA384: u16 = 0x0805;
 const SIG_RSA_PSS_RSAE_SHA512: u16 = 0x0806;
@@ -1061,7 +1062,9 @@ impl Connection {
         let context: &[u8] = if is_server { b"TLS 1.3, client CertificateVerify" } else { b"TLS 1.3, server CertificateVerify" };
         let content = verify_content(context, &self.transcript_hash());
         let alg = match scheme {
-            SIG_ECDSA_P256_SHA256 => SigAlg::EcdsaSha256,
+            // TLS 1.3 binds the curve to the scheme.
+            SIG_ECDSA_P256_SHA256 if matches!(self.peer_key, Some(PublicKey::P256(_))) => SigAlg::Ecdsa(crate::rsa::HashAlg::Sha256),
+            SIG_ECDSA_P384_SHA384 if matches!(self.peer_key, Some(PublicKey::P384(_))) => SigAlg::Ecdsa(crate::rsa::HashAlg::Sha384),
             SIG_ED25519 => SigAlg::Ed25519,
             SIG_RSA_PSS_RSAE_SHA256 => SigAlg::RsaPss(crate::rsa::HashAlg::Sha256, 32),
             SIG_RSA_PSS_RSAE_SHA384 => SigAlg::RsaPss(crate::rsa::HashAlg::Sha384, 48),
@@ -1131,7 +1134,7 @@ impl Connection {
                     put_u16(l, GROUP_P256);
                 }));
                 put_ext(e, EXT_SIGNATURE_ALGORITHMS, |v| put_vec(v, 2, |l| {
-                    for s in [SIG_ECDSA_P256_SHA256, SIG_ED25519, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PSS_RSAE_SHA384, SIG_RSA_PSS_RSAE_SHA512, SIG_RSA_PKCS1_SHA256, SIG_RSA_PKCS1_SHA384, SIG_RSA_PKCS1_SHA512] {
+                    for s in [SIG_ECDSA_P256_SHA256, SIG_ECDSA_P384_SHA384, SIG_ED25519, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PSS_RSAE_SHA384, SIG_RSA_PSS_RSAE_SHA512, SIG_RSA_PKCS1_SHA256, SIG_RSA_PKCS1_SHA384, SIG_RSA_PKCS1_SHA512] {
                         put_u16(l, s);
                     }
                 }));

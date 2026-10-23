@@ -6,7 +6,7 @@
 
 use crate::der::{self, Reader};
 use crate::rsa::{self, HashAlg};
-use crate::{ed25519, p256};
+use crate::{ecc, ed25519, p256};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -17,6 +17,9 @@ type Result<T> = core::result::Result<T, Error>;
 const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]; // 1.2.840.10045.2.1
 const OID_PRIME256V1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]; // 1.2.840.10045.3.1.7
 const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]; // 1.2.840.10045.4.3.2
+const OID_ECDSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03]; // .3
+const OID_ECDSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04]; // .4
+const OID_SECP384R1: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22]; // 1.3.132.0.34
 const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70]; // 1.3.101.112
 const OID_RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]; // 1.2.840.113549.1.1.1
 const OID_RSA_PSS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a]; // .10
@@ -47,6 +50,8 @@ pub const KU_CRL_SIGN: u16 = 1 << 6;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PublicKey {
     P256([u8; 65]),
+    /// Uncompressed SEC1 point (97 bytes); verification only.
+    P384(Vec<u8>),
     Ed25519([u8; 32]),
     /// Verification only (kr never issues RSA certificates).
     Rsa(rsa::PublicKey),
@@ -57,7 +62,12 @@ impl PublicKey {
     /// ECDSA signatures are DER-encoded; Ed25519 signatures are raw 64 bytes.
     pub fn verify(&self, alg: SigAlg, msg: &[u8], sig: &[u8]) -> bool {
         match (self, alg) {
-            (PublicKey::P256(pk), SigAlg::EcdsaSha256) => p256::sig_from_der(sig).is_some_and(|(r, s)| p256::verify(pk, msg, &r, &s)),
+            (PublicKey::P256(pk), SigAlg::Ecdsa(h)) => {
+                ecc::sig_from_der(sig).is_some_and(|(r, s)| ecc::P256.verify_digest(pk, &h.digest(&[msg]), r, s))
+            }
+            (PublicKey::P384(pk), SigAlg::Ecdsa(h)) => {
+                ecc::sig_from_der(sig).is_some_and(|(r, s)| ecc::P384.verify_digest(pk, &h.digest(&[msg]), r, s))
+            }
             (PublicKey::Ed25519(pk), SigAlg::Ed25519) => sig.len() == 64 && ed25519::verify(pk, msg, sig.try_into().unwrap()),
             (PublicKey::Rsa(pk), SigAlg::RsaPkcs1(h)) => pk.verify_pkcs1v15(h, msg, sig),
             (PublicKey::Rsa(pk), SigAlg::RsaPss(h, salt)) => pk.verify_pss(h, msg, sig, salt as usize),
@@ -81,6 +91,13 @@ impl PublicKey {
                     der::nested(o, der::SEQUENCE, |a| der::tlv(a, der::OID, OID_ED25519));
                     der::bit_string(o, pk);
                 }
+                PublicKey::P384(pk) => {
+                    der::nested(o, der::SEQUENCE, |a| {
+                        der::tlv(a, der::OID, OID_EC_PUBLIC_KEY);
+                        der::tlv(a, der::OID, OID_SECP384R1);
+                    });
+                    der::bit_string(o, pk);
+                }
                 PublicKey::Rsa(pk) => {
                     der::nested(o, der::SEQUENCE, |a| {
                         der::tlv(a, der::OID, OID_RSA_ENCRYPTION);
@@ -102,12 +119,11 @@ impl PublicKey {
         let key = s.bit_string()?;
         s.finish()?;
         Ok(match oid {
-            OID_EC_PUBLIC_KEY => {
-                if alg.oid()? != OID_PRIME256V1 || key.len() != 65 || key[0] != 4 {
-                    return Ok(None);
-                }
-                Some(PublicKey::P256(key.try_into().unwrap()))
-            }
+            OID_EC_PUBLIC_KEY => match alg.oid()? {
+                OID_PRIME256V1 if key.len() == 65 && key[0] == 4 => Some(PublicKey::P256(key.try_into().unwrap())),
+                OID_SECP384R1 if key.len() == 97 && key[0] == 4 => Some(PublicKey::P384(key.to_vec())),
+                _ => None, // compressed points and other curves are unsupported
+            },
             OID_ED25519 => {
                 alg.finish()?; // parameters MUST be absent
                 Some(PublicKey::Ed25519(key.try_into().map_err(|_| Error)?))
@@ -120,7 +136,7 @@ impl PublicKey {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SigAlg {
-    EcdsaSha256,
+    Ecdsa(HashAlg),
     Ed25519,
     RsaPkcs1(HashAlg),
     /// Hash (also used for MGF1) and salt length.
@@ -188,7 +204,9 @@ fn parse_sig_alg(r: &mut Reader) -> Result<SigAlg> {
     let mut a = r.sequence()?;
     let oid = a.oid()?;
     let alg = match oid {
-        OID_ECDSA_SHA256 => SigAlg::EcdsaSha256,
+        OID_ECDSA_SHA256 => SigAlg::Ecdsa(HashAlg::Sha256),
+        OID_ECDSA_SHA384 => SigAlg::Ecdsa(HashAlg::Sha384),
+        OID_ECDSA_SHA512 => SigAlg::Ecdsa(HashAlg::Sha512),
         OID_ED25519 => SigAlg::Ed25519,
         OID_SHA256_RSA | OID_SHA384_RSA | OID_SHA512_RSA => {
             a.optional(der::NULL)?; // NULL parameters (absent is tolerated)
@@ -660,7 +678,7 @@ impl SigningKey {
 
     pub fn sig_alg(&self) -> SigAlg {
         match self {
-            SigningKey::P256(_) => SigAlg::EcdsaSha256,
+            SigningKey::P256(_) => SigAlg::Ecdsa(HashAlg::Sha256),
             SigningKey::Ed25519(_) => SigAlg::Ed25519,
         }
     }
@@ -683,6 +701,7 @@ fn key_id(k: &PublicKey) -> [u8; 20] {
     let bits: &[u8] = match k {
         PublicKey::P256(b) => b,
         PublicKey::Ed25519(b) => b,
+        PublicKey::P384(b) => b,
         PublicKey::Rsa(pk) => {
             rsa_bits = pk.to_pkcs1();
             &rsa_bits

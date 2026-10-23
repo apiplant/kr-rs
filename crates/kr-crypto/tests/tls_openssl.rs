@@ -37,7 +37,7 @@ fn setup(tag: &str, ed_server: bool) -> Files {
     let t = now();
     let mut seed = [0u8; 32];
     rng(&mut seed);
-    let ca_key = SigningKey::P256(p256::SecretKey::from_bytes(&[seed[0] | 1; 32]).unwrap());
+    let ca_key = SigningKey::P256(p256::SecretKey::from_bytes(&[(seed[0] & 0x7f) | 1; 32]).unwrap());
     let ca_name = Name { common_name: "kr-test-ca".into(), organizations: vec![] };
     let p = |name: &Name, pk, ca, server, client| CertParams {
         serial: seed[..16].try_into().unwrap(),
@@ -52,10 +52,10 @@ fn setup(tag: &str, ed_server: bool) -> Files {
         public_key: pk,
     };
     let ca = x509::issue(&p(&ca_name, ca_key.public(), true, false, false), &ca_name, &ca_key);
-    let srv_key = if ed_server { SigningKey::Ed25519(ed25519::SigningKey::from_seed(&seed)) } else { SigningKey::P256(p256::SecretKey::from_bytes(&[seed[1] | 1; 32]).unwrap()) };
+    let srv_key = if ed_server { SigningKey::Ed25519(ed25519::SigningKey::from_seed(&seed)) } else { SigningKey::P256(p256::SecretKey::from_bytes(&[(seed[1] & 0x7f) | 1; 32]).unwrap()) };
     let srv_name = Name { common_name: "localhost".into(), organizations: vec![] };
     let srv_cert = x509::issue(&p(&srv_name, srv_key.public(), false, true, false), &ca_name, &ca_key);
-    let cli_key = SigningKey::P256(p256::SecretKey::from_bytes(&[seed[2] | 1; 32]).unwrap());
+    let cli_key = SigningKey::P256(p256::SecretKey::from_bytes(&[(seed[2] & 0x7f) | 1; 32]).unwrap());
     let cli_name = Name { common_name: "alice".into(), organizations: vec!["system:masters".into()] };
     let cli_cert = x509::issue(&p(&cli_name, cli_key.public(), false, false, true), &ca_name, &ca_key);
     for (f, label, der) in [("ca.pem", "CERTIFICATE", &ca), ("srv.pem", "CERTIFICATE", &srv_cert), ("cli.pem", "CERTIFICATE", &cli_cert)] {

@@ -14,6 +14,7 @@ pub mod aes;
 pub mod bigint;
 pub mod chacha;
 pub mod der;
+pub mod ecc;
 pub mod ed25519;
 pub mod field25519;
 pub mod hmac;

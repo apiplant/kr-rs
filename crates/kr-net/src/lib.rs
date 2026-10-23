@@ -10,6 +10,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod dns;
 pub mod http1;
 pub mod netlink;
 pub mod nft;
@@ -27,7 +28,7 @@ pub enum Error {
     Io(Errno),
     /// A connect, request-head or idle-read deadline expired.
     Timeout,
-    /// Name resolution failed (only literals and `/etc/hosts` are supported).
+    /// Name resolution failed (hosts file and DNS).
     Resolve,
     /// An `https` URL was requested from a plain-TCP connector (use `tls::TlsConnector`).
     TlsUnsupported,

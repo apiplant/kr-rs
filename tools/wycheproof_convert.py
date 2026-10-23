@@ -65,4 +65,12 @@ def rsa():
                 rows.append((t["tcId"], t["result"], kind, g["sha"], salt, g["publicKeyAsn"], t["msg"], t["sig"]))
     write("rsa", rows)
 
-x25519(); ed25519(); rsa(); ecdsa(); ecdh(); aead("aes_gcm", "aes_gcm", (128, 256)); aead("chacha20_poly1305", "chacha20_poly1305", (256,)); mac_kdf()
+def ecdsa_more():
+    rows = []
+    for name, curve, sha in [("ecdsa_secp384r1_sha384", "p384", "SHA-384"), ("ecdsa_secp384r1_sha512", "p384", "SHA-512"), ("ecdsa_secp256r1_sha512", "p256", "SHA-512")]:
+        for g in load(name)["testGroups"]:
+            for t in g["tests"]:
+                rows.append((t["tcId"], t["result"], curve, sha, g["publicKey"]["uncompressed"], t["msg"], t["sig"]))
+    write("ecdsa_more", rows)
+
+x25519(); ed25519(); rsa(); ecdsa_more(); ecdsa(); ecdh(); aead("aes_gcm", "aes_gcm", (128, 256)); aead("chacha20_poly1305", "chacha20_poly1305", (256,)); mac_kdf()

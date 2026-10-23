@@ -1,38 +1,117 @@
-//! Constant-time 256-bit modular arithmetic (Montgomery form, 4 x 64-bit limbs) for odd moduli
-//! below 2^256: the P-256 field and group order, and the Ed25519 group order.
+//! Constant-time modular arithmetic in Montgomery form over `N` 64-bit limbs, for odd moduli
+//! below 2^(64N): P-256 and P-384 fields and group orders, and the Ed25519 group order.
 //!
 //! All operations run in time independent of the values: carries are computed arithmetically
 //! and conditional subtractions use masks. Only exponents passed to `pow` are treated as public.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct U256(pub [u64; 4]); // little-endian limbs
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Uint<const N: usize>(pub [u64; N]); // little-endian limbs
 
-impl U256 {
-    pub const ZERO: U256 = U256([0; 4]);
-    pub const ONE: U256 = U256([1, 0, 0, 0]);
+pub type U256 = Uint<4>;
+pub type U384 = Uint<6>;
 
-    pub fn from_be_bytes(b: &[u8; 32]) -> U256 {
-        let mut l = [0u64; 4];
-        for i in 0..4 {
-            l[3 - i] = u64::from_be_bytes(b[8 * i..8 * i + 8].try_into().unwrap());
+impl<const N: usize> Default for Uint<N> {
+    fn default() -> Self {
+        Uint([0; N])
+    }
+}
+
+impl<const N: usize> Uint<N> {
+    pub const ZERO: Self = Uint([0; N]);
+    pub const ONE: Self = {
+        let mut l = [0u64; N];
+        l[0] = 1;
+        Uint(l)
+    };
+    pub const BYTES: usize = 8 * N;
+
+    /// Big-endian bytes; `b.len()` must be exactly `8 * N`.
+    pub fn from_be_slice(b: &[u8]) -> Self {
+        assert_eq!(b.len(), 8 * N);
+        let mut l = [0u64; N];
+        for i in 0..N {
+            l[N - 1 - i] = u64::from_be_bytes(b[8 * i..8 * i + 8].try_into().unwrap());
         }
-        U256(l)
+        Uint(l)
+    }
+
+    pub fn write_be(&self, out: &mut [u8]) {
+        assert_eq!(out.len(), 8 * N);
+        for i in 0..N {
+            out[8 * i..8 * i + 8].copy_from_slice(&self.0[N - 1 - i].to_be_bytes());
+        }
+    }
+
+    pub fn from_le_slice(b: &[u8]) -> Self {
+        assert_eq!(b.len(), 8 * N);
+        let mut l = [0u64; N];
+        for i in 0..N {
+            l[i] = u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap());
+        }
+        Uint(l)
+    }
+
+    /// (self - o, borrow) with borrow in {0, 1}.
+    fn sbb(&self, o: &Self) -> (Self, u64) {
+        let mut r = [0u64; N];
+        let mut borrow = 0u64;
+        for i in 0..N {
+            let (d1, b1) = self.0[i].overflowing_sub(o.0[i]);
+            let (d2, b2) = d1.overflowing_sub(borrow);
+            r[i] = d2;
+            borrow = (b1 | b2) as u64;
+        }
+        (Uint(r), borrow)
+    }
+
+    fn adc(&self, o: &Self) -> (Self, u64) {
+        let mut r = [0u64; N];
+        let mut carry = 0u64;
+        for i in 0..N {
+            let s = self.0[i] as u128 + o.0[i] as u128 + carry as u128;
+            r[i] = s as u64;
+            carry = (s >> 64) as u64;
+        }
+        (Uint(r), carry)
+    }
+
+    /// Constant-time `self < o`.
+    pub fn ct_lt(&self, o: &Self) -> bool {
+        self.sbb(o).1 == 1
+    }
+
+    pub fn is_zero(&self) -> bool {
+        core::hint::black_box(self.0.iter().fold(0, |a, &l| a | l)) == 0
+    }
+
+    /// `b` when `choose` is 1, else `a`.
+    pub fn select(a: &Self, b: &Self, choose: u64) -> Self {
+        let mask = 0u64.wrapping_sub(choose);
+        let mut r = [0u64; N];
+        for i in 0..N {
+            r[i] = a.0[i] ^ (mask & (a.0[i] ^ b.0[i]));
+        }
+        Uint(r)
+    }
+
+    pub fn bit(&self, i: usize) -> u64 {
+        (self.0[i / 64] >> (i % 64)) & 1
+    }
+}
+
+impl Uint<4> {
+    pub fn from_be_bytes(b: &[u8; 32]) -> Self {
+        Self::from_be_slice(b)
     }
 
     pub fn to_be_bytes(&self) -> [u8; 32] {
         let mut b = [0u8; 32];
-        for i in 0..4 {
-            b[8 * i..8 * i + 8].copy_from_slice(&self.0[3 - i].to_be_bytes());
-        }
+        self.write_be(&mut b);
         b
     }
 
-    pub fn from_le_bytes(b: &[u8; 32]) -> U256 {
-        let mut l = [0u64; 4];
-        for i in 0..4 {
-            l[i] = u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap());
-        }
-        U256(l)
+    pub fn from_le_bytes(b: &[u8; 32]) -> Self {
+        Self::from_le_slice(b)
     }
 
     pub fn to_le_bytes(&self) -> [u8; 32] {
@@ -42,140 +121,98 @@ impl U256 {
         }
         b
     }
-
-    /// (self - o, borrow) with borrow in {0, 1}.
-    fn sbb(&self, o: &U256) -> (U256, u64) {
-        let mut r = [0u64; 4];
-        let mut borrow = 0u64;
-        for i in 0..4 {
-            let (d1, b1) = self.0[i].overflowing_sub(o.0[i]);
-            let (d2, b2) = d1.overflowing_sub(borrow);
-            r[i] = d2;
-            borrow = (b1 | b2) as u64;
-        }
-        (U256(r), borrow)
-    }
-
-    fn adc(&self, o: &U256) -> (U256, u64) {
-        let mut r = [0u64; 4];
-        let mut carry = 0u64;
-        for i in 0..4 {
-            let s = self.0[i] as u128 + o.0[i] as u128 + carry as u128;
-            r[i] = s as u64;
-            carry = (s >> 64) as u64;
-        }
-        (U256(r), carry)
-    }
-
-    /// Constant-time `self < o`.
-    pub fn ct_lt(&self, o: &U256) -> bool {
-        self.sbb(o).1 == 1
-    }
-
-    pub fn is_zero(&self) -> bool {
-        core::hint::black_box(self.0.iter().fold(0, |a, &l| a | l)) == 0
-    }
-
-    /// `b` when `choose` is 1, else `a`.
-    pub fn select(a: &U256, b: &U256, choose: u64) -> U256 {
-        let mask = 0u64.wrapping_sub(choose);
-        let mut r = [0u64; 4];
-        for i in 0..4 {
-            r[i] = a.0[i] ^ (mask & (a.0[i] ^ b.0[i]));
-        }
-        U256(r)
-    }
-
-    pub fn bit(&self, i: usize) -> u64 {
-        (self.0[i / 64] >> (i % 64)) & 1
-    }
 }
 
-/// An odd modulus with its Montgomery constants (R = 2^256).
+/// An odd modulus with its Montgomery constants (R = 2^(64N)).
 #[derive(Clone, Copy, Debug)]
-pub struct Modulus {
-    pub m: U256,
+pub struct Modulus<const N: usize> {
+    pub m: Uint<N>,
     /// R^2 mod m.
-    pub r2: U256,
+    pub r2: Uint<N>,
     /// -m^-1 mod 2^64.
     pub n0: u64,
 }
 
 // Constants generated by Python from the moduli; `tests::constants` re-derives them.
-pub const P256_P: Modulus = Modulus { m: U256([0xffffffffffffffff, 0x00000000ffffffff, 0x0000000000000000, 0xffffffff00000001]), r2: U256([0x0000000000000003, 0xfffffffbffffffff, 0xfffffffffffffffe, 0x00000004fffffffd]), n0: 0x0000000000000001 };
-pub const P256_N: Modulus = Modulus { m: U256([0xf3b9cac2fc632551, 0xbce6faada7179e84, 0xffffffffffffffff, 0xffffffff00000000]), r2: U256([0x83244c95be79eea2, 0x4699799c49bd6fa6, 0x2845b2392b6bec59, 0x66e12d94f3d95620]), n0: 0xccd1c8aaee00bc4f };
-pub const ED25519_L: Modulus = Modulus { m: U256([0x5812631a5cf5d3ed, 0x14def9dea2f79cd6, 0x0000000000000000, 0x1000000000000000]), r2: U256([0xa40611e3449c0f01, 0xd00e1ba768859347, 0xceec73d217f5be65, 0x0399411b7c309a3d]), n0: 0xd2b51da312547e1b };
+pub const P256_P: Modulus<4> = Modulus { m: Uint([0xffffffffffffffff, 0x00000000ffffffff, 0x0000000000000000, 0xffffffff00000001]), r2: Uint([0x0000000000000003, 0xfffffffbffffffff, 0xfffffffffffffffe, 0x00000004fffffffd]), n0: 0x0000000000000001 };
+pub const P256_N: Modulus<4> = Modulus { m: Uint([0xf3b9cac2fc632551, 0xbce6faada7179e84, 0xffffffffffffffff, 0xffffffff00000000]), r2: Uint([0x83244c95be79eea2, 0x4699799c49bd6fa6, 0x2845b2392b6bec59, 0x66e12d94f3d95620]), n0: 0xccd1c8aaee00bc4f };
+pub const ED25519_L: Modulus<4> = Modulus { m: Uint([0x5812631a5cf5d3ed, 0x14def9dea2f79cd6, 0x0000000000000000, 0x1000000000000000]), r2: Uint([0xa40611e3449c0f01, 0xd00e1ba768859347, 0xceec73d217f5be65, 0x0399411b7c309a3d]), n0: 0xd2b51da312547e1b };
+pub const P384_P: Modulus<6> = Modulus { m: Uint([0x00000000ffffffff, 0xffffffff00000000, 0xfffffffffffffffe, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff]), r2: Uint([0xfffffffe00000001, 0x0000000200000000, 0xfffffffe00000000, 0x0000000200000000, 0x0000000000000001, 0x0000000000000000]), n0: 0x0000000100000001 };
+pub const P384_N: Modulus<6> = Modulus { m: Uint([0xecec196accc52973, 0x581a0db248b0a77a, 0xc7634d81f4372ddf, 0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff]), r2: Uint([0x2d319b2419b409a9, 0xff3d81e5df1aa419, 0xbc3e483afcb82947, 0xd40d49174aab1cc5, 0x3fb05b7a28266895, 0x0c84ee012b39bf21]), n0: 0x6ed46089e88fdc45 };
 
-impl Modulus {
+impl<const N: usize> Modulus<N> {
     /// Subtracts m once if `(hi:x) >= m`. Requires the value to be below 2m.
-    fn reduce_once(&self, x: &U256, hi: u64) -> U256 {
+    fn reduce_once(&self, x: &Uint<N>, hi: u64) -> Uint<N> {
         let (d, borrow) = x.sbb(&self.m);
-        // Keep d unless (hi == 0 and borrow): i.e. the value really was below m.
         let keep_x = borrow & (hi ^ 1);
-        U256::select(&d, x, keep_x)
+        Uint::select(&d, x, keep_x)
     }
 
-    /// Montgomery product a * b * R^-1 mod m (CIOS). Correct for any a < 2^256 when b < m.
-    pub fn mul(&self, a: &U256, b: &U256) -> U256 {
+    /// Montgomery product a * b * R^-1 mod m (CIOS). Correct for any a < R when b < m.
+    pub fn mul(&self, a: &Uint<N>, b: &Uint<N>) -> Uint<N> {
         let m = &self.m.0;
-        let mut t = [0u64; 6];
-        for i in 0..4 {
+        // t has N + 2 limbs; N <= 8 in practice.
+        let mut t = [0u64; 10];
+        assert!(N + 2 <= t.len());
+        for i in 0..N {
             let mut c: u128 = 0;
-            for j in 0..4 {
+            for j in 0..N {
                 let s = t[j] as u128 + a.0[j] as u128 * b.0[i] as u128 + c;
                 t[j] = s as u64;
                 c = s >> 64;
             }
-            let s = t[4] as u128 + c;
-            t[4] = s as u64;
-            t[5] = (s >> 64) as u64;
+            let s = t[N] as u128 + c;
+            t[N] = s as u64;
+            t[N + 1] = (s >> 64) as u64;
             let q = t[0].wrapping_mul(self.n0);
             let s = t[0] as u128 + q as u128 * m[0] as u128;
             let mut c = s >> 64;
-            for j in 1..4 {
+            for j in 1..N {
                 let s = t[j] as u128 + q as u128 * m[j] as u128 + c;
                 t[j - 1] = s as u64;
                 c = s >> 64;
             }
-            let s = t[4] as u128 + c;
-            t[3] = s as u64;
-            t[4] = t[5] + (s >> 64) as u64;
+            let s = t[N] as u128 + c;
+            t[N - 1] = s as u64;
+            t[N] = t[N + 1] + (s >> 64) as u64;
         }
-        self.reduce_once(&U256([t[0], t[1], t[2], t[3]]), t[4])
+        let mut lo = [0u64; N];
+        lo.copy_from_slice(&t[..N]);
+        self.reduce_once(&Uint(lo), t[N])
     }
 
-    pub fn add(&self, a: &U256, b: &U256) -> U256 {
+    pub fn add(&self, a: &Uint<N>, b: &Uint<N>) -> Uint<N> {
         let (s, carry) = a.adc(b);
         self.reduce_once(&s, carry)
     }
 
-    pub fn sub(&self, a: &U256, b: &U256) -> U256 {
+    pub fn sub(&self, a: &Uint<N>, b: &Uint<N>) -> Uint<N> {
         let (d, borrow) = a.sbb(b);
         let (fixed, _) = d.adc(&self.m);
-        U256::select(&d, &fixed, borrow)
+        Uint::select(&d, &fixed, borrow)
     }
 
-    pub fn neg(&self, a: &U256) -> U256 {
-        self.sub(&U256::ZERO, a)
+    pub fn neg(&self, a: &Uint<N>) -> Uint<N> {
+        self.sub(&Uint::ZERO, a)
     }
 
-    pub fn to_mont(&self, a: &U256) -> U256 {
+    pub fn to_mont(&self, a: &Uint<N>) -> Uint<N> {
         self.mul(a, &self.r2)
     }
 
-    pub fn from_mont(&self, a: &U256) -> U256 {
-        self.mul(a, &U256::ONE)
+    pub fn from_mont(&self, a: &Uint<N>) -> Uint<N> {
+        self.mul(a, &Uint::ONE)
     }
 
     /// Montgomery one (R mod m).
-    pub fn one(&self) -> U256 {
-        self.to_mont(&U256::ONE)
+    pub fn one(&self) -> Uint<N> {
+        self.to_mont(&Uint::ONE)
     }
 
     /// a^e for a in Montgomery form; `e` is public (square-and-multiply on its bits).
-    pub fn pow(&self, a: &U256, e: &U256) -> U256 {
+    pub fn pow(&self, a: &Uint<N>, e: &Uint<N>) -> Uint<N> {
         let mut r = self.one();
-        for i in (0..256).rev() {
+        for i in (0..64 * N).rev() {
             r = self.mul(&r, &r);
             if e.bit(i) == 1 {
                 r = self.mul(&r, a);
@@ -185,16 +222,20 @@ impl Modulus {
     }
 
     /// Inverse of a (Montgomery form) via Fermat; m must be prime. 0 maps to 0.
-    pub fn inv(&self, a: &U256) -> U256 {
-        let (e, _) = self.m.sbb(&U256([2, 0, 0, 0]));
+    pub fn inv(&self, a: &Uint<N>) -> Uint<N> {
+        let mut two = Uint::ZERO;
+        two.0[0] = 2;
+        let (e, _) = self.m.sbb(&two);
         self.pow(a, &e)
     }
 
-    /// Reduces any 256-bit value mod m (plain form in, plain form out).
-    pub fn reduce(&self, a: &U256) -> U256 {
+    /// Reduces any N-limb value mod m (plain form in, plain form out).
+    pub fn reduce(&self, a: &Uint<N>) -> Uint<N> {
         self.from_mont(&self.mul(a, &self.r2))
     }
+}
 
+impl Modulus<4> {
     /// Reduces a 512-bit little-endian value mod m (plain form): lo + hi * 2^256.
     pub fn reduce_wide_le(&self, b: &[u8; 64]) -> U256 {
         let lo = U256::from_le_bytes(b[..32].try_into().unwrap());
@@ -211,22 +252,27 @@ mod tests {
     /// Re-derives R^2 and n0 by slow but obvious arithmetic, guarding the pasted constants.
     #[test]
     fn constants() {
-        for md in [P256_P, P256_N, ED25519_L] {
+        fn check<const N: usize>(md: Modulus<N>) {
             // n0 * m == -1 mod 2^64
             assert_eq!(md.m.0[0].wrapping_mul(md.n0), u64::MAX);
-            // R mod m by 256 modular doublings of 1, then R^2 = R * R via 256 more doublings.
-            let mut x = U256::ONE;
-            for _ in 0..512 {
+            // R^2 mod m by 2 * 64N modular doublings of 1.
+            let mut x = Uint::<N>::ONE;
+            for _ in 0..128 * N {
                 x = md.add(&x, &x);
             }
             assert_eq!(x, md.r2);
         }
+        for md in [P256_P, P256_N, ED25519_L] {
+            check(md);
+        }
+        check(P384_P);
+        check(P384_N);
     }
 
     #[test]
     fn mont_roundtrip_and_inverse() {
         let md = P256_N;
-        let a = U256([0x1234, 0x5678, 0x9abc, 0x0def]);
+        let a = Uint([0x1234, 0x5678, 0x9abc, 0x0def]);
         let am = md.to_mont(&a);
         assert_eq!(md.from_mont(&am), a);
         let inv = md.inv(&am);
