@@ -19,6 +19,9 @@ version = "0.0.1"
 [[package]]
 name = "kr-crypto"
 version = "0.0.1"
+dependencies = [
+ "kr-fmt",
+]
 
 [[package]]
 name = "kr-fmt"

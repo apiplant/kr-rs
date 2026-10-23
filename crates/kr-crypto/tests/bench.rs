@@ -20,16 +20,16 @@ fn time(name: &str, iters: u32, bytes: usize, mut f: impl FnMut()) {
 fn bench() {
     let mut buf = vec![0u8; 16384];
     let key = [7u8; 32];
-    time("chacha20-poly1305 16K", 200, buf.len(), || drop(chacha::seal(&key, &[0; 12], &[], &mut buf)));
+    time("chacha20-poly1305 16K", 200, buf.len(), || { std::hint::black_box(chacha::seal(&key, &[0; 12], &[], &mut buf)); });
     let g = AesGcm::new(&key[..16]);
-    time("aes-128-gcm 16K", 20, buf.len(), || drop(g.seal(&[0; 12], &[], &mut buf)));
-    time("x25519", 200, 0, || drop(x25519::public_key(&key)));
+    time("aes-128-gcm 16K", 20, buf.len(), || { std::hint::black_box(g.seal(&[0; 12], &[], &mut buf)); });
+    time("x25519", 200, 0, || { std::hint::black_box(x25519::public_key(&key)); });
     let ek = ed25519::SigningKey::from_seed(&key);
-    time("ed25519 sign", 100, 0, || drop(ek.sign(b"hello")));
+    time("ed25519 sign", 100, 0, || { std::hint::black_box(ek.sign(b"hello")); });
     let sig = ek.sign(b"hello");
     time("ed25519 verify", 100, 0, || assert!(ed25519::verify(&ek.public_key(), b"hello", &sig)));
     let pk = p256::SecretKey::from_bytes(&key).unwrap();
-    time("p256 sign", 50, 0, || drop(pk.sign(b"hello")));
+    time("p256 sign", 50, 0, || { std::hint::black_box(pk.sign(b"hello")); });
     let (r, s) = pk.sign(b"hello");
     let pub_ = pk.public_key();
     time("p256 verify", 50, 0, || assert!(p256::verify(&pub_, b"hello", &r, &s)));

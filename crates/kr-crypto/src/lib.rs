@@ -13,12 +13,14 @@ extern crate std;
 pub mod aes;
 pub mod bigint;
 pub mod chacha;
+pub mod der;
 pub mod ed25519;
 pub mod field25519;
 pub mod hmac;
 pub mod p256;
 pub mod sha2;
 pub mod x25519;
+pub mod x509;
 
 /// Constant-time equality of equal-length slices (false when lengths differ; lengths are public).
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {

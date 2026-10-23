@@ -96,6 +96,64 @@ def signatures():
         rows.append(("p256", d.to_bytes(32, "big"), pub, msg, det, rnd, k2.public_key().public_bytes(**unc), shared))
     w("signatures.txt", rows)
 
+@gen
+def x509_chains():
+    """Chains built by pyca/OpenSSL for kr's verifier. Times are fixed; tests use NOW=1800000000."""
+    import datetime as dt, ipaddress
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID, ObjectIdentifier
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519
+    from cryptography.hazmat.primitives import serialization as ser
+    d = os.path.join(OUT, "x509"); os.makedirs(d, exist_ok=True)
+    T = lambda s: dt.datetime.fromtimestamp(s, dt.timezone.utc)
+    def key(kind="ec"):
+        return ec.derive_private_key(rng.randrange(1, 2**255), ec.SECP256R1()) if kind == "ec" else ed25519.Ed25519PrivateKey.from_private_bytes(rb(32))
+    def name(cn, o=None):
+        attrs = [x509.NameAttribute(NameOID.COMMON_NAME, cn)] + ([x509.NameAttribute(NameOID.ORGANIZATION_NAME, o)] if o else [])
+        return x509.Name(attrs)
+    def cert(subj, pub, issuer, ikey, ca=False, pathlen=None, eku=None, sans=(), nb=1700000000, na=1900000000, extra=None, ku=True):
+        b = (x509.CertificateBuilder().subject_name(subj).issuer_name(issuer).public_key(pub)
+             .serial_number(rng.randrange(1, 2**63)).not_valid_before(T(nb)).not_valid_after(T(na)))
+        b = b.add_extension(x509.BasicConstraints(ca=ca, path_length=pathlen), critical=True)
+        if ku:
+            b = b.add_extension(x509.KeyUsage(digital_signature=not ca, content_commitment=False, key_encipherment=False, data_encipherment=False,
+                                              key_agreement=False, key_cert_sign=ca, crl_sign=ca, encipher_only=False, decipher_only=False), critical=True)
+        if eku: b = b.add_extension(x509.ExtendedKeyUsage(eku), critical=False)
+        if sans:
+            b = b.add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address(s)) if s[0].isdigit() or ":" in s else x509.DNSName(s) for s in sans]), critical=False)
+        if extra: b = b.add_extension(x509.UnrecognizedExtension(ObjectIdentifier("1.3.6.1.4.1.99999.1"), b"\x05\x00"), critical=extra == "critical")
+        algo = None if isinstance(ikey, ed25519.Ed25519PrivateKey) else hashes.SHA256()
+        return b.sign(ikey, algo)
+    pem = lambda c: c.public_bytes(ser.Encoding.PEM).decode()
+    SRV, CLI = [ExtendedKeyUsageOID.SERVER_AUTH], [ExtendedKeyUsageOID.CLIENT_AUTH]
+    rk = key(); root = cert(name("kr-test-root"), rk.public_key(), name("kr-test-root"), rk, ca=True, pathlen=1)
+    ik = key(); inter = cert(name("kr-test-inter"), ik.public_key(), root.subject, rk, ca=True, pathlen=0)
+    ek = key("ed"); edroot = cert(name("kr-ed-root"), ek.public_key(), name("kr-ed-root"), ek, ca=True)
+    def leaf(cn="api", **kw): k = key(); return cert(name(cn, kw.pop("o", None)), k.public_key(), inter.subject, ik, **kw)
+    cases = {
+        "ok_server_via_inter": (leaf(eku=SRV, sans=["api.kr.local", "*.svc.kr.local", "10.0.0.1", "::1"]), "server", "ok"),
+        "ok_client": (leaf("alice", o="system:masters", eku=CLI), "client", "ok"),
+        "expired": (leaf(eku=SRV, sans=["api.kr.local"], na=1750000000), "server", "Expired"),
+        "wrong_eku": (leaf(eku=CLI, sans=["api.kr.local"]), "server", "Usage"),
+        "wrong_host": (leaf(eku=SRV, sans=["other.kr.local"]), "server", "HostMismatch"),
+        "unknown_critical": (leaf(eku=SRV, sans=["api.kr.local"], extra="critical"), "server", "Parse"),
+        "unknown_noncritical": (leaf(eku=SRV, sans=["api.kr.local"], extra="plain"), "server", "ok"),
+    }
+    # leaf issued by a non-CA leaf
+    fake_k = key(); fake = cert(name("fake-ca"), fake_k.public_key(), inter.subject, ik, eku=SRV)
+    k = key(); cases["issuer_not_ca"] = (cert(name("x"), k.public_key(), fake.subject, fake_k, eku=SRV, sans=["api.kr.local"]), "server", "NotCa")
+    # path length: root pathlen=1 -> inter(pathlen 0) -> inter2 is too deep
+    i2k = key(); inter2 = cert(name("kr-test-inter2"), i2k.public_key(), inter.subject, ik, ca=True)
+    k = key(); cases["pathlen_exceeded"] = (cert(name("y"), k.public_key(), inter2.subject, i2k, eku=SRV, sans=["api.kr.local"]), "server", "NotCa")
+    k = key(); cases["ed25519_root"] = (cert(name("z"), k.public_key(), edroot.subject, ek, eku=SRV, sans=["api.kr.local"]), "server", "ok_ed")
+    ok = key(); other = cert(name("kr-test-inter"), ok.public_key(), root.subject, ok, ca=True)  # same name, wrong key
+    k = key(); cases["unknown_issuer"] = (cert(name("w"), k.public_key(), other.subject, ok, eku=SRV, sans=["api.kr.local"]), "server", "UnknownIssuer")
+    with open(os.path.join(d, "roots.pem"), "w") as f: f.write(pem(root) + pem(edroot))
+    with open(os.path.join(d, "inter.pem"), "w") as f: f.write(pem(inter) + pem(fake) + pem(inter2))
+    with open(os.path.join(d, "cases.txt"), "w") as f:
+        for n, (c, usage, want) in cases.items():
+            f.write("|".join((n, usage, want, c.public_bytes(ser.Encoding.DER).hex())) + "\n")
+
 if __name__ == "__main__":
     for n in (sys.argv[1:] or GENERATORS):
         GENERATORS[n]()
