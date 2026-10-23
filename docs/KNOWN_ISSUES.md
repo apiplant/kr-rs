@@ -121,3 +121,35 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
     Layer unpack is synchronous file I/O and CPU (inflate) on the single-threaded executor, so other tasks stall while a layer extracts. Concurrent pulls of one image race on `rootfs.tmp` (the loser is cleaned up, but there is no lock).
 42. **FIFOs are created, devices are skipped, tar xattrs on symlinks are dropped** — *accepted*
     `trusted.overlay.*` / `user.overlay.*` xattrs from layers are always ignored so an image cannot forge overlayfs markers.
+
+## kr-runtime: isolation (container.rs, security.rs, cgroup.rs)
+
+43. **Rootless maps a single uid/gid** — *open, next*
+    Images that chown to other uids fail. For example, nginx's `chown(..., 101)` returns EINVAL.
+    Plan: map a subordinate range (`/etc/subuid`, via `newuidmap`/`newgidmap`) when rootless, and the full range when root.
+    Related: image `USER` is ignored (a warning is printed) until this lands.
+44. **`/proc` is not masked** — *open*
+    `/proc/kcore`, `/proc/sysrq-trigger`, `/proc/sys` and others are visible. The userns already blocks most writes.
+    Plan: bind `/dev/null` over the sensitive files, and remount `/proc/sys`, `/proc/bus` and `/proc/irq` read-only (as runc's masked/readonly paths do).
+45. **The seccomp profile is a deny-list, not Docker's allow-list** — *accepted for now*
+    It is defence in depth on top of the reduced capabilities. Only the summary state has been checked: `Seccomp: 2`, and unshare/mount are refused. Plan: per-syscall tests, then consider an allow-list.
+46. **Fail-closed startup on hostile image layouts** — *accepted*
+    Startup aborts with ENOENT if `/.oldroot`, `/proc` or `/dev` is a symlink in the image. This is safe (nothing escapes; verified), but such an image cannot run.
+47. **No signal forwarding** — *open*
+    The container's pid 1 ignores SIGINT/SIGTERM from outside unless it installs handlers. On Ctrl-C, kr dies and PDEATHSIG SIGKILLs the container.
+    Plan: kr forwards SIGTERM/SIGINT to pid 1, with a grace period before SIGKILL; optionally a tiny init.
+48. **`container::run` blocks on `wait4`** — *open*
+    The kubelet needs async supervision of many containers. Plan: pidfd + epoll, using the `CLONE_PIDFD` flag.
+49. **The overlay mount line in `/proc/mounts` reveals host store paths** — *accepted*
+    This is an information leak only.
+50. **Container networking is loopback only** — *open, next*
+    There is no veth, bridge or host connectivity yet. That is phase-1 step 4, done in a root VM (ADR-016).
+51. **cgroup supervisor moves every process in the delegated cgroup into `kr-supervisor`** — *accepted*
+    This is intended for a dedicated scope or unit. Running kr inside a shared cgroup with `Delegate=yes` would also move its neighbours.
+
+## Build (cont.)
+
+52. **`_Unwind_Resume` and `rust_eh_personality` are stubbed** — *accepted*
+    The precompiled `core`/`alloc` contain landing pads, and with panic=abort they are never reached. Proper fix: `-Zbuild-std=core,alloc` with `panic_immediate_abort`, which also shrinks the binary.
+53. **The binary grew to 282 KB** — *watch*
+    The growth comes from `core::fmt` (`format!`/`{:?}`), JSON and the store. That is still far under the 2 MB agent budget. Avoid `{:?}` on hot or large types.

@@ -165,3 +165,30 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - Rootless: device nodes in layers are skipped. uid/gid ownership is not preserved (single-uid mapping). Subuid ranges via `newuidmap` come later.
 - Store root: `$KR_ROOT`, defaulting to `$XDG_DATA_HOME/kr`, then `$HOME/.local/share/kr` when rootless, or `/var/lib/kr` when root.
 **Status:** accepted.
+
+## ADR-018: Container security profile and cgroup supervision
+- **Order in the child:**
+  1. Make `/` private.
+  2. Mount the overlay.
+  3. `pivot_root` into it. No image-controlled path is touched before this.
+  4. Mount `/proc` while the old root is still visible.
+  5. Mount a fresh `/dev` (tmpfs, with host nodes bind-mounted), `/dev/pts` (newinstance), `/dev/shm` and `/sys` read-only.
+  6. Detach the old root.
+  7. Bring up `lo` and set the hostname.
+  8. Drop capabilities.
+  9. Set `NO_NEW_PRIVS`.
+  10. Install seccomp.
+  11. `execve`.
+- **Capabilities:** Docker's default set (`0xa80425fb`). The bounding set is reduced, ambient and inheritable are cleared, and effective = permitted = the set.
+- **seccomp:**
+  - An arch check, plus a kill on the x32 ABI.
+  - A deny-list (EPERM) covering io_uring, bpf, userfaultfd, keyrings, perf, kexec/modules, mount APIs, setns/unshare, time setting, and kcmp/process_vm.
+  - `clone3` returns ENOSYS, so libc falls back to `clone`, whose flags *are* inspectable. `clone` with namespace flags gets EPERM.
+- **Setup errors** travel back to the parent over a CLOEXEC pipe as `(step, errno)`. EOF on that pipe means exec succeeded.
+- **cgroups:**
+  - kr moves the delegated cgroup's processes into `kr-supervisor` and enables `cpu memory pids` on the parent.
+  - Each container gets a sibling cgroup and is spawned into it with `CLONE_INTO_CGROUP`, so it is never briefly unlimited.
+  - `memory.swap.max=0` is set with `memory.max`.
+  - OOM is detected from `memory.events`.
+  - CPU millicores map to `cpu.max` over a 100 ms period.
+**Status:** accepted.
