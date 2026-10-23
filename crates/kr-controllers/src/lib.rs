@@ -2,12 +2,17 @@
 //! single-threaded executor (`kr_rt::exec`).
 //!
 //! # Design
-//! Four independent loops, each an `async fn run(c, cfg)` that never returns:
+//! Independent loops, each an `async fn run(c, cfg)` that never returns:
 //!
 //! * [`scheduler`]: binds unscheduled pods to nodes (filter, score, `pods/binding`).
 //! * [`replicaset`]: keeps `spec.replicas` pods per ReplicaSet, adopting matching orphans.
 //! * [`deployment`]: manages ReplicaSets per pod template (Recreate / RollingUpdate), history
 //!   and status.
+//! * [`statefulset`]: ordered, identity-stable pods with ControllerRevisions and PVCs.
+//! * [`daemonset`]: one pod per eligible node, rolling updates.
+//! * [`job`]: run-to-completion pods (completions, parallelism, indexed, backoff, TTL).
+//! * [`cronjob`]: cron parsing and Job creation with concurrency policies.
+//! * [`endpoints`]: Endpoints and EndpointSlices for Services with selectors.
 //! * [`gc`]: deletes dependents whose owner no longer exists (background propagation).
 //!
 //! All of them are *level-triggered*. A watch (list, remember the list's `resourceVersion`,
@@ -28,10 +33,15 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod cronjob;
+pub mod daemonset;
 pub mod deployment;
+pub mod endpoints;
 pub mod gc;
+pub mod job;
 pub mod replicaset;
 pub mod scheduler;
+pub mod statefulset;
 pub mod util;
 
 use kr_apiserver::client::Client;
@@ -76,6 +86,11 @@ pub async fn run_all_with<C: Client + Clone + 'static>(c: C, cfg: Config) {
         spawn(scheduler::run(c.clone(), cfg)),
         spawn(replicaset::run(c.clone(), cfg)),
         spawn(deployment::run(c.clone(), cfg)),
+        spawn(statefulset::run(c.clone(), cfg)),
+        spawn(daemonset::run(c.clone(), cfg)),
+        spawn(job::run(c.clone(), cfg)),
+        spawn(cronjob::run(c.clone(), cfg)),
+        spawn(endpoints::run(c.clone(), cfg)),
         spawn(gc::run(c, cfg)),
     ]);
     // A never-woken future would let the executor free this task (and abort the guard).
@@ -86,3 +101,5 @@ pub async fn run_all_with<C: Client + Clone + 'static>(c: C, cfg: Config) {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_workloads;

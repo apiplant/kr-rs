@@ -10,16 +10,54 @@ use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::future::Future;
-use core::sync::atomic::{AtomicU64, Ordering};
+use alloc::collections::BTreeSet;
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use kr_apiserver::api::ApiServer;
 use kr_apiserver::client::{Client, InProcess};
 use kr_fmt::json::{parse_str, Value};
 use kr_rt::exec::{block_on, sleep, spawn};
 use std::sync::Mutex;
 
-static LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static LOCK: Mutex<()> = Mutex::new(());
 
-fn rng(b: &mut [u8]) {
+/// The fake clock behind `Config::now` and the API server's clock; tests move it.
+pub(crate) static CLOCK: AtomicI64 = AtomicI64::new(T0);
+/// 2027-01-15 08:00:00 UTC.
+pub(crate) const T0: i64 = 1_800_000_000;
+/// While false, pods that carry the annotation `test/outcome` stay Running; once true the fake
+/// kubelet turns them into `Succeeded` (`succeed`) or `Failed` (`fail`).
+pub(crate) static FINISH: AtomicBool = AtomicBool::new(false);
+/// Pods the fake kubelet leaves alone (they stay Pending, without an IP).
+pub(crate) static HOLD: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// Terminating pods whose deletion the fake kubelet does not finish yet.
+pub(crate) static HOLD_DELETE: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// While true the fake kubelet starts no pod at all.
+pub(crate) static HOLD_ALL: AtomicBool = AtomicBool::new(false);
+static NEXT_IP: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn hold(names: &[&str]) {
+    HOLD.lock().unwrap_or_else(|e| e.into_inner()).extend(names.iter().map(|n| n.to_string()));
+}
+pub(crate) fn release(names: &[&str]) {
+    let mut h = HOLD.lock().unwrap_or_else(|e| e.into_inner());
+    for n in names {
+        h.remove(*n);
+    }
+}
+pub(crate) fn hold_delete(names: &[&str]) {
+    HOLD_DELETE.lock().unwrap_or_else(|e| e.into_inner()).extend(names.iter().map(|n| n.to_string()));
+}
+pub(crate) fn release_delete(names: &[&str]) {
+    let mut h = HOLD_DELETE.lock().unwrap_or_else(|e| e.into_inner());
+    for n in names {
+        h.remove(*n);
+    }
+}
+pub(crate) fn advance_clock(secs: i64) {
+    CLOCK.fetch_add(secs, Ordering::SeqCst);
+}
+
+pub(crate) fn rng(b: &mut [u8]) {
     static N: AtomicU64 = AtomicU64::new(1);
     let mut x = N.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed) | 1;
     for byte in b {
@@ -30,22 +68,28 @@ fn rng(b: &mut [u8]) {
     }
 }
 
-fn cfg() -> Config {
-    Config { resync_ms: 150, gc_ms: 60, backoff_ms: 30, retry_ms: 60, now: || 1_800_000_000 }
+pub(crate) fn cfg() -> Config {
+    Config { resync_ms: 150, gc_ms: 60, backoff_ms: 30, retry_ms: 60, now: || CLOCK.load(Ordering::SeqCst) }
 }
 
-fn v(s: &str) -> Value {
+pub(crate) fn v(s: &str) -> Value {
     parse_str(s).unwrap_or_else(|e| panic!("bad test json {s}: {e}"))
 }
 
 /// Runs `f` with the controllers and a fake kubelet running; stops them afterwards.
-fn scenario<F, Fut>(f: F)
+pub(crate) fn scenario<F, Fut>(f: F)
 where
     F: FnOnce(InProcess) -> Fut + 'static,
     Fut: Future<Output = ()> + 'static,
 {
     let _l = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let api = Rc::new(ApiServer::new(kr_store::Store::in_memory(), || 1_800_000_000, rng, "127.0.0.1:6443".to_string()).unwrap());
+    CLOCK.store(T0, Ordering::SeqCst);
+    FINISH.store(false, Ordering::SeqCst);
+    HOLD_ALL.store(false, Ordering::SeqCst);
+    HOLD.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    HOLD_DELETE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    NEXT_IP.store(1, Ordering::SeqCst);
+    let api = Rc::new(ApiServer::new(kr_store::Store::in_memory(), || CLOCK.load(Ordering::SeqCst), rng, "127.0.0.1:6443".to_string()).unwrap());
     let c = InProcess::new(api, "test");
     block_on(async move {
         let ctl = spawn(run_all_with(c.clone(), cfg()));
@@ -56,19 +100,41 @@ where
     });
 }
 
+/// The fake kubelet. Per pod: finish graceful deletions (`gracePeriodSeconds=0`) unless held;
+/// start bound pods that are not held (Running, Ready, with a pod IP); and, once `FINISH` is
+/// set, end Running pods annotated `test/outcome` as Succeeded or Failed.
 async fn kubelet(c: InProcess) {
     loop {
         if let Ok(l) = c.list("/api/v1/pods", "").await {
             for p in items(&l) {
                 let path = alloc::format!("/api/v1/namespaces/{}/pods/{}", namespace(&p), name(&p));
+                let held = HOLD.lock().unwrap_or_else(|e| e.into_inner()).contains(name(&p));
                 if deleting(&p) {
-                    // Containers "stopped": finish the graceful deletion like a kubelet does.
-                    let _ = c.delete(&alloc::format!("{path}?gracePeriodSeconds=0")).await;
+                    if !HOLD_DELETE.lock().unwrap_or_else(|e| e.into_inner()).contains(name(&p)) {
+                        // Containers "stopped": finish the graceful deletion like a kubelet does.
+                        let _ = c.delete(&alloc::format!("{path}?gracePeriodSeconds=0")).await;
+                    }
                     continue;
                 }
-                if !str_at(&p, &["spec", "nodeName"]).is_empty() && !pod_ready(&p) && !deleting(&p) {
-                    let st = v(r#"{"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}}"#);
-                    let _ = c.patch(&alloc::format!("{path}/status"), MERGE, &st).await;
+                if str_at(&p, &["spec", "nodeName"]).is_empty() || held || (HOLD_ALL.load(Ordering::SeqCst) && str_at(&p, &["status", "phase"]).is_empty()) {
+                    continue;
+                }
+                match str_at(&p, &["status", "phase"]) {
+                    "" | "Pending" => {
+                        let ip = alloc::format!("10.244.0.{}", NEXT_IP.fetch_add(1, Ordering::SeqCst));
+                        let st = v(&alloc::format!(r#"{{"status":{{"phase":"Running","podIP":"{ip}","podIPs":[{{"ip":"{ip}"}}],"conditions":[{{"type":"Ready","status":"True"}}]}}}}"#));
+                        let _ = c.patch(&alloc::format!("{path}/status"), MERGE, &st).await;
+                    }
+                    "Running" if FINISH.load(Ordering::SeqCst) => {
+                        let phase = match str_at(&p, &["metadata", "annotations", "test/outcome"]) {
+                            "succeed" => "Succeeded",
+                            "fail" => "Failed",
+                            _ => continue,
+                        };
+                        let st = v(&alloc::format!(r#"{{"status":{{"phase":"{phase}","conditions":[{{"type":"Ready","status":"False"}}]}}}}"#));
+                        let _ = c.patch(&alloc::format!("{path}/status"), MERGE, &st).await;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -76,7 +142,7 @@ async fn kubelet(c: InProcess) {
     }
 }
 
-async fn wait_until<Fut: Future<Output = bool>>(what: &str, mut f: impl FnMut() -> Fut) {
+pub(crate) async fn wait_until<Fut: Future<Output = bool>>(what: &str, mut f: impl FnMut() -> Fut) {
     for _ in 0..800 {
         if f().await {
             return;
@@ -86,7 +152,7 @@ async fn wait_until<Fut: Future<Output = bool>>(what: &str, mut f: impl FnMut() 
     panic!("timed out waiting for: {what}");
 }
 
-fn node(name: &str, labels: &str, taints: &str, cpu: &str) -> Value {
+pub(crate) fn node(name: &str, labels: &str, taints: &str, cpu: &str) -> Value {
     v(&alloc::format!(
         r#"{{"metadata":{{"name":"{name}","labels":{labels}}},"spec":{{"taints":{taints}}},"status":{{"conditions":[{{"type":"Ready","status":"True"}}],"allocatable":{{"cpu":"{cpu}","memory":"8Gi","pods":"110"}}}}}}"#
     ))
@@ -94,7 +160,7 @@ fn node(name: &str, labels: &str, taints: &str, cpu: &str) -> Value {
 
 const DEPLOYMENTS: &str = "/apis/apps/v1/namespaces/default/deployments";
 const RS: &str = "/apis/apps/v1/namespaces/default/replicasets";
-const PODS: &str = "/api/v1/namespaces/default/pods";
+pub(crate) const PODS: &str = "/api/v1/namespaces/default/pods";
 
 fn deployment(replicas: u32, image: &str, extra_spec: &str) -> Value {
     v(&alloc::format!(
@@ -102,7 +168,7 @@ fn deployment(replicas: u32, image: &str, extra_spec: &str) -> Value {
     ))
 }
 
-async fn live_pods(c: &InProcess) -> Vec<Value> {
+pub(crate) async fn live_pods(c: &InProcess) -> Vec<Value> {
     items(&c.list(PODS, "").await.unwrap()).into_iter().filter(|p| !deleting(p)).collect()
 }
 
@@ -119,7 +185,7 @@ async fn scale_to(c: &InProcess, n: u32) {
     c.patch(&alloc::format!("{DEPLOYMENTS}/web/scale"), MERGE, &v(&alloc::format!(r#"{{"spec":{{"replicas":{n}}}}}"#))).await.unwrap();
 }
 
-fn cond<'a>(o: &'a Value, ty: &str) -> Option<&'a Value> {
+pub(crate) fn cond<'a>(o: &'a Value, ty: &str) -> Option<&'a Value> {
     o.pointer(&["status", "conditions"])?.as_array()?.iter().find(|c| str_at(c, &["type"]) == ty)
 }
 

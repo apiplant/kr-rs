@@ -232,6 +232,34 @@ pub fn replicasets(ns: Option<&str>) -> String {
 pub fn deployments(ns: Option<&str>) -> String {
     api_path("apps", "v1", ns, "deployments")
 }
+pub fn statefulsets(ns: Option<&str>) -> String {
+    api_path("apps", "v1", ns, "statefulsets")
+}
+pub fn daemonsets(ns: Option<&str>) -> String {
+    api_path("apps", "v1", ns, "daemonsets")
+}
+pub fn controllerrevisions(ns: Option<&str>) -> String {
+    api_path("apps", "v1", ns, "controllerrevisions")
+}
+pub fn jobs(ns: Option<&str>) -> String {
+    api_path("batch", "v1", ns, "jobs")
+}
+pub fn cronjobs(ns: Option<&str>) -> String {
+    api_path("batch", "v1", ns, "cronjobs")
+}
+pub fn services(ns: Option<&str>) -> String {
+    api_path("", "v1", ns, "services")
+}
+pub fn endpoints(ns: Option<&str>) -> String {
+    api_path("", "v1", ns, "endpoints")
+}
+pub fn endpointslices(ns: Option<&str>) -> String {
+    api_path("discovery.k8s.io", "v1", ns, "endpointslices")
+}
+pub fn pvcs(ns: Option<&str>) -> String {
+    api_path("", "v1", ns, "persistentvolumeclaims")
+}
+pub const NODES: &str = "/api/v1/nodes";
 
 /// Percent-encodes a query value.
 pub fn enc(s: &str) -> String {
@@ -380,4 +408,236 @@ pub fn set_condition(conds: &mut Vec<Value>, cond: Value) {
         Some(i) => conds[i] = cond,
         None => conds.push(cond),
     }
+}
+
+// ---- shared helpers for the workload controllers ----
+
+pub use kr_apiserver::object::rfc3339;
+
+/// Unix seconds of an RFC 3339 `...Z` timestamp.
+pub fn parse_time(s: &str) -> Option<i64> {
+    kr_apiserver::printers::parse_rfc3339(s)
+}
+
+/// True when the pod is `Running` and its `Ready` condition holds.
+pub fn running_ready(p: &Value) -> bool {
+    str_at(p, &["status", "phase"]) == "Running" && pod_ready(p)
+}
+
+/// True when the object's controller owner reference has this uid.
+pub fn controlled_by(o: &Value, owner_uid: &str) -> bool {
+    controller_ref(o).is_some_and(|r| str_at(r, &["uid"]) == owner_uid)
+}
+
+/// DELETE that treats 404 as success.
+pub async fn delete_ok<C: Client>(c: &C, path: &str) -> Result<()> {
+    match c.delete(path).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.code == 404 => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// GET that maps 404 to `None`.
+pub async fn get_opt<C: Client>(c: &C, path: &str) -> Result<Option<Value>> {
+    match c.get(path).await {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.code == 404 => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Reads the object at `path`, derives the wanted `.status` from it with `want` and writes it
+/// through `<path>/status` only if it differs (compared canonically). A vanished object is fine.
+pub async fn put_status<C: Client>(c: &C, path: &str, want: impl Fn(&Value) -> Value) -> Result<()> {
+    retry_conflict(|| async {
+        let Some(mut o) = get_opt(c, path).await? else { return Ok(()) };
+        let st = want(&o);
+        if o.get("status").map(canonical) == Some(canonical(&st)) {
+            return Ok(());
+        }
+        o.set("status", st);
+        c.update(&alloc::format!("{path}/status"), &o).await.map(|_| ())
+    })
+    .await
+}
+
+/// Adds the controller reference to an orphan. `None` when the object vanished or was adopted
+/// by someone else in the meantime (the patch carries the resourceVersion).
+pub async fn adopt<C: Client>(c: &C, path: &str, owner: &Value, api_version: &str, kind: &str, o: &Value) -> Result<Option<Value>> {
+    let mut refs: Vec<Value> = o.pointer(&["metadata", "ownerReferences"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+    refs.push(owner_ref(owner, api_version, kind));
+    let meta = obj(alloc::vec![("ownerReferences", Value::Array(refs)), ("resourceVersion", Value::from(str_at(o, &["metadata", "resourceVersion"])))]);
+    match c.patch(&alloc::format!("{path}/{}", name(o)), MERGE, &obj(alloc::vec![("metadata", meta)])).await {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.code == 404 || e.code == 409 => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// A pod built from `tpl` (a pod template) and owned by `owner`. `name` is either a fixed name
+/// or a `generateName` prefix. Extra labels and annotations are merged over the template's.
+pub fn pod_from_template(owner: &Value, api_version: &str, kind: &str, tpl: &Value, fixed_name: Option<&str>, generate_prefix: &str, labels: &[(&str, &str)], annotations: &[(&str, &str)]) -> Value {
+    let mut meta = Value::Object(Vec::new());
+    match fixed_name {
+        Some(n) => meta.set("name", Value::from(n)),
+        None => meta.set("generateName", Value::from(generate_prefix)),
+    }
+    meta.set("namespace", Value::from(namespace(owner)));
+    for (field, extra) in [("labels", labels), ("annotations", annotations)] {
+        let mut m = tpl.pointer(&["metadata", field]).cloned().unwrap_or(Value::Null);
+        if !extra.is_empty() && !matches!(m, Value::Object(_)) {
+            m = Value::Object(Vec::new());
+        }
+        for (k, v) in extra {
+            m.set(k, Value::from(*v));
+        }
+        if !m.is_null() {
+            meta.set(field, m);
+        }
+    }
+    meta.set("ownerReferences", Value::Array(alloc::vec![owner_ref(owner, api_version, kind)]));
+    obj(alloc::vec![("apiVersion", Value::from("v1")), ("kind", Value::from("Pod")), ("metadata", meta), ("spec", tpl.get("spec").cloned().unwrap_or(Value::Null))])
+}
+
+/// One `matchExpressions` / `matchFields` requirement against an optional value.
+fn expr_matches(e: &Value, value: Option<&str>) -> bool {
+    let vals: Vec<&str> = e.get("values").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    match str_at(e, &["operator"]) {
+        "In" => value.is_some_and(|v| vals.contains(&v)),
+        "NotIn" => value.is_none_or(|v| !vals.contains(&v)),
+        "Exists" => value.is_some(),
+        "DoesNotExist" => value.is_none(),
+        op @ ("Gt" | "Lt") => match (value.and_then(|v| v.parse::<i64>().ok()), vals.first().and_then(|v| v.parse::<i64>().ok())) {
+            (Some(a), Some(b)) => (op == "Gt" && a > b) || (op == "Lt" && a < b),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// `requiredDuringSchedulingIgnoredDuringExecution` node affinity of a pod spec against a node:
+/// the terms are ORed, the expressions and fields of a term ANDed, an empty term matches
+/// nothing. No affinity matches every node.
+pub fn node_affinity_matches(spec: &Value, node: &Value) -> bool {
+    let Some(req) = spec.pointer(&["affinity", "nodeAffinity", "requiredDuringSchedulingIgnoredDuringExecution"]) else { return true };
+    let terms = req.get("nodeSelectorTerms").and_then(Value::as_array).unwrap_or(&[]);
+    terms.iter().any(|t| {
+        let exprs = t.get("matchExpressions").and_then(Value::as_array).unwrap_or(&[]);
+        let fields = t.get("matchFields").and_then(Value::as_array).unwrap_or(&[]);
+        !(exprs.is_empty() && fields.is_empty())
+            && exprs.iter().all(|e| expr_matches(e, node.pointer(&["metadata", "labels", str_at(e, &["key"])]).and_then(Value::as_str)))
+            && fields.iter().all(|e| expr_matches(e, if str_at(e, &["key"]) == "metadata.name" { Some(name(node)) } else { None }))
+    })
+}
+
+/// Joins `a, b, c` style ordinal sets such as `0-2,4` (job `completedIndexes`).
+pub fn compress_indexes(idx: &[i64]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < idx.len() {
+        let mut j = i;
+        while j + 1 < idx.len() && idx[j + 1] == idx[j] + 1 {
+            j += 1;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        if j > i {
+            out.push_str(&alloc::format!("{}-{}", idx[i], idx[j]));
+        } else {
+            out.push_str(&idx[i].to_string());
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// Merges an optional old condition's `lastTransitionTime` into `cond`: kept while the status
+/// is unchanged, and the whole old condition is returned unchanged when nothing differs.
+pub fn merge_condition(old: &[Value], mut cond: Value) -> Value {
+    let ty = str_at(&cond, &["type"]);
+    if let Some(o) = old.iter().find(|o| str_at(o, &["type"]) == ty) {
+        if ["status", "reason", "message"].iter().all(|f| str_at(o, &[f]) == str_at(&cond, &[f])) {
+            return o.clone();
+        }
+        if str_at(o, &["status"]) == str_at(&cond, &["status"]) {
+            cond.set("lastTransitionTime", Value::from(str_at(o, &["lastTransitionTime"])));
+        }
+    }
+    cond
+}
+
+pub fn condition(ty: &str, status: bool, reason: &str, message: &str, now: i64) -> Value {
+    let t = Value::String(rfc3339(now));
+    obj(alloc::vec![
+        ("type", Value::from(ty)),
+        ("status", Value::from(if status { "True" } else { "False" })),
+        ("lastProbeTime", t.clone()),
+        ("lastTransitionTime", t),
+        ("reason", Value::from(reason)),
+        ("message", Value::from(message)),
+    ])
+}
+
+pub fn has_condition(o: &Value, ty: &str) -> bool {
+    o.pointer(&["status", "conditions"]).and_then(Value::as_array).is_some_and(|c| c.iter().any(|x| str_at(x, &["type"]) == ty && str_at(x, &["status"]) == "True"))
+}
+
+// ---- ControllerRevisions (StatefulSet, DaemonSet) ----
+
+/// Finds or creates the ControllerRevision `<owner>-<hash of template>` for `owner`, bumping
+/// its `revision` above every other one when the template is reused (rollback). Returns the
+/// revision's name and all revisions controlled by the owner (including the new one).
+pub async fn ensure_revision<C: Client>(c: &C, owner: &Value, kind: &str, template: &Value) -> Result<(String, Vec<Value>)> {
+    let ns = namespace(owner);
+    let rname = alloc::format!("{}-{}", name(owner), crate::deployment::template_hash(template));
+    let mut revs: Vec<Value> = items(&c.list(&controllerrevisions(Some(ns)), "").await?).into_iter().filter(|r| controlled_by(r, uid(owner))).collect();
+    let max = revs.iter().map(|r| int_at(r, &["revision"], 0)).max().unwrap_or(0);
+    match revs.iter_mut().find(|r| name(r) == rname) {
+        Some(r) => {
+            if int_at(r, &["revision"], 0) < max {
+                let patch = obj(alloc::vec![("revision", num(max + 1))]);
+                *r = c.patch(&alloc::format!("{}/{rname}", controllerrevisions(Some(ns))), MERGE, &patch).await?;
+            }
+        }
+        None => {
+            let mut labels = owner.pointer(&["spec", "selector", "matchLabels"]).cloned().unwrap_or(Value::Object(Vec::new()));
+            labels.set("controller.kubernetes.io/hash", Value::String(rname[name(owner).len() + 1..].to_string()));
+            let rev = obj(alloc::vec![
+                ("apiVersion", Value::from("apps/v1")),
+                ("kind", Value::from("ControllerRevision")),
+                (
+                    "metadata",
+                    obj(alloc::vec![
+                        ("name", Value::from(rname.as_str())),
+                        ("namespace", Value::from(ns)),
+                        ("labels", labels),
+                        ("ownerReferences", Value::Array(alloc::vec![owner_ref(owner, "apps/v1", kind)])),
+                    ])
+                ),
+                ("data", obj(alloc::vec![("spec", obj(alloc::vec![("template", template.clone())]))])),
+                ("revision", num(max + 1)),
+            ]);
+            match c.create(&controllerrevisions(Some(ns)), &rev).await {
+                Ok(r) => revs.push(r),
+                Err(e) if e.code == 409 => revs.push(c.get(&alloc::format!("{}/{rname}", controllerrevisions(Some(ns)))).await?),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok((rname, revs))
+}
+
+/// Deletes the oldest revisions not named in `live` beyond `limit`.
+pub async fn trim_revisions<C: Client>(c: &C, ns: &str, revs: &[Value], live: &[&str], limit: usize) -> Result<()> {
+    let mut dead: Vec<&Value> = revs.iter().filter(|r| !live.contains(&name(r))).collect();
+    if dead.len() <= limit {
+        return Ok(());
+    }
+    dead.sort_by_key(|r| (int_at(r, &["revision"], 0), name(r).to_string()));
+    for r in dead.iter().take(dead.len() - limit) {
+        delete_ok(c, &alloc::format!("{}/{}", controllerrevisions(Some(ns)), name(r))).await?;
+    }
+    Ok(())
 }

@@ -1,7 +1,7 @@
 //! The garbage collector: deletes objects whose owners are gone (background propagation).
 //!
 //! A sweep runs every `Config::gc_ms` and immediately after a watch sees an owner kind lose an
-//! object. For each dependent kind (pods, ReplicaSets, ControllerRevisions, Jobs) it lists the
+//! object. For each dependent kind (pods, ReplicaSets, ControllerRevisions, Jobs, EndpointSlices) it lists the
 //! objects first, then resolves every `ownerReferences` entry to a resource through
 //! `kr_apiserver::resources::RESOURCES` (by `apiVersion` and `kind`) and lists that resource
 //! once per sweep to learn which uids exist. A dependent is deleted when it has at least one
@@ -22,9 +22,9 @@ use kr_apiserver::resources::{Resource, RESOURCES};
 use kr_fmt::json::Value;
 
 /// Kinds whose objects may be garbage collected.
-const DEPENDENTS: &[&str] = &["pods", "replicasets", "controllerrevisions", "jobs"];
+const DEPENDENTS: &[&str] = &["pods", "replicasets", "controllerrevisions", "jobs", "endpointslices"];
 /// Owner kinds watched for deletions.
-const OWNERS: &[(&str, &str)] = &[("apps", "deployments"), ("apps", "replicasets"), ("apps", "statefulsets"), ("apps", "daemonsets"), ("batch", "jobs"), ("batch", "cronjobs")];
+const OWNERS: &[(&str, &str)] = &[("", "services"), ("apps", "deployments"), ("apps", "replicasets"), ("apps", "statefulsets"), ("apps", "daemonsets"), ("batch", "jobs"), ("batch", "cronjobs")];
 
 fn res(group: &str, plural: &str) -> Option<&'static Resource> {
     RESOURCES.iter().find(|r| r.group == group && r.plural == plural)

@@ -185,7 +185,7 @@ pub fn tolerates(tol: &Value, taint: &Value) -> bool {
     }
 }
 
-fn untolerated_taint(pod: &Value, node: &Value) -> bool {
+pub fn untolerated_taint(pod: &Value, node: &Value) -> bool {
     let tols = pod.pointer(&["spec", "tolerations"]).and_then(Value::as_array).unwrap_or(&[]);
     let mut taints: Vec<Value> = node.pointer(&["spec", "taints"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
     if node.pointer(&["spec", "unschedulable"]).and_then(Value::as_bool) == Some(true) {
@@ -194,7 +194,7 @@ fn untolerated_taint(pod: &Value, node: &Value) -> bool {
     taints.iter().filter(|t| matches!(str_at(t, &["effect"]), "NoSchedule" | "NoExecute")).any(|t| !tols.iter().any(|tol| tolerates(tol, t)))
 }
 
-fn selector_matches(pod: &Value, node: &Value) -> bool {
+pub fn selector_matches(pod: &Value, node: &Value) -> bool {
     let Some(sel) = pod.pointer(&["spec", "nodeSelector"]).and_then(Value::as_object) else { return true };
     sel.iter().all(|(k, v)| node.pointer(&["metadata", "labels", k]).and_then(Value::as_str) == v.as_str())
 }
