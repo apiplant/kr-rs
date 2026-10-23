@@ -39,6 +39,14 @@ pub struct Req<'a> {
     pub user: Option<User>,
     /// `Authorization: Bearer <token>` value, if any.
     pub bearer: Option<&'a str>,
+    /// All request headers (needed for protocol upgrades such as WebSocket exec).
+    pub headers: &'a [(String, String)],
+}
+
+/// Serves pod subresources that live on the node (log, exec, attach, portforward). In single
+/// node mode the in-process kubelet implements it; agents will be reached over HTTPS.
+pub trait NodeProxy {
+    fn pod_subresource(&self, sub: &str, namespace: &str, pod: &str, query: &str, headers: &[(String, String)]) -> Result<kr_net::http1::server::Response, ApiError>;
 }
 
 pub enum Reply {
@@ -46,6 +54,8 @@ pub enum Reply {
     Json(u16, String),
     /// A watch: newline-delimited JSON events.
     Watch(WatchStream),
+    /// A raw HTTP response (node proxy: logs, exec upgrades).
+    Http(kr_net::http1::server::Response),
 }
 
 impl Reply {
@@ -65,6 +75,7 @@ pub struct ApiServer {
     version: String,
     /// ServiceAccount token signer and the cluster CA PEM (for kube-root-ca.crt).
     sa: RefCell<Option<(crate::tokens::Signer, String)>>,
+    node_proxy: RefCell<Option<alloc::rc::Rc<dyn NodeProxy>>>,
 }
 
 /// Default namespaces created on first start.
@@ -155,12 +166,16 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.31.0-kr"), sa: RefCell::new(None) };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.31.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None) };
         for ns in SYSTEM_NAMESPACES {
             api.ensure_default_sa(ns);
         }
         api.sync()?;
         Ok(api)
+    }
+
+    pub fn set_node_proxy(&self, p: alloc::rc::Rc<dyn NodeProxy>) {
+        *self.node_proxy.borrow_mut() = Some(p);
     }
 
     /// Enables ServiceAccount tokens (TokenRequest, bearer auth, admission) and creates the
@@ -387,6 +402,12 @@ impl ApiServer {
             }
         }
         match (req.method, &rt.name, sub) {
+            ("GET" | "POST", Some(n), Some(sub @ ("log" | "exec" | "attach" | "portforward"))) => {
+                self.get_kv(rt, n)?;
+                let proxy = self.node_proxy.borrow().clone().ok_or_else(|| ApiError::new(503, "ServiceUnavailable", "no node agent to serve this request"))?;
+                let ns = rt.namespace.clone().unwrap_or_default();
+                proxy.pod_subresource(sub, &ns, n, req.query, req.headers).map(Reply::Http)
+            }
             ("GET", None, None) if q.flag("watch") => self.watch(rt, q),
             ("GET", None, None) => self.list(req, rt, q),
             ("GET", Some(n), Some("scale")) => self.get_scale(rt, n),
@@ -606,6 +627,9 @@ impl ApiServer {
         if rt.res.plural == "pods" {
             let ns = rt.namespace.clone().unwrap_or_default();
             self.admit_pod(o, &ns)?;
+        }
+        if rt.res.plural == "jobs" {
+            admit_job(o, &name)?;
         }
         if rt.res.plural == "namespaces" {
             o.entry_object("spec").set("finalizers", Value::Array(alloc::vec![Value::from("kubernetes")]));
@@ -1068,6 +1092,37 @@ impl ApiServer {
         let timeout_s: u64 = q.get("timeoutSeconds").and_then(|t| t.parse().ok()).unwrap_or(1800).min(3600);
         Ok(Reply::Watch(WatchStream { watcher, initial, ls, fs, deadline: Some(Box::pin(kr_rt::exec::sleep(timeout_s * 1000))) }))
     }
+}
+
+/// Job defaulting and validation (upstream batch/v1 defaults + generated selector).
+fn admit_job(o: &mut Value, name: &str) -> R<()> {
+    let uid = o.pointer(&["metadata", "uid"]).and_then(Value::as_str).unwrap_or("").to_string();
+    let spec = o.entry_object("spec");
+    let rp = spec.pointer(&["template", "spec", "restartPolicy"]).and_then(Value::as_str).unwrap_or("");
+    if rp != "Never" && rp != "OnFailure" {
+        return Err(ApiError::invalid(alloc::format!("spec.template.spec.restartPolicy: Required value: valid values: \"OnFailure\", \"Never\" (got {rp:?})")));
+    }
+    let manual = spec.get("manualSelector").and_then(Value::as_bool) == Some(true);
+    if !manual {
+        if spec.get("selector").is_some() {
+            return Err(ApiError::invalid("spec.selector: `selector` will be auto-generated (set manualSelector: true to provide one)"));
+        }
+        let labels = spec.entry_object("template").entry_object("metadata").entry_object("labels");
+        for (k, v) in [("batch.kubernetes.io/controller-uid", uid.as_str()), ("batch.kubernetes.io/job-name", name), ("controller-uid", uid.as_str()), ("job-name", name)] {
+            labels.set(k, Value::from(v));
+        }
+        spec.set("selector", obj(alloc::vec![("matchLabels", obj(alloc::vec![("batch.kubernetes.io/controller-uid", Value::from(uid.as_str()))]))]));
+    }
+    let unset = |spec: &Value, f: &str| spec.get(f).is_none_or(Value::is_null);
+    if unset(spec, "completions") && unset(spec, "parallelism") {
+        spec.set("completions", Value::Number(Number::from_u64(1)));
+    }
+    for (f, v) in [("parallelism", Value::Number(Number::from_u64(1))), ("backoffLimit", Value::Number(Number::from_u64(6))), ("completionMode", Value::from("NonIndexed")), ("suspend", Value::Bool(false))] {
+        if unset(spec, f) {
+            spec.set(f, v);
+        }
+    }
+    Ok(())
 }
 
 fn event_line(ty: &str, obj: &[u8]) -> Vec<u8> {

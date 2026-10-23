@@ -168,10 +168,12 @@ pub fn main(mut args: Args) -> i32 {
         }
     };
     let controllers = kr_apiserver::client::InProcess::new(api.clone(), "controller-manager");
+    let api_for_proxy = api.clone();
     match kr_rt::exec::block_on(async move {
         let cfg = kr_controllers::Config { now: pki::now, ..kr_controllers::Config::default() };
         kr_rt::exec::spawn(kr_controllers::run_all_with(controllers, cfg));
         if let Some(k) = kubelet {
+            api_for_proxy.set_node_proxy(Rc::new(kr_kubelet::stream::Proxy(k.clone())));
             kr_rt::exec::spawn(k.run());
         }
         kr_apiserver::server::run(api, [0, 0, 0, 0], port, tls).await

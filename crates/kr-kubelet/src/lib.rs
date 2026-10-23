@@ -18,6 +18,7 @@ extern crate alloc;
 pub mod node;
 mod probe;
 mod spec;
+pub mod stream;
 
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;

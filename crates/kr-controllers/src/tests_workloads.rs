@@ -653,9 +653,10 @@ fn job_suspend_and_resume() {
 fn job_rejects_restart_policy_always() {
     scenario(|c| async move {
         c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
-        c.create(JOBS, &job("bad", "", "Always", "succeed")).await.unwrap();
-        wait_until("failed", || jcond(&c, "bad", "Failed")).await;
-        assert_eq!(str_at(cond(&get(&c, &alloc::format!("{JOBS}/bad")).await, "Failed").unwrap(), &["reason"]), "InvalidRestartPolicy");
+        // The API server rejects it at admission (as upstream); the controller's
+        // InvalidRestartPolicy path remains as defence in depth.
+        let e = c.create(JOBS, &job("bad", "", "Always", "succeed")).await.unwrap_err();
+        assert_eq!(e.code, 422);
         assert!(all_pods(&c).await.is_empty());
     });
 }

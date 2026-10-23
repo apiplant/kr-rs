@@ -37,6 +37,7 @@ pub fn handle(api: &ApiServer, req: Request) -> Response {
         accept: req.header("accept"),
         body: &req.body,
         user,
+        headers: &req.headers,
         bearer: req.header("authorization").and_then(|a| a.strip_prefix("Bearer ").or_else(|| a.strip_prefix("bearer "))).map(str::trim),
     };
     match api.handle(&r) {
@@ -44,6 +45,7 @@ pub fn handle(api: &ApiServer, req: Request) -> Response {
             let ct = if body.contains("\"kind\":\"Table\"") && body.starts_with("{\"kind\":\"Table\"") { "application/json;as=Table;v=v1;g=meta.k8s.io" } else { "application/json" };
             Response::new(code, body.into_bytes()).with_header("Content-Type", ct)
         }
+        Reply::Http(r) => r,
         Reply::Watch(w) => Response { status: 200, headers: alloc::vec![("Content-Type".into(), "application/json".into())], body: Body::Stream(Box::new(Watch(w))) },
     }
 }

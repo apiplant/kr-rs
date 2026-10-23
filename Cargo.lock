@@ -60,6 +60,7 @@ version = "0.0.1"
 dependencies = [
  "kr-apiserver",
  "kr-fmt",
+ "kr-net",
  "kr-rt",
  "kr-runtime",
  "kr-sys",

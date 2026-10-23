@@ -10,3 +10,4 @@ kr-rt = { path = "../kr-rt" }
 kr-fmt = { path = "../kr-fmt" }
 kr-apiserver = { path = "../kr-apiserver" }
 kr-runtime = { path = "../kr-runtime" }
+kr-net = { path = "../kr-net" }

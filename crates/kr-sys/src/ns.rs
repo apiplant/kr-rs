@@ -465,3 +465,48 @@ pub fn fstatfs_flags(fd: i32) -> Result<u64> {
     check(unsafe { syscall2(FSTATFS, fd as usize, buf.as_mut_ptr() as usize) })?;
     Ok(buf[10])
 }
+
+/// Sets O_NONBLOCK on one descriptor (fcntl F_GETFL/F_SETFL), leaving any peer end alone.
+pub fn set_nonblocking(fd: i32) -> Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    const FCNTL: usize = 72;
+    #[cfg(target_arch = "aarch64")]
+    const FCNTL: usize = 25;
+    // SAFETY: plain integer arguments (F_GETFL = 3, F_SETFL = 4).
+    let flags = check(unsafe { syscall3(FCNTL, fd as usize, 3, 0) })?;
+    check(unsafe { syscall3(FCNTL, fd as usize, 4, flags | 0o4000) }).map(|_| ())
+}
+
+/// A connected AF_UNIX stream socket pair (close-on-exec).
+pub fn socketpair() -> Result<(Fd, Fd)> {
+    #[cfg(target_arch = "x86_64")]
+    const SOCKETPAIR: usize = 53;
+    #[cfg(target_arch = "aarch64")]
+    const SOCKETPAIR: usize = 199;
+    let mut fds = [0i32; 2];
+    // SAFETY: fds is a writable int[2]. AF_UNIX = 1, SOCK_STREAM = 1.
+    check(unsafe { syscall4(SOCKETPAIR, 1, 1 | super::O_CLOEXEC as usize, 0, fds.as_mut_ptr() as usize) })?;
+    Ok((Fd(fds[0]), Fd(fds[1])))
+}
+
+/// Blocking poll(2) on two descriptors for readability; returns (a_ready, b_ready, hangup).
+pub fn poll2(a: i32, b: i32, timeout_ms: i32) -> Result<(bool, bool, bool)> {
+    // struct pollfd { int fd; short events; short revents; }
+    let mut p: [i32; 4] = [a, 0x1, b, 0x1]; // POLLIN in the low half of the second int
+    #[cfg(target_arch = "x86_64")]
+    let r = {
+        // SAFETY: p is a valid pollfd[2].
+        check(unsafe { syscall3(7, p.as_mut_ptr() as usize, 2, timeout_ms as usize) })
+    };
+    #[cfg(target_arch = "aarch64")]
+    let r = {
+        let ts = super::Timespec { tv_sec: (timeout_ms / 1000) as i64, tv_nsec: ((timeout_ms % 1000) * 1_000_000) as i64 };
+        // SAFETY: ppoll(fds, nfds, timeout, sigmask = NULL).
+        check(unsafe { syscall4(73, p.as_mut_ptr() as usize, 2, &ts as *const _ as usize, 0) })
+    };
+    r?;
+    let rev = |x: i32| (x as u32 >> 16) as u16;
+    let (ra, rb) = (rev(p[1]), rev(p[3]));
+    // POLLIN 0x1, POLLERR 0x8, POLLHUP 0x10
+    Ok((ra & 0x1 != 0, rb & 0x1 != 0, (ra | rb) & 0x18 != 0 && (ra | rb) & 0x1 == 0))
+}
