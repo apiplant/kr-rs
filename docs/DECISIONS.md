@@ -192,3 +192,28 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
   - OOM is detected from `memory.events`.
   - CPU millicores map to `cpu.max` over a 100 ms period.
 **Status:** accepted.
+
+## ADR-019: User-namespace id ranges and the built-in bridge network
+**Context:**
+- Rootless kr mapped a single id, so images that chown or switch users (nginx, postgres) failed.
+- Containers had loopback-only networking.
+- Both features traditionally pull in external helpers: `newuidmap`, CNI plugin binaries, `iptables`/`nft`.
+
+**Decision:**
+- **Id mapping:**
+  - Real root gets the identity map. Rootless gets `0 → own uid` plus `1.. → the /etc/subuid range`, written by the setuid `newuidmap`/`newgidmap`.
+    - These are the only host binaries kr ever runs, and only when a range exists.
+    - The kernel requires a privileged writer for multi-id maps, and these helpers are the standard, distro-audited way to get one.
+  - Without a range, kr falls back to a single id.
+  - Image `USER` is resolved from the image's own passwd/group after `pivot_root`. Then setgroups → setresgid → setresuid, after the capability drop and before NO_NEW_PRIVS and seccomp.
+  - Container state owned by subordinate ids is deleted from inside a throwaway userns with the same maps.
+- **Network (root only):**
+  - Bridge `kr0` with gateway 10.88.0.1/16.
+  - IPAM uses O_EXCL lease files under `<root>/ipam`.
+  - Each container gets a veth pair; the parent creates the peer directly in the child's netns as `eth0` before releasing the child, and the child configures address, link and default route itself.
+  - Outbound traffic goes through nftables masquerade in table `ip kr`.
+  - Everything is programmed via netlink (`kr-net::netlink`, `kr-net::nft`). The veth disappears with the netns, and the lease is released by the supervisor.
+  - Rootless networking (slirp/pasta-style) is out of scope; rootless containers stay loopback-only.
+- **Supervision:** `start()` returns a `Running` with a `CLONE_PIDFD` pidfd. `wait()` is async on the epoll executor. SIGINT/SIGTERM are forwarded through a signalfd and `pidfd_send_signal`.
+
+**Status:** accepted.

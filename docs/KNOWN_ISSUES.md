@@ -143,8 +143,14 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
     `container::start` returns a `Running`. `Running::wait()` is async: a `CLONE_PIDFD` pidfd on the epoll executor plus `waitid(P_PIDFD, WNOHANG)`. `Signaller` clones the pidfd so another task can signal. The blocking `run()` remains for simple callers.
 49. **The overlay mount line in `/proc/mounts` reveals host store paths** — *accepted*
     This is an information leak only.
-50. **Container networking is loopback only** — *open, next*
-    There is no veth, bridge or host connectivity yet. That is phase-1 step 4, done in a root VM (ADR-016).
+50. **Container networking is loopback only** — *fixed for root (ADR-019)*
+    kr0 bridge, veth into the container netns, O_EXCL lease IPAM and nftables masquerade, all over netlink.
+    Verified as root in a privileged throwaway container: host→container HTTP, container→container, outbound ping via NAT, and leases and veths gone after exit.
+    Still open:
+    - Rootless containers stay loopback-only.
+    - No port publishing (`-p`); that comes with kr-proxy DNAT.
+    - IPv4 only.
+    - Leases leak if kr is SIGKILLed; a GC pass is needed.
 51. **cgroup supervisor moves every process in the delegated cgroup into `kr-supervisor`** — *accepted*
     This is intended for a dedicated scope or unit. Running kr inside a shared cgroup with `Delegate=yes` would also move its neighbours.
 

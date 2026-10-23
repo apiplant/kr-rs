@@ -5,6 +5,7 @@ extern crate alloc;
 
 pub mod cgroup;
 pub mod container;
+pub mod network;
 pub mod pull;
 pub mod security;
 pub mod store;

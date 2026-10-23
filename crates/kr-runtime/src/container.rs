@@ -18,6 +18,7 @@ use kr_sys::ns::{self, CloneArgs};
 use kr_sys::{Errno, Fd};
 
 use crate::cgroup::{Cgroup, Limits};
+use crate::network::{self, NetConfig};
 use crate::security;
 
 pub struct RunSpec<'a> {
@@ -42,6 +43,8 @@ pub struct RunSpec<'a> {
     pub user: &'a [u8],
     /// User-namespace id mapping (see `IdMaps::for_current_user`).
     pub maps: &'a IdMaps,
+    /// Bridge networking (root only); None keeps a loopback-only netns.
+    pub net: Option<NetConfig>,
 }
 
 /// Outcome of a container run.
@@ -88,6 +91,7 @@ const STEPS: &[&str] = &[
     "mask /proc",
     "resolve user",
     "set user",
+    "configure eth0",
 ];
 
 /// NUL-terminated concatenation of `parts`.
@@ -228,6 +232,14 @@ pub fn start(spec: &RunSpec) -> Result<Running, RunError> {
         let _ = ns::wait4(pid);
         running.finish();
         return Err(e);
+    }
+    if spec.net.is_some() {
+        if let Err(e) = network::attach(pid, spec.id) {
+            let _ = ns::kill(pid, ns::SIGKILL);
+            let _ = ns::wait4(pid);
+            running.finish();
+            return Err(RunError { step: "attach network", errno: e });
+        }
     }
     let _ = kr_sys::write(go_w.raw(), b"g");
     drop(go_w);
@@ -505,6 +517,9 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool) -> (u8, Errno)
     let _ = ns::rmdir(b"/.oldroot\0");
 
     step!(19, ns::link_up(b"lo"));
+    if let Some(net) = &spec.net {
+        step!(23, network::configure_child(net));
+    }
 
     if !spec.hostname.is_empty() {
         step!(11, ns::sethostname(spec.hostname));

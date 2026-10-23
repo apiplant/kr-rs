@@ -397,3 +397,16 @@ pub fn pidfd_try_wait(pidfd: &Fd) -> Result<Option<i32>> {
         _ => 128 + status,   // CLD_KILLED / CLD_DUMPED
     }))
 }
+
+/// Interface index by name (SIOCGIFINDEX), in the caller's network namespace.
+pub fn ifindex(name: &[u8]) -> Result<i32> {
+    if name.is_empty() || name.len() >= 16 {
+        return Err(Errno(22));
+    }
+    let mut ifr = [0u8; 40];
+    ifr[..name.len()].copy_from_slice(name);
+    let sock = super::socket(super::AF_INET, 2 | super::O_CLOEXEC, 0)?; // SOCK_DGRAM
+    // SAFETY: ifr is a writable 40-byte ifreq; the kernel stores ifr_ifindex at offset 16.
+    check(unsafe { syscall3(n::IOCTL, sock.raw() as usize, 0x8933, ifr.as_mut_ptr() as usize) })?;
+    Ok(i32::from_ne_bytes([ifr[16], ifr[17], ifr[18], ifr[19]]))
+}

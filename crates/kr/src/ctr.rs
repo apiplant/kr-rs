@@ -7,6 +7,7 @@ use kr_fmt::quantity::Quantity;
 use kr_rt::{eprint, print, Args};
 use kr_runtime::cgroup::Limits;
 use kr_runtime::container::{self, IdMaps, RunSpec};
+use kr_runtime::network::{self, NetConfig};
 use kr_runtime::store::Store;
 use kr_sys::ns;
 
@@ -143,6 +144,10 @@ fn run(mut args: Args) -> i32 {
 
     let maps = IdMaps::for_current_user();
     let id = container_id();
+    let lease = match bridge_network(&store, &id) {
+        Ok(l) => l,
+        Err(c) => return c,
+    };
     let dirs = match store.create_container(&id) {
         Ok(d) => d,
         Err(e) => return fail(&format!("create container: {e:?}")),
@@ -160,8 +165,16 @@ fn run(mut args: Args) -> i32 {
         limits,
         user: user.unwrap_or(cfg.user.as_bytes()),
         maps: &maps,
+        net: lease.as_ref().map(|l| NetConfig { ip: l.ip, prefix: network::PREFIX, gateway: network::GATEWAY }),
     };
+    if let Some(l) = &lease {
+        let ip = l.ip;
+        eprint(format!("kr ctr: {id} at {}.{}.{}.{}\n", ip[0], ip[1], ip[2], ip[3]).as_bytes());
+    }
     let code = supervise(&spec);
+    if let Some(l) = lease {
+        l.release();
+    }
     // Files the container created belong to subordinate ids; delete from inside a userns
     // where they are mapped (and kr is root).
     let ok = match maps.run_as_root(|| store.delete_container(&id).is_ok()) {
@@ -173,6 +186,20 @@ fn run(mut args: Args) -> i32 {
         eprint(format!("kr ctr: warning: cleanup of {id} failed\n").as_bytes());
     }
     code
+}
+
+/// As real root, sets up the bridge (idempotent) and leases an address; rootless: no network.
+fn bridge_network(store: &Store, id: &str) -> Result<Option<network::Lease>, i32> {
+    if ns::getuid() != 0 {
+        return Ok(None);
+    }
+    network::setup_host().map_err(|e| fail(&format!("network setup: errno {}", e.0)))?;
+    let dir = format!("{}/ipam", store.root());
+    match ns::mkdir(&nul(dir.as_bytes()), 0o700) {
+        Ok(()) | Err(kr_sys::Errno(17)) => {}
+        Err(e) => return Err(fail(&format!("mkdir ipam: errno {}", e.0))),
+    }
+    network::allocate(dir.as_bytes(), id.as_bytes()).map(Some).map_err(|e| fail(&format!("ipam: errno {}", e.0)))
 }
 
 /// Starts the container and waits for it, forwarding SIGINT/SIGTERM to its pid 1. A second
@@ -277,6 +304,7 @@ fn run_dir(mut args: Args) -> i32 {
         limits,
         user: user.unwrap_or(b""),
         maps: &maps,
+        net: None,
     };
     supervise(&spec)
 }
