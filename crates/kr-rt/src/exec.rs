@@ -586,6 +586,13 @@ impl AsRawFd for Fd {
     }
 }
 
+/// Shared fds (e.g. a pidfd also used to send signals) close when the last Rc drops.
+impl AsRawFd for Rc<Fd> {
+    fn as_raw_fd(&self) -> i32 {
+        self.raw()
+    }
+}
+
 impl<T: AsRawFd> Async<T> {
     /// `inner` must already be in non-blocking mode.
     pub fn new(inner: T) -> Result<Self, Errno> {
@@ -599,6 +606,12 @@ impl<T: AsRawFd> Async<T> {
 
     async fn ready(&self, write: bool) {
         poll_fn(|cx| poll_ready(self.slot, write, cx)).await
+    }
+
+    /// Waits for the next readability edge (pidfd exit, signalfd), clearing the optimistic flag.
+    pub async fn wait_readable(&self) {
+        clear_ready(self.slot, false);
+        self.ready(false).await
     }
 
     pub async fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {

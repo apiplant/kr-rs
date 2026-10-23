@@ -22,6 +22,12 @@ mod n {
     pub const NANOSLEEP: usize = 35;
     pub const IOCTL: usize = 16;
     pub const SECCOMP: usize = 317;
+    pub const SETRESUID: usize = 117;
+    pub const SETRESGID: usize = 119;
+    pub const SETGROUPS: usize = 116;
+    pub const RT_SIGPROCMASK: usize = 14;
+    pub const SIGNALFD4: usize = 289;
+    pub const WAITID: usize = 247;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -44,6 +50,12 @@ mod n {
     pub const NANOSLEEP: usize = 101;
     pub const IOCTL: usize = 29;
     pub const SECCOMP: usize = 277;
+    pub const SETRESUID: usize = 147;
+    pub const SETRESGID: usize = 149;
+    pub const SETGROUPS: usize = 159;
+    pub const RT_SIGPROCMASK: usize = 135;
+    pub const SIGNALFD4: usize = 74;
+    pub const WAITID: usize = 95;
 }
 
 pub const CLONE_NEWNS: u64 = 0x0002_0000;
@@ -57,6 +69,9 @@ pub const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 
 pub const SIGKILL: i32 = 9;
 pub const SIGCHLD: i32 = 17;
+pub const SIGINT: i32 = 2;
+pub const SIGTERM: i32 = 15;
+pub const CLONE_PIDFD: u64 = 0x1000;
 
 pub const MS_RDONLY: usize = 1;
 pub const MS_NOSUID: usize = 2;
@@ -298,4 +313,87 @@ pub fn link_up(name: &[u8]) -> Result<()> {
     ifr[16..18].copy_from_slice(&flags.to_ne_bytes());
     // SAFETY: as above.
     check(unsafe { syscall3(n::IOCTL, sock.raw() as usize, SIOCSIFFLAGS, ifr.as_mut_ptr() as usize) }).map(|_| ())
+}
+
+/// Sets real, effective and saved gid. Call before `setresuid`.
+pub fn setresgid(gid: u32) -> Result<()> {
+    // SAFETY: plain integer arguments.
+    check(unsafe { syscall3(n::SETRESGID, gid as usize, gid as usize, gid as usize) }).map(|_| ())
+}
+
+pub fn setresuid(uid: u32) -> Result<()> {
+    // SAFETY: plain integer arguments.
+    check(unsafe { syscall3(n::SETRESUID, uid as usize, uid as usize, uid as usize) }).map(|_| ())
+}
+
+/// Replaces the supplementary group list.
+pub fn setgroups(groups: &[u32]) -> Result<()> {
+    // SAFETY: groups is a valid array of gid_t for the given length.
+    check(unsafe { syscall2(n::SETGROUPS, groups.len(), groups.as_ptr() as usize) }).map(|_| ())
+}
+
+fn sigmask(sigs: &[i32]) -> u64 {
+    sigs.iter().fold(0u64, |m, &s| m | 1 << (s - 1))
+}
+
+/// Blocks (`block`) or unblocks the given signals for the calling thread.
+pub fn sigprocmask(block: bool, sigs: &[i32]) -> Result<()> {
+    let set = sigmask(sigs);
+    let how = if block { 0 } else { 1 }; // SIG_BLOCK / SIG_UNBLOCK
+    // SAFETY: set is a valid 8-byte sigset; old set pointer is NULL.
+    check(unsafe { syscall4(n::RT_SIGPROCMASK, how, &set as *const u64 as usize, 0, 8) }).map(|_| ())
+}
+
+/// Unblocks every signal (the mask survives fork and execve, so a child must reset it).
+pub fn sigmask_reset() -> Result<()> {
+    let set = 0u64;
+    // SAFETY: set is a valid 8-byte sigset. how = SIG_SETMASK.
+    check(unsafe { syscall4(n::RT_SIGPROCMASK, 2, &set as *const u64 as usize, 0, 8) }).map(|_| ())
+}
+
+/// A non-blocking, close-on-exec signalfd for `sigs` (which must be blocked first).
+pub fn signalfd(sigs: &[i32]) -> Result<Fd> {
+    let set = sigmask(sigs);
+    // SAFETY: set is a valid 8-byte sigset. Flags: SFD_NONBLOCK | SFD_CLOEXEC.
+    check(unsafe { syscall4(n::SIGNALFD4, usize::MAX, &set as *const u64 as usize, 8, 0o4000 | super::O_CLOEXEC as usize) })
+        .map(|fd| Fd(fd as i32))
+}
+
+/// Reads one pending signal number from a signalfd (`struct signalfd_siginfo` is 128 bytes).
+pub fn signalfd_read(fd: &Fd) -> Result<i32> {
+    let mut info = [0u8; 128];
+    let n = super::read(fd.raw(), &mut info)?;
+    if n < 4 {
+        return Err(Errno(5));
+    }
+    Ok(u32::from_ne_bytes([info[0], info[1], info[2], info[3]]) as i32)
+}
+
+/// Sends `sig` through a pidfd, which cannot hit a recycled pid.
+pub fn pidfd_send_signal(pidfd: &Fd, sig: i32) -> Result<()> {
+    // SAFETY: plain integer arguments; info is NULL.
+    check(unsafe { syscall4(424, pidfd.raw() as usize, sig as usize, 0, 0) }).map(|_| ())
+}
+
+/// Non-blocking reap of the process behind `pidfd`: Ok(None) while it is still running,
+/// otherwise its shell-style exit code.
+pub fn pidfd_try_wait(pidfd: &Fd) -> Result<Option<i32>> {
+    // siginfo_t is 128 bytes: si_signo, si_errno, si_code (i32 each), pad, si_pid, si_uid, si_status.
+    let mut info = [0u8; 128];
+    const P_PIDFD: usize = 3;
+    const WEXITED: usize = 4;
+    const WNOHANG: usize = 1;
+    // SAFETY: info is a writable siginfo_t-sized buffer; rusage is NULL.
+    check(unsafe {
+        syscall5(n::WAITID, P_PIDFD, pidfd.raw() as usize, info.as_mut_ptr() as usize, WEXITED | WNOHANG, 0)
+    })?;
+    let rd = |o: usize| i32::from_ne_bytes([info[o], info[o + 1], info[o + 2], info[o + 3]]);
+    if rd(16) == 0 {
+        return Ok(None); // si_pid == 0: still running
+    }
+    let (code, status) = (rd(8), rd(24));
+    Ok(Some(match code {
+        1 => status & 0xff,  // CLD_EXITED
+        _ => 128 + status,   // CLD_KILLED / CLD_DUMPED
+    }))
 }

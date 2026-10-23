@@ -124,22 +124,23 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
 
 ## kr-runtime: isolation (container.rs, security.rs, cgroup.rs)
 
-43. **Rootless maps a single uid/gid** — *open, next*
-    Images that chown to other uids fail. For example, nginx's `chown(..., 101)` returns EINVAL.
-    Plan: map a subordinate range (`/etc/subuid`, via `newuidmap`/`newgidmap`) when rootless, and the full range when root.
-    Related: image `USER` is ignored (a warning is printed) until this lands.
-44. **`/proc` is not masked** — *open*
-    `/proc/kcore`, `/proc/sysrq-trigger`, `/proc/sys` and others are visible. The userns already blocks most writes.
-    Plan: bind `/dev/null` over the sensitive files, and remount `/proc/sys`, `/proc/bus` and `/proc/irq` read-only (as runc's masked/readonly paths do).
+43. **Rootless maps a single uid/gid** — *fixed*
+    kr maps a subordinate range from `/etc/subuid`/`/etc/subgid` through `newuidmap`/`newgidmap`, and the identity range as root. Image `USER` (and `--user`) resolves against the image's own passwd/group after pivot_root.
+    Verified in a throwaway privileged container: nginx serves its page, `adduser`+`su` works, and subuid-owned files with mode 700 are deleted on cleanup (done from a userns, `IdMaps::run_as_root`).
+    Remaining limits:
+    - Without a range, only root is mapped and a non-root USER fails with a hint.
+    - Rootless unpack drops image file ownership, so everything is owned by container root.
+    - `newuidmap` is the only host binary used.
+44. **`/proc` is not masked** — *fixed*
+    Docker's masked paths (`kcore`, `keys`, `timer_list`, `sched_debug`, ...) get `/dev/null` or an empty read-only tmpfs. `/proc/sys`, `bus`, `fs`, `irq` and `sysrq-trigger` are bind-remounted read-only (keeping the userns-locked flags). Verified: `/proc/kcore` reads 0 bytes and writes to `/proc/sys` give EROFS.
 45. **The seccomp profile is a deny-list, not Docker's allow-list** — *accepted for now*
     It is defence in depth on top of the reduced capabilities. Only the summary state has been checked: `Seccomp: 2`, and unshare/mount are refused. Plan: per-syscall tests, then consider an allow-list.
 46. **Fail-closed startup on hostile image layouts** — *accepted*
     Startup aborts with ENOENT if `/.oldroot`, `/proc` or `/dev` is a symlink in the image. This is safe (nothing escapes; verified), but such an image cannot run.
-47. **No signal forwarding** — *open*
-    The container's pid 1 ignores SIGINT/SIGTERM from outside unless it installs handlers. On Ctrl-C, kr dies and PDEATHSIG SIGKILLs the container.
-    Plan: kr forwards SIGTERM/SIGINT to pid 1, with a grace period before SIGKILL; optionally a tiny init.
-48. **`container::run` blocks on `wait4`** — *open*
-    The kubelet needs async supervision of many containers. Plan: pidfd + epoll, using the `CLONE_PIDFD` flag.
+47. **No signal forwarding** — *fixed*
+    `kr ctr` blocks SIGINT/SIGTERM, reads them from a signalfd and forwards them via `pidfd_send_signal`. A second SIGINT sends SIGKILL, since pid 1 without a handler ignores the first. The child resets its signal mask before exec. Verified: a trap in sh sees TERM, and double Ctrl-C on `sleep` exits 137.
+48. **`container::run` blocks on `wait4`** — *fixed*
+    `container::start` returns a `Running`. `Running::wait()` is async: a `CLONE_PIDFD` pidfd on the epoll executor plus `waitid(P_PIDFD, WNOHANG)`. `Signaller` clones the pidfd so another task can signal. The blocking `run()` remains for simple callers.
 49. **The overlay mount line in `/proc/mounts` reveals host store paths** — *accepted*
     This is an information leak only.
 50. **Container networking is loopback only** — *open, next*

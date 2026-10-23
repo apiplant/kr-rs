@@ -6,13 +6,13 @@ use alloc::vec::Vec;
 use kr_fmt::quantity::Quantity;
 use kr_rt::{eprint, print, Args};
 use kr_runtime::cgroup::Limits;
-use kr_runtime::container::{self, RunSpec};
+use kr_runtime::container::{self, IdMaps, RunSpec};
 use kr_runtime::store::Store;
 use kr_sys::ns;
 
 const USAGE: &[u8] = b"usage:
   kr ctr pull <image>
-  kr ctr run [--memory 64Mi] [--cpus 500m] [--pids 64] <image> [--] [cmd args...]
+  kr ctr run [--memory 64Mi] [--cpus 500m] [--pids 64] [--user uid[:gid]] <image> [--] [cmd args...]
   kr ctr run-dir [limits...] <rootfs> <state-dir> [--] <cmd> [args...]
 ";
 
@@ -31,11 +31,20 @@ pub fn main(mut args: Args) -> i32 {
 }
 
 /// Parses leading limit flags and then `n` positional arguments; the rest is the command.
-fn parse(args: &mut Args, n: usize) -> Result<(Limits, Vec<&'static [u8]>, Vec<Vec<u8>>), i32> {
+fn parse(args: &mut Args, n: usize) -> Result<(Limits, Option<&'static [u8]>, Vec<&'static [u8]>, Vec<Vec<u8>>), i32> {
     let mut limits = Limits::default();
+    let mut user = None;
     let mut positional = Vec::new();
     while positional.len() < n {
         let Some(a) = args.next() else { break };
+        if a == b"--user" {
+            user = args.next();
+            if user.is_none() {
+                eprint(USAGE);
+                return Err(2);
+            }
+            continue;
+        }
         let flag = match a {
             b"--memory" | b"--cpus" | b"--pids" => a,
             _ => {
@@ -64,7 +73,7 @@ fn parse(args: &mut Args, n: usize) -> Result<(Limits, Vec<&'static [u8]>, Vec<V
     if cmd.first().map(|a| a.as_slice()) == Some(b"--") {
         cmd.remove(0);
     }
-    Ok((limits, positional, cmd))
+    Ok((limits, user, positional, cmd))
 }
 
 fn utf8(b: &[u8]) -> Option<String> {
@@ -99,7 +108,7 @@ fn container_id() -> String {
 }
 
 fn run(mut args: Args) -> i32 {
-    let (limits, pos, override_cmd) = match parse(&mut args, 1) {
+    let (limits, user, pos, override_cmd) = match parse(&mut args, 1) {
         Ok(v) => v,
         Err(c) => return c,
     };
@@ -131,10 +140,8 @@ fn run(mut args: Args) -> i32 {
     if !env.iter().any(|e| e.starts_with(b"PATH=")) {
         env.push(DEFAULT_PATH.as_bytes().to_vec());
     }
-    if !cfg.user.is_empty() && cfg.user != "0" && cfg.user != "root" {
-        eprint(b"kr ctr: warning: image USER is ignored for now (runs as container root)\n");
-    }
 
+    let maps = IdMaps::for_current_user();
     let id = container_id();
     let dirs = match store.create_container(&id) {
         Ok(d) => d,
@@ -151,12 +158,60 @@ fn run(mut args: Args) -> i32 {
         hostname: id.as_bytes(),
         id: id.as_bytes(),
         limits,
+        user: user.unwrap_or(cfg.user.as_bytes()),
+        maps: &maps,
     };
-    let code = report(container::run(&spec));
-    if let Err(e) = store.delete_container(&id) {
-        eprint(format!("kr ctr: warning: cleanup {id}: {e:?}\n").as_bytes());
+    let code = supervise(&spec);
+    // Files the container created belong to subordinate ids; delete from inside a userns
+    // where they are mapped (and kr is root).
+    let ok = match maps.run_as_root(|| store.delete_container(&id).is_ok()) {
+        Ok(ok) => ok,
+        // Mapping failed (e.g. newuidmap broken): nothing ran under subordinate ids, try directly.
+        Err(_) => store.delete_container(&id).is_ok(),
+    };
+    if !ok {
+        eprint(format!("kr ctr: warning: cleanup of {id} failed\n").as_bytes());
     }
     code
+}
+
+/// Starts the container and waits for it, forwarding SIGINT/SIGTERM to its pid 1. A second
+/// SIGINT kills it (pid 1 may have no handler, so the first one can be ignored).
+fn supervise(spec: &RunSpec) -> i32 {
+    let sigs = [ns::SIGINT, ns::SIGTERM];
+    // Blocked so they arrive on the signalfd; the container child resets its mask before exec.
+    if ns::sigprocmask(true, &sigs).is_err() {
+        return fail("sigprocmask");
+    }
+    let sfd = ns::signalfd(&sigs);
+    let running = match container::start(spec) {
+        Ok(r) => r,
+        Err(e) => return report(Err(e)),
+    };
+    let sig = running.signaller();
+    let res = kr_rt::exec::block_on(async move {
+        let fwd = sfd.ok().and_then(|fd| kr_rt::exec::Async::new(fd).ok()).map(|fd| {
+            kr_rt::exec::spawn(async move {
+                let mut interrupts = 0;
+                loop {
+                    match ns::signalfd_read(fd.get_ref()) {
+                        Ok(s) => {
+                            interrupts += (s == ns::SIGINT) as u32;
+                            let _ = sig.send(if interrupts >= 2 { ns::SIGKILL } else { s });
+                        }
+                        Err(_) => fd.wait_readable().await,
+                    }
+                }
+            })
+        });
+        let r = running.wait().await;
+        if let Some(f) = fwd {
+            f.abort();
+        }
+        r
+    });
+    let _ = ns::sigprocmask(false, &sigs);
+    report(res)
 }
 
 fn report(r: Result<container::Exit, container::RunError>) -> i32 {
@@ -167,6 +222,10 @@ fn report(r: Result<container::Exit, container::RunError>) -> i32 {
             }
             exit.code
         }
+        Err(e) if e.step == "set user" && e.errno.0 == 22 => fail(
+            "set user: id not mapped. Rootless kr maps only your own uid unless /etc/subuid and \
+             /etc/subgid give you a range (e.g. `usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER`)",
+        ),
         Err(e) => fail(&format!("{}: errno {}", e.step, e.errno.0)),
     }
 }
@@ -186,7 +245,7 @@ fn nul(p: &[u8]) -> Vec<u8> {
 
 /// Dev command: run a container from a plain directory, without the image store.
 fn run_dir(mut args: Args) -> i32 {
-    let (limits, pos, argv) = match parse(&mut args, 2) {
+    let (limits, user, pos, argv) = match parse(&mut args, 2) {
         Ok(v) => v,
         Err(c) => return c,
     };
@@ -202,6 +261,7 @@ fn run_dir(mut args: Args) -> i32 {
             Err(e) => return fail(&format!("mkdir state: errno {}", e.0)),
         }
     }
+    let maps = IdMaps::for_current_user();
     let id = container_id();
     let env = [DEFAULT_PATH.as_bytes().to_vec(), b"HOME=/root".to_vec()];
     let spec = RunSpec {
@@ -215,8 +275,10 @@ fn run_dir(mut args: Args) -> i32 {
         hostname: b"kr",
         id: id.as_bytes(),
         limits,
+        user: user.unwrap_or(b""),
+        maps: &maps,
     };
-    report(container::run(&spec))
+    supervise(&spec)
 }
 
 fn fail(msg: &str) -> i32 {
