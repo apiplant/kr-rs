@@ -6,6 +6,7 @@ extern crate alloc;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::Cell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use kr_rt::exec::{self, spawn, sleep, timeout, Async};
 use kr_rt::{eprint, fmt_u64, print, Args};
 use kr_sys::{self as sys, Fd};
@@ -13,6 +14,11 @@ use kr_sys::{self as sys, Fd};
 const MAX_REQ: usize = 16 * 1024;
 const IO_DEADLINE_MS: u64 = 10_000;
 const LINGER_MS: u64 = 1_000;
+/// Request bodies up to this size are read and discarded so the connection ends cleanly.
+const MAX_BODY: usize = 1024 * 1024;
+/// Maximum number of connections in the lingering-close drain at once; above it, close at once.
+const MAX_LINGER: usize = 256;
+static LINGERING: AtomicUsize = AtomicUsize::new(0);
 
 #[no_mangle]
 fn kr_main(mut args: Args) -> i32 {
@@ -129,12 +135,34 @@ async fn sleep_test() {
     print(b"live_tasks_ok\n");
 }
 
+/// `Some(n)` for a valid Content-Length (0 if absent); `None` if unparsable, duplicated oddly,
+/// or a Transfer-Encoding is present (body length unknown).
+fn content_length(head: &[u8]) -> Option<usize> {
+    let mut cl = 0usize;
+    for line in head.split(|&b| b == b'\n').skip(1) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(i) = line.iter().position(|&b| b == b':') else { continue };
+        let (name, val) = (&line[..i], line[i + 1..].trim_ascii());
+        if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            return None;
+        }
+        if name.eq_ignore_ascii_case(b"content-length") {
+            if val.is_empty() || val.len() > 12 || !val.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            cl = val.iter().fold(0usize, |a, &d| a * 10 + (d - b'0') as usize);
+        }
+    }
+    Some(cl)
+}
+
 fn find_end(b: &[u8]) -> Option<usize> {
     b.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
 }
 
 enum Req {
-    Complete(Vec<u8>),
+    /// Request head, and whether all of the request input was consumed (no unread input can remain).
+    Complete(Vec<u8>, bool),
     TooLarge,
     Closed,
 }
@@ -149,8 +177,25 @@ async fn read_request(c: &Async<Fd>) -> Result<Req, sys::Errno> {
         }
         buf.extend_from_slice(&tmp[..n]);
         if let Some(end) = find_end(&buf) {
+            let extra = buf.len() - end;
             buf.truncate(end);
-            return Ok(Req::Complete(buf));
+            let clean = match content_length(&buf) {
+                Some(cl) if cl <= MAX_BODY && extra <= cl => {
+                    // Read and discard the rest of the body.
+                    let mut left = cl - extra;
+                    while left > 0 {
+                        let want = left.min(tmp.len());
+                        let n = c.read(&mut tmp[..want]).await?;
+                        if n == 0 {
+                            break;
+                        }
+                        left -= n;
+                    }
+                    left == 0
+                }
+                _ => false,
+            };
+            return Ok(Req::Complete(buf, clean));
         }
         if buf.len() > MAX_REQ {
             return Ok(Req::TooLarge);
@@ -164,10 +209,12 @@ async fn handle(c: Async<Fd>) {
         Ok(Ok(r)) => r,
         _ => return, // timed out or I/O error: just close
     };
+    let mut clean = false;
     let out: Vec<u8> = match req {
         Req::Closed => return,
         Req::TooLarge => b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
-        Req::Complete(body) => {
+        Req::Complete(body, cl) => {
+            clean = cl;
             let mut nb = [0u8; 20];
             let len = fmt_u64(body.len() as u64, &mut nb);
             let mut out: Vec<u8> = Vec::with_capacity(body.len() + 96);
@@ -178,7 +225,7 @@ async fn handle(c: Async<Fd>) {
             out
         }
     };
-    if timeout(IO_DEADLINE_MS, c.write_all(&out)).await.is_ok_and(|r| r.is_ok()) {
+    if timeout(IO_DEADLINE_MS, c.write_all(&out)).await.is_ok_and(|r| r.is_ok()) && !clean {
         linger_close(&c).await;
     }
 }
@@ -187,6 +234,17 @@ async fn handle(c: Async<Fd>) {
 /// sends for up to 1 s, so closing with unread data does not turn into a TCP RST that could
 /// destroy the response before the client reads it. The caller's drop then closes the fd.
 async fn linger_close(c: &Async<Fd>) {
+    struct Slot;
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            LINGERING.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    if LINGERING.fetch_add(1, Ordering::Relaxed) >= MAX_LINGER {
+        LINGERING.fetch_sub(1, Ordering::Relaxed);
+        return; // too many lingering already: close immediately
+    }
+    let _slot = Slot;
     if sys::shutdown(c.get_ref().raw(), sys::SHUT_WR).is_err() {
         return;
     }

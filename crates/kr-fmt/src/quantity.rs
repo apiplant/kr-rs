@@ -301,7 +301,7 @@ impl Quantity {
         // Decimal: mantissa without trailing zeros, exponent a multiple of 3.
         let mut m = self.mantissa.unsigned_abs();
         let mut exp = i64::from(self.scale);
-        while m % 10 == 0 {
+        while m.is_multiple_of(10) {
             m /= 10;
             exp += 1;
         }

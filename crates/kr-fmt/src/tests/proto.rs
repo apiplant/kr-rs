@@ -71,7 +71,7 @@ fn tags() {
     assert_eq!(split_tag(make_tag(MAX_FIELD, WireType::Fixed64)), Ok((MAX_FIELD, WireType::Fixed64)));
     assert_eq!(split_tag(0x00), Err(ErrorKind::InvalidFieldNumber));
     assert_eq!(split_tag(0x02), Err(ErrorKind::InvalidFieldNumber));
-    assert_eq!(split_tag(((MAX_FIELD as u64 + 1) << 3) | 0), Err(ErrorKind::InvalidFieldNumber));
+    assert_eq!(split_tag((MAX_FIELD as u64 + 1) << 3), Err(ErrorKind::InvalidFieldNumber));
     for wt in [3, 4, 6, 7] {
         assert_eq!(split_tag(8 | wt), Err(ErrorKind::InvalidWireType));
     }

@@ -118,7 +118,7 @@ pub fn decode_config(s: &[u8], alpha: Alphabet, pad: Padding) -> Result<Vec<u8>,
     let pads = s.len() - body;
     match pad {
         Padding::Required => {
-            if s.len() % 4 != 0 {
+            if !s.len().is_multiple_of(4) {
                 return err(ErrorKind::InvalidLength, s.len());
             }
             let rem = body % 4;

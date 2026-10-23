@@ -81,7 +81,7 @@ pub fn encode_varint(mut v: u64, out: &mut Vec<u8>) {
 
 /// Encoded size of a varint.
 pub fn varint_len(v: u64) -> usize {
-    ((64 - (v | 1).leading_zeros() as usize) + 6) / 7
+    (64 - (v | 1).leading_zeros() as usize).div_ceil(7)
 }
 
 /// Decode a varint; returns (value, bytes consumed). Non-minimal encodings
@@ -289,7 +289,7 @@ impl Writer {
     }
 
     fn tag(&mut self, field: u32, wt: WireType) {
-        debug_assert!(field >= 1 && field <= MAX_FIELD);
+        debug_assert!((1..=MAX_FIELD).contains(&field));
         encode_varint(make_tag(field, wt), &mut self.buf);
     }
 

@@ -133,11 +133,11 @@ struct Line<'a> {
 }
 
 fn is_blank(t: &str) -> bool {
-    t.trim_matches(|c| c == ' ' || c == '\t').is_empty()
+    t.trim_matches([' ', '\t']).is_empty()
 }
 
 fn is_blank_or_comment(t: &str) -> bool {
-    let t = t.trim_start_matches(|c| c == ' ' || c == '\t');
+    let t = t.trim_start_matches([' ', '\t']);
     t.is_empty() || t.starts_with('#')
 }
 
@@ -154,7 +154,7 @@ fn split_docs(src: &str) -> Vec<Vec<Line<'_>>> {
         let no = n + 1;
         if is_marker(raw, "---") {
             docs.push(Vec::new());
-            let rest = raw[3..].trim_start_matches(|c| c == ' ' || c == '\t');
+            let rest = raw[3..].trim_start_matches([' ', '\t']);
             if !rest.is_empty() && !rest.starts_with('#') {
                 // Content on the marker line behaves like a line indented by 4.
                 if let Some(d) = docs.last_mut() {
@@ -188,10 +188,10 @@ fn strip_comment(t: &str) -> (&str, bool) {
     let b = t.as_bytes();
     for i in 0..b.len() {
         if b[i] == b'#' && (i == 0 || is_ws(b[i - 1])) {
-            return (t[..i].trim_end_matches(|c| c == ' ' || c == '\t'), true);
+            return (t[..i].trim_end_matches([' ', '\t']), true);
         }
     }
-    (t.trim_end_matches(|c| c == ' ' || c == '\t'), false)
+    (t.trim_end_matches([' ', '\t']), false)
 }
 
 /// If `t` is `key: rest`, return the key text and the text after the colon.
@@ -223,7 +223,7 @@ fn split_key(t: &str) -> Result<Option<(String, &str)>, ErrorKind> {
             for i in 0..b.len() {
                 match b[i] {
                     b':' if i + 1 == b.len() || is_ws(b[i + 1]) => {
-                        let key = t[..i].trim_end_matches(|c| c == ' ' || c == '\t');
+                        let key = t[..i].trim_end_matches([' ', '\t']);
                         if key.is_empty() {
                             return Err(ErrorKind::Syntax("empty mapping key"));
                         }
@@ -306,7 +306,7 @@ impl<'a> P<'a> {
                 break;
             }
             let rest = &text[1..];
-            let ws = rest.len() - rest.trim_start_matches(|c| c == ' ' || c == '\t').len();
+            let ws = rest.len() - rest.trim_start_matches([' ', '\t']).len();
             let rest = &rest[ws..];
             let v = if rest.is_empty() || rest.starts_with('#') {
                 self.idx += 1;
@@ -345,7 +345,7 @@ impl<'a> P<'a> {
             if entries.iter().any(|(k, _)| *k == key) {
                 return Err(self.err_at(ErrorKind::DuplicateKey, no));
             }
-            let rest = rest.trim_start_matches(|c| c == ' ' || c == '\t');
+            let rest = rest.trim_start_matches([' ', '\t']);
             let v = if rest.is_empty() || rest.starts_with('#') {
                 self.idx += 1;
                 self.skip_blank()?;
@@ -452,7 +452,7 @@ impl<'a> P<'a> {
             match f(&buf) {
                 Ok((v, end)) => {
                     let tail = &buf[end..];
-                    let t = tail.trim_start_matches(|c| c == ' ' || c == '\t');
+                    let t = tail.trim_start_matches([' ', '\t']);
                     let ok = t.is_empty() || (t.starts_with('#') && t.len() < tail.len());
                     if !ok {
                         return Err(self.err_at(
@@ -500,7 +500,7 @@ impl<'a> P<'a> {
             }
             i += 1;
         }
-        let tail = header[i..].trim_start_matches(|c| c == ' ' || c == '\t');
+        let tail = header[i..].trim_start_matches([' ', '\t']);
         if !tail.is_empty() && !tail.starts_with('#') {
             return Err(self.err_at(ErrorKind::Syntax("invalid block scalar header"), no));
         }
@@ -916,7 +916,7 @@ impl<'b> Flow<'b> {
         while let Some(&c) = self.b.get(self.pos) {
             match c {
                 b',' | b'[' | b']' | b'{' | b'}' => break,
-                b':' if matches!(self.b.get(self.pos + 1), None)
+                b':' if self.b.get(self.pos + 1).is_none()
                     || self.b.get(self.pos + 1).is_some_and(|&n| {
                         matches!(n, b' ' | b'\t' | b'\n' | b'\r') || is_flow_ind(n)
                     }) =>

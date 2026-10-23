@@ -91,6 +91,7 @@ spec:
 ";
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14 is a YAML scalar under test, not PI
 fn deployment_manifest() {
     let v = parse(DEPLOYMENT).unwrap();
     assert_eq!(v.get("apiVersion").and_then(Value::as_str), Some("apps/v1"));
