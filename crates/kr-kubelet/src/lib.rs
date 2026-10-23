@@ -160,6 +160,9 @@ pub struct Kubelet<C: Client> {
     pulls: RefCell<BTreeMap<String, Pull>>,
     /// Images pulled successfully by this kubelet (pullPolicy Always / :latest satisfied).
     done_pulls: RefCell<Vec<String>>,
+    /// Rootless pod network: a namespace pair owned by kr holding the bridge; pod sandboxes
+    /// are nested inside it so pods get IPs and reach each other without real root.
+    infra: RefCell<Option<Sandbox>>,
 }
 
 enum Pull {
@@ -172,7 +175,7 @@ const BACKOFF_MAX_MS: u64 = 300_000;
 
 impl<C: Client + Clone + 'static> Kubelet<C> {
     pub fn new(c: C, cfg: Config, store: Store) -> Rc<Self> {
-        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()) })
+        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None) })
     }
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
@@ -180,6 +183,35 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         if self.cfg.network {
             if let Err(e) = network::setup_host() {
                 kr_rt::eprint(alloc::format!("kubelet: network setup failed (errno {}); pods get no IP\n", e.0).as_bytes());
+            }
+        } else {
+            match container::start_sandbox(b"kr-pod-network", b"", &self.maps, None) {
+                Ok(infra) => {
+                    // ip_forward + bridge inside the infra namespaces; outbound NAT is not
+                    // possible rootless (no route out), so a failure there is tolerated.
+                    let ok = container::run_in_net(&infra, || {
+                        let nl = match kr_net::netlink::Netlink::route() {
+                            Ok(n) => n,
+                            Err(_) => return 1,
+                        };
+                        let _ = nl.bridge_add(network::BRIDGE);
+                        let Ok(br) = kr_net::netlink::ifindex(network::BRIDGE) else { return 2 };
+                        let _ = nl.addr_add(br, network::GATEWAY, network::PREFIX);
+                        if nl.link_up(br).is_err() {
+                            return 3;
+                        }
+                        let _ = kr_sys::ns::write_file(b"/proc/sys/net/ipv4/ip_forward\0", b"1");
+                        0
+                    });
+                    match ok {
+                        Ok(0) => *self.infra.borrow_mut() = Some(infra),
+                        r => {
+                            kr_rt::eprint(alloc::format!("kubelet: rootless pod network setup failed ({}); pods get no IP\n", r.map(|c| c.to_string()).unwrap_or_else(|e| alloc::format!("{}: errno {}", e.step, e.errno.0))).as_bytes());
+                            infra.stop();
+                        }
+                    }
+                }
+                Err(e) => kr_rt::eprint(alloc::format!("kubelet: rootless pod network unavailable ({}: errno {})\n", e.step, e.errno.0).as_bytes()),
             }
         }
         node::register(&self.c, &self.cfg).await;
@@ -331,7 +363,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let dir = self.pods.borrow()[uid].dir.clone();
         kr_runtime::store::mkdir_p(&dir, 0o711).map_err(|_| String::from("cannot create pod directory"))?;
         let mut lease = None;
-        if self.cfg.network {
+        let rootless_net = self.infra.borrow().is_some();
+        if self.cfg.network || rootless_net {
             let ipam = alloc::format!("{}/ipam", self.cfg.root);
             let _ = kr_runtime::store::mkdir_p(&ipam, 0o700);
             lease = network::allocate(ipam.as_bytes(), uid.as_bytes()).ok();
@@ -339,7 +372,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let ip = lease.as_ref().map(|l: &Lease| l.ip);
         let net = ip.map(|ip| NetConfig { ip, prefix: network::PREFIX, gateway: network::GATEWAY });
         let hostname = spec::pod_hostname(pod);
-        let sb = match container::start_sandbox(uid.as_bytes(), hostname.as_bytes(), &self.maps, net) {
+        let started = match self.infra.borrow().as_ref() {
+            Some(infra) => container::start_sandbox_in(infra, uid.as_bytes(), hostname.as_bytes(), &self.maps, net),
+            None => container::start_sandbox(uid.as_bytes(), hostname.as_bytes(), &self.maps, net),
+        };
+        let sb = match started {
             Ok(s) => s,
             Err(e) => {
                 if let Some(l) = lease {

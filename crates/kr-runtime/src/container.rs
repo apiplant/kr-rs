@@ -195,16 +195,67 @@ impl Sandbox {
 
 /// Starts a pod sandbox. `net` (root only) attaches it to the bridge with that address.
 pub fn start_sandbox(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>) -> Result<Sandbox, RunError> {
+    sandbox_inner(id, hostname, maps, net, false).map(|(pid, pidfd)| Sandbox { pid, pidfd: pidfd.expect("pidfd without CLONE_PARENT") })
+}
+
+/// Starts a pod sandbox whose user and network namespaces are children of `parent`'s (the
+/// rootless pod network): a helper joins `parent`, creates the sandbox as kr's child
+/// (CLONE_PARENT), writes the nested maps and plugs it into the bridge living there.
+pub fn start_sandbox_in(parent: &Sandbox, id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>) -> Result<Sandbox, RunError> {
+    let nested = maps.nested();
+    let (pid_r, pid_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
+    let helper = fork_into(&parent.pidfd, ns::CLONE_NEWUSER | ns::CLONE_NEWNET, None, move || match sandbox_inner(id, hostname, &nested, net, true) {
+        Ok((pid, _)) => {
+            let _ = kr_sys::write(pid_w.raw(), &(pid as u32).to_le_bytes());
+            0
+        }
+        Err(e) => {
+            let mut b = [0u8; 8];
+            b[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+            b[4..].copy_from_slice(&(e.errno.0 as u32).to_le_bytes());
+            let _ = kr_sys::write(pid_w.raw(), &b);
+            1
+        }
+    })?;
+    let _ = ns::wait4(helper.pid);
+    drop(helper);
+    let mut b = [0u8; 8];
+    let n = read_full(&pid_r, &mut b);
+    let first = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    if n < 4 || first == u32::MAX {
+        let e = if n == 8 { u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as i32 } else { 5 };
+        return Err(RunError { step: "nested sandbox", errno: Errno(e) });
+    }
+    let pid = first as i32;
+    // The sandbox is kr's (unreaped) child via CLONE_PARENT: the pid cannot be reused.
+    let pidfd = ns::pidfd_open(pid).map_err(err("pidfd_open"))?;
+    Ok(Sandbox { pid, pidfd })
+}
+
+/// Runs `f` inside `sb`'s user and network namespaces and waits for it (e.g. to configure
+/// the bridge in the rootless pod network). Returns its exit code.
+pub fn run_in_net(sb: &Sandbox, f: impl FnOnce() -> i32) -> Result<i32, RunError> {
+    let r = fork_into(&sb.pidfd, ns::CLONE_NEWUSER | ns::CLONE_NEWNET, None, f)?;
+    let status = ns::wait4(r.pid).map_err(err("wait4"))?;
+    Ok(ns::exit_code(status))
+}
+
+/// Shared sandbox start. With `clone_parent` the sandbox becomes the caller's parent's child
+/// (used from a helper inside the pod-network namespaces) and no pidfd is returned.
+fn sandbox_inner(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>, clone_parent: bool) -> Result<(i32, Option<Fd>), RunError> {
     let (go_r, go_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     let (rep_r, rep_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     let (uid, gid) = (ns::getuid(), ns::getgid());
     let mut pidfd: i32 = -1;
-    let mut args = CloneArgs {
-        flags: ns::CLONE_NEWUSER | ns::CLONE_NEWNET | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC | ns::CLONE_PIDFD,
-        exit_signal: ns::SIGCHLD as u64,
-        ..Default::default()
-    };
-    args.pidfd = &mut pidfd as *mut i32 as u64;
+    let mut args = CloneArgs { flags: ns::CLONE_NEWUSER | ns::CLONE_NEWNET | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC, ..Default::default() };
+    if clone_parent {
+        // clone3 requires exit_signal 0 with CLONE_PARENT (the parent's own signal is used).
+        args.flags |= ns::CLONE_PARENT;
+    } else {
+        args.flags |= ns::CLONE_PIDFD;
+        args.exit_signal = ns::SIGCHLD as u64;
+        args.pidfd = &mut pidfd as *mut i32 as u64;
+    }
     // SAFETY: single-threaded runtime (ADR-005).
     let pid = unsafe { ns::clone3(&mut args) }.map_err(err("clone3 sandbox"))?;
     if pid == 0 {
@@ -238,9 +289,11 @@ pub fn start_sandbox(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetC
     }
     drop(go_r);
     drop(rep_w);
-    let sb = Sandbox { pid, pidfd: Fd(pidfd) };
     let fail = |e: RunError| {
-        sb.stop();
+        let _ = ns::kill(pid, ns::SIGKILL);
+        if !clone_parent {
+            let _ = ns::wait4(pid);
+        }
         Err(e)
     };
     if let Err(e) = maps.apply(pid, uid, gid) {
@@ -258,7 +311,7 @@ pub fn start_sandbox(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetC
         let step = STEPS.get(rep[0] as usize).copied().unwrap_or("unknown");
         return fail(RunError { step, errno: Errno(rep[1] as i32 | (rep[2] as i32) << 8) });
     }
-    Ok(sb)
+    Ok((pid, (!clone_parent).then_some(Fd(pidfd))))
 }
 
 /// Outcome of a container run.
@@ -514,6 +567,9 @@ pub struct IdMaps {
     /// (start, count) of the subordinate uid/gid range; None = single-id mapping.
     sub_uid: Option<(u32, u32)>,
     sub_gid: Option<(u32, u32)>,
+    /// Applied from inside a parent namespace created with these maps (rootless pod network):
+    /// identity over the parent's range.
+    nested: bool,
 }
 
 const NEWUIDMAP: &[u8] = b"/usr/bin/newuidmap\0";
@@ -543,7 +599,7 @@ impl IdMaps {
         let (u, g) = (find(b"/etc/subuid\0"), find(b"/etc/subgid\0"));
         // Both or neither: a mixed mapping would leave files with unmapped owners.
         if u.is_some() && g.is_some() {
-            IdMaps { sub_uid: u, sub_gid: g }
+            IdMaps { sub_uid: u, sub_gid: g, nested: false }
         } else {
             IdMaps::default()
         }
@@ -554,8 +610,25 @@ impl IdMaps {
         self.sub_uid.is_some() || !rootless(ns::getuid())
     }
 
+    /// The same maps, applied from inside a parent user namespace that already uses them.
+    pub fn nested(&self) -> IdMaps {
+        IdMaps { nested: true, ..self.clone() }
+    }
+
     fn apply(&self, pid: i32, uid: u32, gid: u32) -> Result<(), RunError> {
         let d = fmt_u32(pid as u32);
+        if self.nested {
+            // Inside the parent userns we are root; map its whole range 1:1.
+            let base = |f: &[u8]| cstr(&[b"/proc/", &d, b"/", f]);
+            let line = |sub: Option<(u32, u32)>| {
+                let mut v = b"0 0 ".to_vec();
+                v.extend_from_slice(&fmt_u32(1 + sub.map_or(0, |s| s.1)));
+                v.push(b'\n');
+                v
+            };
+            ns::write_file(&base(b"uid_map"), &line(self.sub_uid)).map_err(err("write nested uid_map"))?;
+            return ns::write_file(&base(b"gid_map"), &line(self.sub_gid)).map_err(err("write nested gid_map"));
+        }
         if !rootless(uid) {
             let base = |f: &[u8]| cstr(&[b"/proc/", &d, b"/", f]);
             ns::write_file(&base(b"uid_map"), b"0 0 4294967295\n").map_err(err("write uid_map"))?;
