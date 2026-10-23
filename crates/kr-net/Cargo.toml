@@ -1,0 +1,10 @@
+[package]
+name = "kr-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kr-sys = { path = "../kr-sys" }
+kr-rt = { path = "../kr-rt" }
+kr-fmt = { path = "../kr-fmt" }

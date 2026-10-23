@@ -11,8 +11,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-archive"
+version = "0.0.1"
+
+[[package]]
 name = "kr-fmt"
 version = "0.0.1"
+
+[[package]]
+name = "kr-net"
+version = "0.0.1"
+dependencies = [
+ "kr-fmt",
+ "kr-rt",
+ "kr-sys",
+]
 
 [[package]]
 name = "kr-rt"

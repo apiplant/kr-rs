@@ -107,3 +107,13 @@ Scalars use the YAML 1.2 core schema: `null/~`, `true/false` (any of three cases
 **Protobuf:** varint, zigzag, fixed32/64 and length-delimited fields only. Groups are rejected. Length prefixes are capped by a configurable limit.
 
 **Status:** accepted.
+
+## ADR-013: Phase 1 layering, with plain-HTTP registries until TLS lands
+Crates:
+- `kr-archive` handles inflate (RFC 1951/1952) and tar. It is pure: no syscalls, `forbid(unsafe)`.
+- `kr-net` holds the HTTP/1.1 client and server plus the OCI distribution (registry v2) client.
+- `kr-runtime` covers image store, rootfs, and isolation. The main model owns it because it is security-critical.
+
+Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP registry (`registry:2` on localhost). The registry client is written against a `Transport` trait so that TLS can be plugged in without API changes.
+**Why:** this unblocks the runtime without rushing the riskiest crate.
+**Status:** accepted.
