@@ -1,0 +1,8 @@
+[package]
+name = "kr-rt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kr-sys = { path = "../kr-sys" }
