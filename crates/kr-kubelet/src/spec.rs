@@ -158,6 +158,50 @@ async fn materialize<C: Client>(c: &C, ns: &str, kind: &str, name: &str, src: &V
     Ok(())
 }
 
+fn write_item(dir: &str, path: &str, data: &[u8]) -> Result<(), String> {
+    if path.is_empty() || path.starts_with('/') || path.split('/').any(|c| c == ".." || c.is_empty()) {
+        return Err(alloc::format!("invalid volume item path {path}"));
+    }
+    let full = alloc::format!("{dir}/{path}");
+    if let Some((parent, _)) = full.rsplit_once('/') {
+        let _ = kr_runtime::store::mkdir_p(parent, 0o755);
+    }
+    kr_runtime::store::write_file_atomic(&full, data).map_err(|_| alloc::format!("cannot write {path}"))
+}
+
+/// downwardAPI items (fieldRef only; resourceFieldRef not yet).
+fn downward(pod: &Value, d: &Value, dir: &str) -> Result<(), String> {
+    for it in d.get("items").and_then(Value::as_array).unwrap_or(&[]) {
+        let path = it.get("path").and_then(Value::as_str).unwrap_or("");
+        let Some(fp) = it.pointer(&["fieldRef", "fieldPath"]).and_then(Value::as_str) else { continue };
+        let val = match fp {
+            "metadata.labels" | "metadata.annotations" => {
+                let m = pod.pointer(&["metadata", &fp[9..]]).and_then(Value::as_object).unwrap_or(&[]);
+                m.iter().map(|(k, v)| alloc::format!("{k}=\"{}\"\n", v.as_str().unwrap_or(""))).collect::<String>()
+            }
+            other => field_ref(pod, other, None, "").unwrap_or_default(),
+        };
+        write_item(dir, path, val.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Requests a pod-bound ServiceAccount token (TokenRequest API).
+async fn request_token<C: Client>(c: &C, pod: &Value, src: &Value) -> Result<String, String> {
+    let ns = meta(pod, "namespace");
+    let sa = pod.pointer(&["spec", "serviceAccountName"]).and_then(Value::as_str).unwrap_or("default");
+    let exp = src.get("expirationSeconds").and_then(Value::as_i64).unwrap_or(3607);
+    let aud = src.get("audience").and_then(Value::as_str).map(|a| alloc::format!(r#","audiences":["{a}"]"#)).unwrap_or_default();
+    let body = alloc::format!(
+        r#"{{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","spec":{{"expirationSeconds":{exp}{aud},"boundObjectRef":{{"kind":"Pod","apiVersion":"v1","name":"{}","uid":"{}"}}}}}}"#,
+        meta(pod, "name"),
+        meta(pod, "uid")
+    );
+    let req = kr_fmt::json::parse(body.as_bytes()).map_err(|_| String::from("bad token request"))?;
+    let r = c.create(&alloc::format!("/api/v1/namespaces/{ns}/serviceaccounts/{sa}/token"), &req).await.map_err(|e| alloc::format!("token request failed: {}", e.message))?;
+    r.pointer(&["status", "token"]).and_then(Value::as_str).map(String::from).ok_or_else(|| String::from("token request returned no token"))
+}
+
 /// Resolves a pod volume to a host directory (creating/materializing it).
 async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str) -> Result<Option<String>, String> {
     let name = vol.get("name").and_then(Value::as_str).unwrap_or("");
@@ -181,8 +225,28 @@ async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str
     } else if let Some(sec) = vol.get("secret") {
         materialize(c, ns, "secrets", sec.get("secretName").and_then(Value::as_str).unwrap_or(""), sec, &dir).await?;
         Ok(Some(dir))
+    } else if let Some(pj) = vol.get("projected") {
+        let _ = kr_runtime::store::mkdir_p(&dir, 0o755);
+        for src in pj.get("sources").and_then(Value::as_array).unwrap_or(&[]) {
+            if let Some(t) = src.get("serviceAccountToken") {
+                let token = request_token(c, pod, t).await?;
+                let path = t.get("path").and_then(Value::as_str).unwrap_or("token");
+                write_item(&dir, path, token.as_bytes())?;
+            } else if let Some(cm) = src.get("configMap") {
+                materialize(c, ns, "configmaps", cm.get("name").and_then(Value::as_str).unwrap_or(""), cm, &dir).await?;
+            } else if let Some(sec) = src.get("secret") {
+                materialize(c, ns, "secrets", sec.get("name").and_then(Value::as_str).unwrap_or(""), sec, &dir).await?;
+            } else if let Some(d) = src.get("downwardAPI") {
+                downward(pod, d, &dir)?;
+            }
+        }
+        Ok(Some(dir))
+    } else if let Some(d) = vol.get("downwardAPI") {
+        let _ = kr_runtime::store::mkdir_p(&dir, 0o755);
+        downward(pod, d, &dir)?;
+        Ok(Some(dir))
     } else {
-        // projected / downwardAPI / PVCs: not yet (KNOWN_ISSUES); mounted as an empty dir.
+        // PVCs and other types: not yet (KNOWN_ISSUES); mounted as an empty dir.
         kr_runtime::store::mkdir_p(&dir, 0o755).map_err(|_| String::from("cannot create volume dir"))?;
         Ok(Some(dir))
     }
@@ -276,6 +340,9 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         limits.cpu_milli = cpu.milli_value().and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
     }
 
+    if let Some(cpu) = quantity(ctr.pointer(&["resources", "requests", "cpu"])).or_else(|| quantity(ctr.pointer(&["resources", "limits", "cpu"]))) {
+        limits.cpu_request_milli = cpu.milli_value().and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
+    }
     let vols = pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]);
     let mut mounts = alloc::vec![Mount { source: alloc::format!("{pod_dir}/etc-hosts").into_bytes(), target: b"/etc/hosts".to_vec(), readonly: false }];
     for vm in ctr.get("volumeMounts").and_then(Value::as_array).unwrap_or(&[]) {
@@ -289,7 +356,7 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
             }
             src = alloc::format!("{src}/{sub}");
         }
-        let ro = vm.get("readOnly").and_then(Value::as_bool).unwrap_or(false) || vol.get("configMap").is_some() || vol.get("secret").is_some();
+        let ro = vm.get("readOnly").and_then(Value::as_bool).unwrap_or(false) || ["configMap", "secret", "projected", "downwardAPI"].iter().any(|k| vol.get(k).is_some());
         mounts.push(Mount { source: src.into_bytes(), target: target.as_bytes().to_vec(), readonly: ro });
     }
     let cwd = ctr.get("workingDir").and_then(Value::as_str).filter(|w| !w.is_empty()).map(String::from).unwrap_or_else(|| img.working_dir.clone());

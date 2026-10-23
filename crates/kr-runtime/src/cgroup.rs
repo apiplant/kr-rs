@@ -18,11 +18,13 @@ pub struct Limits {
     pub pids: Option<u64>,
     /// CPU in millicores (1000 = one CPU), written as cpu.max quota over a 100 ms period.
     pub cpu_milli: Option<u64>,
+    /// CPU request in millicores, written as cpu.weight (relative share under contention).
+    pub cpu_request_milli: Option<u64>,
 }
 
 impl Limits {
     pub fn is_empty(&self) -> bool {
-        self.memory_bytes.is_none() && self.pids.is_none() && self.cpu_milli.is_none()
+        self.memory_bytes.is_none() && self.pids.is_none() && self.cpu_milli.is_none() && self.cpu_request_milli.is_none()
     }
 }
 
@@ -163,6 +165,11 @@ impl Cgroup {
             v.push(b' ');
             v.extend_from_slice(&dec(CPU_PERIOD_US));
             self.set(b"cpu.max", &v)?;
+        }
+        if let Some(r) = l.cpu_request_milli {
+            // Upstream: shares = milli * 1024 / 1000 (min 2), weight = 1 + (shares - 2) * 9999 / 262142.
+            let shares = (r.saturating_mul(1024) / 1000).clamp(2, 262_144);
+            self.set(b"cpu.weight", &dec(1 + (shares - 2) * 9999 / 262_142))?;
         }
         Ok(())
     }

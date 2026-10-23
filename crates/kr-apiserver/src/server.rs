@@ -37,6 +37,7 @@ pub fn handle(api: &ApiServer, req: Request) -> Response {
         accept: req.header("accept"),
         body: &req.body,
         user,
+        bearer: req.header("authorization").and_then(|a| a.strip_prefix("Bearer ").or_else(|| a.strip_prefix("bearer "))).map(str::trim),
     };
     match api.handle(&r) {
         Reply::Json(code, body) => {

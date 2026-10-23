@@ -95,6 +95,7 @@ pub const O_DIRECTORY: i32 = 0o200000;
 
 pub const O_RDONLY: i32 = 0;
 pub const O_WRONLY: i32 = 1;
+pub const O_RDWR: i32 = 2;
 pub const O_CREAT: i32 = 0o100;
 pub const AT_FDCWD: i32 = -100;
 

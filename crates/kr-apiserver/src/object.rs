@@ -65,6 +65,11 @@ pub fn is_dns_label(s: &str) -> bool {
     !b.is_empty() && b.len() <= 63 && is_alnum_lower(b[0]) && is_alnum_lower(b[b.len() - 1]) && b.iter().all(|&c| is_alnum_lower(c) || c == b'-')
 }
 
+/// Path-segment name: non-empty, not "." or "..", no '/' or '%'.
+pub fn is_path_segment(s: &str) -> bool {
+    !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '%']) && s.len() <= 253
+}
+
 /// DNS-1123 subdomain: dot-separated labels, at most 253 chars.
 pub fn is_dns_subdomain(s: &str) -> bool {
     s.len() <= 253 && s.split('.').all(is_dns_label)
@@ -215,9 +220,17 @@ pub fn prepare_create(o: &mut Value, t: &Target, clock: &Clock, rev: u64) -> Res
             meta.set("name", Value::from(name.as_str()));
         }
     }
-    let ok = if t.name_is_label { is_dns_label(&name) } else { is_dns_subdomain(&name) && !name.is_empty() };
+    // RBAC objects only need to be valid path segments (upstream allows "system:..." names).
+    let path_segment = matches!(t.kind, "Role" | "ClusterRole" | "RoleBinding" | "ClusterRoleBinding");
+    let ok = if path_segment {
+        is_path_segment(&name)
+    } else if t.name_is_label {
+        is_dns_label(&name)
+    } else {
+        is_dns_subdomain(&name) && !name.is_empty()
+    };
     if !ok {
-        return Err(ApiError::invalid(alloc::format!("metadata.name: invalid value {name:?}: must be a lowercase RFC 1123 {}", if t.name_is_label { "label" } else { "subdomain" })));
+        return Err(ApiError::invalid(alloc::format!("metadata.name: invalid value {name:?}: must be a {}", if path_segment { "valid path segment" } else if t.name_is_label { "lowercase RFC 1123 label" } else { "lowercase RFC 1123 subdomain" })));
     }
     match (t.namespace, meta.get("namespace").and_then(Value::as_str)) {
         (Some(url), Some(body)) if url != body => {

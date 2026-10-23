@@ -35,7 +35,10 @@ pub struct Req<'a> {
     pub content_type: Option<&'a str>,
     pub accept: Option<&'a str>,
     pub body: &'a [u8],
+    /// Identity from the transport (verified client certificate), if any.
     pub user: Option<User>,
+    /// `Authorization: Bearer <token>` value, if any.
+    pub bearer: Option<&'a str>,
 }
 
 pub enum Reply {
@@ -60,6 +63,8 @@ pub struct ApiServer {
     rng: fn(&mut [u8]),
     server_address: String,
     version: String,
+    /// ServiceAccount token signer and the cluster CA PEM (for kube-root-ca.crt).
+    sa: RefCell<Option<(crate::tokens::Signer, String)>>,
 }
 
 /// Default namespaces created on first start.
@@ -150,12 +155,134 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.31.0-kr") };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.31.0-kr"), sa: RefCell::new(None) };
         for ns in SYSTEM_NAMESPACES {
             api.ensure_default_sa(ns);
         }
         api.sync()?;
         Ok(api)
+    }
+
+    /// Enables ServiceAccount tokens (TokenRequest, bearer auth, admission) and creates the
+    /// bootstrap RBAC policy and kube-root-ca.crt ConfigMaps.
+    pub fn set_service_accounts(&self, signer: crate::tokens::Signer, ca_pem: String) -> Result<(), ApiError> {
+        *self.sa.borrow_mut() = Some((signer, ca_pem));
+        let crr = resources::find("rbac.authorization.k8s.io", "v1", "clusterroles").unwrap();
+        let crbr = resources::find("rbac.authorization.k8s.io", "v1", "clusterrolebindings").unwrap();
+        for (name, rules) in crate::rbac::bootstrap_roles() {
+            let body = alloc::format!(r#"{{"metadata":{{"name":"{name}","labels":{{"kubernetes.io/bootstrapping":"rbac-defaults"}}}},"rules":{rules}}}"#);
+            self.bootstrap_object(crr, None, name, "ClusterRole", &body);
+        }
+        for (name, role, subjects) in crate::rbac::bootstrap_bindings() {
+            let body = alloc::format!(r#"{{"metadata":{{"name":"{name}","labels":{{"kubernetes.io/bootstrapping":"rbac-defaults"}}}},"roleRef":{{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"{role}"}},"subjects":{subjects}}}"#);
+            self.bootstrap_object(crbr, None, name, "ClusterRoleBinding", &body);
+        }
+        let nsr = resources::find("", "v1", "namespaces").unwrap();
+        let (namespaces, _) = self.store.borrow().list(&nsr.prefix(), None, 0);
+        for kv in namespaces {
+            if let Some(name) = kv.key.rsplit('/').next() {
+                self.ensure_root_ca(name);
+            }
+        }
+        self.sync()
+    }
+
+    /// Creates an object if missing (bootstrap data; never overwrites user changes).
+    fn bootstrap_object(&self, res: &Resource, ns: Option<&str>, name: &str, kind: &str, body: &str) {
+        let key = res.key(ns, name);
+        if self.store.borrow().get(&key).is_some() {
+            return;
+        }
+        let Ok(mut o) = json::parse(body.as_bytes()) else { return };
+        let gv = res.group_version();
+        let t = Target { api_version: &gv, kind, namespace: ns, name_is_label: false };
+        let rev = self.store.borrow().revision() + 1;
+        if object::prepare_create(&mut o, &t, &self.clock(), rev).is_ok() {
+            let _ = self.store.borrow_mut().create(&key, json::to_string(&o).into_bytes());
+        }
+    }
+
+    /// The `kube-root-ca.crt` ConfigMap every namespace gets (root CA publisher).
+    fn ensure_root_ca(&self, ns: &str) {
+        let Some(pem) = self.sa.borrow().as_ref().map(|(_, p)| p.clone()) else { return };
+        let cm = resources::find("", "v1", "configmaps").unwrap();
+        let mut body = String::from(r#"{"metadata":{"name":"kube-root-ca.crt"},"data":{"ca.crt":"#);
+        json::write_str(&pem, &mut body);
+        body.push_str("}}");
+        self.bootstrap_object(cm, Some(ns), "kube-root-ca.crt", "ConfigMap", &body);
+    }
+
+    /// Client certificate user, else a valid ServiceAccount token, else anonymous.
+    fn authenticate(&self, req: &Req) -> R<User> {
+        if let Some(u) = &req.user {
+            return Ok(u.clone());
+        }
+        let Some(token) = req.bearer else {
+            return Ok(User { name: "system:anonymous".into(), groups: alloc::vec!["system:unauthenticated".into()] });
+        };
+        let unauthorized = || ApiError::new(401, "Unauthorized", "Unauthorized");
+        let sa = self.sa.borrow();
+        let (signer, _) = sa.as_ref().ok_or_else(unauthorized)?;
+        let c = signer.verify(token, (self.now)()).ok_or_else(unauthorized)?;
+        if !c.audiences.iter().any(|a| crate::tokens::API_AUDIENCES.contains(&a.as_str())) {
+            return Err(unauthorized());
+        }
+        // Revocation: the ServiceAccount (and a bound pod) must still exist with the same uid.
+        let store = self.store.borrow();
+        let uid_of = |plural: &str, name: &str| -> Option<String> {
+            let r = resources::find("", "v1", plural)?;
+            let kv = store.get(&r.key(Some(&c.namespace), name))?;
+            json::parse(&kv.value).ok()?.pointer(&["metadata", "uid"]).and_then(Value::as_str).map(String::from)
+        };
+        if uid_of("serviceaccounts", &c.sa_name).as_deref() != Some(c.sa_uid.as_str()) {
+            return Err(unauthorized());
+        }
+        if let Some((pod, puid)) = &c.pod {
+            if uid_of("pods", pod).as_deref() != Some(puid.as_str()) {
+                return Err(unauthorized());
+            }
+        }
+        Ok(User {
+            name: alloc::format!("system:serviceaccount:{}:{}", c.namespace, c.sa_name),
+            groups: alloc::vec!["system:serviceaccounts".into(), alloc::format!("system:serviceaccounts:{}", c.namespace), "system:authenticated".into()],
+        })
+    }
+
+    /// RBAC decision for `a` (system:masters short-circuits).
+    fn authorize(&self, user: &User, a: &crate::rbac::Attrs) -> bool {
+        if is_masters(user) {
+            return true;
+        }
+        let store = self.store.borrow();
+        let list = |group: &str, plural: &str, ns: Option<&str>| -> Vec<Value> {
+            let Some(r) = resources::find(group, "v1", plural) else { return Vec::new() };
+            let prefix = match ns {
+                Some(n) => alloc::format!("{}{n}/", r.prefix()),
+                None => r.prefix(),
+            };
+            store.list(&prefix, None, 0).0.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect()
+        };
+        let rbac = "rbac.authorization.k8s.io";
+        let crbs = list(rbac, "clusterrolebindings", None);
+        let rbs = if a.namespace.is_empty() { Vec::new() } else { list(rbac, "rolebindings", Some(&a.namespace)) };
+        let lookup = |kind: &str, ns: &str, name: &str| -> Option<Vec<Value>> {
+            let (plural, nsopt) = if kind == "Role" { ("roles", Some(ns)) } else { ("clusterroles", None) };
+            let r = resources::find(rbac, "v1", plural)?;
+            let kv = store.get(&r.key(nsopt, name))?;
+            json::parse(&kv.value).ok()?.get("rules").and_then(Value::as_array).map(|a| a.to_vec())
+        };
+        crate::rbac::allowed(user, a, &crbs, &rbs, &lookup)
+    }
+
+    fn forbidden(user: &User, a: &crate::rbac::Attrs) -> ApiError {
+        let what = if a.resource_request {
+            let res = if a.subresource.is_empty() { a.resource.clone() } else { alloc::format!("{}/{}", a.resource, a.subresource) };
+            let scope = if a.namespace.is_empty() { String::from("at the cluster scope") } else { alloc::format!("in the namespace \"{}\"", a.namespace) };
+            alloc::format!("cannot {} resource \"{res}\" in API group \"{}\" {scope}", a.verb, a.api_group)
+        } else {
+            alloc::format!("cannot {} path \"{}\"", a.verb, a.path)
+        };
+        ApiError::new(403, "Forbidden", alloc::format!("User \"{}\" {what}", user.name))
     }
 
     fn clock(&self) -> Clock {
@@ -171,6 +298,42 @@ impl ApiServer {
 
     fn route(&self, req: &Req) -> R<Reply> {
         let path = req.path.trim_end_matches('/');
+        let user = self.authenticate(req)?;
+        let q = Query::parse(req.query)?;
+        let segs: Vec<&str> = path.split('/').skip(1).collect();
+        // Resource URL? Then authorize on resource attributes; otherwise on the path.
+        let resource = match segs.as_slice() {
+            ["api", "v1", rest @ ..] if !rest.is_empty() => parse_route("", "v1", rest),
+            ["apis", g, v, rest @ ..] if !rest.is_empty() => parse_route(g, v, rest),
+            _ => None,
+        };
+        let attrs = match &resource {
+            Some(rt) => crate::rbac::Attrs {
+                verb: crate::rbac::verb(req.method, rt.name.is_some(), q.flag("watch")),
+                api_group: rt.res.group.into(),
+                resource: rt.res.plural.into(),
+                subresource: rt.sub.clone().unwrap_or_default(),
+                namespace: rt.namespace.clone().unwrap_or_default(),
+                name: rt.name.clone().unwrap_or_default(),
+                resource_request: true,
+                path: String::new(),
+            },
+            // Review APIs are virtual resources (create-only, not in the storage table).
+            None if path.starts_with("/apis/authorization.k8s.io/v1/") || path.starts_with("/apis/authentication.k8s.io/v1/") => crate::rbac::Attrs {
+                verb: "create".into(),
+                api_group: segs.get(1).copied().unwrap_or("").into(),
+                resource: segs.last().copied().unwrap_or("").into(),
+                resource_request: true,
+                ..Default::default()
+            },
+            None => crate::rbac::Attrs { verb: req.method.to_ascii_lowercase(), path: if path.is_empty() { "/".into() } else { path.into() }, ..Default::default() },
+        };
+        if !self.authorize(&user, &attrs) {
+            if user.name == "system:anonymous" {
+                return Err(ApiError::new(401, "Unauthorized", "Unauthorized"));
+            }
+            return Err(Self::forbidden(&user, &attrs));
+        }
         match path {
             "/healthz" | "/livez" | "/readyz" => return Ok(Reply::Json(200, String::from("\"ok\""))),
             "/version" => {
@@ -183,13 +346,17 @@ impl ApiServer {
             }
             _ => {}
         }
-        let user = req.user.as_ref().ok_or_else(|| ApiError::new(401, "Unauthorized", "Unauthorized"))?;
-        // Authorization: only system:masters until RBAC lands (KNOWN_ISSUES).
-        if !is_masters(user) {
-            return Err(ApiError::new(403, "Forbidden", alloc::format!("User \"{}\" cannot {} {}: kr allows only system:masters until RBAC is implemented", user.name, req.method, path)));
-        }
-        let segs: Vec<&str> = path.split('/').skip(1).collect();
         match segs.as_slice() {
+            [".well-known", "openid-configuration"] => {
+                return Ok(Reply::Json(200, alloc::format!(
+                    r#"{{"issuer":"{iss}","jwks_uri":"{iss}/openid/v1/jwks","response_types_supported":["id_token"],"subject_types_supported":["public"],"id_token_signing_alg_values_supported":["ES256"]}}"#,
+                    iss = crate::tokens::ISSUER
+                )))
+            }
+            ["openid", "v1", "jwks"] => {
+                return self.sa.borrow().as_ref().map(|(s, _)| Reply::Json(200, s.jwks())).ok_or_else(|| ApiError::not_found("jwks", "jwks"));
+            }
+            ["apis", "authorization.k8s.io", "v1", "selfsubjectaccessreviews"] if req.method == "POST" => return self.self_subject_access_review(req, &user),
             ["api"] => return Ok(Reply::Json(200, discovery::core_versions(&self.server_address))),
             ["api", "v1"] => return Ok(Reply::Json(200, discovery::resource_list("", "v1").unwrap())),
             ["apis"] => return Ok(Reply::Json(200, discovery::group_list())),
@@ -207,8 +374,8 @@ impl ApiServer {
             ["apis", g, v, rest @ ..] => (*g, *v, rest),
             _ => return Err(ApiError::not_found("path", path)),
         };
-        let route = parse_route(group, version, rest).ok_or_else(|| ApiError::not_found("path", path))?;
-        let q = Query::parse(req.query)?;
+        let _ = (group, version, rest);
+        let route = resource.ok_or_else(|| ApiError::not_found("path", path))?;
         self.dispatch(req, &route, &q)
     }
 
@@ -234,6 +401,7 @@ impl ApiServer {
             }
             ("POST", None, None) => self.create(req, rt, q),
             ("POST", Some(n), Some("binding")) => self.bind(req, rt, n),
+            ("POST", Some(n), Some("token")) => self.token_request(req, rt, n),
             ("PUT", Some(n), Some("scale")) => self.update_scale(req, rt, n, false),
             ("PATCH", Some(n), Some("scale")) => self.update_scale(req, rt, n, true),
             ("PUT", Some(n), s) => self.update(req, rt, n, s == Some("status"), q, None),
@@ -435,6 +603,10 @@ impl ApiServer {
         let rev = self.store.borrow().revision() + 1;
         let name = object::prepare_create(o, &t, &self.clock(), rev)?;
         self.check_namespace(rt, &name)?;
+        if rt.res.plural == "pods" {
+            let ns = rt.namespace.clone().unwrap_or_default();
+            self.admit_pod(o, &ns)?;
+        }
         if rt.res.plural == "namespaces" {
             o.entry_object("spec").set("finalizers", Value::Array(alloc::vec![Value::from("kubernetes")]));
             o.entry_object("status").set("phase", Value::from("Active"));
@@ -447,6 +619,8 @@ impl ApiServer {
         debug_assert_eq!(kv.mod_rev, rev);
         if rt.res.plural == "namespaces" {
             self.ensure_default_sa(&name);
+            self.ensure_root_ca(&name);
+            let _ = self.sync();
         }
         self.sync()?;
         Ok(o.clone())
@@ -636,6 +810,131 @@ impl ApiServer {
         self.store.borrow_mut().update(&kv.key, json::to_string(&new).into_bytes(), Some(kv.mod_rev)).map_err(|e| store_err(e, "pod", name))?;
         self.sync()?;
         Ok(Reply::Json(201, json::to_string(&object::status_value(201, "", "Success"))))
+    }
+
+    /// `serviceaccounts/<name>/token` (TokenRequest).
+    fn token_request(&self, req: &Req, rt: &Route, name: &str) -> R<Reply> {
+        let (_, sa) = self.get_value(rt, name)?;
+        let ns = rt.namespace.clone().unwrap_or_default();
+        let tr = if req.body.is_empty() { obj(alloc::vec![]) } else { self.parse_body(req)? };
+        let spec = tr.get("spec").cloned().unwrap_or(Value::Null);
+        let audiences: Vec<String> = match spec.get("audiences").and_then(Value::as_array) {
+            Some(a) if !a.is_empty() => a.iter().filter_map(Value::as_str).map(String::from).collect(),
+            _ => alloc::vec![String::from(crate::tokens::ISSUER)],
+        };
+        // upstream: default 1 h, minimum 10 min, maximum capped (we cap at 48 h).
+        let ttl = spec.get("expirationSeconds").and_then(Value::as_i64).unwrap_or(3600);
+        if ttl < 600 {
+            return Err(ApiError::invalid("spec.expirationSeconds: may not specify a duration less than 10 minutes"));
+        }
+        let ttl = ttl.min(48 * 3600);
+        let pod = match spec.get("boundObjectRef") {
+            Some(b) if b.get("kind").and_then(Value::as_str) == Some("Pod") => {
+                let pname = b.get("name").and_then(Value::as_str).unwrap_or("");
+                let pr = resources::find("", "v1", "pods").unwrap();
+                let kv = self.store.borrow().get(&pr.key(Some(&ns), pname)).ok_or_else(|| ApiError::not_found("pods", pname))?;
+                let puid = json::parse(&kv.value).ok().and_then(|v| v.pointer(&["metadata", "uid"]).and_then(Value::as_str).map(String::from)).unwrap_or_default();
+                if let Some(want) = b.get("uid").and_then(Value::as_str) {
+                    if want != puid {
+                        return Err(ApiError::conflict("pod", pname));
+                    }
+                }
+                Some((pname.to_string(), puid))
+            }
+            Some(_) => return Err(ApiError::invalid("boundObjectRef: only Pod is supported")),
+            None => None,
+        };
+        let sa_uid = sa.pointer(&["metadata", "uid"]).and_then(Value::as_str).unwrap_or("").to_string();
+        let now = (self.now)();
+        let token = {
+            let guard = self.sa.borrow();
+            let (signer, _) = guard.as_ref().ok_or_else(|| ApiError::new(503, "ServiceUnavailable", "ServiceAccount tokens are not configured"))?;
+            signer.issue(&ns, name, &sa_uid, pod.as_ref().map(|(n, u)| (n.as_str(), u.as_str())), &audiences, now, ttl)
+        };
+        let mut out = tr.clone();
+        out.set("kind", Value::from("TokenRequest"));
+        out.set("apiVersion", Value::from("authentication.k8s.io/v1"));
+        out.entry_object("status").set("token", Value::String(token));
+        out.entry_object("status").set("expirationTimestamp", Value::String(object::rfc3339(now + ttl)));
+        Ok(Reply::Json(201, json::to_string(&out)))
+    }
+
+    /// `kubectl auth can-i`: evaluates the caller's own permissions.
+    fn self_subject_access_review(&self, req: &Req, user: &User) -> R<Reply> {
+        let mut r = self.parse_body(req)?;
+        let ra = r.pointer(&["spec", "resourceAttributes"]).cloned();
+        let nra = r.pointer(&["spec", "nonResourceAttributes"]).cloned();
+        let s = |v: &Option<Value>, f: &str| v.as_ref().and_then(|x| x.get(f)).and_then(Value::as_str).unwrap_or("").to_string();
+        let attrs = if ra.is_some() {
+            crate::rbac::Attrs {
+                verb: s(&ra, "verb"),
+                api_group: s(&ra, "group"),
+                resource: s(&ra, "resource"),
+                subresource: s(&ra, "subresource"),
+                namespace: s(&ra, "namespace"),
+                name: s(&ra, "name"),
+                resource_request: true,
+                path: String::new(),
+            }
+        } else {
+            crate::rbac::Attrs { verb: s(&nra, "verb"), path: s(&nra, "path"), ..Default::default() }
+        };
+        let ok = self.authorize(user, &attrs);
+        r.set("apiVersion", Value::from("authorization.k8s.io/v1"));
+        r.set("kind", Value::from("SelfSubjectAccessReview"));
+        r.set("status", obj(alloc::vec![("allowed", Value::Bool(ok))]));
+        Ok(Reply::Json(201, json::to_string(&r)))
+    }
+
+    /// ServiceAccount admission for pods: default `serviceAccountName`, require it to exist,
+    /// and inject the projected `kube-api-access-*` volume unless automounting is disabled.
+    fn admit_pod(&self, o: &mut Value, ns: &str) -> R<()> {
+        let spec = o.entry_object("spec");
+        let sa_name = spec.get("serviceAccountName").and_then(Value::as_str).filter(|s| !s.is_empty()).or_else(|| spec.get("serviceAccount").and_then(Value::as_str)).unwrap_or("default").to_string();
+        spec.set("serviceAccountName", Value::String(sa_name.clone()));
+        let sar = resources::find("", "v1", "serviceaccounts").unwrap();
+        let Some(kv) = self.store.borrow().get(&sar.key(Some(ns), &sa_name)) else {
+            return Err(ApiError::new(403, "Forbidden", alloc::format!("error looking up service account {ns}/{sa_name}: serviceaccount \"{sa_name}\" not found")));
+        };
+        if self.sa.borrow().is_none() {
+            return Ok(());
+        }
+        let sa = json::parse(&kv.value).unwrap_or(Value::Null);
+        let automount = o.pointer(&["spec", "automountServiceAccountToken"]).and_then(Value::as_bool).or_else(|| sa.get("automountServiceAccountToken").and_then(Value::as_bool)).unwrap_or(true);
+        const MOUNT: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+        let already = |c: &Value| c.get("volumeMounts").and_then(Value::as_array).is_some_and(|m| m.iter().any(|v| v.get("mountPath").and_then(Value::as_str) == Some(MOUNT)));
+        if !automount {
+            return Ok(());
+        }
+        let vname = alloc::format!("kube-api-access-{}", object::name_suffix(self.rng));
+        let vol = json::parse(alloc::format!(
+            r#"{{"name":"{vname}","projected":{{"defaultMode":420,"sources":[{{"serviceAccountToken":{{"expirationSeconds":3607,"path":"token"}}}},{{"configMap":{{"name":"kube-root-ca.crt","items":[{{"key":"ca.crt","path":"ca.crt"}}]}}}},{{"downwardAPI":{{"items":[{{"path":"namespace","fieldRef":{{"apiVersion":"v1","fieldPath":"metadata.namespace"}}}}]}}}}]}}}}"#
+        ).as_bytes())
+        .unwrap();
+        let mount = json::parse(alloc::format!(r#"{{"name":"{vname}","readOnly":true,"mountPath":"{MOUNT}"}}"#).as_bytes()).unwrap();
+        let spec = o.get_mut("spec").unwrap();
+        let mut injected = false;
+        for key in ["initContainers", "containers"] {
+            if let Some(Value::Array(cs)) = spec.get_mut(key) {
+                for c in cs.iter_mut() {
+                    if already(c) {
+                        continue;
+                    }
+                    match c.get_mut("volumeMounts") {
+                        Some(Value::Array(m)) => m.push(mount.clone()),
+                        _ => c.set("volumeMounts", Value::Array(alloc::vec![mount.clone()])),
+                    }
+                    injected = true;
+                }
+            }
+        }
+        if injected {
+            match spec.get_mut("volumes") {
+                Some(Value::Array(v)) => v.push(vol),
+                _ => spec.set("volumes", Value::Array(alloc::vec![vol])),
+            }
+        }
+        Ok(())
     }
 
     /// Creates the `default` ServiceAccount in a namespace (the ServiceAccount controller's job).

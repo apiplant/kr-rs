@@ -21,7 +21,7 @@ import os, re, sys, urllib.request
 VERSION = "v0.31.0"
 RAW = "https://raw.githubusercontent.com/kubernetes/%s/" + VERSION + "/%s"
 API_GROUPS = ["core/v1", "apps/v1", "batch/v1", "coordination/v1", "discovery/v1", "networking/v1",
-              "policy/v1", "scheduling/v1", "rbac/v1", "autoscaling/v1"]
+              "policy/v1", "scheduling/v1", "rbac/v1", "autoscaling/v1", "authentication/v1", "authorization/v1"]
 # local name -> (repo, path inside repo, proto package prefix, go package basename)
 SOURCES = {}
 for _g in API_GROUPS:
@@ -47,9 +47,13 @@ SPECIAL = {
 }
 # Extra top-level kinds beyond resources.rs: (apiVersion, kind, message).
 EXTRA_ROOTS = [("v1", "DeleteOptions", META + ".DeleteOptions"),
-               ("autoscaling/v1", "Scale", "k8s.io.api.autoscaling.v1.Scale")]
+               ("autoscaling/v1", "Scale", "k8s.io.api.autoscaling.v1.Scale"),
+               ("authentication.k8s.io/v1", "TokenRequest", "k8s.io.api.authentication.v1.TokenRequest"),
+               ("authentication.k8s.io/v1", "TokenReview", "k8s.io.api.authentication.v1.TokenReview"),
+               ("authorization.k8s.io/v1", "SelfSubjectAccessReview", "k8s.io.api.authorization.v1.SelfSubjectAccessReview"),
+               ("authorization.k8s.io/v1", "SubjectAccessReview", "k8s.io.api.authorization.v1.SubjectAccessReview")]
 # Fields whose JSON name legitimately differs from the proto name (message, number) -> json name.
-NAME_OVERRIDES = {("k8s.io.api.networking.v1.IngressClassParametersReference", 1): "apiGroup"}
+NAME_OVERRIDES = {("k8s.io.api.authentication.v1.BoundObjectReference", 4): "uid", ("k8s.io.api.networking.v1.IngressClassParametersReference", 1): "apiGroup"}
 
 SCALARS = {"string": "STRING", "bytes": "BYTES", "int32": "INT32", "int64": "INT64", "bool": "BOOL",
            "double": "DOUBLE", "float": "FLOAT", "uint32": "UINT32", "uint64": "UINT64"}

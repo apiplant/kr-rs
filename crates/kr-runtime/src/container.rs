@@ -63,6 +63,112 @@ pub struct Mount {
     pub readonly: bool,
 }
 
+/// What `exec_in` needs to enter a running container.
+#[derive(Clone)]
+pub struct ExecTarget {
+    pidfd: Rc<Fd>,
+    cgroup: Option<i32>,
+}
+
+/// A process to start inside a running container.
+pub struct ExecSpec<'a> {
+    pub argv: &'a [Vec<u8>],
+    pub env: &'a [Vec<u8>],
+    pub cwd: &'a [u8],
+    pub user: &'a [u8],
+    /// Descriptors for the new process's stdin/stdout/stderr (None: /dev/null).
+    pub stdin: Option<i32>,
+    pub stdout: Option<i32>,
+    pub stderr: Option<i32>,
+    pub maps: &'a IdMaps,
+}
+
+const ALL_NS: u64 = ns::CLONE_NEWUSER | ns::CLONE_NEWNS | ns::CLONE_NEWPID | ns::CLONE_NEWNET | ns::CLONE_NEWIPC | ns::CLONE_NEWUTS | ns::CLONE_NEWCGROUP;
+
+/// Forks a helper that joins `nstype` namespaces of the process behind `pidfd` and then clones
+/// the real child (CLONE_PARENT: it is kr's child, supervised by pidfd). `child` runs in that
+/// final process and returns its exit code. The joined pid namespace only applies to the
+/// final child, which is why the extra clone is needed.
+fn fork_into(pidfd: &Fd, nstype: u64, cgroup: Option<i32>, child: impl FnOnce() -> i32) -> Result<Running, RunError> {
+    let (pid_r, pid_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
+    let mut hargs = CloneArgs { exit_signal: ns::SIGCHLD as u64, ..Default::default() };
+    // SAFETY: single-threaded runtime (ADR-005).
+    let helper = unsafe { ns::clone3(&mut hargs) }.map_err(err("clone3 helper"))?;
+    if helper == 0 {
+        drop(pid_r);
+        // Failures are reported as 0xffff_ff00 | step followed by the errno.
+        let fail = |step: u32, e: Errno| -> ! {
+            let mut b = [0u8; 8];
+            b[..4].copy_from_slice(&(0xffff_ff00u32 | step).to_le_bytes());
+            b[4..].copy_from_slice(&(e.0 as u32).to_le_bytes());
+            let _ = kr_sys::write(pid_w.raw(), &b);
+            kr_sys::exit_group(126)
+        };
+        if let Err(e) = ns::setns(pidfd, nstype) {
+            fail(0, e);
+        }
+        // No CLONE_INTO_CGROUP here: after joining the target's cgroup namespace the kernel
+        // refuses it (ENOENT); kr moves the process via cgroup.procs right after the clone.
+        let mut args = CloneArgs { flags: ns::CLONE_PARENT, ..Default::default() };
+        // SAFETY: the helper is single-threaded.
+        match unsafe { ns::clone3(&mut args) } {
+            Ok(0) => {
+                drop(pid_w);
+                let _ = ns::sigmask_reset();
+                let _ = ns::prctl(ns::PR_SET_PDEATHSIG, ns::SIGKILL as usize);
+                kr_sys::exit_group(child());
+            }
+            Ok(pid) => {
+                let _ = kr_sys::write(pid_w.raw(), &(pid as u32).to_le_bytes());
+                kr_sys::exit_group(0);
+            }
+            Err(e) => fail(1, e),
+        }
+    }
+    drop(pid_w);
+    let _ = ns::wait4(helper);
+    let mut pb = [0u8; 8];
+    let n = read_full(&pid_r, &mut pb);
+    let first = u32::from_le_bytes([pb[0], pb[1], pb[2], pb[3]]);
+    if n < 4 || first >= 0xffff_ff00 {
+        let errno = Errno(if n == 8 { u32::from_le_bytes([pb[4], pb[5], pb[6], pb[7]]) as i32 } else { 5 });
+        let step = if first & 0xff == 1 { "clone into namespaces" } else { "setns" };
+        return Err(RunError { step, errno });
+    }
+    let pid = first as i32;
+    let pidfd = ns::pidfd_open(pid).map_err(err("pidfd_open"))?;
+    if let Some(cg) = cgroup {
+        let procs = kr_sys::fs::openat(cg, b"cgroup.procs\0", ns::O_WRONLY | kr_sys::O_CLOEXEC, 0);
+        if let Ok(f) = procs {
+            let _ = kr_sys::write(f.raw(), &fmt_u32(pid as u32));
+        }
+    }
+    Ok(Running { pid, pidfd: Rc::new(pidfd), cgroup: None })
+}
+
+/// Starts `spec` inside a running container (all of its namespaces and its cgroup), with the
+/// same privilege drop as the container's own processes. Exit 127 = could not exec.
+pub fn exec_in(target: &ExecTarget, spec: &ExecSpec) -> Result<Running, RunError> {
+    let full_map = spec.maps.full();
+    fork_into(&target.pidfd, ALL_NS, target.cgroup, || {
+        let null = ns::open(b"/dev/null\0", ns::O_RDWR, 0).ok();
+        let nfd = null.as_ref().map(|n| n.raw()).unwrap_or(-1);
+        for (src, dst) in [(spec.stdin.unwrap_or(nfd), 0), (spec.stdout.unwrap_or(nfd), 1), (spec.stderr.unwrap_or(nfd), 2)] {
+            if src >= 0 && ns::dup_to(src, dst).is_err() {
+                return 126;
+            }
+        }
+        let _ = drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env);
+        127
+    })
+}
+
+/// Runs `f` in a child that joined the user and network namespaces of a pod (via any of its
+/// processes), e.g. for tcpSocket/httpGet probes that must reach the pod without a pod IP.
+pub fn in_pod_net(target: &ExecTarget, f: impl FnOnce() -> i32) -> Result<Running, RunError> {
+    fork_into(&target.pidfd, ns::CLONE_NEWUSER | ns::CLONE_NEWNET, None, f)
+}
+
 /// A pod sandbox: a parked process owning the pod's user, network, UTS and IPC namespaces.
 /// Containers of the pod join these and get their own mount/pid/cgroup namespaces.
 pub struct Sandbox {
@@ -71,6 +177,11 @@ pub struct Sandbox {
 }
 
 impl Sandbox {
+    /// A target for joining the pod's network (probes); the sandbox owns the netns.
+    pub fn target(&self) -> Result<ExecTarget, Errno> {
+        Ok(ExecTarget { pidfd: Rc::new(ns::pidfd_open(self.pid)?), cgroup: None })
+    }
+
     /// Kills and reaps the sandbox (its namespaces disappear with the last member).
     pub fn stop(&self) {
         let _ = ns::pidfd_send_signal(&self.pidfd, ns::SIGKILL);
@@ -239,6 +350,16 @@ impl Signaller {
 impl Running {
     pub fn signaller(&self) -> Signaller {
         Signaller(self.pidfd.clone())
+    }
+
+    /// The container's cgroup directory fd, if it has one.
+    pub fn cgroup_fd(&self) -> Option<i32> {
+        self.cgroup.as_ref().map(|c| c.dir.raw())
+    }
+
+    /// A handle for running more processes inside this container (exec, probes).
+    pub fn target(&self) -> ExecTarget {
+        ExecTarget { pidfd: self.pidfd.clone(), cgroup: self.cgroup_fd() }
     }
 
     /// Waits for exit without blocking the executor (pidfd becomes readable on exit).
@@ -811,10 +932,23 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
             step!(11, ns::sethostname(spec.hostname));
         }
     }
-    let cwd = if spec.cwd.is_empty() { cstr(&[b"/"]) } else { cstr(&[spec.cwd]) };
+    drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env)
+}
+
+/// The common tail of every process start inside a container: cwd, user, capabilities,
+/// NO_NEW_PRIVS, seccomp, execve. Only returns on failure.
+fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env: &[Vec<u8>]) -> (u8, Errno) {
+    macro_rules! step {
+        ($i:expr, $e:expr) => {
+            if let Err(e) = $e {
+                return ($i, e);
+            }
+        };
+    }
+    let cwd = if cwd.is_empty() { cstr(&[b"/"]) } else { cstr(&[cwd]) };
     step!(12, ns::chdir(&cwd));
     // Resolved inside the container root, so the image's own /etc/passwd is used.
-    let ids = match resolve_user(spec.user) {
+    let ids = match resolve_user(user) {
         Ok(ids) => ids,
         Err(e) => return (21, e),
     };
@@ -832,8 +966,7 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
     // Built before installing: the filter must be the last thing before execve.
     let filter = security::default_filter();
     step!(17, ns::seccomp_set_filter(&filter));
-
-    exec(spec)
+    exec_argv(argv, env)
 }
 
 /// Hides kernel interfaces a container has no business reading or writing (Docker's masked and
@@ -925,7 +1058,12 @@ fn populate_dev() -> Result<(), Errno> {
     Ok(())
 }
 
-fn exec(spec: &RunSpec) -> (u8, Errno) {
+fn exec_argv(spec_argv: &[Vec<u8>], spec_env: &[Vec<u8>]) -> (u8, Errno) {
+    struct S<'a> {
+        argv: &'a [Vec<u8>],
+        env: &'a [Vec<u8>],
+    }
+    let spec = S { argv: spec_argv, env: spec_env };
     let argv_c: Vec<Vec<u8>> = spec.argv.iter().map(|a| cstr(&[a])).collect();
     let env_c: Vec<Vec<u8>> = spec.env.iter().map(|e| cstr(&[e])).collect();
     let mut argv: Vec<*const u8> = argv_c.iter().map(|a| a.as_ptr()).collect();

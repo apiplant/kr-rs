@@ -4,10 +4,13 @@
 //! later (ADR-013, ADR-015) without touching the protocol code.
 
 pub mod body;
+pub mod channel;
 pub mod client;
 pub mod head;
 pub mod server;
+pub mod upgrade;
 pub mod url;
+pub mod websocket;
 
 pub use client::{Client, Config, Response};
 pub use head::{Framing, Header, Limits};

@@ -16,6 +16,7 @@
 extern crate alloc;
 
 pub mod node;
+mod probe;
 mod spec;
 
 use alloc::collections::BTreeMap;
@@ -114,6 +115,13 @@ struct Ctr {
     not_before: u64,
     backoff_ms: u64,
     seq: u32,
+    /// Handle for exec probes / exec while running.
+    target: Option<container::ExecTarget>,
+    probes: Vec<(probe::Kind, probe::State)>,
+    /// startupProbe passed (or none).
+    started: bool,
+    /// readinessProbe verdict (true without a readiness probe).
+    ready: bool,
 }
 
 struct PodRt {
@@ -147,6 +155,15 @@ pub struct Kubelet<C: Client> {
     pods: RefCell<BTreeMap<String, PodRt>>,
     exits: RefCell<Vec<Exit>>,
     notify: Notify,
+    /// Image pulls in flight or recently failed (image ref -> state).
+    pulls: RefCell<BTreeMap<String, Pull>>,
+    /// Images pulled successfully by this kubelet (pullPolicy Always / :latest satisfied).
+    done_pulls: RefCell<Vec<String>>,
+}
+
+enum Pull {
+    InProgress,
+    Failed { msg: String, retry_at: u64 },
 }
 
 const BACKOFF_START_MS: u64 = 10_000;
@@ -154,7 +171,7 @@ const BACKOFF_MAX_MS: u64 = 300_000;
 
 impl<C: Client + Clone + 'static> Kubelet<C> {
     pub fn new(c: C, cfg: Config, store: Store) -> Rc<Self> {
-        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default() })
+        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()) })
     }
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
@@ -204,6 +221,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 self.terminate(&uid, pod).await;
             } else {
                 self.sync_pod(&uid, pod).await;
+                self.run_probes(&uid, pod);
             }
             self.report_status(&uid, pod).await;
         }
@@ -230,6 +248,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         c.state = CState::Terminated(term.clone());
         c.last_term = Some(term);
         c.signaller = None;
+        c.target = None;
+        c.probes.clear();
+        c.ready = false;
         // CrashLoopBackOff: every restart after an exit waits 10 s, doubling up to 5 min.
         c.backoff_ms = if c.backoff_ms == 0 { BACKOFF_START_MS } else { (c.backoff_ms * 2).min(BACKOFF_MAX_MS) };
         c.not_before = now_ms() + c.backoff_ms;
@@ -295,6 +316,10 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     not_before: 0,
                     backoff_ms: 0,
                     seq: 0,
+                    target: None,
+                    probes: Vec::new(),
+                    started: false,
+                    ready: false,
                 });
             }
         }
@@ -351,12 +376,16 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let policy = cspec.and_then(|c| c.get("imagePullPolicy")).and_then(Value::as_str).unwrap_or("");
         let latest = !image.contains(':') || image.ends_with(":latest");
         let need_pull = self.store.image(&image).is_none() || (policy == "Always" && self.pods.borrow()[uid].ctrs[i].seq == 0) || (policy.is_empty() && latest && self.pods.borrow()[uid].ctrs[i].seq == 0);
-        if need_pull && policy != "Never" {
-            if let Err(e) = kr_runtime::pull::pull(&self.store, &image).await {
-                self.set_waiting(uid, i, "ErrImagePull", alloc::format!("failed to pull {image}: {e:?}"));
-                self.backoff(uid, i);
-                return;
+        if need_pull && policy != "Never" && !self.ensure_pulled(&image) {
+            let msg = match self.pulls.borrow().get(&image) {
+                Some(Pull::Failed { msg, .. }) => Some(msg.clone()),
+                _ => None,
+            };
+            match msg {
+                Some(m) => self.set_waiting(uid, i, "ImagePullBackOff", m),
+                None => self.set_waiting(uid, i, "ContainerCreating", alloc::format!("pulling image {image}")),
             }
+            return;
         }
         let Some((_, img, mut rootfs)) = self.store.image(&image) else {
             self.set_waiting(uid, i, "ErrImageNeverPull", alloc::format!("image {image} not present"));
@@ -417,7 +446,17 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     }
                     c.seq = seq;
                     c.signaller = Some(running.signaller());
+                    c.target = Some(running.target());
                     c.state = CState::Running { started_at: started, id: cid.clone() };
+                    // Probes restart with every container start.
+                    let cs = cspec.cloned().unwrap_or(Value::Null);
+                    c.probes = [probe::Kind::Startup, probe::Kind::Liveness, probe::Kind::Readiness]
+                        .into_iter()
+                        .filter(|_| !c.init)
+                        .filter_map(|k| cs.get(k.field()).map(|p| (k, probe::State::new(p.clone(), now_ms()))))
+                        .collect();
+                    c.started = !c.probes.iter().any(|(k, _)| *k == probe::Kind::Startup);
+                    c.ready = !c.probes.iter().any(|(k, _)| *k == probe::Kind::Readiness);
                 }
                 self.spawn_waiter(uid.to_string(), name, cid, running, started);
             }
@@ -428,6 +467,46 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 self.backoff(uid, i);
             }
         }
+    }
+
+    /// Pulls happen in background tasks so a slow registry never stalls the sync loop.
+    /// Returns true once the image may be used (pull finished in this kubelet's lifetime, or a
+    /// pull is unnecessary); false while pulling or backing off after a failure.
+    fn ensure_pulled(self: &Rc<Self>, image: &str) -> bool {
+        let mut pulls = self.pulls.borrow_mut();
+        match pulls.get(image) {
+            Some(Pull::InProgress) => return false,
+            Some(Pull::Failed { retry_at, .. }) if now_ms() < *retry_at => return false,
+            _ => {}
+        }
+        // A completed pull is recorded by removing the entry and the image being present.
+        if self.store.image(image).is_some() && !pulls.contains_key(image) && self.pulled_once(image) {
+            return true;
+        }
+        pulls.insert(image.to_string(), Pull::InProgress);
+        drop(pulls);
+        let me = self.clone();
+        let img = image.to_string();
+        kr_rt::exec::spawn(async move {
+            let r = kr_runtime::pull::pull(&me.store, &img).await;
+            let mut pulls = me.pulls.borrow_mut();
+            match r {
+                Ok(_) => {
+                    pulls.remove(&img);
+                    me.done_pulls.borrow_mut().push(img);
+                }
+                Err(e) => {
+                    pulls.insert(img.clone(), Pull::Failed { msg: alloc::format!("failed to pull {img}: {e:?}"), retry_at: now_ms() + 10_000 });
+                }
+            }
+            drop(pulls);
+            me.notify.notify();
+        });
+        false
+    }
+
+    fn pulled_once(&self, image: &str) -> bool {
+        self.done_pulls.borrow().iter().any(|i| i == image)
     }
 
     fn spawn_waiter(self: &Rc<Self>, pod_uid: String, ctr: String, cid: String, running: Running, started_at: i64) {
@@ -441,6 +520,58 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             me.exits.borrow_mut().push(Exit { pod_uid, ctr, exit_code, oom, started_at });
             me.notify.notify();
         });
+    }
+
+    /// Starts any due probes as background tasks; results arrive via `probe_done`.
+    fn run_probes(self: &Rc<Self>, uid: &str, pod: &Value) {
+        let now = now_ms();
+        let mut due = Vec::new();
+        {
+            let mut pods = self.pods.borrow_mut();
+            let Some(p) = pods.get_mut(uid) else { return };
+            let pod_target = p.sandbox.as_ref().and_then(|s| s.target().ok());
+            for (ci, c) in p.ctrs.iter_mut().enumerate() {
+                let Some(target) = c.target.clone() else { continue };
+                let started = c.started;
+                for (pi, (kind, st)) in c.probes.iter_mut().enumerate() {
+                    // Startup runs until it passes; liveness/readiness only after that.
+                    let active = if *kind == probe::Kind::Startup { !started } else { started };
+                    if active && !st.in_flight && now >= st.next_at {
+                        st.in_flight = true;
+                        due.push((ci, pi, c.name.clone(), st.spec.clone(), st.timeout_ms(), target.clone(), pod_target.clone()));
+                    }
+                }
+            }
+        }
+        for (ci, pi, name, spec, timeout, target, pod_target) in due {
+            let me = self.clone();
+            let uid = uid.to_string();
+            let ctr = spec::find_container(pod, &name).cloned().unwrap_or(Value::Null);
+            kr_rt::exec::spawn(async move {
+                let ok = probe::run(&spec, &ctr, &target, pod_target.as_ref(), &me.maps, timeout).await;
+                me.probe_done(&uid, ci, pi, ok);
+                me.notify.notify();
+            });
+        }
+    }
+
+    fn probe_done(&self, uid: &str, ci: usize, pi: usize, ok: bool) {
+        let mut pods = self.pods.borrow_mut();
+        let Some(c) = pods.get_mut(uid).and_then(|p| p.ctrs.get_mut(ci)) else { return };
+        let Some((kind, st)) = c.probes.get_mut(pi) else { return };
+        let kind = *kind;
+        let Some(verdict) = st.record(ok, now_ms()) else { return };
+        match (kind, verdict) {
+            (probe::Kind::Startup, true) => c.started = true,
+            (probe::Kind::Readiness, v) => c.ready = v,
+            // Failed liveness/startup: kill; the exit is handled by the restart policy.
+            (probe::Kind::Startup | probe::Kind::Liveness, false) => {
+                if let Some(s) = &c.signaller {
+                    let _ = s.send(kr_sys::ns::SIGKILL);
+                }
+            }
+            (probe::Kind::Liveness, true) => {}
+        }
     }
 
     fn set_waiting(&self, uid: &str, i: usize, reason: &'static str, msg: String) {
@@ -551,13 +682,14 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 _ => String::new(),
             };
             let running = matches!(c.state, CState::Running { .. });
+            let ready = running && c.started && c.ready;
             let mut f = alloc::vec![
                 ("name", Value::from(c.name.as_str())),
                 ("image", Value::from(c.image.as_str())),
                 ("imageID", Value::from("")),
                 ("containerID", Value::String(id)),
-                ("ready", Value::Bool(running && !c.init)),
-                ("started", Value::Bool(running)),
+                ("ready", Value::Bool(ready && !c.init)),
+                ("started", Value::Bool(running && c.started)),
                 ("restartCount", Value::Number(Number::from_u64(c.restart_count as u64))),
                 ("state", state_json(&c.state)),
             ];
@@ -566,7 +698,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         };
         let apps: Vec<&Ctr> = p.ctrs.iter().filter(|c| !c.init).collect();
         let inits_done = p.ctrs.iter().filter(|c| c.init).all(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code == 0));
-        let all_running = !apps.is_empty() && apps.iter().all(|c| matches!(c.state, CState::Running { .. }));
+        let all_running = !apps.is_empty() && apps.iter().all(|c| matches!(c.state, CState::Running { .. }) && c.started && c.ready);
         let all_done = !apps.is_empty() && apps.iter().all(|c| matches!(c.state, CState::Terminated(_)));
         let failed = apps.iter().any(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code != 0)) || p.ctrs.iter().any(|c| c.init && matches!(&c.state, CState::Terminated(t) if t.exit_code != 0) && policy == "Never");
         let phase = if p.failed_setup.is_some() {

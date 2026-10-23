@@ -62,7 +62,7 @@ pub static RESOURCES: &[Resource] = &[
     r!("", "v1", "Endpoints", "endpoints", "endpoints", true, ["ep"], [], []),
     r!("", "v1", "ConfigMap", "configmaps", "configmap", true, ["cm"], [], []),
     r!("", "v1", "Secret", "secrets", "secret", true, [], [], []),
-    r!("", "v1", "ServiceAccount", "serviceaccounts", "serviceaccount", true, ["sa"], [], []),
+    r!("", "v1", "ServiceAccount", "serviceaccounts", "serviceaccount", true, ["sa"], ["token"], []),
     r!("", "v1", "Event", "events", "event", true, ["ev"], [], []),
     r!("", "v1", "PersistentVolumeClaim", "persistentvolumeclaims", "persistentvolumeclaim", true, ["pvc"], ["status"], []),
     r!("", "v1", "PersistentVolume", "persistentvolumes", "persistentvolume", false, ["pv"], ["status"], []),

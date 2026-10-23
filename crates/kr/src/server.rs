@@ -84,6 +84,10 @@ fn bootstrap(data: &str, port: u16) -> Result<(), String> {
         let name = Name { common_name: "kube-apiserver".into(), organizations: Vec::new() };
         issue(&pki_dir, "apiserver", &ca, name, true, false, dns, alloc::vec![alloc::vec![127, 0, 0, 1]])?;
     }
+    if !exists(&pki::path(&pki_dir, "sa.key")) {
+        let key = pki::new_key();
+        pki::write_new(&pki::path(&pki_dir, "sa.key"), x509::pem_encode("PRIVATE KEY", &x509::private_key_to_pkcs8(&key)).as_bytes(), 0o600)?;
+    }
     if !exists(&pki::path(&pki_dir, "admin.pem")) {
         let name = Name { common_name: "kubernetes-admin".into(), organizations: alloc::vec!["system:masters".into()] };
         issue(&pki_dir, "admin", &ca, name, false, true, Vec::new(), Vec::new())?;
@@ -144,6 +148,17 @@ pub fn main(mut args: Args) -> i32 {
         Ok(a) => Rc::new(a),
         Err(e) => return fail(&e.message),
     };
+    let sa_setup = || -> Result<(), String> {
+        let der = load_pem(&pki_dir, "sa.key", "PRIVATE KEY")?.pop().ok_or("sa.key empty")?;
+        let x509::SigningKey::P256(key) = x509::private_key_from_pkcs8(&der).map_err(|_| "sa.key unsupported")? else {
+            return Err("sa.key must be a P-256 key".into());
+        };
+        let ca_pem = fs::read_file(&pki::path(&pki_dir, "ca.pem"), 1 << 20).ok().and_then(|b| String::from_utf8(b).ok()).ok_or("cannot read ca.pem")?;
+        api.set_service_accounts(kr_apiserver::tokens::Signer::new(key), ca_pem).map_err(|e| e.message)
+    };
+    if let Err(e) = sa_setup() {
+        return fail(&e);
+    }
     print(format!("kr server: listening on https://0.0.0.0:{port}\nkr server: export KUBECONFIG={data}/admin.kubeconfig\n").as_bytes());
     let kubelet = match start_kubelet(&api) {
         Ok(k) => Some(k),
