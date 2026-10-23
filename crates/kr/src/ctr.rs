@@ -350,7 +350,7 @@ fn pod_demo(mut args: Args) -> i32 {
     };
     let vol = format!("{}/containers/{id}-vol", store.root());
     let _ = ns::mkdir(&nul(vol.as_bytes()), 0o755);
-    let mounts = [Mount { source: vol.clone().into_bytes(), target: b"/shared".to_vec(), readonly: false }];
+    let mounts = [Mount { source: vol.clone().into_bytes(), sub_path: None, target: b"/shared".to_vec(), readonly: false }];
     let env = [DEFAULT_PATH.as_bytes().to_vec()];
     let mk = |name: &str, argv: &[&str]| -> (String, Vec<Vec<u8>>) {
         (format!("{id}-{name}"), argv.iter().map(|a| a.as_bytes().to_vec()).collect())

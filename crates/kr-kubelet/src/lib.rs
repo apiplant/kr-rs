@@ -138,6 +138,8 @@ struct PodRt {
     kill_at: Option<u64>,
     last_status: String,
     failed_setup: Option<String>,
+    /// Last refresh of configMap/secret/projected volumes (ms).
+    volumes_synced: u64,
 }
 
 struct Exit {
@@ -255,6 +257,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             } else {
                 self.sync_pod(&uid, pod).await;
                 self.run_probes(&uid, pod);
+                self.refresh_volumes(&uid, pod).await;
             }
             self.report_status(&uid, pod).await;
         }
@@ -356,7 +359,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 });
             }
         }
-        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ctrs, start_time: now(), kill_at: None, last_status: String::new(), failed_setup: None }
+        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ctrs, start_time: now(), kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms() }
     }
 
     fn start_sandbox(&self, uid: &str, pod: &Value) -> Result<(), String> {
@@ -430,7 +433,13 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             return;
         };
         rootfs.pop();
-        let built = match spec::build(&self.c, pod, cspec.unwrap_or(&Value::Null), &img, &self.pods.borrow()[uid].dir, self.pods.borrow()[uid].ip, &self.cfg.node_name).await {
+        // Copy out first: RefCell guards in the match scrutinee would live across the await
+        // and through the arms (which borrow mutably).
+        let (pod_dir, pod_ip) = {
+            let pods = self.pods.borrow();
+            (pods[uid].dir.clone(), pods[uid].ip)
+        };
+        let built = match spec::build(&self.c, pod, cspec.unwrap_or(&Value::Null), &img, &pod_dir, pod_ip, &self.cfg.node_name).await {
             Ok(b) => b,
             Err(msg) => {
                 self.set_waiting(uid, i, "CreateContainerConfigError", msg);
@@ -558,6 +567,22 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             me.exits.borrow_mut().push(Exit { pod_uid, ctr, exit_code, oom, started_at });
             me.notify.notify();
         });
+    }
+
+    /// Every 5 minutes: rewrite configMap/secret/projected volumes (picks up ConfigMap edits and
+    /// rotates the 1 h ServiceAccount token well before it expires).
+    async fn refresh_volumes(&self, uid: &str, pod: &Value) {
+        const EVERY_MS: u64 = 300_000;
+        let dir = {
+            let mut pods = self.pods.borrow_mut();
+            let Some(p) = pods.get_mut(uid) else { return };
+            if p.sandbox.is_none() || now_ms() < p.volumes_synced + EVERY_MS {
+                return;
+            }
+            p.volumes_synced = now_ms();
+            p.dir.clone()
+        };
+        spec::refresh_volumes(&self.c, pod, &dir).await;
     }
 
     /// Starts any due probes as background tasks; results arrive via `probe_done`.

@@ -11,6 +11,7 @@ use kr_runtime::container::Mount;
 use kr_runtime::store::ImageConfig;
 
 pub struct Built {
+
     pub argv: Vec<Vec<u8>>,
     pub env: Vec<Vec<u8>>,
     pub cwd: String,
@@ -202,6 +203,36 @@ async fn request_token<C: Client>(c: &C, pod: &Value, src: &Value) -> Result<Str
     r.pointer(&["status", "token"]).and_then(Value::as_str).map(String::from).ok_or_else(|| String::from("token request returned no token"))
 }
 
+/// mkdir -p of `rel` beneath `root`, without following symlinks; returns an O_PATH fd.
+fn create_beneath(root: &kr_sys::Fd, rel: &str) -> Option<kr_sys::Fd> {
+    let how = kr_sys::fs::OpenHow {
+        flags: (kr_sys::fs::O_PATH | kr_sys::ns::O_DIRECTORY | kr_sys::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: kr_sys::fs::RESOLVE_NO_SYMLINKS | kr_sys::fs::RESOLVE_BENEATH | kr_sys::fs::RESOLVE_NO_MAGICLINKS,
+    };
+    let mut cur: Option<kr_sys::Fd> = None;
+    for comp in rel.split('/').filter(|c| !c.is_empty() && *c != ".") {
+        let dir = cur.as_ref().unwrap_or(root).raw();
+        let name = alloc::format!("{comp}\0");
+        match kr_sys::fs::mkdirat(dir, name.as_bytes(), 0o755) {
+            Ok(()) | Err(kr_sys::Errno(17)) => {}
+            Err(_) => return None,
+        }
+        cur = Some(kr_sys::fs::openat2(dir, name.as_bytes(), &how).ok()?);
+    }
+    cur
+}
+
+/// Re-materializes configMap/secret/projected/downwardAPI volumes of a running pod (live
+/// updates and token rotation). Files are replaced atomically.
+pub async fn refresh_volumes<C: Client>(c: &C, pod: &Value, pod_dir: &str) {
+    for vol in pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]) {
+        if ["configMap", "secret", "projected", "downwardAPI"].iter().any(|k| vol.get(k).is_some()) {
+            let _ = volume_source(c, pod, vol, pod_dir).await;
+        }
+    }
+}
+
 /// Resolves a pod volume to a host directory (creating/materializing it).
 async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str) -> Result<Option<String>, String> {
     let name = vol.get("name").and_then(Value::as_str).unwrap_or("");
@@ -344,20 +375,34 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         limits.cpu_request_milli = cpu.milli_value().and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
     }
     let vols = pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]);
-    let mut mounts = alloc::vec![Mount { source: alloc::format!("{pod_dir}/etc-hosts").into_bytes(), target: b"/etc/hosts".to_vec(), readonly: false }];
+    let mut mounts = alloc::vec![Mount { source: alloc::format!("{pod_dir}/etc-hosts").into_bytes(), sub_path: None, target: b"/etc/hosts".to_vec(), readonly: false }];
     for vm in ctr.get("volumeMounts").and_then(Value::as_array).unwrap_or(&[]) {
         let name = vm.get("name").and_then(Value::as_str).unwrap_or("");
         let target = vm.get("mountPath").and_then(Value::as_str).unwrap_or("");
         let vol = vols.iter().find(|v| v.get("name").and_then(Value::as_str) == Some(name)).ok_or_else(|| alloc::format!("volume {name} not found"))?;
-        let Some(mut src) = volume_source(c, pod, vol, pod_dir).await? else { continue };
+        let Some(src) = volume_source(c, pod, vol, pod_dir).await? else { continue };
+        let mut sub_path = None;
         if let Some(sub) = vm.get("subPath").and_then(Value::as_str).filter(|s| !s.is_empty()) {
             if sub.starts_with('/') || sub.split('/').any(|c| c == "..") {
                 return Err(alloc::format!("invalid subPath {sub}"));
             }
-            src = alloc::format!("{src}/{sub}");
+            // Resolve inside the volume (RESOLVE_IN_ROOT): a symlink the container created in
+            // the volume cannot lead outside it. The O_PATH fd is what gets mounted.
+            let root = kr_sys::ns::open(alloc::format!("{src}\0").as_bytes(), kr_sys::fs::O_PATH | kr_sys::ns::O_DIRECTORY, 0).map_err(|_| alloc::format!("volume {name} is missing"))?;
+            let how = kr_sys::fs::OpenHow { flags: (kr_sys::fs::O_PATH | kr_sys::O_CLOEXEC) as u64, mode: 0, resolve: kr_sys::fs::RESOLVE_IN_ROOT | kr_sys::fs::RESOLVE_NO_MAGICLINKS };
+            let fd = match kr_sys::fs::openat2(root.raw(), alloc::format!("{sub}\0").as_bytes(), &how) {
+                Ok(fd) => fd,
+                // Upstream creates a missing subPath directory. Create it one component at a
+                // time, refusing symlinks, so a planted link cannot make us mkdir on the host.
+                Err(_) => create_beneath(&root, sub).ok_or_else(|| alloc::format!("cannot resolve subPath {sub}"))?,
+            };
+            // The early resolution only validates and pre-creates; the container child resolves
+            // again inside its own mount namespace (an fd from ours cannot be bind-mounted).
+            drop(fd);
+            sub_path = Some(sub.as_bytes().to_vec());
         }
         let ro = vm.get("readOnly").and_then(Value::as_bool).unwrap_or(false) || ["configMap", "secret", "projected", "downwardAPI"].iter().any(|k| vol.get(k).is_some());
-        mounts.push(Mount { source: src.into_bytes(), target: target.as_bytes().to_vec(), readonly: ro });
+        mounts.push(Mount { source: src.into_bytes(), sub_path, target: target.as_bytes().to_vec(), readonly: ro });
     }
     let cwd = ctr.get("workingDir").and_then(Value::as_str).filter(|w| !w.is_empty()).map(String::from).unwrap_or_else(|| img.working_dir.clone());
     Ok(Built {

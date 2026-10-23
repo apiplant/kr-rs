@@ -58,6 +58,10 @@ pub struct RunSpec<'a> {
 pub struct Mount {
     /// Absolute host path (directory or file).
     pub source: Vec<u8>,
+    /// subPath inside `source`. Resolved in the container's mount namespace at mount time with
+    /// RESOLVE_IN_ROOT relative to the volume, so symlinks a container planted in the volume
+    /// cannot point the mount at host paths (and nothing can be swapped in between).
+    pub sub_path: Option<Vec<u8>>,
     /// Absolute path inside the container; must not traverse symlinks.
     pub target: Vec<u8>,
     pub readonly: bool,
@@ -894,7 +898,21 @@ fn mount_volumes(mounts: &[Mount]) -> Result<(), Errno> {
         if m.source.first() != Some(&b'/') || m.target.first() != Some(&b'/') {
             return Err(Errno(22));
         }
-        let src = cstr(&[b"/.oldroot", &m.source]);
+        // Keeps the resolved subPath fd open until the bind mount is done.
+        let mut _sub_fd = None;
+        let src = match &m.sub_path {
+            Some(sub) => {
+                let root = ns::open(&cstr(&[b"/.oldroot", &m.source]), kr_sys::fs::O_PATH | ns::O_DIRECTORY, 0)?;
+                let how = kr_sys::fs::OpenHow { flags: (kr_sys::fs::O_PATH | kr_sys::O_CLOEXEC) as u64, mode: 0, resolve: kr_sys::fs::RESOLVE_IN_ROOT | kr_sys::fs::RESOLVE_NO_MAGICLINKS };
+                let fd = kr_sys::fs::openat2(root.raw(), &cstr(&[sub]), &how)?;
+                let mut p = b"/proc/self/fd/".to_vec();
+                p.extend_from_slice(&fmt_u32(fd.raw() as u32));
+                p.push(0);
+                _sub_fd = Some(fd);
+                p
+            }
+            None => cstr(&[b"/.oldroot", &m.source]),
+        };
         let is_dir = ns::open(&src, ns::O_RDONLY | ns::O_DIRECTORY, 0).is_ok();
         let target = open_mount_target(&m.target, is_dir)?;
         let mut fdpath = b"/proc/self/fd/".to_vec();
