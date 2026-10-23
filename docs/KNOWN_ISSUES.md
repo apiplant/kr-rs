@@ -200,8 +200,12 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
     - kr accepts unknown fields even with `fieldValidation=Strict`.
     - kind-specific defaults (e.g. `strategy`, `imagePullPolicy`) and per-kind validation are missing.
     - Plan: generate schemas from the upstream OpenAPI, as the protobuf table does.
-64. **RBAC not implemented** — *open*
-    Only `system:masters` is authorized; there are no ServiceAccount tokens or bootstrap tokens yet. Needed before agents join.
+64. **RBAC not implemented** — *fixed*
+    - Roles, ClusterRoles and bindings are enforced.
+    - Bootstrap policy: cluster-admin, admin/edit/view, system:discovery, public-info, basic-user, issuer discovery.
+    - ServiceAccount tokens: ES256 JWTs via TokenRequest, optionally pod-bound; revoked when the SA or pod is deleted.
+    - Bearer authentication; `kubectl auth can-i` works via SelfSubjectAccessReview.
+    - Remaining: aggregated ClusterRoles (aggregationRule), bootstrap tokens for joining nodes, and the TokenReview/SubjectAccessReview APIs.
 65. **Server-side apply is approximate** — *open*
     `application/apply-patch+yaml` is treated as create-or-strategic-merge: there are no managedFields, no field ownership and no conflict detection. Client-side `kubectl apply` is fully supported.
 66. **Watch history is not persisted** — *accepted*
@@ -216,23 +220,34 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
 
 ## Node agent and controllers (phase 4)
 
-71. **No probes** — *open*
-    Readiness equals running, and liveness/startup probes are ignored. exec/httpGet/tcpSocket probes are needed (C6).
-72. **No `kubectl logs/exec/attach/port-forward`** — *open (phase 6, C6)*
-    Logs are written to `<root>/pods/<uid>/<container>.log` but are not yet served through the API (the apiserver → kubelet proxy is missing).
-73. **Volume and token gaps** — *open*
-    - projected, downwardAPI and PVC volumes are mounted as empty dirs;
-    - no ServiceAccount token projection;
-    - configMap/secret volumes are written once at pod start (no live updates);
-    - subPath is joined without the upstream symlink-safe resolution, but the target is still resolved without symlinks.
-74. **Rootless pods have no pod IP** — *accepted*
-    Loopback only. Root mode uses the kr0 bridge (verified: nginx reachable at its pod IP).
-75. **Resource requests are not enforced** — *open*
-    cpu/memory requests are not mapped to cgroup weights; only limits are, and only with a delegated cgroup. No QoS classes, no eviction.
-76. **Controllers are basic** — *open (C8)*
-    - not done: StatefulSet, DaemonSet, Job/CronJob, Endpoints/EndpointSlice and namespace controllers;
-    - Deployment does not handle pause, progressDeadlineSeconds or minReadySeconds;
-    - the template hash differs from upstream's.
-77. **Image pulls block the kubelet sync loop** — *open*
-    A slow pull delays other pods on the node. Pulls should become separate tasks.
+71. **No probes** — *fixed*
+    exec, tcpSocket and httpGet as startup, liveness and readiness probes, with upstream thresholds. Network probes run inside the pod network namespace (they work rootless). HTTPS httpGet probes are treated as TCP probes.
+72. **No `kubectl logs/exec/attach/port-forward`** — *mostly fixed*
+    - logs (`--tail`, `-f`), exec (WebSocket v4/v5, stdin, exit codes) and attach work via the node proxy.
+    - Port-forward needs SPDY tunneled over WebSocket and is in progress.
+    - No TTY yet: `exec -t` runs without a terminal.
+    - attach is output-only.
+    - `logs --previous` returns the same file.
+73. **Volume and token gaps** — *mostly fixed*
+    - projected and downwardAPI volumes work (pod-bound SA token, configMap, secret, fieldRef items).
+    - configMap, secret and projected volumes are refreshed every 5 minutes, which also rotates tokens.
+    - subPath is resolved with RESOLVE_IN_ROOT inside the container mount namespace; verified that symlink escapes are refused.
+    - Remaining: PVCs and resourceFieldRef.
+74. **Rootless pods have no pod IP** — *fixed*
+    An infra user+net namespace holds the bridge, and pod sandboxes are nested in it. Pods get IPs and reach each other (verified).
+    Remaining limits:
+    - The host cannot reach pod IPs directly (use port-forward).
+    - Pods have no outbound internet rootless; that needs a user-mode network stack (slirp/pasta-like).
+75. **Resource requests are not enforced** — *partly fixed*
+    CPU requests become `cpu.weight` (upstream formula). Remaining: memory requests (memory.min/low), QoS classes and eviction.
+76. **Controllers are basic** — *mostly fixed*
+    StatefulSet, DaemonSet, Job, CronJob and Endpoints/EndpointSlice controllers exist (49 tests), and Job admission defaulting is in.
+    Remaining:
+    - Deployment pause/progress deadline/minReadySeconds;
+    - Job backoff delay;
+    - the namespace controller (deletion is still synchronous).
+77. **Image pulls block the kubelet sync loop** — *fixed*
+    Pulls run as background tasks; failures back off and are reported as `ImagePullBackOff`.
+78. **exec/probe processes join the container cgroup slightly late** — *accepted*
+    The kernel refuses CLONE_INTO_CGROUP after joining the container's cgroup namespace. kr moves the process via cgroup.procs right after the clone, so there is a brief window outside the container's limits.
 
