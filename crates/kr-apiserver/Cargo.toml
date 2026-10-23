@@ -1,0 +1,15 @@
+[package]
+name = "kr-apiserver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kr-sys = { path = "../kr-sys" }
+kr-rt = { path = "../kr-rt" }
+kr-fmt = { path = "../kr-fmt" }
+kr-crypto = { path = "../kr-crypto" }
+# kr-net (re-added once the HTTP server lands)
+
+[dev-dependencies]
+kr-rt = { path = "../kr-rt", features = ["host"] }

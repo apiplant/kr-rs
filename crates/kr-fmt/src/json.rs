@@ -289,6 +289,68 @@ impl Value {
     pub fn at(&self, i: usize) -> Option<&Value> {
         self.as_array()?.get(i)
     }
+    /// Follows a path of object keys.
+    pub fn pointer(&self, path: &[&str]) -> Option<&Value> {
+        path.iter().try_fold(self, |v, k| v.get(k))
+    }
+    pub fn as_object_mut(&mut self) -> Option<&mut Vec<(String, Value)>> {
+        if let Value::Object(o) = self { Some(o) } else { None }
+    }
+    pub fn as_array_mut(&mut self) -> Option<&mut Vec<Value>> {
+        if let Value::Array(a) = self { Some(a) } else { None }
+    }
+    /// Mutable member lookup (last duplicate wins, like `get`).
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+        self.as_object_mut()?.iter_mut().rev().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+    /// Sets a member (replacing every existing entry with that key). No-op on non-objects.
+    pub fn set(&mut self, key: &str, v: Value) {
+        if let Some(o) = self.as_object_mut() {
+            match o.iter().position(|(k, _)| k == key) {
+                Some(i) => {
+                    o[i].1 = v;
+                    let mut j = i + 1;
+                    while j < o.len() {
+                        if o[j].0 == key {
+                            o.remove(j);
+                        } else {
+                            j += 1;
+                        }
+                    }
+                }
+                None => o.push((key.into(), v)),
+            }
+        }
+    }
+    /// Removes all members named `key`, returning the last one.
+    pub fn remove(&mut self, key: &str) -> Option<Value> {
+        let o = self.as_object_mut()?;
+        let mut out = None;
+        o.retain_mut(|(k, v)| {
+            if k == key {
+                out = Some(core::mem::replace(v, Value::Null));
+                false
+            } else {
+                true
+            }
+        });
+        out
+    }
+    /// Gets member `key`, inserting an empty object first if it is missing or not an object.
+    pub fn entry_object(&mut self, key: &str) -> &mut Value {
+        if !matches!(self.get(key), Some(Value::Object(_))) {
+            self.set(key, Value::Object(Vec::new()));
+        }
+        self.get_mut(key).unwrap()
+    }
+    /// True if any object (at any depth) contains the same key twice.
+    pub fn has_duplicate_keys(&self) -> bool {
+        match self {
+            Value::Object(o) => o.iter().enumerate().any(|(i, (k, v))| o[..i].iter().any(|(k2, _)| k2 == k) || v.has_duplicate_keys()),
+            Value::Array(a) => a.iter().any(Value::has_duplicate_keys),
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for Value {
