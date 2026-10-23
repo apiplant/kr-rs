@@ -6,3 +6,9 @@ license.workspace = true
 
 [dependencies]
 kr-sys = { path = "../kr-sys" }
+
+[features]
+# Host-test mode: omit `_start`, the panic handler, the global allocator and the mem*
+# intrinsics so crates depending on kr-rt can be unit-tested under the std test harness
+# (which provides all of those). Never enable this for the shipped binary.
+host = []

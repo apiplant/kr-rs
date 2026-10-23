@@ -10,11 +10,10 @@ pub mod exec;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
-use core::ffi::c_void;
 
 // ---------- entry ----------
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "host")))]
 core::arch::global_asm!(
     ".globl _start",
     ".type _start,@function",
@@ -26,7 +25,7 @@ core::arch::global_asm!(
     "ud2",
 );
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(feature = "host")))]
 core::arch::global_asm!(
     ".globl _start",
     "_start:",
@@ -75,12 +74,14 @@ impl Iterator for Args {
     }
 }
 
+#[cfg(not(feature = "host"))]
 extern "Rust" {
     fn kr_main(args: Args) -> i32;
 }
 
 /// # Safety
 /// Called only from `_start` with the original stack pointer.
+#[cfg(not(feature = "host"))]
 #[no_mangle]
 pub unsafe extern "C" fn kr_rt_start(sp: *const usize) -> ! {
     // SAFETY: at process entry sp points to argc followed by argv pointers.
@@ -128,6 +129,7 @@ pub fn fmt_u64(mut n: u64, buf: &mut [u8; 20]) -> &[u8] {
 
 // ---------- panic ----------
 
+#[cfg_attr(any(test, feature = "host"), allow(dead_code))]
 struct Stderr;
 impl core::fmt::Write for Stderr {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
@@ -136,7 +138,7 @@ impl core::fmt::Write for Stderr {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "host")))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     use core::fmt::Write;
@@ -252,10 +254,16 @@ unsafe impl GlobalAlloc for KrAlloc {
     }
 }
 
+#[cfg(not(feature = "host"))]
 #[global_allocator]
 static ALLOC: KrAlloc = KrAlloc::new();
 
 // ---------- mem* ----------
+// Gated off under the `host` feature, where the host libc provides these symbols.
+#[cfg(not(feature = "host"))]
+mod mem {
+use core::ffi::c_void;
+
 // Implemented with inline asm / non-inlined volatile loops so the compiler cannot recognise
 // the pattern and turn it back into a call to the same symbol.
 
@@ -378,4 +386,5 @@ pub unsafe extern "C" fn memcmp(a: *const c_void, b: *const c_void, n: usize) ->
 pub unsafe extern "C" fn bcmp(a: *const c_void, b: *const c_void, n: usize) -> i32 {
     // SAFETY: same contract as memcmp.
     unsafe { memcmp(a, b, n) }
+}
 }

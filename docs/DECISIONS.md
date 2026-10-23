@@ -117,3 +117,33 @@ Crates:
 Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP registry (`registry:2` on localhost). The registry client is written against a `Transport` trait so that TLS can be plugged in without API changes.
 **Why:** this unblocks the runtime without rushing the riskiest crate.
 **Status:** accepted.
+
+## ADR-014: `kr-archive` streaming design and the whiteout/sanitize contract
+- **Push-based, constant memory:** `Inflater::feed`, `GzDecoder::feed` and `TarReader::feed` take input chunks of any size (down to 1 byte) and deliver output through callbacks. Memory is a 32 KiB window plus one 512-byte header (tar metadata records are capped at 1 MiB). A layer is never buffered whole, and the stack composes as `gzip -> tar -> sink`.
+- **Decoder:** the bit reader is lazy about partial symbols (a step that lacks bits consumes nothing and resumes on the next feed). Huffman decoding uses a 10-bit primary table plus a canonical fallback for longer codes. Trees are validated strictly (over-subscribed or incomplete trees are rejected, except zlib's single 1-bit code for literal/length and distance trees). `Status::Done{consumed}` returns the unread tail, which is how gzip finds its trailer and the next member.
+- **gzip:** CRC32 (slice-by-8) and ISIZE are verified per member. Multi-member input is supported. Bytes after a member that don't start a new member are `TrailingGarbage`. `finish()` is required to detect truncation.
+- **tar:** supports ustar/pax/GNU and reports the already-merged `Entry` (precedence pax > GNU long > header) then `Data` chunks then `End`. Non-file entries carry no data. Strings must be UTF-8.
+- **Contract with the runtime (`kr-runtime`):**
+  1. Always run `tar::sanitize(entry.path)` first. It is lexical only: it rejects absolute paths, NULs and `..` that escape, and normalizes `.`, `//` and trailing `/`. An empty result is the layer root.
+  2. The runtime MUST ALSO defend against symlink traversal when extracting. `sanitize` cannot see that an earlier entry made `a -> /etc`. Use an `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)` or `O_NOFOLLOW` walk against the rootfs fd. `linkname` of symlinks and hardlinks is reported verbatim and must be validated by the runtime (hardlink targets are layer-relative and must be sanitized too).
+  3. Whiteouts: call `tar::whiteout(sanitized_path)`. `Remove(p)` means delete `p` from the lower layers and do NOT create the marker file. `Opaque(dir)` means clear lower-layer content of `dir` (empty string = root) while keeping this layer's own entries. Apply the removal to lower layers only, never to files already extracted by the same layer. `.wh..wh.*` names other than the opaque marker are reserved (`is_reserved_whiteout`) and must be skipped.
+**Why:** the layer unpack path is attacker-controlled input, so the parser is total (never panics, covered by mutation tests), and the policy decisions that need a filesystem stay in the runtime.
+**Status:** accepted.
+
+## ADR-015: `kr-net` HTTP/1.1 strictness, `Transport`/`Connector` traits, interim sha256
+**Strictness rules** (parser: `kr_net::http1::head`, `body`):
+- Lines end in CRLF only. A bare LF or a bare CR anywhere in a head or in chunk framing is an error (RFC 9112 2.2 allows recipients to be lenient; we are not, because lenient line splitting is a classic smuggling differential).
+- obs-fold (a header line starting with SP/HTAB) is rejected. Whitespace between the field name and the colon is rejected (the name must be a token). Header values may contain only HTAB, SP, VCHAR and obs-text, and must be valid UTF-8; NUL/CTL/DEL are rejected.
+- Request line: exactly `method SP target SP HTTP/1.0|1.1`, one space each; the target is visible ASCII only. HTTP/1.1 requests need exactly one `Host`. Status line: `HTTP/1.x SP 3DIGIT [SP reason]` (the SP before an empty reason may be omitted, which is the one tolerated deviation).
+- Limits apply to partial input too, so a peer cannot make us buffer without bound: head 16 KiB, line 8 KiB, 100 headers (configurable via `Limits`). Chunk extensions are capped at 1 KiB, trailers at 8 KiB per line and 16 KiB in total; chunk sizes are 1-16 hex digits with overflow checks.
+- Framing: `Transfer-Encoding` together with `Content-Length` is an error (for requests AND responses); `Content-Length` must be `1*DIGIT`, and repeated or comma-listed values must all be equal; the only accepted transfer coding is a single, final `chunked` (anything else, including `gzip, chunked`, is an error); `Transfer-Encoding` in an HTTP/1.0 message is an error. Chunk framing is checked byte by byte; trailers are validated and discarded.
+- The client keeps a connection for reuse only after the body is fully consumed with no stray bytes left in the buffer. A reused connection that dies before any response byte arrives is retried once, for GET/HEAD only.
+- Redirects: at most 5; the scheme may not change; `Authorization`/`Cookie` are dropped when the origin changes; 303 (and 301/302 for POST) become GET.
+- Callers cannot set `Host`, `Content-Length`, `Transfer-Encoding` or `Connection`, and header names/values are validated, so request splitting is impossible from the API.
+
+**Traits:** `Transport` (`async read` / `async write_all`) is implemented for `Async<Fd>`; `Connector` creates a `Transport` for a `Url`. `Client<C: Connector>` and `Registry<C>` are generic over it, so a TLS connector from `kr-crypto` can be added without API changes (ADR-013). `TcpConnector` returns `Error::TlsUnsupported` for `https`. Name resolution goes through a `Resolver` trait; only literals + `/etc/hosts` exist.
+
+**Interim sha256:** `kr_net::sha256` is a small FIPS 180-4 implementation (tested against the standard vectors) used only to verify public manifest and blob digests. It is not constant-time and will be replaced by `kr-crypto`.
+
+**Runtime test support:** `kr-rt` has a `host` feature that removes `_start`, `kr_rt_start`, the panic handler, the global allocator and the `mem*` symbols, so the executor can run under the std test harness. `kr-net` enables it only through `[dev-dependencies]`, so release builds of `kr` are unaffected. Since the executor is single-threaded and global, tests serialise `block_on` calls with a mutex. Do not enable `host` in a shipped binary.
+**Status:** accepted.

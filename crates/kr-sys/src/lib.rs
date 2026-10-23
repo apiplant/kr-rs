@@ -11,7 +11,12 @@ pub type Result<T> = core::result::Result<T, Errno>;
 pub const EAGAIN: i32 = 11;
 pub const EINTR: i32 = 4;
 
+pub const EINPROGRESS: i32 = 115;
 pub const AF_INET: i32 = 2;
+pub const AF_INET6: i32 = 10;
+pub const SO_ERROR: i32 = 4;
+pub const AT_FDCWD: i32 = -100;
+pub const O_RDONLY: i32 = 0;
 pub const SOCK_STREAM: i32 = 1;
 pub const SOCK_NONBLOCK: i32 = 0o4000;
 pub const SOCK_CLOEXEC: i32 = 0o2000000;
@@ -48,6 +53,9 @@ mod nr {
     pub const MMAP: usize = 9;
     pub const MUNMAP: usize = 11;
     pub const SOCKET: usize = 41;
+    pub const CONNECT: usize = 42;
+    pub const GETSOCKOPT: usize = 55;
+    pub const OPENAT: usize = 257;
     pub const BIND: usize = 49;
     pub const SHUTDOWN: usize = 48;
     pub const PIPE2: usize = 293;
@@ -69,6 +77,9 @@ mod nr {
     pub const MMAP: usize = 222;
     pub const MUNMAP: usize = 215;
     pub const SOCKET: usize = 198;
+    pub const CONNECT: usize = 203;
+    pub const GETSOCKOPT: usize = 209;
+    pub const OPENAT: usize = 56;
     pub const BIND: usize = 200;
     pub const SHUTDOWN: usize = 210;
     pub const PIPE2: usize = 59;
@@ -217,6 +228,23 @@ impl SockaddrIn {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockaddrIn6 {
+    pub sin6_family: u16,
+    /// Network byte order.
+    pub sin6_port: u16,
+    pub sin6_flowinfo: u32,
+    pub sin6_addr: [u8; 16],
+    pub sin6_scope_id: u32,
+}
+
+impl SockaddrIn6 {
+    pub fn new(addr: [u8; 16], port: u16) -> Self {
+        SockaddrIn6 { sin6_family: AF_INET6 as u16, sin6_port: port.to_be(), sin6_flowinfo: 0, sin6_addr: addr, sin6_scope_id: 0 }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -307,6 +335,53 @@ pub fn bind(fd: i32, addr: &SockaddrIn) -> Result<()> {
         syscall3(nr::BIND, fd as usize, addr as *const _ as usize, core::mem::size_of::<SockaddrIn>())
     })
     .map(|_| ())
+}
+
+/// Non-blocking sockets return `Err(Errno(EINPROGRESS))` while the handshake is pending.
+pub fn connect(fd: i32, addr: &SockaddrIn) -> Result<()> {
+    // SAFETY: addr points to a valid repr(C) sockaddr_in of the stated size.
+    check(unsafe {
+        syscall3(nr::CONNECT, fd as usize, addr as *const _ as usize, core::mem::size_of::<SockaddrIn>())
+    })
+    .map(|_| ())
+}
+
+pub fn connect6(fd: i32, addr: &SockaddrIn6) -> Result<()> {
+    // SAFETY: addr points to a valid repr(C) sockaddr_in6 of the stated size.
+    check(unsafe {
+        syscall3(nr::CONNECT, fd as usize, addr as *const _ as usize, core::mem::size_of::<SockaddrIn6>())
+    })
+    .map(|_| ())
+}
+
+/// Reads and clears the pending socket error (`SO_ERROR`); `Ok(0)` means none.
+pub fn socket_error(fd: i32) -> Result<i32> {
+    let mut val: i32 = 0;
+    let mut len: u32 = 4;
+    // SAFETY: val/len are valid writable locals of the sizes the kernel expects.
+    check(unsafe {
+        syscall5(
+            nr::GETSOCKOPT,
+            fd as usize,
+            SOL_SOCKET as usize,
+            SO_ERROR as usize,
+            &mut val as *mut i32 as usize,
+            &mut len as *mut u32 as usize,
+        )
+    })?;
+    Ok(val)
+}
+
+/// Opens a file read-only. `path` must be NUL-terminated (checked).
+pub fn open_read(path: &[u8]) -> Result<Fd> {
+    if path.last() != Some(&0) {
+        return Err(Errno(22)); // EINVAL
+    }
+    // SAFETY: path is a valid NUL-terminated byte string for the duration of the call.
+    check(unsafe {
+        syscall4(nr::OPENAT, AT_FDCWD as usize, path.as_ptr() as usize, (O_RDONLY | O_CLOEXEC) as usize, 0)
+    })
+    .map(|r| Fd(r as i32))
 }
 
 /// `how` is `SHUT_WR` (or 0 = SHUT_RD, 2 = SHUT_RDWR).

@@ -8,3 +8,7 @@ license.workspace = true
 kr-sys = { path = "../kr-sys" }
 kr-rt = { path = "../kr-rt" }
 kr-fmt = { path = "../kr-fmt" }
+
+[dev-dependencies]
+# `host` drops _start/panic handler/allocator/mem* so the std test harness can link (ADR-015).
+kr-rt = { path = "../kr-rt", features = ["host"] }

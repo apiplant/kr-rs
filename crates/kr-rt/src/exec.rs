@@ -635,6 +635,14 @@ impl<T: AsRawFd> Async<T> {
 }
 
 impl Async<Fd> {
+    /// Waits for the next writability edge, e.g. completion of a non-blocking `connect`.
+    /// `register` optimistically marks the fd writable, so that flag is cleared first; the
+    /// kernel queues the event when the socket was already connected at registration time.
+    pub async fn wait_writable(&self) {
+        clear_ready(self.slot, true);
+        self.ready(true).await
+    }
+
     /// Accepts one connection from a listening socket; the result is registered and non-blocking.
     pub async fn accept(&self) -> Result<Async<Fd>, Errno> {
         loop {

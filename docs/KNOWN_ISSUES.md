@@ -46,7 +46,7 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
 
 ## Echo server (cont.)
 
-14. **The lingering close holds each connection for up to 1 s after the response** — *open*
+14. **The lingering close holds each connection for up to 1 s after the response** — *fixed* (commit: )
     Under heavy load this raises the number of concurrent connections. Plan: skip the drain when the request was fully read, and cap total lingering connections.
 
 ## kr-fmt
@@ -62,4 +62,45 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
     The behaviour is inconsistent, but each matches its consumer: the apiserver can enforce strictness at a higher layer.
 17. **Quantity mantissa is i128** — *accepted*
     `1e40` is OutOfRange. k8s has the same practical bounds.
-18. **14 clippy style lints in kr-fmt** — *open (cleanup)*
+18. **14 clippy style lints in kr-fmt** — *fixed* (commit: )
+
+## kr-archive
+
+19. **Tar: no sparse files, unknown type flags are errors, strings must be UTF-8** — *accepted*
+    GNU sparse (`S`, pax `GNU.sparse.*`) and any non-standard typeflag fail with `UnsupportedType`. Non-UTF-8 names, link targets or pax values fail with `InvalidUtf8`. Container image layers do not use these. Revisit if a real layer hits them.
+20. **pax `mtime` fractions are truncated; global (`g`) pax `path`/`linkpath`/`size` are ignored; `LIBARCHIVE.xattr.*` is not parsed (only `SCHILY.xattr.*`)** — *accepted*
+21. **Hardlink/symlink targets and the symlink-traversal check are the runtime's job** — *open (kr-runtime)*
+    `sanitize` is lexical. `kr-runtime` must implement the no-follow extraction (ADR-014) and validate `linkname`.
+22. **gzip: any non-gzip trailing bytes after the last member are an error** — *accepted*
+    Unlike `gzip -d`, which tolerates zero padding. Also, a stream that ends cleanly without ever feeding a byte is `Truncated`. Only DEFLATE with CM=8 is supported (no zlib/raw-deflate wrapper API beyond `Inflater`).
+23. **Inflate throughput depends on the profile** — *accepted*
+    The workspace release profile uses `opt-level = "z"`. The 50 MB benchmark (`cargo test --release -p kr-archive --test gzip -- --ignored --nocapture`) measures about 800 MB/s on this machine, well above the 150 MB/s target, but re-check if the profile or target changes.
+24. **No decompression-bomb limit in the crate** — *open (kr-runtime)*
+    Output is streamed, so memory is safe, but callers should cap total uncompressed bytes and entry counts.
+
+## kr-net
+
+25. **No DNS: only IP literals, `/etc/hosts` and a built-in `localhost`** — *open (kr-net)*
+    The `Resolver` trait is the extension point; implement a UDP/TCP DNS resolver later. IPv6 zone ids (`fe80::1%eth0`) are not parsed, and `/etc/hosts` is read once when the connector is created.
+26. **TLS is not implemented; `https` URLs fail with `Error::TlsUnsupported`** — *open (kr-crypto)*
+    This includes docker.io and any redirect from a plain-HTTP registry to a CDN over https. Only loopback or explicitly allowed (`Registry::allow_plain_http`) registries work.
+27. **Interim SHA-256 in `kr-net/src/sha256.rs`** — *open (kr-crypto)*
+    A small, non-constant-time FIPS 180-4 implementation, tested against the standard vectors. `kr-crypto` must replace it and `kr-net` should then re-export the new one.
+28. **HTTP/1.1 client limits** — *accepted*
+    No request body streaming (the body is a `&[u8]`; `body::encode_chunk` exists but the client does not send chunked requests), no proxies, no `Expect: 100-continue`, no response decompression (`Accept-Encoding: identity` is sent), no HTTP/1.0 keep-alive negotiation beyond `Connection: keep-alive`. Responses with `Transfer-Encoding` AND `Content-Length` are rejected rather than handled per the RFC's "TE wins" rule.
+29. **Bare LF line endings are rejected, even though RFC 9112 allows recipients to accept them** — *accepted*
+    Deliberate (ADR-015). A buggy server that sends LF-only heads will fail with `Parse("bare LF")`.
+30. **Keep-alive pool has no idle timeout** — *open*
+    Stale connections are detected only when reused (one retry for GET/HEAD). Add a timer-based eviction if long-lived clients appear.
+31. **Registry auth supports anonymous Bearer tokens only** — *open*
+    No Basic auth, no credentials (`~/.docker/config.json`), no token refresh by expiry (a token is retried once after a 401), and `scope` is taken from the challenge or defaults to `repository:<repo>:pull`.
+32. **Registry client is pull-only** — *accepted*
+    No push, no tags/catalog listing, no referrers, no resumable or range blob download. Schema-1 manifests are rejected. A sink that has already received data from a blob with a digest mismatch must be discarded by the caller (the mismatch is only known at the end).
+33. **`kr-rt` `host` feature for host tests** — *accepted*
+    It removes `_start`/panic handler/allocator/`mem*` so `cargo test` works for crates that use the executor. It is enabled only via `kr-net` dev-dependencies, but cargo feature unification means `cargo test --workspace` would enable it for `kr` too; run tests per package. `Async::wait_writable` was added to `kr-rt` for non-blocking connect.
+34. **Integration test with a real registry is `#[ignore]`d** — *accepted*
+    `cargo test -p kr-net -- --ignored` runs `registry:2` under docker/podman on 127.0.0.1:5000, pushes busybox (needs network for the first pull) and pulls it through the client; it skips when offline or port 5000 is busy and falls back to the std fake registry when no container tool exists. The always-on tests use that std fake server.
+
+## kr-sys (cont.)
+
+35. **`syscall0..6` lack `# Safety` docs (clippy `missing_safety_doc`)** — *open (cleanup)*
