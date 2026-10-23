@@ -28,6 +28,7 @@ mod n {
     pub const RT_SIGPROCMASK: usize = 14;
     pub const SIGNALFD4: usize = 289;
     pub const WAITID: usize = 247;
+    pub const SETNS: usize = 308;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -56,6 +57,7 @@ mod n {
     pub const RT_SIGPROCMASK: usize = 135;
     pub const SIGNALFD4: usize = 74;
     pub const WAITID: usize = 95;
+    pub const SETNS: usize = 268;
 }
 
 pub const CLONE_NEWNS: u64 = 0x0002_0000;
@@ -72,6 +74,7 @@ pub const SIGCHLD: i32 = 17;
 pub const SIGINT: i32 = 2;
 pub const SIGTERM: i32 = 15;
 pub const CLONE_PIDFD: u64 = 0x1000;
+pub const CLONE_PARENT: u64 = 0x8000;
 
 pub const MS_RDONLY: usize = 1;
 pub const MS_NOSUID: usize = 2;
@@ -409,4 +412,55 @@ pub fn ifindex(name: &[u8]) -> Result<i32> {
     // SAFETY: ifr is a writable 40-byte ifreq; the kernel stores ifr_ifindex at offset 16.
     check(unsafe { syscall3(n::IOCTL, sock.raw() as usize, 0x8933, ifr.as_mut_ptr() as usize) })?;
     Ok(i32::from_ne_bytes([ifr[16], ifr[17], ifr[18], ifr[19]]))
+}
+
+/// pidfd for an existing process (only race-free for our own unreaped children).
+pub fn pidfd_open(pid: i32) -> Result<Fd> {
+    // SAFETY: plain integer arguments.
+    check(unsafe { syscall2(434, pid as usize, 0) }).map(|fd| Fd(fd as i32))
+}
+
+/// Joins the namespaces `nstype` (CLONE_NEW* flags) of the process behind `pidfd`.
+/// The caller must be single-threaded to join a user namespace.
+pub fn setns(pidfd: &Fd, nstype: u64) -> Result<()> {
+    // SAFETY: plain integer arguments.
+    check(unsafe { syscall2(n::SETNS, pidfd.raw() as usize, nstype as usize) }).map(|_| ())
+}
+
+/// Sleeps until a signal arrives (used by the pod sandbox process).
+pub fn pause_forever() -> ! {
+    loop {
+        let ts = super::Timespec { tv_sec: 1 << 30, tv_nsec: 0 };
+        let _ = nanosleep(&ts);
+    }
+}
+
+/// Closes every fd >= `first` (close_range, Linux 5.9).
+pub fn close_from(first: u32) {
+    // SAFETY: plain integer arguments.
+    let _ = unsafe { syscall3(436, first as usize, u32::MAX as usize, 0) };
+}
+
+/// dup3(old, new, 0): makes `new` refer to `old` (used for container stdio).
+pub fn dup_to(old: i32, new: i32) -> Result<()> {
+    // SAFETY: plain integer arguments. x86_64 dup3 = 292, aarch64 dup3 = 24.
+    #[cfg(target_arch = "x86_64")]
+    const DUP3: usize = 292;
+    #[cfg(target_arch = "aarch64")]
+    const DUP3: usize = 24;
+    check(unsafe { syscall3(DUP3, old as usize, new as usize, 0) }).map(|_| ())
+}
+
+/// Mount flags (ST_*) of the filesystem containing `fd` (fstatfs `f_flags`).
+pub fn fstatfs_flags(fd: i32) -> Result<u64> {
+    #[cfg(target_arch = "x86_64")]
+    const FSTATFS: usize = 138;
+    #[cfg(target_arch = "aarch64")]
+    const FSTATFS: usize = 44;
+    // struct statfs (120 bytes): type, bsize, blocks, bfree, bavail, files, ffree, fsid, namelen,
+    // frsize, flags, spare[4] -- f_flags is the u64 at offset 80 on both arches.
+    let mut buf = [0u64; 15];
+    // SAFETY: buf is a writable, suitably aligned 120-byte struct statfs.
+    check(unsafe { syscall2(FSTATFS, fd as usize, buf.as_mut_ptr() as usize) })?;
+    Ok(buf[10])
 }

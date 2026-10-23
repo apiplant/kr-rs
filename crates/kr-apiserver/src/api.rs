@@ -150,7 +150,12 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        Ok(ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.31.0-kr") })
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.31.0-kr") };
+        for ns in SYSTEM_NAMESPACES {
+            api.ensure_default_sa(ns);
+        }
+        api.sync()?;
+        Ok(api)
     }
 
     fn clock(&self) -> Clock {
@@ -218,11 +223,17 @@ impl ApiServer {
             ("GET", None, None) if q.flag("watch") => self.watch(rt, q),
             ("GET", None, None) => self.list(req, rt, q),
             ("GET", Some(n), Some("scale")) => self.get_scale(rt, n),
+            ("GET", Some(n), None) if wants_table(req.accept) => {
+                let kv = self.get_kv(rt, n)?;
+                let rev = self.store.borrow().revision();
+                Ok(Reply::Json(200, self.table(rt.res, &[kv], rev, None)))
+            }
             ("GET", Some(n), _) => {
                 let (_, v) = self.get_value(rt, n)?;
                 Ok(Reply::ok(&v))
             }
             ("POST", None, None) => self.create(req, rt, q),
+            ("POST", Some(n), Some("binding")) => self.bind(req, rt, n),
             ("PUT", Some(n), Some("scale")) => self.update_scale(req, rt, n, false),
             ("PATCH", Some(n), Some("scale")) => self.update_scale(req, rt, n, true),
             ("PUT", Some(n), s) => self.update(req, rt, n, s == Some("status"), q, None),
@@ -434,6 +445,9 @@ impl ApiServer {
         let key = rt.res.key(rt.namespace.as_deref(), &name);
         let kv = self.store.borrow_mut().create(&key, json::to_string(o).into_bytes()).map_err(|e| store_err(e, rt.res.singular, &name))?;
         debug_assert_eq!(kv.mod_rev, rev);
+        if rt.res.plural == "namespaces" {
+            self.ensure_default_sa(&name);
+        }
         self.sync()?;
         Ok(o.clone())
     }
@@ -528,6 +542,24 @@ impl ApiServer {
         if rt.res.plural == "namespaces" {
             return self.delete_namespace(&kv, v, name);
         }
+        // Graceful pod deletion: a bound pod only gets a deletionTimestamp; its kubelet stops
+        // the containers and then deletes it with gracePeriodSeconds=0.
+        let opts = if req.body.is_empty() { Value::Null } else { json::parse(req.body).unwrap_or(Value::Null) };
+        let grace = q.get("gracePeriodSeconds").and_then(|g| g.parse::<i64>().ok()).or_else(|| opts.get("gracePeriodSeconds").and_then(Value::as_i64));
+        let bound = v.pointer(&["spec", "nodeName"]).and_then(Value::as_str).is_some_and(|n| !n.is_empty());
+        if rt.res.plural == "pods" && bound && grace != Some(0) {
+            if v.pointer(&["metadata", "deletionTimestamp"]).is_none() {
+                let g = grace.or_else(|| v.pointer(&["spec", "terminationGracePeriodSeconds"]).and_then(Value::as_i64)).unwrap_or(30).max(1);
+                let rev = self.store.borrow().revision() + 1;
+                let m = v.entry_object("metadata");
+                m.set("deletionTimestamp", Value::String(object::rfc3339((self.now)() + g)));
+                m.set("deletionGracePeriodSeconds", Value::Number(Number::from_i64(g)));
+                m.set("resourceVersion", Value::String(rev.to_string()));
+                self.store.borrow_mut().update(&kv.key, json::to_string(&v).into_bytes(), Some(kv.mod_rev)).map_err(|e| store_err(e, rt.res.singular, name))?;
+                self.sync()?;
+            }
+            return Ok(Reply::ok(&v));
+        }
         let has_finalizers = v.pointer(&["metadata", "finalizers"]).and_then(Value::as_array).is_some_and(|f| !f.is_empty());
         if has_finalizers {
             if v.pointer(&["metadata", "deletionTimestamp"]).is_none() {
@@ -587,6 +619,38 @@ impl ApiServer {
             ("metadata", obj(alloc::vec![("resourceVersion", Value::String(self.store.borrow().revision().to_string()))])),
             ("items", Value::Array(deleted)),
         ])))
+    }
+
+    /// `pods/binding`: assigns a node once (the scheduler's write path).
+    fn bind(&self, req: &Req, rt: &Route, name: &str) -> R<Reply> {
+        let b = self.parse_body(req)?;
+        let node = b.pointer(&["target", "name"]).and_then(Value::as_str).filter(|n| !n.is_empty()).ok_or_else(|| ApiError::invalid("target.name is required"))?;
+        let (kv, old) = self.get_value(rt, name)?;
+        if old.pointer(&["spec", "nodeName"]).and_then(Value::as_str).is_some_and(|n| !n.is_empty()) {
+            return Err(ApiError::new(409, "Conflict", alloc::format!("pod {name} is already assigned to a node")));
+        }
+        let mut new = old.clone();
+        new.entry_object("spec").set("nodeName", Value::from(node));
+        let rev = self.store.borrow().revision() + 1;
+        new.entry_object("metadata").set("resourceVersion", Value::String(rev.to_string()));
+        self.store.borrow_mut().update(&kv.key, json::to_string(&new).into_bytes(), Some(kv.mod_rev)).map_err(|e| store_err(e, "pod", name))?;
+        self.sync()?;
+        Ok(Reply::Json(201, json::to_string(&object::status_value(201, "", "Success"))))
+    }
+
+    /// Creates the `default` ServiceAccount in a namespace (the ServiceAccount controller's job).
+    fn ensure_default_sa(&self, ns: &str) {
+        let Some(sa) = resources::find("", "v1", "serviceaccounts") else { return };
+        let key = sa.key(Some(ns), "default");
+        if self.store.borrow().get(&key).is_some() {
+            return;
+        }
+        let mut o = obj(alloc::vec![("metadata", obj(alloc::vec![("name", Value::from("default"))]))]);
+        let t = Target { api_version: "v1", kind: "ServiceAccount", namespace: Some(ns), name_is_label: false };
+        let rev = self.store.borrow().revision() + 1;
+        if object::prepare_create(&mut o, &t, &self.clock(), rev).is_ok() {
+            let _ = self.store.borrow_mut().create(&key, json::to_string(&o).into_bytes());
+        }
     }
 
     // ---- scale ----
@@ -656,7 +720,28 @@ impl ApiServer {
         let rv = q.get("resourceVersion").unwrap_or("");
         let mut store = self.store.borrow_mut();
         let mut initial = VecDeque::new();
+        // WatchList (sendInitialEvents=true): current state as ADDED events, then a BOOKMARK
+        // annotated k8s.io/initial-events-end, then live events (kubectl wait/delete use it).
+        let send_initial = q.flag("sendInitialEvents");
         let after = match rv {
+            _ if send_initial => {
+                let (items, _) = store.list(&prefix, None, 0);
+                for kv in items {
+                    if let Ok(v) = json::parse(&kv.value) {
+                        if ls.matches(&v) && fs.matches(&v) {
+                            initial.push_back(event_line("ADDED", &kv.value));
+                        }
+                    }
+                }
+                let rev = store.revision();
+                let mark = alloc::format!(
+                    r#"{{"kind":"{}","apiVersion":"{}","metadata":{{"resourceVersion":"{rev}","annotations":{{"k8s.io/initial-events-end":"true"}}}}}}"#,
+                    rt.res.kind,
+                    rt.res.group_version()
+                );
+                initial.push_back(event_line("BOOKMARK", mark.as_bytes()));
+                rev
+            }
             "" | "0" => {
                 // "Get state and start at most recent": synthetic ADDED events first.
                 let (items, _) = store.list(&prefix, None, 0);

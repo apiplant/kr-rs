@@ -145,8 +145,47 @@ pub fn main(mut args: Args) -> i32 {
         Err(e) => return fail(&e.message),
     };
     print(format!("kr server: listening on https://0.0.0.0:{port}\nkr server: export KUBECONFIG={data}/admin.kubeconfig\n").as_bytes());
-    match kr_rt::exec::block_on(kr_apiserver::server::run(api, [0, 0, 0, 0], port, tls)) {
+    let kubelet = match start_kubelet(&api) {
+        Ok(k) => Some(k),
+        Err(e) => {
+            eprint(format!("kr server: kubelet disabled: {e}\n").as_bytes());
+            None
+        }
+    };
+    let controllers = kr_apiserver::client::InProcess::new(api.clone(), "controller-manager");
+    match kr_rt::exec::block_on(async move {
+        let cfg = kr_controllers::Config { now: pki::now, ..kr_controllers::Config::default() };
+        kr_rt::exec::spawn(kr_controllers::run_all_with(controllers, cfg));
+        if let Some(k) = kubelet {
+            kr_rt::exec::spawn(k.run());
+        }
+        kr_apiserver::server::run(api, [0, 0, 0, 0], port, tls).await
+    }) {
         Ok(()) => 0,
         Err(_) => fail("listener failed"),
     }
+}
+
+/// The node agent embedded in the server (single-node mode).
+fn start_kubelet(api: &Rc<kr_apiserver::api::ApiServer>) -> Result<Rc<kr_kubelet::Kubelet<kr_apiserver::client::InProcess>>, String> {
+    let store = kr_runtime::store::Store::open(None).map_err(|_| String::from("cannot open the image store"))?;
+    let mut name = hostname().to_ascii_lowercase();
+    if !kr_apiserver::object::is_dns_subdomain(&name) || name.is_empty() {
+        name = "kr-node".into();
+    }
+    // cgroup limits need a delegated cgroup (systemd Delegate=yes); probe once.
+    let probe = kr_runtime::cgroup::Limits { pids: Some(1024), ..Default::default() };
+    let cgroups = match kr_runtime::cgroup::Cgroup::create(b"kr-probe", &probe) {
+        Ok(cg) => {
+            cg.remove();
+            true
+        }
+        Err(_) => {
+            eprint(b"kr server: no delegated cgroup; container resource limits are not enforced\n");
+            false
+        }
+    };
+    let cfg = kr_kubelet::Config { node_name: name, root: String::from(store.root()), network: ns::getuid() == 0, cgroups };
+    let client = kr_apiserver::client::InProcess::new(api.clone(), "kubelet");
+    Ok(kr_kubelet::Kubelet::new(client, cfg, store))
 }

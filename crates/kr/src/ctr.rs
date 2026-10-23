@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use kr_fmt::quantity::Quantity;
 use kr_rt::{eprint, print, Args};
 use kr_runtime::cgroup::Limits;
-use kr_runtime::container::{self, IdMaps, RunSpec};
+use kr_runtime::container::{self, IdMaps, Mount, RunSpec};
 use kr_runtime::network::{self, NetConfig};
 use kr_runtime::store::Store;
 use kr_sys::ns;
@@ -24,6 +24,7 @@ pub fn main(mut args: Args) -> i32 {
         Some(b"pull") => pull(args),
         Some(b"run") => run(args),
         Some(b"run-dir") => run_dir(args),
+        Some(b"pod-demo") => pod_demo(args),
         _ => {
             eprint(USAGE);
             2
@@ -166,6 +167,9 @@ fn run(mut args: Args) -> i32 {
         user: user.unwrap_or(cfg.user.as_bytes()),
         maps: &maps,
         net: lease.as_ref().map(|l| NetConfig { ip: l.ip, prefix: network::PREFIX, gateway: network::GATEWAY }),
+        sandbox: None,
+        mounts: &[],
+        log_fd: None,
     };
     if let Some(l) = &lease {
         let ip = l.ip;
@@ -305,6 +309,9 @@ fn run_dir(mut args: Args) -> i32 {
         user: user.unwrap_or(b""),
         maps: &maps,
         net: None,
+        sandbox: None,
+        mounts: &[],
+        log_fd: None,
     };
     supervise(&spec)
 }
@@ -314,4 +321,87 @@ fn fail(msg: &str) -> i32 {
     eprint(msg.as_bytes());
     eprint(b"\n");
     125
+}
+
+/// Dev check of pod semantics: two containers in one sandbox share localhost, the hostname and
+/// a volume, but not their pid namespaces.
+fn pod_demo(mut args: Args) -> i32 {
+    let Some(image) = args.next().and_then(utf8) else {
+        eprint(b"usage: kr ctr pod-demo <image with busybox httpd/wget>\n");
+        return 2;
+    };
+    let store = match open_store() {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    if store.image(&image).is_none() {
+        let (s, i) = (store.clone(), image.clone());
+        if let Err(e) = kr_rt::exec::block_on(async move { kr_runtime::pull::pull(&s, &i).await }) {
+            return fail(&format!("pull: {e:?}"));
+        }
+    }
+    let Some((_, _, mut rootfs)) = store.image(&image) else { return fail("image vanished") };
+    rootfs.pop();
+    let maps = IdMaps::for_current_user();
+    let id = container_id();
+    let sb = match container::start_sandbox(id.as_bytes(), b"demo-pod", &maps, None) {
+        Ok(s) => s,
+        Err(e) => return fail(&format!("sandbox: {}: errno {}", e.step, e.errno.0)),
+    };
+    let vol = format!("{}/containers/{id}-vol", store.root());
+    let _ = ns::mkdir(&nul(vol.as_bytes()), 0o755);
+    let mounts = [Mount { source: vol.clone().into_bytes(), target: b"/shared".to_vec(), readonly: false }];
+    let env = [DEFAULT_PATH.as_bytes().to_vec()];
+    let mk = |name: &str, argv: &[&str]| -> (String, Vec<Vec<u8>>) {
+        (format!("{id}-{name}"), argv.iter().map(|a| a.as_bytes().to_vec()).collect())
+    };
+    let (id1, argv1) = mk("server", &["sh", "-c", "echo \"hello from $(hostname), server pid $$\" > /shared/index.html; exec httpd -f -p 127.0.0.1:8080 -h /shared"]);
+    let (id2, argv2) = mk("client", &["sh", "-c", "sleep 0.3; wget -qO- http://127.0.0.1:8080/; echo \"client: hostname $(hostname), pid $$, sees $(ls /proc | grep -c '^[0-9]') processes\""]);
+    let mut dirs = Vec::new();
+    let mut started = Vec::new();
+    for (cid, argv) in [(&id1, &argv1), (&id2, &argv2)] {
+        let d = match store.create_container(cid) {
+            Ok(d) => d,
+            Err(e) => return fail(&format!("create container: {e:?}")),
+        };
+        let spec = RunSpec {
+            rootfs: &rootfs,
+            upper: d.upper.as_bytes(),
+            work: d.work.as_bytes(),
+            merged: d.merged.as_bytes(),
+            argv,
+            env: &env,
+            cwd: b"/",
+            hostname: b"",
+            id: cid.as_bytes(),
+            limits: Limits::default(),
+            user: b"",
+            maps: &maps,
+            net: None,
+            sandbox: Some(&sb),
+            mounts: &mounts,
+            log_fd: None,
+        };
+        match container::start(&spec) {
+            Ok(r) => started.push(r),
+            Err(e) => return fail(&format!("{cid}: {}: errno {}", e.step, e.errno.0)),
+        }
+        dirs.push(cid.clone());
+    }
+    let client = started.pop().unwrap();
+    let server = started.pop().unwrap();
+    let code = kr_rt::exec::block_on(async move {
+        let r = client.wait().await;
+        let _ = server.signaller().send(ns::SIGKILL);
+        let _ = server.wait().await;
+        r
+    });
+    sb.stop();
+    let _ = maps.run_as_root(|| {
+        dirs.iter().all(|d| store.delete_container(d).is_ok()) && {
+            let (parent, name) = vol.rsplit_once('/').unwrap_or((".", vol.as_str()));
+            ns::open(&nul(parent.as_bytes()), ns::O_RDONLY | ns::O_DIRECTORY, 0).is_ok_and(|fd| kr_sys::fs::remove_all(fd.raw(), &nul(name.as_bytes())).is_ok())
+        }
+    });
+    report(code)
 }

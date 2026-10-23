@@ -1,0 +1,12 @@
+[package]
+name = "kr-kubelet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kr-sys = { path = "../kr-sys" }
+kr-rt = { path = "../kr-rt" }
+kr-fmt = { path = "../kr-fmt" }
+kr-apiserver = { path = "../kr-apiserver" }
+kr-runtime = { path = "../kr-runtime" }

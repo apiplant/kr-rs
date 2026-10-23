@@ -7,8 +7,10 @@ name = "kr"
 version = "0.0.1"
 dependencies = [
  "kr-apiserver",
+ "kr-controllers",
  "kr-crypto",
  "kr-fmt",
+ "kr-kubelet",
  "kr-rt",
  "kr-runtime",
  "kr-store",
@@ -32,6 +34,16 @@ name = "kr-archive"
 version = "0.0.1"
 
 [[package]]
+name = "kr-controllers"
+version = "0.0.1"
+dependencies = [
+ "kr-apiserver",
+ "kr-fmt",
+ "kr-rt",
+ "kr-store",
+]
+
+[[package]]
 name = "kr-crypto"
 version = "0.0.1"
 dependencies = [
@@ -41,6 +53,17 @@ dependencies = [
 [[package]]
 name = "kr-fmt"
 version = "0.0.1"
+
+[[package]]
+name = "kr-kubelet"
+version = "0.0.1"
+dependencies = [
+ "kr-apiserver",
+ "kr-fmt",
+ "kr-rt",
+ "kr-runtime",
+ "kr-sys",
+]
 
 [[package]]
 name = "kr-net"

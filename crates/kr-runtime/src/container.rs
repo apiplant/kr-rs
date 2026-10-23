@@ -43,8 +43,111 @@ pub struct RunSpec<'a> {
     pub user: &'a [u8],
     /// User-namespace id mapping (see `IdMaps::for_current_user`).
     pub maps: &'a IdMaps,
-    /// Bridge networking (root only); None keeps a loopback-only netns.
+    /// Bridge networking (root only); None keeps a loopback-only netns. Ignored in a sandbox.
     pub net: Option<NetConfig>,
+    /// Join this pod sandbox's user/net/uts/ipc namespaces instead of creating them.
+    pub sandbox: Option<&'a Sandbox>,
+    /// Bind mounts (volumes), applied inside the container root after pivot_root.
+    pub mounts: &'a [Mount],
+    /// If set, stdout and stderr go to this fd and stdin is /dev/null (else inherited).
+    pub log_fd: Option<i32>,
+}
+
+/// A bind mount of a host path into the container.
+#[derive(Clone, Debug)]
+pub struct Mount {
+    /// Absolute host path (directory or file).
+    pub source: Vec<u8>,
+    /// Absolute path inside the container; must not traverse symlinks.
+    pub target: Vec<u8>,
+    pub readonly: bool,
+}
+
+/// A pod sandbox: a parked process owning the pod's user, network, UTS and IPC namespaces.
+/// Containers of the pod join these and get their own mount/pid/cgroup namespaces.
+pub struct Sandbox {
+    pub pid: i32,
+    pidfd: Fd,
+}
+
+impl Sandbox {
+    /// Kills and reaps the sandbox (its namespaces disappear with the last member).
+    pub fn stop(&self) {
+        let _ = ns::pidfd_send_signal(&self.pidfd, ns::SIGKILL);
+        let _ = ns::wait4(self.pid);
+    }
+
+    pub fn is_alive(&self) -> bool {
+        matches!(ns::pidfd_try_wait(&self.pidfd), Ok(None))
+    }
+}
+
+/// Starts a pod sandbox. `net` (root only) attaches it to the bridge with that address.
+pub fn start_sandbox(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>) -> Result<Sandbox, RunError> {
+    let (go_r, go_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
+    let (rep_r, rep_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
+    let (uid, gid) = (ns::getuid(), ns::getgid());
+    let mut pidfd: i32 = -1;
+    let mut args = CloneArgs {
+        flags: ns::CLONE_NEWUSER | ns::CLONE_NEWNET | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC | ns::CLONE_PIDFD,
+        exit_signal: ns::SIGCHLD as u64,
+        ..Default::default()
+    };
+    args.pidfd = &mut pidfd as *mut i32 as u64;
+    // SAFETY: single-threaded runtime (ADR-005).
+    let pid = unsafe { ns::clone3(&mut args) }.map_err(err("clone3 sandbox"))?;
+    if pid == 0 {
+        drop(go_w);
+        drop(rep_r);
+        let _ = ns::sigmask_reset();
+        let _ = ns::prctl(ns::PR_SET_PDEATHSIG, ns::SIGKILL as usize);
+        let mut b = [0u8; 1];
+        if read_full(&go_r, &mut b) != 1 {
+            kr_sys::exit_group(1);
+        }
+        let r = (|| -> Result<(), (u8, Errno)> {
+            ns::link_up(b"lo").map_err(|e| (19, e))?;
+            if let Some(n) = &net {
+                network::configure_child(n).map_err(|e| (23, e))?;
+            }
+            if !hostname.is_empty() {
+                ns::sethostname(hostname).map_err(|e| (11, e))?;
+            }
+            Ok(())
+        })();
+        if let Err((step, e)) = r {
+            let _ = kr_sys::write(rep_w.raw(), &[step, e.0 as u8, (e.0 >> 8) as u8]);
+            kr_sys::exit_group(127);
+        }
+        drop(rep_w);
+        drop(go_r);
+        // Never execs: drop every inherited descriptor (sockets, store files) explicitly.
+        ns::close_from(3);
+        ns::pause_forever();
+    }
+    drop(go_r);
+    drop(rep_w);
+    let sb = Sandbox { pid, pidfd: Fd(pidfd) };
+    let fail = |e: RunError| {
+        sb.stop();
+        Err(e)
+    };
+    if let Err(e) = maps.apply(pid, uid, gid) {
+        return fail(e);
+    }
+    if net.is_some() {
+        if let Err(e) = network::attach(pid, id) {
+            return fail(RunError { step: "attach network", errno: e });
+        }
+    }
+    let _ = kr_sys::write(go_w.raw(), b"g");
+    drop(go_w);
+    let mut rep = [0u8; 3];
+    if read_full(&rep_r, &mut rep) == 3 {
+        let step = STEPS.get(rep[0] as usize).copied().unwrap_or("unknown");
+        return fail(RunError { step, errno: Errno(rep[1] as i32 | (rep[2] as i32) << 8) });
+    }
+    Ok(sb)
 }
 
 /// Outcome of a container run.
@@ -92,6 +195,9 @@ const STEPS: &[&str] = &[
     "resolve user",
     "set user",
     "configure eth0",
+    "join sandbox",
+    "volume mount",
+    "stdio",
 ];
 
 /// NUL-terminated concatenation of `parts`.
@@ -187,6 +293,10 @@ pub fn start(spec: &RunSpec) -> Result<Running, RunError> {
         Some(Cgroup::create(spec.id, &spec.limits).map_err(err("create cgroup (is kr in a delegated cgroup? try systemd-run --user --scope -p Delegate=yes)"))?)
     };
 
+    if let Some(sb) = spec.sandbox {
+        return start_in_sandbox(spec, sb, cgroup, rootless(uid), full_map);
+    }
+
     let mut args = CloneArgs {
         flags: ns::CLONE_NEWUSER
             | ns::CLONE_NEWNS
@@ -219,7 +329,7 @@ pub fn start(spec: &RunSpec) -> Result<Running, RunError> {
     if pid == 0 {
         drop(go_w);
         drop(rep_r);
-        let (step, e) = child(spec, &go_r, rootless(uid), full_map);
+        let (step, e) = child(spec, &go_r, rootless(uid), full_map, false);
         let _ = kr_sys::write(rep_w.raw(), &[step, e.0 as u8, (e.0 >> 8) as u8]);
         kr_sys::exit_group(127);
     }
@@ -458,7 +568,169 @@ fn fmt_u32(mut n: u32) -> Vec<u8> {
 }
 
 /// Child side. Only returns on failure, with (step index, errno).
-fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool) -> (u8, Errno) {
+/// Container start inside a sandbox: a helper process joins the sandbox namespaces, then clones
+/// the container (new mount/pid/cgroup namespaces) as kr's own child via CLONE_PARENT and
+/// reports its pid. kr then supervises it with a pidfd exactly like a standalone container.
+fn start_in_sandbox(spec: &RunSpec, sb: &Sandbox, cgroup: Option<Cgroup>, rootless: bool, full_map: bool) -> Result<Running, RunError> {
+    let (go_r, go_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
+    let (rep_r, rep_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
+    let (pid_r, pid_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
+    let cleanup = |cg: &Option<Cgroup>| {
+        if let Some(c) = cg {
+            c.remove();
+        }
+    };
+    let mut hargs = CloneArgs { exit_signal: ns::SIGCHLD as u64, ..Default::default() };
+    // SAFETY: single-threaded runtime (ADR-005).
+    let helper = match unsafe { ns::clone3(&mut hargs) } {
+        Ok(p) => p,
+        Err(e) => {
+            cleanup(&cgroup);
+            return Err(RunError { step: "clone3 helper", errno: e });
+        }
+    };
+    if helper == 0 {
+        drop(go_w);
+        drop(rep_r);
+        drop(pid_r);
+        if let Err(e) = ns::setns(&sb.pidfd, ns::CLONE_NEWUSER | ns::CLONE_NEWNET | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC) {
+            report_exit(&rep_w, 24, e);
+        }
+        let mut args = CloneArgs { flags: ns::CLONE_NEWNS | ns::CLONE_NEWPID | ns::CLONE_NEWCGROUP | ns::CLONE_PARENT, ..Default::default() };
+        // clone3 rejects exit_signal with CLONE_PARENT; the child inherits ours (SIGCHLD), so kr
+        // (its new parent) is notified and can reap it.
+        if let Some(cg) = &cgroup {
+            args.flags |= ns::CLONE_INTO_CGROUP;
+            args.cgroup = cg.dir.raw() as u64;
+        }
+        // SAFETY: the helper is single-threaded too.
+        match unsafe { ns::clone3(&mut args) } {
+            Ok(0) => {
+                drop(pid_w);
+                let (step, e) = child(spec, &go_r, rootless, full_map, true);
+                let _ = kr_sys::write(rep_w.raw(), &[step, e.0 as u8, (e.0 >> 8) as u8]);
+                kr_sys::exit_group(127);
+            }
+            Ok(pid) => {
+                let _ = kr_sys::write(pid_w.raw(), &(pid as u32).to_le_bytes());
+                kr_sys::exit_group(0);
+            }
+            Err(e) => report_exit(&rep_w, 24, e),
+        }
+    }
+    drop(go_r);
+    drop(rep_w);
+    drop(pid_w);
+    let _ = ns::wait4(helper);
+    let mut pb = [0u8; 4];
+    if read_full(&pid_r, &mut pb) != 4 {
+        let mut rep = [0u8; 3];
+        let e = if read_full(&rep_r, &mut rep) == 3 {
+            RunError { step: STEPS.get(rep[0] as usize).copied().unwrap_or("unknown"), errno: Errno(rep[1] as i32 | (rep[2] as i32) << 8) }
+        } else {
+            RunError { step: "join sandbox", errno: Errno(5) }
+        };
+        cleanup(&cgroup);
+        return Err(e);
+    }
+    let pid = u32::from_le_bytes(pb) as i32;
+    // The container is our child (CLONE_PARENT) and unreaped, so the pid cannot be recycled.
+    let pidfd = match ns::pidfd_open(pid) {
+        Ok(fd) => fd,
+        Err(e) => {
+            let _ = ns::kill(pid, ns::SIGKILL);
+            let _ = ns::wait4(pid);
+            cleanup(&cgroup);
+            return Err(RunError { step: "pidfd_open", errno: e });
+        }
+    };
+    let running = Running { pid, pidfd: Rc::new(pidfd), cgroup };
+    let _ = kr_sys::write(go_w.raw(), b"g");
+    drop(go_w);
+    let mut rep = [0u8; 3];
+    if read_full(&rep_r, &mut rep) == 3 {
+        let _ = ns::wait4(pid);
+        running.finish();
+        let step = STEPS.get(rep[0] as usize).copied().unwrap_or("unknown");
+        return Err(RunError { step, errno: Errno(rep[1] as i32 | (rep[2] as i32) << 8) });
+    }
+    Ok(running)
+}
+
+/// Child side of a setup failure: report (step, errno) to the parent and exit.
+fn report_exit(rep: &Fd, step: u8, e: Errno) -> ! {
+    let _ = kr_sys::write(rep.raw(), &[step, e.0 as u8, (e.0 >> 8) as u8]);
+    kr_sys::exit_group(127)
+}
+
+/// Opens (creating as needed) `path` inside the current root as an O_PATH fd, refusing
+/// symlinks in every component so an image cannot redirect a volume mount.
+fn open_mount_target(path: &[u8], dir: bool) -> Result<Fd, Errno> {
+    use kr_sys::fs;
+    let comps: Vec<&[u8]> = path.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+    if comps.iter().any(|c| *c == b"." || *c == b"..") {
+        return Err(Errno(22));
+    }
+    let how = |flags: i32| fs::OpenHow { flags: (flags | fs::O_PATH | kr_sys::O_CLOEXEC) as u64, mode: 0, resolve: fs::RESOLVE_NO_SYMLINKS | fs::RESOLVE_NO_MAGICLINKS | fs::RESOLVE_BENEATH };
+    // The root itself is opened plainly (RESOLVE_BENEATH rejects absolute paths); every
+    // component below it is resolved strictly.
+    let mut cur = ns::open(b"/\0", fs::O_PATH | ns::O_DIRECTORY, 0)?;
+    for (i, c) in comps.iter().enumerate() {
+        let last = i + 1 == comps.len();
+        let name = cstr(&[c]);
+        if last && !dir {
+            match fs::openat(cur.raw(), &name, ns::O_WRONLY | ns::O_CREAT | fs::O_NOFOLLOW | kr_sys::O_CLOEXEC, 0o644) {
+                Ok(_) | Err(Errno(21)) | Err(Errno(26)) => {}
+                Err(e) => return Err(e),
+            }
+            return fs::openat2(cur.raw(), &name, &how(0));
+        }
+        match fs::mkdirat(cur.raw(), &name, 0o755) {
+            Ok(()) | Err(Errno(17)) => {}
+            Err(e) => return Err(e),
+        }
+        cur = fs::openat2(cur.raw(), &name, &how(fs::O_DIRECTORY))?;
+    }
+    Ok(cur)
+}
+
+/// Bind-mounts each volume from the old root (still attached at /.oldroot).
+fn mount_volumes(mounts: &[Mount]) -> Result<(), Errno> {
+    for m in mounts {
+        if m.source.first() != Some(&b'/') || m.target.first() != Some(&b'/') {
+            return Err(Errno(22));
+        }
+        let src = cstr(&[b"/.oldroot", &m.source]);
+        let is_dir = ns::open(&src, ns::O_RDONLY | ns::O_DIRECTORY, 0).is_ok();
+        let target = open_mount_target(&m.target, is_dir)?;
+        let mut fdpath = b"/proc/self/fd/".to_vec();
+        fdpath.extend_from_slice(&fmt_u32(target.raw() as u32));
+        fdpath.push(0);
+        ns::mount(Some(&src), &fdpath, None, ns::MS_BIND | ns::MS_REC, None)?;
+        if m.readonly {
+            // In a user namespace the remount must repeat every flag the source mount locks
+            // (nosuid/nodev/noexec and the atime mode), so carry over what fstatfs reports.
+            // `target` (and its magic link) still name the directory *under* the new mount;
+            // resolving the path again by name crosses into the mount we just made.
+            let mounted = open_mount_target(&m.target, is_dir)?;
+            let mut mpath = b"/proc/self/fd/".to_vec();
+            mpath.extend_from_slice(&fmt_u32(mounted.raw() as u32));
+            mpath.push(0);
+            let fdpath = mpath;
+            let st = ns::fstatfs_flags(mounted.raw())?;
+            let mut flags = ns::MS_BIND | ns::MS_REMOUNT | ns::MS_RDONLY;
+            for (stf, msf) in [(2u64, ns::MS_NOSUID), (4, ns::MS_NODEV), (8, ns::MS_NOEXEC), (1024, 1024usize), (2048, 2048), (4096, 1 << 21)] {
+                if st & stf != 0 {
+                    flags |= msf;
+                }
+            }
+            ns::mount(None, &fdpath, None, flags, None)?;
+        }
+    }
+    Ok(())
+}
+
+fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bool) -> (u8, Errno) {
     macro_rules! step {
         ($i:expr, $e:expr) => {
             if let Err(e) = $e {
@@ -468,6 +740,18 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool) -> (u8, Errno)
     }
     // The supervisor blocks signals it reads through a signalfd; the mask would survive execve.
     let _ = ns::sigmask_reset();
+    if let Some(fd) = spec.log_fd {
+        // Opened before pivot_root: /dev/null of the host.
+        let null = match ns::open(b"/dev/null\0", ns::O_RDONLY, 0) {
+            Ok(n) => n,
+            Err(e) => return (26, e),
+        };
+        for (src, dst) in [(null.raw(), 0), (fd, 1), (fd, 2)] {
+            if let Err(e) = ns::dup_to(src, dst) {
+                return (26, e);
+            }
+        }
+    }
     // Die with the parent rather than linger as an orphaned pid-1.
     let _ = ns::prctl(ns::PR_SET_PDEATHSIG, ns::SIGKILL as usize);
     let mut b = [0u8; 1];
@@ -513,16 +797,19 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool) -> (u8, Errno)
         }
     }
 
+    step!(25, mount_volumes(spec.mounts));
     step!(10, ns::umount2(b"/.oldroot\0", ns::MNT_DETACH));
     let _ = ns::rmdir(b"/.oldroot\0");
 
-    step!(19, ns::link_up(b"lo"));
-    if let Some(net) = &spec.net {
-        step!(23, network::configure_child(net));
-    }
-
-    if !spec.hostname.is_empty() {
-        step!(11, ns::sethostname(spec.hostname));
+    // In a sandbox, loopback, eth0 and the hostname belong to the sandbox.
+    if !in_sandbox {
+        step!(19, ns::link_up(b"lo"));
+        if let Some(net) = &spec.net {
+            step!(23, network::configure_child(net));
+        }
+        if !spec.hostname.is_empty() {
+            step!(11, ns::sethostname(spec.hostname));
+        }
     }
     let cwd = if spec.cwd.is_empty() { cstr(&[b"/"]) } else { cstr(&[spec.cwd]) };
     step!(12, ns::chdir(&cwd));
