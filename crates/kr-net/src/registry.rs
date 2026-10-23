@@ -1,7 +1,7 @@
 //! OCI distribution (registry v2) client: image references, manifests, blobs, bearer auth.
 //!
-//! Only plain-HTTP registries work until TLS lands (ADR-013): loopback hosts default to
-//! `http`, everything else to `https` (which currently fails with `TlsUnsupported`).
+//! Loopback hosts default to plain `http` (local dev registries), everything else uses `https`
+//! through whatever [`Connector`] the client has (`tls::TlsConnector` in kr).
 
 use crate::http1::url::Url;
 use crate::http1::{Client, Connector, Response, TcpConnector, Transport};
@@ -443,6 +443,7 @@ pub struct Registry<C: Connector = TcpConnector> {
     /// Bearer tokens keyed by `registry/repository`.
     tokens: Vec<(String, String)>,
     plain_http: Vec<String>,
+    tls_loopback: bool,
     os: String,
     arch: String,
 }
@@ -470,7 +471,12 @@ fn is_loopback_host(hostport: &str) -> bool {
 
 impl<C: Connector> Registry<C> {
     pub fn with_client(http: Client<C>) -> Self {
-        Registry { http, tokens: Vec::new(), plain_http: Vec::new(), os: "linux".to_string(), arch: target_arch().to_string() }
+        Registry { http, tokens: Vec::new(), plain_http: Vec::new(), tls_loopback: false, os: "linux".to_string(), arch: target_arch().to_string() }
+    }
+
+    /// Uses https for loopback registries too (e.g. a local registry with its own CA).
+    pub fn tls_for_loopback(&mut self) {
+        self.tls_loopback = true;
     }
 
     /// Allows plain HTTP for a non-loopback registry (`host[:port]`), like docker's insecure list.
@@ -485,7 +491,7 @@ impl<C: Connector> Registry<C> {
     }
 
     fn base(&self, r: &Reference) -> String {
-        let plain = is_loopback_host(&r.registry) || self.plain_http.contains(&r.registry);
+        let plain = (is_loopback_host(&r.registry) && !self.tls_loopback) || self.plain_http.contains(&r.registry);
         format!("{}://{}", if plain { "http" } else { "https" }, r.endpoint())
     }
 

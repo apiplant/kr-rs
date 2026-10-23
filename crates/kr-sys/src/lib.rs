@@ -59,6 +59,7 @@ mod nr {
     pub const CONNECT: usize = 42;
     pub const GETSOCKOPT: usize = 55;
     pub const OPENAT: usize = 257;
+    pub const GETRANDOM: usize = 318;
     pub const BIND: usize = 49;
     pub const SHUTDOWN: usize = 48;
     pub const PIPE2: usize = 293;
@@ -83,6 +84,7 @@ mod nr {
     pub const CONNECT: usize = 203;
     pub const GETSOCKOPT: usize = 209;
     pub const OPENAT: usize = 56;
+    pub const GETRANDOM: usize = 278;
     pub const BIND: usize = 200;
     pub const SHUTDOWN: usize = 210;
     pub const PIPE2: usize = 59;
@@ -278,6 +280,20 @@ pub struct Timespec {
 }
 
 // ---- typed wrappers ----
+
+/// Fills `buf` from the kernel CSPRNG (blocks only until the pool is initialised at boot).
+pub fn getrandom(buf: &mut [u8]) {
+    let mut done = 0;
+    while done < buf.len() {
+        // SAFETY: the pointer/length pair describes the writable remainder of `buf`.
+        match check(unsafe { syscall3(nr::GETRANDOM, buf[done..].as_mut_ptr() as usize, buf.len() - done, 0) }) {
+            Ok(n) => done += n,
+            Err(Errno(EINTR)) => {}
+            // No usable randomness means no safe keys: stop rather than continue weakly.
+            Err(_) => exit_group(134),
+        }
+    }
+}
 
 pub fn read(fd: i32, buf: &mut [u8]) -> Result<usize> {
     // SAFETY: buf is a valid writable region of buf.len() bytes.

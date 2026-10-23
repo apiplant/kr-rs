@@ -82,10 +82,10 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
 
 25. **No DNS: only IP literals, `/etc/hosts` and a built-in `localhost`** — *open (kr-net)*
     The `Resolver` trait is the extension point; implement a UDP/TCP DNS resolver later. IPv6 zone ids (`fe80::1%eth0`) are not parsed, and `/etc/hosts` is read once when the connector is created.
-26. **TLS is not implemented; `https` URLs fail with `Error::TlsUnsupported`** — *open (kr-crypto)*
-    This includes docker.io and any redirect from a plain-HTTP registry to a CDN over https. Only loopback or explicitly allowed (`Registry::allow_plain_http`) registries work.
-27. **Interim SHA-256 in `kr-net/src/sha256.rs`** — *open (kr-crypto)*
-    A small, non-constant-time FIPS 180-4 implementation, tested against the standard vectors. `kr-crypto` must replace it and `kr-net` should then re-export the new one.
+26. **TLS is not implemented; `https` URLs fail with `Error::TlsUnsupported`** — *fixed (ADR-020)*
+    `kr-net::tls::TlsConnector` serves `https`, and image pulls use it. Trust anchors come from `KR_CA_BUNDLE` or the system bundle.
+27. **Interim SHA-256 in `kr-net/src/sha256.rs`** — *fixed*
+    It now re-exports `kr_crypto::sha2`.
 28. **HTTP/1.1 client limits** — *accepted*
     No request body streaming (the body is a `&[u8]`; `body::encode_chunk` exists but the client does not send chunked requests), no proxies, no `Expect: 100-continue`, no response decompression (`Accept-Encoding: identity` is sent), no HTTP/1.0 keep-alive negotiation beyond `Connection: keep-alive`. Responses with `Transfer-Encoding` AND `Content-Length` are rejected rather than handled per the RFC's "TE wins" rule.
 29. **Bare LF line endings are rejected, even though RFC 9112 allows recipients to accept them** — *accepted*
@@ -158,5 +158,29 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
 
 52. **`_Unwind_Resume` and `rust_eh_personality` are stubbed** — *accepted*
     The precompiled `core`/`alloc` contain landing pads, and with panic=abort they are never reached. Proper fix: `-Zbuild-std=core,alloc` with `panic_immediate_abort`, which also shrinks the binary.
-53. **The binary grew to 282 KB** — *watch*
-    The growth comes from `core::fmt` (`format!`/`{:?}`), JSON and the store. That is still far under the 2 MB agent budget. Avoid `{:?}` on hot or large types.
+53. **Binary size** — *watch*
+    The binary is 395 KB with TLS, X.509 and the crypto suite included. That is still far under the 2 MB agent budget. Avoid `{:?}` on hot or large types.
+
+## kr-crypto / TLS (ADR-020)
+
+54. **Constant-time AES-GCM is slow (~3.5 MB/s)** — *accepted for now*
+    Bitsliced and table-free; TLS prefers ChaCha20-Poly1305 (~260 MB/s), so AES is only used when a peer offers nothing else.
+    Fix: process 4 CTR blocks per pass in `u64` planes (about 4x faster). AES-NI would need `unsafe`, which kr-crypto forbids.
+55. **No RSA signature verification** — *open, blocks public registries*
+    Docker Hub and most public CAs use RSA chains, so `kr ctr pull docker.io/...` fails certificate verification even with the system bundle.
+    Plan: PKCS#1 v1.5 and PSS verification (public-key operations only, so variable time is acceptable).
+56. **No DNS resolver** — *open, blocks public registries*
+    `tcp::HostsResolver` only knows IP literals and `/etc/hosts`.
+    Plan: a small async stub resolver (A/AAAA over UDP, falling back to TCP) reading `/etc/resolv.conf`. It is also the base for cluster DNS.
+57. **TLS feature gaps** — *accepted*
+    - As a server, no HelloRetryRequest: clients must offer an X25519 or P-256 key share up front. Go, OpenSSL and curl all do.
+    - No TLS 1.2, no PSK/resumption, no 0-RTT, and no NewSessionTicket sent.
+    - Only the SHA-256 suites (AES-128-GCM, ChaCha20-Poly1305).
+    - As a client, HRR to P-256 is supported but cookies are not.
+58. **Constant-time behaviour is by construction, not yet measured** — *open*
+    The plan's dudect-style timing checks on x25519, P-256 signing, Ed25519 signing and the AEADs are still to do (phase 6 fuzz/timing harness).
+59. **Secret wiping is best-effort** — *accepted*
+    `wipe` plus `black_box` zeroes keys on drop, but copies made by moves and by register spills are not tracked (no `unsafe`/volatile).
+60. **P-256 scalar multiplication is a plain ladder (~0.8 ms sign, ~1.5 ms verify)** — *watch*
+    That is fine per handshake. Fixed-base tables would speed up the apiserver when there are many clients.
+

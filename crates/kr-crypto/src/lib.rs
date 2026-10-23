@@ -19,6 +19,7 @@ pub mod field25519;
 pub mod hmac;
 pub mod p256;
 pub mod sha2;
+pub mod tls;
 pub mod x25519;
 pub mod x509;
 

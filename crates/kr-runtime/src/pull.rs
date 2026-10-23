@@ -4,7 +4,9 @@ use crate::unpack::{unpack_layer_fd, Limits, Stats};
 use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
+use kr_net::http1::{Client, Config};
 use kr_net::registry::{Descriptor, Reference, Registry};
+use kr_net::tls::TlsConnector;
 use kr_sys::fs::{self, AT_FDCWD};
 use kr_sys::Errno;
 
@@ -13,6 +15,30 @@ const MAX_CONFIG: u64 = 4 << 20;
 
 /// Pulls `image_ref` into `store` and returns its id. Returns immediately when the reference is
 /// already present. Blobs already in the store are re-verified instead of downloaded again.
+/// Default system trust store locations (Debian/Arch/Alpine, then Fedora/RHEL).
+const SYSTEM_BUNDLES: &[&[u8]] = &[b"/etc/ssl/certs/ca-certificates.crt\0", b"/etc/pki/tls/certs/ca-bundle.crt\0"];
+
+/// A registry client over TLS. Trust anchors: `$KR_CA_BUNDLE` (a PEM file; then loopback
+/// registries also use https), else the system bundle if present.
+fn registry() -> Result<Registry<TlsConnector>> {
+    let custom = crate::store::env_var("KR_CA_BUNDLE");
+    let pem = match &custom {
+        Some(path) => {
+            let mut p = path.as_bytes().to_vec();
+            p.push(0);
+            fs::read_file(&p, 4 << 20).map_err(|_| Error::Image("cannot read KR_CA_BUNDLE"))?
+        }
+        None => SYSTEM_BUNDLES.iter().find_map(|p| fs::read_file(p, 4 << 20).ok()).unwrap_or_default(),
+    };
+    let pem = core::str::from_utf8(&pem).map_err(|_| Error::Image("CA bundle is not UTF-8"))?;
+    let connector = TlsConnector::with_roots_pem(pem)?;
+    let mut reg = Registry::with_client(Client::with_connector(connector, Config::default()));
+    if custom.is_some() {
+        reg.tls_for_loopback();
+    }
+    Ok(reg)
+}
+
 pub async fn pull(store: &Store, image_ref: &str) -> Result<ImageId> {
     pull_with(store, image_ref, &Limits::default()).await
 }
@@ -25,7 +51,7 @@ pub async fn pull_with(store: &Store, image_ref: &str, limits: &Limits) -> Resul
         }
     }
     let r = Reference::parse(image_ref)?;
-    let mut reg = Registry::new();
+    let mut reg = registry()?;
     let image = reg.resolve(&r).await?;
     if image.manifest.layers.len() > MAX_LAYERS {
         return Err(Error::Image("too many layers"));
@@ -101,7 +127,7 @@ fn build_rootfs(store: &Store, layers: &[Descriptor], gz: &[bool], tmp: &str, li
 }
 
 /// Makes sure the blob is in the store, downloading and verifying it if absent or corrupt.
-async fn ensure_blob(store: &Store, reg: &mut Registry, r: &Reference, d: &Descriptor) -> Result<()> {
+async fn ensure_blob(store: &Store, reg: &mut Registry<TlsConnector>, r: &Reference, d: &Descriptor) -> Result<()> {
     if !d.digest.is_sha256() {
         return Err(Error::Net(kr_net::Error::UnsupportedDigest));
     }

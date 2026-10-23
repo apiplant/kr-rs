@@ -16,6 +16,7 @@ pub mod nft;
 pub mod registry;
 pub mod sha256;
 pub mod tcp;
+pub mod tls;
 
 use kr_sys::Errno;
 
@@ -28,8 +29,10 @@ pub enum Error {
     Timeout,
     /// Name resolution failed (only literals and `/etc/hosts` are supported).
     Resolve,
-    /// An `https` URL was requested but no TLS connector exists yet.
+    /// An `https` URL was requested from a plain-TCP connector (use `tls::TlsConnector`).
     TlsUnsupported,
+    /// The TLS handshake or record layer failed.
+    Tls(kr_crypto::tls::Error),
     BadUrl(&'static str),
     /// Malformed HTTP syntax.
     Parse(&'static str),
