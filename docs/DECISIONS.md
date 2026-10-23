@@ -147,3 +147,12 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 
 **Runtime test support:** `kr-rt` has a `host` feature that removes `_start`, `kr_rt_start`, the panic handler, the global allocator and the `mem*` symbols, so the executor can run under the std test harness. `kr-net` enables it only through `[dev-dependencies]`, so release builds of `kr` are unaffected. Since the executor is single-threaded and global, tests serialise `block_on` calls with a mutex. Do not enable `host` in a shipped binary.
 **Status:** accepted.
+
+## ADR-016: Rootless-first runtime using kernel isolation; qemu only for privileged paths
+`kr-runtime` isolates containers with kernel primitives directly: no podman/runc, consistent with ADR-007.
+- A **user namespace** is created first, unprivileged. Inside it we are uid 0 and can create mount, pid, net, uts, ipc and cgroup namespaces, mount overlayfs (Linux ≥ 5.11) and call `pivot_root`.
+- **cgroup v2** limits go through a delegated subtree: `systemd-run --user --scope -p Delegate=yes` in dev, and the agent's own systemd unit (`Delegate=yes`) in production. The controllers available rootless are cpu, memory and pids. io and cpuset need a root agent.
+- **seccomp** (a BPF filter plus `NO_NEW_PRIVS`) and capability dropping need no privileges.
+- Tests run rootless on the dev box, so there is no sudo and no VM in the normal loop. A throwaway **qemu VM** is used only for paths that need real root: host-level network setup (bridge, veth to host, nftables), the io/cpuset controllers, and running as a root agent.
+**Verified on the dev box (2026-10-23):** user+mount+pid namespaces, overlayfs inside a userns, netns creation, and cgroup delegation via systemd-run all work unprivileged.
+**Status:** accepted.
