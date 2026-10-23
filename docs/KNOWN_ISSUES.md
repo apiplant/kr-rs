@@ -194,3 +194,21 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
 62. **Pull speed is network-bound** — *note*
     kr's HTTPS download matches curl on the same file (2.5 s vs 2.2 s for 3.5 MB on this link). Layers are fetched sequentially; parallel layer downloads would help on high-latency links.
 
+## Control plane (ADR-021)
+
+63. **No typed schemas or defaulting** — *open*
+    - kr accepts unknown fields even with `fieldValidation=Strict`.
+    - kind-specific defaults (e.g. `strategy`, `imagePullPolicy`) and per-kind validation are missing.
+    - Plan: generate schemas from the upstream OpenAPI, as the protobuf table does.
+64. **RBAC not implemented** — *open*
+    Only `system:masters` is authorized; there are no ServiceAccount tokens or bootstrap tokens yet. Needed before agents join.
+65. **Server-side apply is approximate** — *open*
+    `application/apply-patch+yaml` is treated as create-or-strategic-merge: there are no managedFields, no field ownership and no conflict detection. Client-side `kubectl apply` is fully supported.
+66. **Watch history is not persisted** — *accepted*
+    After a restart, watching from an older resourceVersion returns 410 and clients relist, which is standard Kubernetes recovery.
+67. **No aggregated discovery, no HTTP/2, no OpenAPI schemas** — *accepted for now*
+    kubectl falls back to legacy discovery and HTTP/1.1. `kubectl explain` does not work.
+68. **Namespace deletion is synchronous** — *accepted*
+    Contents are deleted inline rather than by a namespace controller, and finalizers inside the namespace are not honoured during this cascade.
+69. **No garbage collection by ownerReferences** — *open (controllers, phase 4)*
+

@@ -249,3 +249,28 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **CLI:** `kr pki ca|issue` creates the cluster CA and certificates.
 
 **Status:** accepted.
+
+## ADR-021: kr-store and the API server
+**Context:** phase 3 needs a datastore and an API server that stock kubectl accepts, while staying within the memory budget.
+
+**Decision:**
+- **kr-store (replaces etcd):**
+  - An append-only log of CRC-framed records with an in-memory sorted index and global revisions. Revisions are the Kubernetes `resourceVersion`.
+  - Compare-and-swap on mod_rev. Watches replay from bounded history and then run live.
+  - Snapshot plus log compaction. A torn tail is truncated; a mid-log CRC failure is a hard error.
+  - Callers fsync (`sync()`) before acknowledging.
+  - Single-threaded, owned by the API server's executor. Handlers never await mid-transaction, so a read-modify-write is atomic.
+- **kr-apiserver:** generic JSON objects, with the server validating only the fields it relies on: type, metadata, labels/annotations and names.
+  - **Resources:** a static resource table drives discovery, routing, keys (`/registry/<group>/<plural>/[ns/]name`) and the OpenAPI v3 probe surface.
+  - **Patches:** merge patch, JSON patch, and strategic merge patch with a built-in merge-key table.
+  - **Server-side apply** is approximated as create-or-strategic-merge.
+  - **Status/scale:** status and scale subresources; `generation` bumps when `spec` changes.
+  - **Deletes:** finalizer-aware deletes, and synchronous namespace deletion.
+  - **Watches:** chunked NDJSON with selector enter/leave semantics, and 410 for compacted revisions.
+  - **Server-side Table printing:** `kubectl get`.
+- **Lists:** stored JSON is spliced directly into list responses; no decode/encode per item.
+- **Authentication:** TLS client certificates against the cluster CA (CN = user, O = groups). Until RBAC lands, only `system:masters` is authorized.
+- **Bootstrap:** `kr server` creates the CA, the apiserver and admin certificates, and `admin.kubeconfig` on first start.
+- **Protobuf request bodies** (sent by kubectl's typed clients) are decoded with a generated schema table; responses are always JSON.
+
+**Status:** accepted.
