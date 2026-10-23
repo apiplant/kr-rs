@@ -156,3 +156,12 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - Tests run rootless on the dev box, so there is no sudo and no VM in the normal loop. A throwaway **qemu VM** is used only for paths that need real root: host-level network setup (bridge, veth to host, nftables), the io/cpuset controllers, and running as a root agent.
 **Verified on the dev box (2026-10-23):** user+mount+pid namespaces, overlayfs inside a userns, netns creation, and cgroup delegation via systemd-run all work unprivileged.
 **Status:** accepted.
+
+## ADR-017: Flattened per-image rootfs + per-container overlay; safe unpack via openat2
+- Each image's layers are applied in order into one flattened directory: `<root>/images/<config-digest>/rootfs`. Whiteouts are applied by deleting. A container gets an overlay with that directory as `lowerdir` and a private `upper`/`work`, mounted with `userxattr` (ADR-016).
+  **Why:** whiteout char devices (0:0) and `trusted.*` xattrs are not reliably creatable rootless, so flattening sidesteps both. **Cost:** disk space is not shared between images that share base layers (*revisit:* layer-level lowerdirs once running as root).
+- Every filesystem operation during unpack goes through `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)` relative to the rootfs dirfd, so the kernel itself prevents symlink and `..` escapes. The lexical `sanitize()` from kr-archive is a first filter, not the guard.
+- Layers have a decompression-bomb cap: a per-layer uncompressed byte limit and an entry-count limit, configurable with safe defaults.
+- Rootless: device nodes in layers are skipped. uid/gid ownership is not preserved (single-uid mapping). Subuid ranges via `newuidmap` come later.
+- Store root: `$KR_ROOT`, defaulting to `$XDG_DATA_HOME/kr`, then `$HOME/.local/share/kr` when rootless, or `/var/lib/kr` when root.
+**Status:** accepted.

@@ -1,0 +1,12 @@
+[package]
+name = "kr-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kr-sys = { path = "../kr-sys" }
+kr-rt = { path = "../kr-rt" }
+kr-fmt = { path = "../kr-fmt" }
+kr-archive = { path = "../kr-archive" }
+kr-net = { path = "../kr-net" }

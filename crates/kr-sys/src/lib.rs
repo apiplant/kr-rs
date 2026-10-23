@@ -3,6 +3,9 @@
 
 use core::arch::asm;
 
+pub mod fs;
+pub mod ns;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Errno(pub i32);
 
