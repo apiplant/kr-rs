@@ -214,3 +214,25 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
 70. **Conformance gaps** — *open; tracked as C1–C9 in PLAN.md*
     The missing pieces are CRDs, admission webhooks, protobuf responses, typed schemas/OpenAPI, SSA managedFields, and the pod, network and controller surface the e2e suite exercises.
 
+## Node agent and controllers (phase 4)
+
+71. **No probes** — *open*
+    Readiness equals running, and liveness/startup probes are ignored. exec/httpGet/tcpSocket probes are needed (C6).
+72. **No `kubectl logs/exec/attach/port-forward`** — *open (phase 6, C6)*
+    Logs are written to `<root>/pods/<uid>/<container>.log` but are not yet served through the API (the apiserver → kubelet proxy is missing).
+73. **Volume and token gaps** — *open*
+    - projected, downwardAPI and PVC volumes are mounted as empty dirs;
+    - no ServiceAccount token projection;
+    - configMap/secret volumes are written once at pod start (no live updates);
+    - subPath is joined without the upstream symlink-safe resolution, but the target is still resolved without symlinks.
+74. **Rootless pods have no pod IP** — *accepted*
+    Loopback only. Root mode uses the kr0 bridge (verified: nginx reachable at its pod IP).
+75. **Resource requests are not enforced** — *open*
+    cpu/memory requests are not mapped to cgroup weights; only limits are, and only with a delegated cgroup. No QoS classes, no eviction.
+76. **Controllers are basic** — *open (C8)*
+    - not done: StatefulSet, DaemonSet, Job/CronJob, Endpoints/EndpointSlice and namespace controllers;
+    - Deployment does not handle pause, progressDeadlineSeconds or minReadySeconds;
+    - the template hash differs from upstream's.
+77. **Image pulls block the kubelet sync loop** — *open*
+    A slow pull delays other pods on the node. Pulls should become separate tasks.
+
