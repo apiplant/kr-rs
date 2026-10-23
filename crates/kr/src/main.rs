@@ -12,6 +12,7 @@ use kr_sys::{self as sys, Fd};
 
 const MAX_REQ: usize = 16 * 1024;
 const IO_DEADLINE_MS: u64 = 10_000;
+const LINGER_MS: u64 = 1_000;
 
 #[no_mangle]
 fn kr_main(mut args: Args) -> i32 {
@@ -72,25 +73,60 @@ fn parse_port(s: &[u8]) -> Option<u16> {
 }
 
 async fn sleep_test() {
+    const MS: u64 = 100;
     let start = exec::now_ms();
     let done = Rc::new(Cell::new(0u32));
     let mut hs = Vec::new();
     for _ in 0..3 {
         let done = done.clone();
         hs.push(spawn(async move {
-            sleep(100).await;
+            let t0 = exec::now_ns();
+            sleep(MS).await;
             done.set(done.get() + 1);
+            exec::now_ns() - t0
         }));
     }
+    let mut min_ns = u64::MAX;
     for h in hs {
-        h.await;
+        let el = h.await.expect("sleep task aborted");
+        assert!(el >= MS * 1_000_000, "sleep fired early");
+        min_ns = min_ns.min(el);
     }
     let mut b = [0u8; 20];
     print(b"elapsed_ms=");
     print(fmt_u64(exec::now_ms() - start, &mut b));
     print(b" done=");
     print(fmt_u64(done.get() as u64, &mut b));
+    print(b" min_ns=");
+    print(fmt_u64(min_ns, &mut b));
     print(b"\n");
+
+    // Many short sleeps: none may complete early (ms truncation used to allow up to 1 ms).
+    for ms in [1u64, 1, 1, 2, 3, 5] {
+        for _ in 0..20 {
+            let t0 = exec::now_ns();
+            sleep(ms).await;
+            assert!(exec::now_ns() - t0 >= ms * 1_000_000, "short sleep fired early");
+        }
+    }
+    print(b"sleep_ok\n");
+
+    // Abort of a task blocked on a never-ready read must free it (breaks the Rc cycle).
+    let (rd, _wr) = sys::pipe2(sys::O_NONBLOCK | sys::O_CLOEXEC).expect("pipe2");
+    let rd = Async::new(rd).expect("register pipe");
+    let base = exec::live_tasks();
+    let h = spawn(async move {
+        let mut one = [0u8; 1];
+        let _ = rd.read(&mut one).await;
+    });
+    sleep(1).await; // let it run and park on the read
+    assert_eq!(exec::live_tasks(), base + 1, "task not live");
+    assert!(!h.is_finished());
+    h.abort();
+    sleep(1).await; // one loop tick
+    assert!(h.await == Err(exec::Aborted), "handle did not report abort");
+    assert_eq!(exec::live_tasks(), base, "task leaked after abort");
+    print(b"live_tasks_ok\n");
 }
 
 fn find_end(b: &[u8]) -> Option<usize> {
@@ -142,7 +178,28 @@ async fn handle(c: Async<Fd>) {
             out
         }
     };
-    let _ = timeout(IO_DEADLINE_MS, c.write_all(&out)).await;
+    if timeout(IO_DEADLINE_MS, c.write_all(&out)).await.is_ok_and(|r| r.is_ok()) {
+        linger_close(&c).await;
+    }
+}
+
+/// Lingering close: signal EOF with `shutdown(SHUT_WR)` and discard whatever the peer still
+/// sends for up to 1 s, so closing with unread data does not turn into a TCP RST that could
+/// destroy the response before the client reads it. The caller's drop then closes the fd.
+async fn linger_close(c: &Async<Fd>) {
+    if sys::shutdown(c.get_ref().raw(), sys::SHUT_WR).is_err() {
+        return;
+    }
+    let _ = timeout(LINGER_MS, async {
+        let mut tmp = [0u8; 4096];
+        loop {
+            match c.read(&mut tmp).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
 }
 
 async fn echo(port: u16) -> Result<(), sys::Errno> {

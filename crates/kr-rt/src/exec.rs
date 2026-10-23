@@ -14,7 +14,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
-use alloc::rc::Rc;
+use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell, UnsafeCell};
 use core::future::{poll_fn, Future};
@@ -56,6 +56,25 @@ fn ex() -> &'static Exec {
 struct Task {
     fut: RefCell<Option<Pin<Box<dyn Future<Output = ()>>>>>,
     queued: Cell<bool>,
+    /// Abort requested while the future was being polled; honoured right after the poll.
+    abort_pending: Cell<bool>,
+}
+
+static LIVE_TASKS: Global<Cell<usize>> = Global(UnsafeCell::new(Cell::new(0)));
+
+/// Number of tasks that have been spawned and not yet freed (leak detection). A task is freed
+/// when its future has finished or been aborted and every waker referencing it is gone.
+pub fn live_tasks() -> usize {
+    // SAFETY: single-threaded (module docs).
+    unsafe { (*LIVE_TASKS.0.get()).get() }
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        // SAFETY: single-threaded (module docs).
+        let c = unsafe { &*LIVE_TASKS.0.get() };
+        c.set(c.get() - 1);
+    }
 }
 
 fn schedule(t: Rc<Task>) {
@@ -95,19 +114,60 @@ fn waker_for(t: &Rc<Task>) -> Waker {
 
 struct JoinState<T> {
     result: RefCell<Option<T>>,
+    aborted: Cell<bool>,
     waker: RefCell<Option<Waker>>,
 }
 
-/// Handle to a spawned task. Dropping it detaches the task.
+/// Error returned by a [`JoinHandle`] whose task was aborted before it completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Aborted;
+
+/// Handle to a spawned task. Dropping it detaches the task (it keeps running).
 pub struct JoinHandle<T> {
     st: Rc<JoinState<T>>,
+    task: Weak<Task>,
+}
+
+impl<T> JoinHandle<T> {
+    /// Drops the task's future immediately, which releases everything it owns (I/O slots,
+    /// wakers) and so breaks the task <-> waker reference cycle. The handle then resolves to
+    /// `Err(Aborted)`. Does nothing if the task already completed.
+    pub fn abort(&self) {
+        if self.st.result.borrow().is_some() {
+            return;
+        }
+        let Some(task) = self.task.upgrade() else { return };
+        self.st.aborted.set(true);
+        // Take the future out first and drop it with no borrow held: dropping it may drop
+        // an `Async` (touches the reactor) or wakers (may free tasks).
+        let fut = match task.fut.try_borrow_mut() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => {
+                task.abort_pending.set(true); // the task is polling itself right now
+                None
+            }
+        };
+        drop(fut);
+        let w = self.st.waker.borrow_mut().take();
+        if let Some(w) = w {
+            w.wake();
+        }
+    }
+
+    /// True once the task completed or was aborted.
+    pub fn is_finished(&self) -> bool {
+        self.st.aborted.get() || self.st.result.borrow().is_some()
+    }
 }
 
 impl<T> Future for JoinHandle<T> {
-    type Output = T;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+    type Output = Result<T, Aborted>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(v) = self.st.result.borrow_mut().take() {
-            return Poll::Ready(v);
+            return Poll::Ready(Ok(v));
+        }
+        if self.st.aborted.get() {
+            return Poll::Ready(Err(Aborted));
         }
         let old = self.st.waker.borrow_mut().replace(cx.waker().clone());
         drop(old);
@@ -120,7 +180,7 @@ where
     F: Future + 'static,
     F::Output: 'static,
 {
-    let st = Rc::new(JoinState { result: RefCell::new(None), waker: RefCell::new(None) });
+    let st = Rc::new(JoinState { result: RefCell::new(None), aborted: Cell::new(false), waker: RefCell::new(None) });
     let st2 = st.clone();
     let wrapped = async move {
         let v = fut.await;
@@ -130,9 +190,17 @@ where
             w.wake();
         }
     };
-    let t = Rc::new(Task { fut: RefCell::new(Some(Box::pin(wrapped))), queued: Cell::new(false) });
+    let t = Rc::new(Task {
+        fut: RefCell::new(Some(Box::pin(wrapped))),
+        queued: Cell::new(false),
+        abort_pending: Cell::new(false),
+    });
+    // SAFETY: single-threaded (module docs).
+    let c = unsafe { &*LIVE_TASKS.0.get() };
+    c.set(c.get() + 1);
+    let task = Rc::downgrade(&t);
     schedule(t);
-    JoinHandle { st }
+    JoinHandle { st, task }
 }
 
 /// Runs the event loop until `fut` completes and returns its output.
@@ -179,22 +247,30 @@ fn run_queue() {
         let waker = waker_for(&task);
         let mut cx = Context::from_waker(&waker);
         let mut slot = task.fut.borrow_mut();
+        let mut dead = None;
         if let Some(f) = slot.as_mut() {
-            if f.as_mut().poll(&mut cx).is_ready() {
-                *slot = None;
+            if f.as_mut().poll(&mut cx).is_ready() || task.abort_pending.get() {
+                dead = slot.take();
             }
         }
+        drop(slot);
+        drop(dead); // dropped with no borrow held (re-entrancy rule)
     }
 }
 
 // ---------- time ----------
 
-/// Monotonic milliseconds (arbitrary epoch).
-pub fn now_ms() -> u64 {
+/// Monotonic nanoseconds (arbitrary epoch).
+pub fn now_ns() -> u64 {
     match sys::clock_gettime(sys::CLOCK_MONOTONIC) {
-        Ok(ts) => ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000,
+        Ok(ts) => (ts.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec as u64),
         Err(_) => 0,
     }
+}
+
+/// Monotonic milliseconds (arbitrary epoch), truncated.
+pub fn now_ms() -> u64 {
+    now_ns() / 1_000_000
 }
 
 const LEVELS: usize = 4;
@@ -317,20 +393,22 @@ fn run_timers() {
 }
 
 pub struct Sleep {
-    deadline: u64,
+    /// Absolute deadline in ns; the future never completes before it.
+    deadline_ns: u64,
     state: Option<Rc<TimerState>>,
 }
 
-/// Completes after `ms` milliseconds (may fire up to 1 ms early due to ms truncation).
+/// Completes after at least `ms` milliseconds (never early). The deadline is computed with ns
+/// precision; the wheel entry uses it rounded up (ceil) to the next ms tick.
 pub fn sleep(ms: u64) -> Sleep {
-    Sleep { deadline: now_ms().saturating_add(ms), state: None }
+    Sleep { deadline_ns: now_ns().saturating_add(ms.saturating_mul(1_000_000)), state: None }
 }
 
 impl Future for Sleep {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let now = now_ms();
-        if now >= self.deadline {
+        let now = now_ns();
+        if now >= self.deadline_ns {
             return Poll::Ready(());
         }
         match &self.state {
@@ -345,7 +423,8 @@ impl Future for Sleep {
             None => {
                 let st = Rc::new(TimerState { waker: RefCell::new(Some(cx.waker().clone())) });
                 self.state = Some(st.clone());
-                ex().wheel.borrow_mut().insert_new(Entry { deadline: self.deadline, state: st }, now);
+                let deadline_ms = self.deadline_ns.div_ceil(1_000_000);
+                ex().wheel.borrow_mut().insert_new(Entry { deadline: deadline_ms, state: st }, now / 1_000_000);
             }
         }
         Poll::Pending

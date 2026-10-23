@@ -36,6 +36,9 @@ pub const PROT_WRITE: usize = 2;
 pub const PROT_EXEC: usize = 4;
 pub const MAP_PRIVATE: usize = 0x02;
 pub const MAP_ANONYMOUS: usize = 0x20;
+pub const SHUT_WR: i32 = 1;
+pub const O_NONBLOCK: i32 = 0o4000;
+pub const O_CLOEXEC: i32 = 0o2000000;
 
 #[cfg(target_arch = "x86_64")]
 mod nr {
@@ -46,6 +49,8 @@ mod nr {
     pub const MUNMAP: usize = 11;
     pub const SOCKET: usize = 41;
     pub const BIND: usize = 49;
+    pub const SHUTDOWN: usize = 48;
+    pub const PIPE2: usize = 293;
     pub const LISTEN: usize = 50;
     pub const SETSOCKOPT: usize = 54;
     pub const EXIT_GROUP: usize = 231;
@@ -65,6 +70,8 @@ mod nr {
     pub const MUNMAP: usize = 215;
     pub const SOCKET: usize = 198;
     pub const BIND: usize = 200;
+    pub const SHUTDOWN: usize = 210;
+    pub const PIPE2: usize = 59;
     pub const LISTEN: usize = 201;
     pub const SETSOCKOPT: usize = 208;
     pub const EXIT_GROUP: usize = 94;
@@ -300,6 +307,20 @@ pub fn bind(fd: i32, addr: &SockaddrIn) -> Result<()> {
         syscall3(nr::BIND, fd as usize, addr as *const _ as usize, core::mem::size_of::<SockaddrIn>())
     })
     .map(|_| ())
+}
+
+/// `how` is `SHUT_WR` (or 0 = SHUT_RD, 2 = SHUT_RDWR).
+pub fn shutdown(fd: i32, how: i32) -> Result<()> {
+    // SAFETY: integer-only arguments.
+    check(unsafe { syscall2(nr::SHUTDOWN, fd as usize, how as usize) }).map(|_| ())
+}
+
+/// Returns `(read_end, write_end)`.
+pub fn pipe2(flags: i32) -> Result<(Fd, Fd)> {
+    let mut fds = [0i32; 2];
+    // SAFETY: fds is a valid writable array of two c_ints.
+    check(unsafe { syscall2(nr::PIPE2, fds.as_mut_ptr() as usize, flags as usize) })?;
+    Ok((Fd(fds[0]), Fd(fds[1])))
 }
 
 pub fn listen(fd: i32, backlog: i32) -> Result<()> {
