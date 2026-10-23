@@ -4,11 +4,11 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
 
 ## Runtime (kr-rt)
 
-1. **Pending task + Async forms an Rc cycle** — *fixed* (commit: )
+1. **Pending task + Async forms an Rc cycle** — *fixed* (commit: 68940ad)
    The task owns the future, the future owns the `Async`, the `Async`'s I/O slot owns a waker, and the waker owns the task. A task that never completes is never freed.
    Plan: add `JoinHandle::abort()` to drop the future and break the cycle, and add a live-task counter for leak detection. Rule: every network wait must have a deadline.
    Fix: `JoinHandle::abort()` drops the future immediately, and the handle then resolves to `Err(Aborted)` (the output is now `Result<T, Aborted>`, and there is also `is_finished()`). `exec::live_tasks()` counts tasks until their `Task` is freed, and `kr sleep-test` asserts on it (`live_tasks_ok`). A task that never completes and has no deadline or abort is still a leak hazard by design.
-2. **`sleep` can fire up to 1 ms early** — *fixed* (commit: )
+2. **`sleep` can fire up to 1 ms early** — *fixed* (commit: 68940ad)
    The millisecond clock is truncated. Plan: round deadlines up, so a sleep never fires before it was asked to.
    Fix: deadlines are computed in ns (`now_ns`), `Sleep` completes only when `now_ns >= deadline`, and the wheel entry uses `ceil(deadline_ns / 1e6)`. `kr sleep-test` verifies every elapsed time is >= the requested one.
 3. **Allocator is single-threaded** — *accepted (phase 0)*
@@ -35,7 +35,7 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
 
 ## Echo server (demo only)
 
-12. **The 431 path closes with unread data, so the client may see a TCP RST** — *fixed* (commit: )
+12. **The 431 path closes with unread data, so the client may see a TCP RST** — *fixed* (commit: 68940ad)
     Plan: lingering close. Send the response, `shutdown(SHUT_WR)`, then drain the input for up to 1 s and close.
     Fix: `linger_close` runs after every response (not only the 431) using the new `kr_sys::shutdown`. Note that a request whose headers are complete is answered 200 even if a large body follows, and the lingering close drains that body without a reset.
 
