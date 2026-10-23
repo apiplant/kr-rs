@@ -9,6 +9,7 @@
 use crate::discovery;
 use crate::object::{self, obj, ApiError, Clock, FieldSelector, Selector, Target};
 use crate::patch;
+use crate::proto;
 use crate::resources::{self, Resource, RESOURCES};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -370,11 +371,13 @@ impl ApiServer {
 
     fn parse_body(&self, req: &Req) -> R<Value> {
         let ct = req.content_type.unwrap_or("application/json");
-        if ct.starts_with("application/vnd.kubernetes.protobuf") || ct.starts_with("application/cbor") {
-            // No generated schemas for the protobuf/CBOR encodings; clients retry with JSON on 415.
-            return Err(ApiError::new(415, "UnsupportedMediaType", alloc::format!("the body of the request was in an unknown format - accepted media types include: application/json, application/yaml (got {ct})")));
+        if ct.starts_with("application/cbor") {
+            // No CBOR decoder; clients retry with JSON on 415.
+            return Err(ApiError::new(415, "UnsupportedMediaType", alloc::format!("the body of the request was in an unknown format - accepted media types include: application/json, application/yaml, application/vnd.kubernetes.protobuf (got {ct})")));
         }
-        let v = if ct.starts_with("application/yaml") || ct.starts_with("application/apply-patch+yaml") {
+        let v = if ct.starts_with("application/vnd.kubernetes.protobuf") {
+            proto::decode_body(req.body).map_err(ApiError::bad_request)?
+        } else if ct.starts_with("application/yaml") || ct.starts_with("application/apply-patch+yaml") {
             let s = core::str::from_utf8(req.body).map_err(|_| ApiError::bad_request("body is not UTF-8"))?;
             kr_fmt::yaml::parse(s).map_err(|_| ApiError::bad_request("invalid YAML body"))?
         } else {

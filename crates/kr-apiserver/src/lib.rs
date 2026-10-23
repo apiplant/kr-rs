@@ -15,5 +15,7 @@ pub mod object;
 pub mod openapi;
 pub mod patch;
 pub mod printers;
+pub mod proto;
+pub mod proto_schema;
 pub mod resources;
 pub mod server;

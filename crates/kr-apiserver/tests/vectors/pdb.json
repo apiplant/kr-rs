@@ -1,0 +1,1 @@
+{"kind":"PodDisruptionBudget","apiVersion":"policy/v1","metadata":{"name":"pdb","namespace":"default","creationTimestamp":null},"spec":{"minAvailable":"50%","selector":{"matchLabels":{"app":"web","tier":"front"}}},"status":{"disruptionsAllowed":0,"currentHealthy":0,"desiredHealthy":0,"expectedPods":0}}

@@ -1,0 +1,1 @@
+{"kind":"Ingress","apiVersion":"networking.k8s.io/v1","metadata":{"name":"ing","namespace":"default","creationTimestamp":null},"spec":{"ingressClassName":"nginx","rules":[{"host":"a.example.com","http":{"paths":[{"path":"/","pathType":"Prefix","backend":{"service":{"name":"web","port":{"number":80}}}}]}}]},"status":{"loadBalancer":{}}}

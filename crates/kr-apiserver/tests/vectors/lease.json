@@ -1,0 +1,1 @@
+{"kind":"Lease","apiVersion":"coordination.k8s.io/v1","metadata":{"name":"l","namespace":"kube-system","creationTimestamp":null},"spec":{"holderIdentity":"me","leaseDurationSeconds":15,"acquireTime":"2024-05-17T13:04:05.123456Z","renewTime":"2024-05-17T13:04:05.123456Z","leaseTransitions":2}}

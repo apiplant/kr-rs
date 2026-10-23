@@ -1,0 +1,1 @@
+{"kind":"ConfigMap","apiVersion":"v1","metadata":{"name":"x","namespace":"default","creationTimestamp":"2024-05-17T13:04:05Z","labels":{"app":"web","tier":"front"},"annotations":{"note":"héllo \"q\""}},"data":{"a":"b","multi":"line1\nline2"},"binaryData":{"bin":"AAEC//4="}}

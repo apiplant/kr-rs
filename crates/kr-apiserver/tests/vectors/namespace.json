@@ -1,0 +1,1 @@
+{"kind":"Namespace","apiVersion":"v1","metadata":{"name":"team-a","creationTimestamp":null,"labels":{"env":"dev"}},"spec":{},"status":{}}

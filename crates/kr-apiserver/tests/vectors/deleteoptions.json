@@ -1,0 +1,1 @@
+{"kind":"DeleteOptions","apiVersion":"v1","gracePeriodSeconds":0,"preconditions":{"uid":"abc","resourceVersion":"12"},"propagationPolicy":"Foreground","dryRun":["All"]}
