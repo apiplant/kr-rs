@@ -5,5 +5,6 @@ extern crate alloc;
 
 pub mod container;
 pub mod pull;
+pub mod security;
 pub mod store;
 pub mod unpack;

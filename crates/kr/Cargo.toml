@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 kr-sys = { path = "../kr-sys" }
 kr-rt = { path = "../kr-rt" }
+kr-runtime = { path = "../kr-runtime" }

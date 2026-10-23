@@ -3,6 +3,8 @@
 
 extern crate alloc;
 
+mod ctr;
+
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::Cell;
@@ -50,12 +52,13 @@ fn kr_main(mut args: Args) -> i32 {
                 }
             }
         }
+        Some(b"ctr") => ctr::main(args),
         Some(b"sleep-test") => {
             exec::block_on(sleep_test());
             0
         }
         _ => {
-            eprint(b"usage: kr <version | echo [port] | sleep-test>\n");
+            eprint(b"usage: kr <version | echo [port] | ctr ... | sleep-test>\n");
             2
         }
     }
