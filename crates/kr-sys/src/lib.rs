@@ -19,6 +19,13 @@ pub const SOL_SOCKET: i32 = 1;
 pub const SO_REUSEADDR: i32 = 2;
 
 pub const EPOLLIN: u32 = 0x1;
+pub const EPOLLOUT: u32 = 0x4;
+pub const EPOLLERR: u32 = 0x8;
+pub const EPOLLHUP: u32 = 0x10;
+pub const EPOLLRDHUP: u32 = 0x2000;
+pub const EPOLLET: u32 = 1 << 31;
+pub const EPIPE: i32 = 32;
+pub const CLOCK_MONOTONIC: i32 = 1;
 pub const EPOLL_CTL_ADD: i32 = 1;
 pub const EPOLL_CTL_DEL: i32 = 2;
 pub const EPOLL_CLOEXEC: i32 = 0o2000000;
@@ -42,6 +49,7 @@ mod nr {
     pub const LISTEN: usize = 50;
     pub const SETSOCKOPT: usize = 54;
     pub const EXIT_GROUP: usize = 231;
+    pub const CLOCK_GETTIME: usize = 228;
     pub const EPOLL_CTL: usize = 233;
     pub const ACCEPT4: usize = 288;
     pub const EPOLL_CREATE1: usize = 291;
@@ -60,6 +68,7 @@ mod nr {
     pub const LISTEN: usize = 201;
     pub const SETSOCKOPT: usize = 208;
     pub const EXIT_GROUP: usize = 94;
+    pub const CLOCK_GETTIME: usize = 113;
     pub const EPOLL_CTL: usize = 21;
     pub const ACCEPT4: usize = 242;
     pub const EPOLL_CREATE1: usize = 20;
@@ -223,6 +232,13 @@ impl EpollEvent {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Timespec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
 // ---- typed wrappers ----
 
 pub fn read(fd: i32, buf: &mut [u8]) -> Result<usize> {
@@ -321,6 +337,13 @@ pub fn epoll_wait(epfd: i32, events: &mut [EpollEvent], timeout_ms: i32) -> Resu
     // SAFETY: as above; a null sigmask is permitted by epoll_pwait(2).
     let r = unsafe { syscall6(nr::EPOLL_PWAIT, epfd as usize, p, n, timeout_ms as usize, 0, 8) };
     check(r)
+}
+
+pub fn clock_gettime(clock: i32) -> Result<Timespec> {
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: ts is a valid writable repr(C) timespec (two i64) for the duration of the call.
+    check(unsafe { syscall2(nr::CLOCK_GETTIME, clock as usize, &mut ts as *mut Timespec as usize) })?;
+    Ok(ts)
 }
 
 /// Owned file descriptor, closed on drop.

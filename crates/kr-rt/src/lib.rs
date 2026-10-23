@@ -6,6 +6,8 @@
 
 extern crate alloc;
 
+pub mod exec;
+
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ffi::c_void;

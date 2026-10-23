@@ -27,7 +27,14 @@ Raw syscalls go through inline asm (`kr-sys`) for x86_64 and aarch64. Host requi
 ## ADR-005: Hand-rolled epoll executor, no tokio
 It is single-threaded by default and uses a hierarchical timer wheel.
 **Why:** tokio is std-bound and heavy, and an agent's workload is I/O-bound with low concurrency.
-**Status:** accepted (implementation pending; phase 0 uses a plain epoll loop).
+**Status:** accepted (implemented in `kr_rt::exec`).
+
+**Implementation notes:**
+- Tasks are `Rc<Task>` (boxed future plus a `queued` flag) with hand-written `RawWakerVTable` wakers over the `Rc`. These wakers are `!Send` in practice and must never leave the executor thread.
+- The reactor uses one epoll fd. Fds are registered edge-triggered (`EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET`) with a slab index as epoll data. Readiness flags are set by events and cleared on `EAGAIN`, so I/O is always read or written until `EAGAIN`.
+- Timers use a hierarchical wheel with 4 levels x 64 slots and 1 ms ticks (about 4.6 h). Longer deadlines are clamped and re-armed when they fire early. The epoll timeout is derived from the next non-empty slot, or -1 if none.
+- Loop: poll the tasks queued at the start of the round (a self-waking task cannot starve I/O), then `epoll_wait` (timeout 0 if work is queued), then expire timers.
+- Single-thread invariant: all executor state lives in one `static` (`UnsafeCell` + `unsafe impl Sync`, like the allocator). No `RefCell` borrow is held across anything that can drop a waker.
 
 ## ADR-006: Embedded store replaces etcd
 An append-only log, an in-memory B-tree index and MVCC resourceVersion. Raft for HA comes later.
