@@ -138,6 +138,12 @@ impl core::fmt::Write for Stderr {
     }
 }
 
+/// The precompiled `core` is built with unwinding, so unoptimised builds still reference the
+/// personality routine even though we use panic=abort. It is never called.
+#[cfg(not(any(test, feature = "host")))]
+#[no_mangle]
+pub extern "C" fn rust_eh_personality() {}
+
 #[cfg(not(any(test, feature = "host")))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {

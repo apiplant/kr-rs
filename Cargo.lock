@@ -35,5 +35,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-runtime"
+version = "0.0.1"
+dependencies = [
+ "kr-archive",
+ "kr-fmt",
+ "kr-net",
+ "kr-rt",
+ "kr-sys",
+]
+
+[[package]]
 name = "kr-sys"
 version = "0.0.1"
