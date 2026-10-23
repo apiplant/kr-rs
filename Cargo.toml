@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/kr-sys", "crates/kr-rt", "crates/kr-fmt", "crates/kr-archive", "crates/kr-net", "crates/kr-runtime", "crates/kr"]
+members = ["crates/kr-sys", "crates/kr-rt", "crates/kr-fmt", "crates/kr-archive", "crates/kr-crypto", "crates/kr-net", "crates/kr-runtime", "crates/kr"]
 
 [workspace.package]
 version = "0.0.1"

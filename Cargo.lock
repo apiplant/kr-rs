@@ -17,6 +17,10 @@ name = "kr-archive"
 version = "0.0.1"
 
 [[package]]
+name = "kr-crypto"
+version = "0.0.1"
+
+[[package]]
 name = "kr-fmt"
 version = "0.0.1"
 
