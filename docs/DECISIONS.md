@@ -64,3 +64,46 @@ Only core/v1, apps/v1, batch/v1, coordination, discovery and RBAC are supported.
 ## ADR-011: Process — delegate simple implementation work
 Mechanical or well-specified implementation is delegated to cheaper Sonnet subagents. Design, review and security-sensitive code (crypto, runtime isolation) stay with the main model.
 **Status:** accepted (user request, 2026-10-23).
+
+## ADR-012: `kr-fmt` scope: JSON, a YAML subset, protobuf wire, base64, quantities
+`kr-fmt` is a `no_std` + `alloc` crate with no dependencies at all (not even `kr-sys`) and `#![forbid(unsafe_code)]`. It holds JSON (strict RFC 8259 parser, compact serializer and a zero-copy pull tokenizer), a YAML subset, the protobuf wire format, base64, Kubernetes `resource.Quantity` and Go-format durations.
+**Why:** these are the formats `kubectl` and manifests actually use. A full YAML 1.2 implementation is large, error-prone and not needed by a Kubernetes distro.
+
+**JSON:**
+- Numbers are held exact as `i64`/`u64`, otherwise as `f64`. The original text is kept so that serialization round-trips byte for byte.
+- Objects are an ordered `Vec` and duplicate keys are kept (`get` returns the last).
+- The parser has a depth limit (default 64) and an input size limit (default 32 MiB). It is iterative, so hostile nesting cannot overflow the stack.
+- Lone surrogates, invalid UTF-8, a BOM, comments and trailing data are rejected. Numbers that overflow `f64` are rejected.
+
+**YAML:** the output is always `json::Value`. Supported:
+- block maps and sequences, including a sequence at the same indent as its key;
+- flow `[]` and `{}`, including across lines;
+- plain, single- and double-quoted scalars with YAML folding rules;
+- `|` and `>` block scalars with chomping and indentation indicators;
+- comments, and multi-document streams (`---`, `...`).
+
+Scalars use the YAML 1.2 core schema: `null/~`, `true/false` (any of three cases), decimal, `0o` and `0x` ints, and floats. `yes/no/on/off` are strings. Object keys are never typed.
+
+**Rejected with a specific error:**
+- Anchors, aliases and tags (`&`, `*`, `!`), and therefore the `<<` merge key. Manifests that use them are expanded by tooling before they reach the cluster. Aliases also enable "billion laughs" amplification, and tags make the data model depend on a type registry. A clear error beats silently misparsing.
+- Directives (`%YAML`, `%TAG`) and explicit or complex keys (`? `, collection keys).
+- Tab indentation, as the YAML spec requires.
+- Duplicate mapping keys, in both block and flow maps. The spec says keys must be unique, and silently taking the last one hides manifest mistakes.
+- `.inf` and `.nan`, which JSON cannot represent.
+- Single-pair mappings inside flow sequences (`[a: b]`).
+
+**Deviations and choices:**
+- `parse_all` drops documents that are empty (only comments and whitespace).
+- Content after `--- ` on the marker line is supported.
+- Integers outside the 64-bit range become inexact floats.
+- A YAML-core int such as `0123` or `+5` is normalized to decimal text.
+- The k8s Go stack (yaml.v2/YAML 1.1) would read `yes` as a bool. We follow 1.2 on purpose and manifests that need booleans must write `true`.
+
+**Quantities:**
+- A quantity is held exactly as an `i128` mantissa times a power of ten. Binary suffixes are folded into the mantissa. Overflow is an error.
+- The one deliberate rounding mirrors Kubernetes: precision below 1n is rounded up (away from zero) to 1n.
+- Canonical formatting follows the Go rules: decimal forms use exponents that are multiples of 3, binary forms use the largest dividing power of 1024, and small or fractional binary values fall back to decimal.
+
+**Protobuf:** varint, zigzag, fixed32/64 and length-delimited fields only. Groups are rejected. Length prefixes are capped by a configurable limit.
+
+**Status:** accepted.

@@ -43,3 +43,23 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
 
 13. **Linker passes `-pie` alongside `-static`** — *accepted*
     The output is `ET_EXEC` with no relocations, which was verified. Re-check after toolchain bumps, since a static-pie would need self-relocation in `_start`.
+
+## Echo server (cont.)
+
+14. **The lingering close holds each connection for up to 1 s after the response** — *open*
+    Under heavy load this raises the number of concurrent connections. Plan: skip the drain when the request was fully read, and cap total lingering connections.
+
+## kr-fmt
+
+15. **YAML subset gaps** — *accepted*
+    These are rejected or approximate:
+    - `[a: b]` single-pair mappings inside flow sequences;
+    - multi-line quoted keys;
+    - some blank-line edge cases in block scalars;
+    - ints wider than 64 bits, which degrade to f64.
+    Revisit if real manifests hit them.
+16. **JSON duplicate keys are kept (last one wins on `get`); YAML duplicate keys are an error** — *accepted*
+    The behaviour is inconsistent, but each matches its consumer: the apiserver can enforce strictness at a higher layer.
+17. **Quantity mantissa is i128** — *accepted*
+    `1e40` is OutOfRange. k8s has the same practical bounds.
+18. **14 clippy style lints in kr-fmt** — *open (cleanup)*
