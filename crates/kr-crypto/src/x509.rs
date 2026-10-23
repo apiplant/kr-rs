@@ -5,6 +5,7 @@
 //! unusable, as RFC 5280 requires. Hostname checks use SANs only (no CN fallback, like Go).
 
 use crate::der::{self, Reader};
+use crate::rsa::{self, HashAlg};
 use crate::{ed25519, p256};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -17,6 +18,15 @@ const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]; //
 const OID_PRIME256V1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]; // 1.2.840.10045.3.1.7
 const OID_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]; // 1.2.840.10045.4.3.2
 const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70]; // 1.3.101.112
+const OID_RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]; // 1.2.840.113549.1.1.1
+const OID_RSA_PSS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a]; // .10
+const OID_SHA256_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b]; // .11
+const OID_SHA384_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c]; // .12
+const OID_SHA512_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d]; // .13
+const OID_MGF1: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08];
+const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+const OID_SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
+const OID_SHA512: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03];
 const OID_CN: &[u8] = &[0x55, 0x04, 0x03];
 const OID_O: &[u8] = &[0x55, 0x04, 0x0a];
 const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
@@ -34,10 +44,12 @@ pub const KU_KEY_ENCIPHERMENT: u16 = 1 << 2;
 pub const KU_KEY_CERT_SIGN: u16 = 1 << 5;
 pub const KU_CRL_SIGN: u16 = 1 << 6;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PublicKey {
     P256([u8; 65]),
     Ed25519([u8; 32]),
+    /// Verification only (kr never issues RSA certificates).
+    Rsa(rsa::PublicKey),
 }
 
 impl PublicKey {
@@ -47,6 +59,8 @@ impl PublicKey {
         match (self, alg) {
             (PublicKey::P256(pk), SigAlg::EcdsaSha256) => p256::sig_from_der(sig).is_some_and(|(r, s)| p256::verify(pk, msg, &r, &s)),
             (PublicKey::Ed25519(pk), SigAlg::Ed25519) => sig.len() == 64 && ed25519::verify(pk, msg, sig.try_into().unwrap()),
+            (PublicKey::Rsa(pk), SigAlg::RsaPkcs1(h)) => pk.verify_pkcs1v15(h, msg, sig),
+            (PublicKey::Rsa(pk), SigAlg::RsaPss(h, salt)) => pk.verify_pss(h, msg, sig, salt as usize),
             _ => false,
         }
     }
@@ -66,6 +80,13 @@ impl PublicKey {
                 PublicKey::Ed25519(pk) => {
                     der::nested(o, der::SEQUENCE, |a| der::tlv(a, der::OID, OID_ED25519));
                     der::bit_string(o, pk);
+                }
+                PublicKey::Rsa(pk) => {
+                    der::nested(o, der::SEQUENCE, |a| {
+                        der::tlv(a, der::OID, OID_RSA_ENCRYPTION);
+                        der::tlv(a, der::NULL, &[]);
+                    });
+                    der::bit_string(o, &pk.to_pkcs1());
                 }
             }
         });
@@ -91,6 +112,7 @@ impl PublicKey {
                 alg.finish()?; // parameters MUST be absent
                 Some(PublicKey::Ed25519(key.try_into().map_err(|_| Error)?))
             }
+            OID_RSA_ENCRYPTION => rsa::PublicKey::from_pkcs1(key).map(PublicKey::Rsa),
             _ => None,
         })
     }
@@ -100,7 +122,66 @@ impl PublicKey {
 pub enum SigAlg {
     EcdsaSha256,
     Ed25519,
+    RsaPkcs1(HashAlg),
+    /// Hash (also used for MGF1) and salt length.
+    RsaPss(HashAlg, u32),
     Unsupported,
+}
+
+fn hash_oid(oid: &[u8]) -> Option<HashAlg> {
+    match oid {
+        OID_SHA256 => Some(HashAlg::Sha256),
+        OID_SHA384 => Some(HashAlg::Sha384),
+        OID_SHA512 => Some(HashAlg::Sha512),
+        _ => None,
+    }
+}
+
+/// AlgorithmIdentifier of a hash, with absent or NULL parameters.
+fn parse_hash_alg(contents: &[u8]) -> Result<Option<HashAlg>> {
+    let mut r = Reader::new(contents);
+    let mut a = r.sequence()?;
+    r.finish()?;
+    let h = hash_oid(a.oid()?);
+    a.optional(der::NULL)?;
+    a.finish()?;
+    Ok(h)
+}
+
+/// RSASSA-PSS-params; only MGF1 with the same hash and trailer 1 (SHA-1 defaults unsupported).
+fn parse_pss_params(a: &mut Reader) -> Result<SigAlg> {
+    let mut p = a.sequence()?;
+    let Some(h) = p.optional(der::ctx(0))?.map(parse_hash_alg).transpose()?.flatten() else { return Ok(SigAlg::Unsupported) };
+    let Some(mgf) = p.optional(der::ctx(1))? else { return Ok(SigAlg::Unsupported) };
+    let mut mr = Reader::new(mgf);
+    let mut m = mr.sequence()?;
+    mr.finish()?;
+    if m.oid()? != OID_MGF1 {
+        return Ok(SigAlg::Unsupported);
+    }
+    let (_, mgf_hash, _) = m.any()?;
+    let mut full = Vec::new();
+    der::tlv(&mut full, der::SEQUENCE, mgf_hash);
+    if parse_hash_alg(&full)? != Some(h) {
+        return Ok(SigAlg::Unsupported);
+    }
+    let salt = match p.optional(der::ctx(2))? {
+        Some(v) => {
+            let mut sr = Reader::new(v);
+            let n = sr.small_uint()?;
+            sr.finish()?;
+            u32::try_from(n).map_err(|_| Error)?
+        }
+        None => 20,
+    };
+    if let Some(v) = p.optional(der::ctx(3))? {
+        let mut tr = Reader::new(v);
+        if tr.small_uint()? != 1 {
+            return Err(Error);
+        }
+    }
+    p.finish()?;
+    Ok(SigAlg::RsaPss(h, salt))
 }
 
 fn parse_sig_alg(r: &mut Reader) -> Result<SigAlg> {
@@ -109,9 +190,19 @@ fn parse_sig_alg(r: &mut Reader) -> Result<SigAlg> {
     let alg = match oid {
         OID_ECDSA_SHA256 => SigAlg::EcdsaSha256,
         OID_ED25519 => SigAlg::Ed25519,
+        OID_SHA256_RSA | OID_SHA384_RSA | OID_SHA512_RSA => {
+            a.optional(der::NULL)?; // NULL parameters (absent is tolerated)
+            let h = match oid {
+                OID_SHA256_RSA => HashAlg::Sha256,
+                OID_SHA384_RSA => HashAlg::Sha384,
+                _ => HashAlg::Sha512,
+            };
+            SigAlg::RsaPkcs1(h)
+        }
+        OID_RSA_PSS => parse_pss_params(&mut a)?,
         _ => return Ok(SigAlg::Unsupported), // may carry parameters; not inspected
     };
-    a.finish()?; // both supported algorithms have absent parameters
+    a.finish()?;
     Ok(alg)
 }
 
@@ -512,13 +603,13 @@ pub fn verify_chain(chain: &[&[u8]], roots: &[&[u8]], now: i64, usage: Usage) ->
     if leaf.key_usage.is_some_and(|ku| ku & KU_DIGITAL_SIGNATURE == 0) {
         return Err(VerifyError::Usage);
     }
-    leaf.public_key.ok_or(VerifyError::UnsupportedKey)?;
+    leaf.public_key.as_ref().ok_or(VerifyError::UnsupportedKey)?;
 
     let mut cur = leaf;
     for depth in 0..MAX_DEPTH {
         // Is `cur` signed by a trust anchor?
         for a in &anchors {
-            if a.subject == cur.issuer && a.public_key.is_some_and(|k| cur.signed_by(&k)) {
+            if a.subject == cur.issuer && a.public_key.as_ref().is_some_and(|k| cur.signed_by(k)) {
                 if !in_time(a) {
                     return Err(VerifyError::Expired);
                 }
@@ -529,7 +620,7 @@ pub fn verify_chain(chain: &[&[u8]], roots: &[&[u8]], now: i64, usage: Usage) ->
         // Otherwise step to an intermediate.
         let next = pool
             .iter()
-            .find(|c| c.subject == cur.issuer && c.public_key.is_some_and(|k| cur.signed_by(&k)))
+            .find(|c| c.subject == cur.issuer && c.public_key.as_ref().is_some_and(|k| cur.signed_by(k)))
             .ok_or(VerifyError::UnknownIssuer)?;
         if !in_time(next) {
             return Err(VerifyError::Expired);
@@ -588,9 +679,14 @@ impl SigningKey {
 
 /// Key identifier: SHA-256 of the subjectPublicKey bits, truncated to 160 bits (RFC 7093).
 fn key_id(k: &PublicKey) -> [u8; 20] {
+    let rsa_bits;
     let bits: &[u8] = match k {
         PublicKey::P256(b) => b,
         PublicKey::Ed25519(b) => b,
+        PublicKey::Rsa(pk) => {
+            rsa_bits = pk.to_pkcs1();
+            &rsa_bits
+        }
     };
     crate::sha2::sha256(bits)[..20].try_into().unwrap()
 }

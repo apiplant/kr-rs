@@ -262,3 +262,42 @@ fn kubectl_vs_kr_server() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("v1.31.0-kr"), "stdout={stdout} stderr={}", String::from_utf8_lossy(&out.stderr));
 }
+
+/// kr client against an RSA server: RSA CA (sha256WithRSA) -> RSA leaf, RSA-PSS CertificateVerify.
+#[test]
+fn client_vs_openssl_rsa_chain() {
+    if !have_openssl() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kr-tls-rsa-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sh = |script: &str| {
+        let o = Command::new("sh").arg("-c").arg(script).current_dir(&dir).output().unwrap();
+        assert!(o.status.success(), "{script}: {}", String::from_utf8_lossy(&o.stderr));
+    };
+    sh("openssl req -x509 -newkey rsa:3072 -nodes -keyout ca.key -out ca.pem -days 2 -subj /CN=rsa-ca -sha256 2>/dev/null");
+    sh("openssl req -newkey rsa:2048 -nodes -keyout srv.key -out srv.csr -subj /CN=localhost 2>/dev/null");
+    sh("printf 'subjectAltName=DNS:localhost\\nextendedKeyUsage=serverAuth\\nbasicConstraints=critical,CA:FALSE\\nkeyUsage=critical,digitalSignature,keyEncipherment\\n' > ext && \
+        openssl x509 -req -in srv.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out srv.pem -days 1 -sha384 -extfile ext 2>/dev/null");
+    let port = free_port();
+    let mut srv = Command::new("openssl")
+        .args(["s_server", "-quiet", "-tls1_3", "-accept", &port.to_string(), "-naccept", "1", "-cert", "srv.pem", "-key", "srv.key"])
+        .current_dir(&dir)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    let mut sock = (0..100).find_map(|_| { std::thread::sleep(Duration::from_millis(30)); TcpStream::connect(("127.0.0.1", port)).ok() }).expect("connect");
+    let ca = x509::pem_decode_all(&std::fs::read_to_string(dir.join("ca.pem")).unwrap(), "CERTIFICATE").unwrap();
+    let cfg = Rc::new(ClientConfig { roots: ca, client_cert: None, alpn: vec![] });
+    let mut c = Connection::client(cfg, b"localhost", rng, now());
+    drive(&mut c, &mut sock, |c| !c.is_handshaking());
+    let leaf = x509::Certificate::parse(&c.peer_certificates()[0]).unwrap();
+    assert!(matches!(leaf.public_key, Some(x509::PublicKey::Rsa(_))));
+    c.write(b"rsa ok\n").unwrap();
+    drive(&mut c, &mut sock, |c| !c.has_output());
+    std::thread::sleep(Duration::from_millis(300));
+    c.close();
+    sock.write_all(&c.take_output()).unwrap();
+    drop(srv.stdin.take());
+    let out = srv.wait_with_output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("rsa ok"));
+}

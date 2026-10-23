@@ -48,6 +48,13 @@ const GROUP_X25519: u16 = 0x001d;
 const GROUP_P256: u16 = 0x0017;
 const SIG_ECDSA_P256_SHA256: u16 = 0x0403;
 const SIG_ED25519: u16 = 0x0807;
+const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
+const SIG_RSA_PSS_RSAE_SHA384: u16 = 0x0805;
+const SIG_RSA_PSS_RSAE_SHA512: u16 = 0x0806;
+/// PKCS#1 v1.5 schemes are offered only for certificate signatures (never CertificateVerify).
+const SIG_RSA_PKCS1_SHA256: u16 = 0x0401;
+const SIG_RSA_PKCS1_SHA384: u16 = 0x0501;
+const SIG_RSA_PKCS1_SHA512: u16 = 0x0601;
 
 /// SHA-256("HelloRetryRequest"): the ServerHello.random of a HelloRetryRequest.
 const HRR_RANDOM: [u8; 32] = [
@@ -1039,7 +1046,7 @@ impl Connection {
             });
         }
         let leaf = x509::Certificate::parse(&chain[0]).or(fail(Alert::BadCertificate))?;
-        self.peer_key = leaf.public_key;
+        self.peer_key = leaf.public_key.clone();
         self.peer_certs = chain;
         self.state = if is_server { State::SrvWaitCertVerify } else { State::CliWaitCertVerify };
         Ok(())
@@ -1056,9 +1063,12 @@ impl Connection {
         let alg = match scheme {
             SIG_ECDSA_P256_SHA256 => SigAlg::EcdsaSha256,
             SIG_ED25519 => SigAlg::Ed25519,
+            SIG_RSA_PSS_RSAE_SHA256 => SigAlg::RsaPss(crate::rsa::HashAlg::Sha256, 32),
+            SIG_RSA_PSS_RSAE_SHA384 => SigAlg::RsaPss(crate::rsa::HashAlg::Sha384, 48),
+            SIG_RSA_PSS_RSAE_SHA512 => SigAlg::RsaPss(crate::rsa::HashAlg::Sha512, 64),
             _ => return fail(Alert::IllegalParameter),
         };
-        let key = self.peer_key.ok_or(Error::Local(Alert::BadCertificate))?;
+        let key = self.peer_key.as_ref().ok_or(Error::Local(Alert::BadCertificate))?;
         if !key.verify(alg, &content, sig) {
             return fail(Alert::DecryptError);
         }
@@ -1121,8 +1131,9 @@ impl Connection {
                     put_u16(l, GROUP_P256);
                 }));
                 put_ext(e, EXT_SIGNATURE_ALGORITHMS, |v| put_vec(v, 2, |l| {
-                    put_u16(l, SIG_ECDSA_P256_SHA256);
-                    put_u16(l, SIG_ED25519);
+                    for s in [SIG_ECDSA_P256_SHA256, SIG_ED25519, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PSS_RSAE_SHA384, SIG_RSA_PSS_RSAE_SHA512, SIG_RSA_PKCS1_SHA256, SIG_RSA_PKCS1_SHA384, SIG_RSA_PKCS1_SHA512] {
+                        put_u16(l, s);
+                    }
                 }));
                 put_ext(e, EXT_KEY_SHARE, |v| put_vec(v, 2, |l| {
                     put_u16(l, if p256_only { GROUP_P256 } else { GROUP_X25519 });

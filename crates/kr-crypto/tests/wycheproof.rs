@@ -139,3 +139,27 @@ fn hkdf_hmac_sha256_suites() {
         assert_eq!(ok, c.result == "valid", "tc {}", c.id);
     }
 }
+
+#[test]
+fn rsa_pkcs1_and_pss_suites() {
+    use kr_crypto::rsa::{HashAlg, PublicKey};
+    let mut n = 0;
+    for c in cases(include_str!("wycheproof/rsa.txt")) {
+        let (kind, sha, salt) = (c.f[0], c.f[1], c.f[2].parse::<usize>().unwrap());
+        let h = match sha {
+            "SHA-256" => HashAlg::Sha256,
+            "SHA-384" => HashAlg::Sha384,
+            _ => HashAlg::Sha512,
+        };
+        let key = PublicKey::from_pkcs1(&unhex(c.f[3])).expect("wycheproof key parses");
+        let (msg, sig) = (unhex(c.f[4]), unhex(c.f[5]));
+        let ok = if kind == "pkcs1" { key.verify_pkcs1v15(h, &msg, &sig) } else { key.verify_pss(h, &msg, &sig, salt) };
+        match c.result {
+            "valid" => assert!(ok, "tc {} ({kind} {sha}) should verify", c.id),
+            "invalid" => assert!(!ok, "tc {} ({kind} {sha}) should be rejected", c.id),
+            _ => {}
+        }
+        n += 1;
+    }
+    assert_eq!(n, 1275);
+}

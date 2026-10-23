@@ -3,7 +3,7 @@
 line format: tcId|result|fields... with result in valid/invalid/acceptable.
 
 Usage: python3 -I tools/wycheproof_convert.py <dir-with-json>
-Suites converted (and the parameter subsets kr supports):
+Suites converted (and the parameter subsets kr supports), plus RSA PKCS#1 v1.5 / PSS signatures:
   x25519, ed25519, ecdsa P-256/SHA-256 (DER sigs), ecdh P-256 (uncompressed points only),
   AES-GCM (96-bit IV, 128-bit tag, 128/256-bit keys), ChaCha20-Poly1305 (96-bit IV), HKDF/HMAC-SHA256.
 """
@@ -52,4 +52,17 @@ def mac_kdf():
     write("hmac_sha256", [(t["tcId"], t["result"], t["key"], t["msg"], t["tag"], g["tagSize"])
                           for g in load("hmac_sha256")["testGroups"] for t in g["tests"]])
 
-x25519(); ed25519(); ecdsa(); ecdh(); aead("aes_gcm", "aes_gcm", (128, 256)); aead("chacha20_poly1305", "chacha20_poly1305", (256,)); mac_kdf()
+def rsa():
+    rows = []
+    for name, kind in [("rsa_signature_2048_sha256", "pkcs1"), ("rsa_signature_3072_sha384", "pkcs1"), ("rsa_signature_4096_sha512", "pkcs1"),
+                       ("rsa_pss_2048_sha256_mgf1_32", "pss"), ("rsa_pss_3072_sha256_mgf1_32", "pss"), ("rsa_pss_4096_sha512_mgf1_64", "pss"),
+                       ("rsa_pss_2048_sha256_mgf1_0", "pss")]:
+        for g in load(name)["testGroups"]:
+            if kind == "pss" and g["mgfSha"] != g["sha"]: continue
+            salt = g.get("sLen", 0)
+            for t in g["tests"]:
+                # publicKeyAsn is the DER RSAPublicKey (PKCS#1)
+                rows.append((t["tcId"], t["result"], kind, g["sha"], salt, g["publicKeyAsn"], t["msg"], t["sig"]))
+    write("rsa", rows)
+
+x25519(); ed25519(); rsa(); ecdsa(); ecdh(); aead("aes_gcm", "aes_gcm", (128, 256)); aead("chacha20_poly1305", "chacha20_poly1305", (256,)); mac_kdf()
