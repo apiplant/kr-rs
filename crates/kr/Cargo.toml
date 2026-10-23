@@ -8,3 +8,4 @@ license.workspace = true
 kr-sys = { path = "../kr-sys" }
 kr-rt = { path = "../kr-rt" }
 kr-runtime = { path = "../kr-runtime" }
+kr-fmt = { path = "../kr-fmt" }

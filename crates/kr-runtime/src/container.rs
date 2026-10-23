@@ -16,6 +16,7 @@ use alloc::vec::Vec;
 use kr_sys::ns::{self, CloneArgs};
 use kr_sys::{Errno, Fd};
 
+use crate::cgroup::{Cgroup, Limits};
 use crate::security;
 
 pub struct RunSpec<'a> {
@@ -32,6 +33,18 @@ pub struct RunSpec<'a> {
     /// Working directory inside the container ("" means "/").
     pub cwd: &'a [u8],
     pub hostname: &'a [u8],
+    /// Container id; names the cgroup. Required when `limits` is non-empty.
+    pub id: &'a [u8],
+    pub limits: Limits,
+}
+
+/// Outcome of a container run.
+#[derive(Debug)]
+pub struct Exit {
+    /// Shell-style exit code (128+signal when killed).
+    pub code: i32,
+    /// The kernel OOM-killed a process in the container's cgroup.
+    pub oom_killed: bool,
 }
 
 #[derive(Debug)]
@@ -78,7 +91,7 @@ fn cstr(parts: &[&[u8]]) -> Vec<u8> {
 }
 
 /// Runs the container to completion and returns its exit code (128+signal if killed).
-pub fn run(spec: &RunSpec) -> Result<i32, RunError> {
+pub fn run(spec: &RunSpec) -> Result<Exit, RunError> {
     // Overlay options are comma/colon separated, so those bytes (and NUL) must not occur in paths.
     let bad = |p: &[u8]| p.is_empty() || p.iter().any(|&b| b == b',' || b == b':' || b == 0);
     if bad(spec.rootfs) || bad(spec.upper) || bad(spec.work) || bad(spec.merged) || spec.argv.is_empty() {
@@ -88,6 +101,12 @@ pub fn run(spec: &RunSpec) -> Result<i32, RunError> {
     let (go_r, go_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     let (rep_r, rep_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     let (uid, gid) = (ns::getuid(), ns::getgid());
+
+    let cgroup = if spec.limits.is_empty() {
+        None
+    } else {
+        Some(Cgroup::create(spec.id, &spec.limits).map_err(err("create cgroup (is kr in a delegated cgroup? try systemd-run --user --scope -p Delegate=yes)"))?)
+    };
 
     let mut args = CloneArgs {
         flags: ns::CLONE_NEWUSER
@@ -100,8 +119,20 @@ pub fn run(spec: &RunSpec) -> Result<i32, RunError> {
         exit_signal: ns::SIGCHLD as u64,
         ..Default::default()
     };
+    if let Some(cg) = &cgroup {
+        args.flags |= ns::CLONE_INTO_CGROUP;
+        args.cgroup = cg.dir.raw() as u64;
+    }
     // SAFETY: the runtime is single-threaded (ADR-005), so the forked child's memory is coherent.
-    let pid = unsafe { ns::clone3(&mut args) }.map_err(err("clone3"))?;
+    let pid = match unsafe { ns::clone3(&mut args) } {
+        Ok(p) => p,
+        Err(e) => {
+            if let Some(cg) = &cgroup {
+                cg.remove();
+            }
+            return Err(RunError { step: "clone3", errno: e });
+        }
+    };
 
     if pid == 0 {
         drop(go_w);
@@ -113,9 +144,17 @@ pub fn run(spec: &RunSpec) -> Result<i32, RunError> {
 
     drop(go_r);
     drop(rep_w);
+    let finish = |cg: &Option<Cgroup>| -> bool {
+        let oom = cg.as_ref().is_some_and(|c| c.oom_kills() > 0);
+        if let Some(c) = cg {
+            c.remove();
+        }
+        oom
+    };
     if let Err(e) = write_id_maps(pid, uid, gid) {
         let _ = ns::kill(pid, ns::SIGKILL);
         let _ = ns::wait4(pid);
+        finish(&cgroup);
         return Err(e);
     }
     let _ = kr_sys::write(go_w.raw(), b"g");
@@ -123,12 +162,14 @@ pub fn run(spec: &RunSpec) -> Result<i32, RunError> {
 
     let mut rep = [0u8; 3];
     let n = read_full(&rep_r, &mut rep);
-    let status = ns::wait4(pid).map_err(err("wait4"))?;
+    let status = ns::wait4(pid);
+    let oom_killed = finish(&cgroup);
+    let status = status.map_err(err("wait4"))?;
     if n == 3 {
         let step = STEPS.get(rep[0] as usize).copied().unwrap_or("unknown");
         return Err(RunError { step, errno: Errno(rep[1] as i32 | (rep[2] as i32) << 8) });
     }
-    Ok(ns::exit_code(status))
+    Ok(Exit { code: ns::exit_code(status), oom_killed })
 }
 
 fn rootless(uid: u32) -> bool {

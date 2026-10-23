@@ -19,6 +19,7 @@ mod n {
     pub const KILL: usize = 62;
     pub const UNLINKAT: usize = 263;
     pub const CAPSET: usize = 126;
+    pub const NANOSLEEP: usize = 35;
     pub const SECCOMP: usize = 317;
 }
 
@@ -39,6 +40,7 @@ mod n {
     pub const KILL: usize = 129;
     pub const UNLINKAT: usize = 35;
     pub const CAPSET: usize = 91;
+    pub const NANOSLEEP: usize = 101;
     pub const SECCOMP: usize = 277;
 }
 
@@ -267,4 +269,10 @@ pub fn seccomp_set_filter(prog: &[SockFilter]) -> Result<()> {
     let fprog = SockFprog { len: prog.len() as u16, filter: prog.as_ptr() };
     // SAFETY: fprog points at `prog`, which outlives the call; the kernel copies the program.
     check(unsafe { syscall3(n::SECCOMP, 1, 0, &fprog as *const SockFprog as usize) }).map(|_| ())
+}
+
+/// Blocking sleep (for short retry loops outside the executor).
+pub fn nanosleep(ts: &super::Timespec) -> Result<()> {
+    // SAFETY: ts is a valid timespec; the remaining-time pointer is NULL.
+    check(unsafe { syscall2(n::NANOSLEEP, ts as *const super::Timespec as usize, 0) }).map(|_| ())
 }
