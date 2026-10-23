@@ -10,9 +10,13 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod aes;
+pub mod bigint;
 pub mod chacha;
+pub mod ed25519;
 pub mod field25519;
 pub mod hmac;
+pub mod p256;
 pub mod sha2;
 pub mod x25519;
 
@@ -31,10 +35,4 @@ pub fn wipe(b: &mut [u8]) {
         *x = 0;
     }
     core::hint::black_box(b);
-}
-
-#[cfg(test)]
-pub(crate) fn unhex(s: &str) -> alloc::vec::Vec<u8> {
-    let s: alloc::string::String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
 }

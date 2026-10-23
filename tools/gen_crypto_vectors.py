@@ -62,6 +62,40 @@ def chacha_x25519():
         rows.append(("x25519", a, b, pa, B.exchange(X25519PublicKey.from_public_bytes(pa))))
     w("chacha_x25519.txt", rows)
 
+@gen
+def aes_gcm():
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    rows = []
+    for kl in (16, 32):
+        for n in [0, 1, 15, 16, 17, 31, 32, 33, 64, 100, 1000]:
+            k, nonce, aad, pt = rb(kl), rb(12), rb(rng.choice([0, 1, 13, 16, 20, 40])), rb(n)
+            rows.append((k, nonce, aad, pt, AESGCM(k).encrypt(nonce, pt, aad)))
+    w("aes_gcm.txt", rows)
+
+@gen
+def signatures():
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+    from cryptography.hazmat.primitives import serialization as ser
+    rows = []
+    raw = dict(encoding=ser.Encoding.Raw, format=ser.PublicFormat.Raw)
+    for _ in range(16):
+        seed, msg = rb(32), rb(rng.randrange(0, 200))
+        k = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
+        rows.append(("ed25519", seed, k.public_key().public_bytes(**raw), msg, k.sign(msg)))
+    unc = dict(encoding=ser.Encoding.X962, format=ser.PublicFormat.UncompressedPoint)
+    n = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
+    for _ in range(12):
+        d = rng.randrange(1, n); msg = rb(rng.randrange(0, 200))
+        k = ec.derive_private_key(d, ec.SECP256R1())
+        pub = k.public_key().public_bytes(**unc)
+        det = k.sign(msg, ec.ECDSA(hashes.SHA256(), deterministic_signing=True))
+        rnd = k.sign(msg, ec.ECDSA(hashes.SHA256()))
+        d2 = rng.randrange(1, n); k2 = ec.derive_private_key(d2, ec.SECP256R1())
+        shared = k.exchange(ec.ECDH(), k2.public_key())
+        rows.append(("p256", d.to_bytes(32, "big"), pub, msg, det, rnd, k2.public_key().public_bytes(**unc), shared))
+    w("signatures.txt", rows)
+
 if __name__ == "__main__":
     for n in (sys.argv[1:] or GENERATORS):
         GENERATORS[n]()
