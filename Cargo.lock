@@ -6,7 +6,9 @@ version = 4
 name = "kr"
 version = "0.0.1"
 dependencies = [
+ "kr-fmt",
  "kr-rt",
+ "kr-runtime",
  "kr-sys",
 ]
 

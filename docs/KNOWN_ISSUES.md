@@ -104,3 +104,20 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
 ## kr-sys (cont.)
 
 35. **`syscall0..6` lack `# Safety` docs (clippy `missing_safety_doc`)** — *open (cleanup)*
+
+## kr-runtime store / unpack / pull
+
+36. **Store root env is read from `/proc/self/environ`** — *accepted*
+    `kr-rt` has no environment accessor, so `store::env_var` parses `/proc/self/environ` (the startup environment; later `setenv` calls are not seen). Without procfs, only the explicit `Store::open(Some(root))` works.
+37. **Rootless unpack normalises ownership, setuid/setgid and directory permissions** — *accepted*
+    Ownership is not preserved (chown failures with EPERM/EINVAL are ignored), setuid/setgid bits are stripped, and directories get `|0700` so later layers, whiteouts and `rm -rf` of the store keep working (a `0555` dir becomes `0755`). As real root, modes are exact. Revisit with subuid ranges.
+38. **Unpack uses O(depth) kernel path walks per entry and a recursion depth limit of 512 for removals** — *accepted*
+    Each entry resolves its parent with `openat2` (no fd cache). `fs::remove_all` holds one fd per level and fails with ELOOP past depth 512. A directory with mode `000` that was not created by us cannot be emptied rootless (no `/proc/self/fd` chmod fallback).
+39. **Layer diff_ids are not verified; only blob digests are** — *open*
+    The sha256 of the uncompressed tar (`rootfs.diff_ids` in the config) is not compared. zstd layers (`+zstd`) are rejected with `Error::Image`. Pulled-image refs are never refreshed (a moved `:latest` is not re-fetched once present).
+40. **Whiteout/created-path tracking uses 64-bit FNV hashes** — *accepted*
+    The per-layer set of created paths (so a layer's own entries survive its own whiteouts/opaque markers) stores hashes, not strings, to bound memory at ~8 MiB per million entries. A crafted collision can only make a layer keep a lower-layer path it meant to delete; it cannot escape the root.
+41. **Pull/unpack are blocking inside the async executor** — *accepted*
+    Layer unpack is synchronous file I/O and CPU (inflate) on the single-threaded executor, so other tasks stall while a layer extracts. Concurrent pulls of one image race on `rootfs.tmp` (the loser is cleaned up, but there is no lock).
+42. **FIFOs are created, devices are skipped, tar xattrs on symlinks are dropped** — *accepted*
+    `trusted.overlay.*` / `user.overlay.*` xattrs from layers are always ignored so an image cannot forge overlayfs markers.
