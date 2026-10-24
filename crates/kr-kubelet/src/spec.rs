@@ -23,7 +23,7 @@ pub struct Built {
 }
 
 pub fn find_container<'a>(pod: &'a Value, name: &str) -> Option<&'a Value> {
-    ["initContainers", "containers"]
+    ["initContainers", "containers", "ephemeralContainers"]
         .iter()
         .flat_map(|k| pod.pointer(&["spec", k]).and_then(Value::as_array).unwrap_or(&[]).iter())
         .find(|c| c.get("name").and_then(Value::as_str) == Some(name))

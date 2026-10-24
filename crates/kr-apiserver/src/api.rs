@@ -580,8 +580,15 @@ impl ApiServer {
             ("POST", Some(n), Some("token")) => self.token_request(req, rt, n),
             ("PUT", Some(n), Some("scale")) => self.update_scale(req, rt, n, false),
             ("PATCH", Some(n), Some("scale")) => self.update_scale(req, rt, n, true),
+            ("PUT", Some(n), Some("ephemeralcontainers")) => {
+                let (kv, old) = self.get_value(rt, n)?;
+                let mut new = self.parse_body(req)?;
+                eph_only(&old, &mut new)?;
+                self.update(req, rt, n, false, q, Some((kv, old, new)))
+            }
+            ("PATCH", Some(n), Some("ephemeralcontainers")) => self.patch(req, rt, n, false, q, true),
             ("PUT", Some(n), s) => self.update(req, rt, n, s == Some("status"), q, None),
-            ("PATCH", Some(n), s) => self.patch(req, rt, n, s == Some("status"), q),
+            ("PATCH", Some(n), s) => self.patch(req, rt, n, s == Some("status"), q, false),
             ("DELETE", Some(n), None) => self.delete(req, rt, n, q),
             ("DELETE", None, None) => self.delete_collection(rt, q),
             _ => Err(ApiError::new(405, "MethodNotAllowed", alloc::format!("method {} not allowed here", req.method))),
@@ -865,7 +872,7 @@ impl ApiServer {
         Ok(Reply::ok(&new))
     }
 
-    fn patch(&self, req: &Req, rt: &Route, name: &str, status: bool, q: &Query) -> R<Reply> {
+    fn patch(&self, req: &Req, rt: &Route, name: &str, status: bool, q: &Query, eph: bool) -> R<Reply> {
         let ct = req.content_type.unwrap_or("");
         let p = self.parse_body(req)?;
         let existing = self.get_value(rt, name);
@@ -892,6 +899,9 @@ impl ApiServer {
             return Err(ApiError::new(415, "UnsupportedMediaType", alloc::format!("unsupported patch type {ct:?}")));
         };
         r.map_err(|e| ApiError::invalid(e.0))?;
+        if eph {
+            eph_only(&old, &mut new)?;
+        }
         // A patch never carries a resourceVersion precondition unless it sets one explicitly.
         if p.pointer(&["metadata", "resourceVersion"]).is_none() {
             if let Some(m) = new.get_mut("metadata") {
@@ -1690,4 +1700,30 @@ impl crate::node_authz::Pods for StorePods<'_> {
         let prefix = alloc::format!("{}{ns}/", r.prefix());
         self.0.store.borrow().list(&prefix, None, 0).0.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect()
     }
+}
+
+/// pods/ephemeralcontainers: only spec.ephemeralContainers may change, and existing entries are immutable.
+fn eph_only(old: &Value, new: &mut Value) -> R<()> {
+    let ephs = new.pointer(&["spec", "ephemeralContainers"]).cloned();
+    let prev = old.pointer(&["spec", "ephemeralContainers"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+    let now = ephs.as_ref().and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+    for p in &prev {
+        let n = p.get("name").and_then(Value::as_str);
+        if !now.iter().any(|c| c.get("name").and_then(Value::as_str) == n && c == p) {
+            return Err(ApiError::invalid("Forbidden: existing ephemeral containers may not be changed or removed"));
+        }
+    }
+    let used = |n: &str| ["initContainers", "containers"].iter().any(|k| old.pointer(&["spec", k]).and_then(Value::as_array).is_some_and(|a| a.iter().any(|c| c.get("name").and_then(Value::as_str) == Some(n))));
+    for c in &now {
+        let n = c.get("name").and_then(Value::as_str).unwrap_or("");
+        if n.is_empty() || (used(n) && !prev.iter().any(|p| p.get("name").and_then(Value::as_str) == Some(n))) {
+            return Err(ApiError::invalid(alloc::format!("spec.ephemeralContainers: Duplicate value: {n:?}")));
+        }
+    }
+    let mut out = old.clone();
+    if let Some(e) = ephs {
+        out.entry_object("spec").set("ephemeralContainers", e);
+    }
+    *new = out;
+    Ok(())
 }
