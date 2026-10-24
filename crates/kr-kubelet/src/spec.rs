@@ -33,6 +33,78 @@ pub fn pod_hostname(pod: &Value) -> String {
     h.chars().take(63).collect::<String>().trim_end_matches(['-', '.']).to_string()
 }
 
+/// /etc/resolv.conf for the pod per `dnsPolicy` (ClusterFirst by default).
+pub fn write_resolv_conf(pod_dir: &str, pod: &Value) -> Result<(), ()> {
+    let ns = meta(pod, "namespace");
+    let policy = pod.pointer(&["spec", "dnsPolicy"]).and_then(Value::as_str).unwrap_or("ClusterFirst");
+    let host_net = pod.pointer(&["spec", "hostNetwork"]).and_then(Value::as_bool) == Some(true);
+    let mut s = match policy {
+        "Default" => String::from_utf8(kr_sys::fs::read_file(b"/etc/resolv.conf\0", 64 * 1024).unwrap_or_default()).unwrap_or_default(),
+        "ClusterFirstWithHostNet" | "ClusterFirst" if !(host_net && policy == "ClusterFirst") => {
+            alloc::format!("search {ns}.svc.cluster.local svc.cluster.local cluster.local\nnameserver 10.96.0.10\noptions ndots:5\n")
+        }
+        "ClusterFirst" => String::from_utf8(kr_sys::fs::read_file(b"/etc/resolv.conf\0", 64 * 1024).unwrap_or_default()).unwrap_or_default(),
+        _ => String::new(), // "None": only dnsConfig below
+    };
+    if let Some(cfg) = pod.pointer(&["spec", "dnsConfig"]) {
+        for n in cfg.get("nameservers").and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_str) {
+            s.push_str(&alloc::format!("nameserver {n}\n"));
+        }
+        let search: Vec<&str> = cfg.get("searches").and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_str).collect();
+        if !search.is_empty() {
+            s.push_str(&alloc::format!("search {}\n", search.join(" ")));
+        }
+        for o in cfg.get("options").and_then(Value::as_array).unwrap_or(&[]) {
+            let name = o.get("name").and_then(Value::as_str).unwrap_or("");
+            match o.get("value").and_then(Value::as_str) {
+                Some(v) => s.push_str(&alloc::format!("options {name}:{v}\n")),
+                None => s.push_str(&alloc::format!("options {name}\n")),
+            }
+        }
+    }
+    kr_runtime::store::write_file_atomic(&alloc::format!("{pod_dir}/resolv.conf"), s.as_bytes()).map_err(|_| ())
+}
+
+/// Docker-link style service environment variables for the pod's namespace.
+async fn service_env<C: Client>(c: &C, pod: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    // The kubernetes service is always injected; others only with enableServiceLinks.
+    let links = pod.pointer(&["spec", "enableServiceLinks"]).and_then(Value::as_bool) != Some(false);
+    let ns = meta(pod, "namespace");
+    let mut svcs: Vec<Value> = Vec::new();
+    if let Ok(l) = c.get("/api/v1/namespaces/default/services/kubernetes").await {
+        svcs.push(l);
+    }
+    if links {
+        if let Ok(l) = c.list(&alloc::format!("/api/v1/namespaces/{ns}/services"), "").await {
+            svcs.extend(l.get("items").and_then(Value::as_array).unwrap_or(&[]).iter().filter(|s| !(ns == "default" && meta(s, "name") == "kubernetes")).cloned());
+        }
+    }
+    for s in svcs {
+        let Some(ip) = s.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).filter(|i| !i.is_empty() && *i != "None") else { continue };
+        let name: String = meta(&s, "name").chars().map(|c| if c == '-' { '_' } else { c.to_ascii_uppercase() }).collect();
+        let ports = s.pointer(&["spec", "ports"]).and_then(Value::as_array).unwrap_or(&[]);
+        let Some(first) = ports.first() else { continue };
+        let port = |p: &Value| p.get("port").and_then(Value::as_u64).unwrap_or(0);
+        let proto = |p: &Value| p.get("protocol").and_then(Value::as_str).unwrap_or("TCP").to_string();
+        out.push((alloc::format!("{name}_SERVICE_HOST"), ip.to_string()));
+        out.push((alloc::format!("{name}_SERVICE_PORT"), port(first).to_string()));
+        out.push((alloc::format!("{name}_PORT"), alloc::format!("{}://{ip}:{}", proto(first).to_ascii_lowercase(), port(first))));
+        for p in ports {
+            let pr = proto(p);
+            let base = alloc::format!("{name}_PORT_{}_{}", port(p), pr);
+            if let Some(pn) = p.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()) {
+                out.push((alloc::format!("{name}_SERVICE_PORT_{}", pn.replace('-', "_").to_ascii_uppercase()), port(p).to_string()));
+            }
+            out.push((base.clone(), alloc::format!("{}://{ip}:{}", pr.to_ascii_lowercase(), port(p))));
+            out.push((alloc::format!("{base}_PROTO"), pr.to_ascii_lowercase()));
+            out.push((alloc::format!("{base}_PORT"), port(p).to_string()));
+            out.push((alloc::format!("{base}_ADDR"), ip.to_string()));
+        }
+    }
+    out
+}
+
 pub fn write_etc_hosts(pod_dir: &str, hostname: &str, ip: Option<[u8; 4]>) -> Result<(), ()> {
     let mut s = String::from("# Kubernetes-managed hosts file (kr).\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
     if let Some(a) = ip {
@@ -291,6 +363,7 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         env.push(("PATH".into(), "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()));
     }
     env.push(("HOSTNAME".into(), pod_hostname(pod)));
+    env.extend(service_env(c, pod).await);
     for from in ctr.get("envFrom").and_then(Value::as_array).unwrap_or(&[]) {
         let prefix = from.get("prefix").and_then(Value::as_str).unwrap_or("");
         for (kind, field, b64) in [("configmaps", "configMapRef", false), ("secrets", "secretRef", true)] {
@@ -375,7 +448,10 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         limits.cpu_request_milli = cpu.milli_value().and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
     }
     let vols = pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]);
-    let mut mounts = alloc::vec![Mount { source: alloc::format!("{pod_dir}/etc-hosts").into_bytes(), sub_path: None, target: b"/etc/hosts".to_vec(), readonly: false }];
+    let mut mounts = alloc::vec![
+        Mount { source: alloc::format!("{pod_dir}/etc-hosts").into_bytes(), sub_path: None, target: b"/etc/hosts".to_vec(), readonly: false },
+        Mount { source: alloc::format!("{pod_dir}/resolv.conf").into_bytes(), sub_path: None, target: b"/etc/resolv.conf".to_vec(), readonly: false },
+    ];
     for vm in ctr.get("volumeMounts").and_then(Value::as_array).unwrap_or(&[]) {
         let name = vm.get("name").and_then(Value::as_str).unwrap_or("");
         let target = vm.get("mountPath").and_then(Value::as_str).unwrap_or("");

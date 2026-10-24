@@ -45,7 +45,12 @@ fn ready_of(v: &Value) -> String {
 
 fn svc_ports(v: &Value) -> String {
     let ports = v.pointer(&["spec", "ports"]).and_then(Value::as_array).unwrap_or(&[]);
-    let out: alloc::vec::Vec<String> = ports.iter().map(|p| alloc::format!("{}/{}", s(p, &["port"]), { let pr = s(p, &["protocol"]); if pr.is_empty() { "TCP".into() } else { pr } })).collect();
+    let out: alloc::vec::Vec<String> = ports.iter().map(|p| {
+        let pr = s(p, &["protocol"]);
+        let pr = if pr.is_empty() { String::from("TCP") } else { pr };
+        let np = s(p, &["nodePort"]);
+        if np.is_empty() { alloc::format!("{}/{pr}", s(p, &["port"])) } else { alloc::format!("{}:{np}/{pr}", s(p, &["port"])) }
+    }).collect();
     if out.is_empty() { "<none>".into() } else { out.join(",") }
 }
 
