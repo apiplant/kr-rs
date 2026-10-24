@@ -67,14 +67,15 @@ pub enum Reply {
 impl Reply {
     fn aggregated_discovery(req: &Req, extra: &[&'static Resource], core: bool) -> Reply {
         use kr_net::http1::server::Response;
-        if discovery::negotiate(req.accept) == discovery::Negotiated::NotAcceptable {
-            return Reply::Http(Response::new(406, Vec::new()));
-        }
-        let body = discovery::aggregated(extra, core);
+        let ver = match discovery::negotiate(req.accept) {
+            discovery::Negotiated::Aggregated(v) => v,
+            _ => return Reply::Http(Response::new(406, Vec::new())),
+        };
+        let body = discovery::aggregated(extra, core, ver);
         let tag = discovery::etag(&body);
         let matched = req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("if-none-match") && v.split(',').any(|t| t.trim() == tag || t.trim() == "*"));
         let resp = if matched { Response::new(304, Vec::new()) } else { Response::new(200, body.into_bytes()) };
-        Reply::Http(resp.with_header("Content-Type", discovery::agg_content_type()).with_header("ETag", &tag))
+        Reply::Http(resp.with_header("Content-Type", &discovery::agg_content_type(ver)).with_header("ETag", &tag))
     }
 
     pub(crate) fn err(e: ApiError) -> Reply {

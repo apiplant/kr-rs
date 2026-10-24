@@ -95,15 +95,15 @@ pub fn group(extra: &[&'static Resource], name: &str) -> Option<String> {
     Some(json::to_string(&Value::Object(f)))
 }
 
-const AGG_CT: &str = "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList";
 
 /// Outcome of negotiating the `Accept` header for `/api` and `/apis`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Negotiated {
     /// Serve the legacy document.
     Legacy,
-    /// Serve the aggregated JSON document.
-    Aggregated,
+    /// Serve the aggregated JSON document in this apidiscovery version ("v2" or "v2beta1":
+    /// older client-go asks for v2beta1 and rejects a v2 answer).
+    Aggregated(&'static str),
     /// Only the (unsupported) protobuf aggregated form was requested.
     NotAcceptable,
 }
@@ -135,10 +135,11 @@ pub fn negotiate(accept: Option<&str>) -> Negotiated {
         let mt = parts.next().unwrap_or("");
         let params: Vec<&str> = parts.collect();
         let has = |k: &str, v: &str| params.iter().any(|p| p.strip_prefix(k).and_then(|x| x.strip_prefix('=')).is_some_and(|x| x == v));
-        let agg = has("g", "apidiscovery.k8s.io") && has("as", "APIGroupDiscoveryList") && (has("v", "v2") || has("v", "v2beta1"));
+        let ver = if has("v", "v2") { Some("v2") } else if has("v", "v2beta1") { Some("v2beta1") } else { None };
+        let agg = has("g", "apidiscovery.k8s.io") && has("as", "APIGroupDiscoveryList") && ver.is_some();
         let q = q_of(&params);
         let kind = match mt {
-            "application/json" if agg => Negotiated::Aggregated,
+            "application/json" if agg => Negotiated::Aggregated(ver.unwrap_or("v2")),
             "application/vnd.kubernetes.protobuf" if agg => {
                 proto_agg = true;
                 continue;
@@ -157,8 +158,8 @@ pub fn negotiate(accept: Option<&str>) -> Negotiated {
     }
 }
 
-pub fn agg_content_type() -> &'static str {
-    AGG_CT
+pub fn agg_content_type(ver: &str) -> String {
+    alloc::format!("application/json;g=apidiscovery.k8s.io;v={ver};as=APIGroupDiscoveryList")
 }
 
 /// Quoted ETag for a body (two FNV-style 64-bit hashes).
@@ -206,11 +207,11 @@ fn agg_group(extra: &[&'static Resource], g: &str) -> Value {
 }
 
 /// Aggregated discovery for `/api` (`core == true`, the core group only) or `/apis` (all other groups).
-pub fn aggregated(extra: &[&'static Resource], core: bool) -> String {
+pub fn aggregated(extra: &[&'static Resource], core: bool, ver: &str) -> String {
     let items: Vec<Value> = if core { alloc::vec![agg_group(extra, "")] } else { resources::groups(extra).into_iter().filter(|g| !g.is_empty()).map(|g| agg_group(extra, g)).collect() };
     json::to_string(&obj(alloc::vec![
         ("kind", s("APIGroupDiscoveryList")),
-        ("apiVersion", s("apidiscovery.k8s.io/v2")),
+        ("apiVersion", Value::String(alloc::format!("apidiscovery.k8s.io/{ver}"))),
         ("metadata", obj(alloc::vec![])),
         ("items", Value::Array(items)),
     ]))
@@ -226,27 +227,27 @@ mod tests {
     fn negotiation() {
         assert_eq!(negotiate(None), Negotiated::Legacy);
         assert_eq!(negotiate(Some("application/json")), Negotiated::Legacy);
-        assert_eq!(negotiate(Some(JSON_AGG)), Negotiated::Aggregated);
+        assert_eq!(negotiate(Some(JSON_AGG)), Negotiated::Aggregated("v2"));
         let both = "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList,application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList,application/json";
-        assert_eq!(negotiate(Some(both)), Negotiated::Aggregated);
+        assert_eq!(negotiate(Some(both)), Negotiated::Aggregated("v2"));
         let q = "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList;q=0.5,application/json;q=0.9";
         assert_eq!(negotiate(Some(q)), Negotiated::Legacy);
         let proto = "application/vnd.kubernetes.protobuf;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList";
         assert_eq!(negotiate(Some(proto)), Negotiated::NotAcceptable);
-        assert_eq!(negotiate(Some(&alloc::format!("{proto},{JSON_AGG}"))), Negotiated::Aggregated);
+        assert_eq!(negotiate(Some(&alloc::format!("{proto},{JSON_AGG}"))), Negotiated::Aggregated("v2"));
         assert_eq!(negotiate(Some(&alloc::format!("{proto},application/json"))), Negotiated::Legacy);
     }
 
     #[test]
     fn shape() {
-        let core = aggregated(&[], true);
+        let core = aggregated(&[], true, "v2");
         assert!(core.contains("\"kind\":\"APIGroupDiscoveryList\"") && core.contains("apidiscovery.k8s.io/v2"));
         let v = json::parse_str(&core).unwrap();
         let items = v.get("items").and_then(|i| i.as_array()).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].get("metadata").and_then(|m| m.get("name")).and_then(|n| n.as_str()), Some(""));
         assert!(core.contains("\"scope\":\"Namespaced\"") && core.contains("\"freshness\":\"Current\"") && core.contains("\"singularResource\":\"pod\""));
-        let apis = aggregated(&[], false);
+        let apis = aggregated(&[], false, "v2");
         assert!(apis.contains("\"name\":\"apps\"") && !apis.contains("\"name\":\"\""));
     }
 
@@ -259,7 +260,20 @@ mod tests {
     #[test]
     fn crd_included() {
         static R: Resource = Resource { group: "example.com", version: "v1", kind: "Widget", plural: "widgets", singular: "widget", namespaced: false, short: &["wd"], subresources: &["status"], categories: &[] };
-        let d = aggregated(&[&R], false);
+        let d = aggregated(&[&R], false, "v2");
         assert!(d.contains("\"name\":\"example.com\"") && d.contains("\"resource\":\"widgets\"") && d.contains("\"scope\":\"Cluster\"") && d.contains("\"kind\":\"Widget\""));
+    }
+}
+
+#[cfg(test)]
+mod v2beta1_tests {
+    use super::*;
+
+    #[test]
+    fn older_clients_get_the_version_they_asked_for() {
+        let old = "application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList,application/json";
+        assert_eq!(negotiate(Some(old)), Negotiated::Aggregated("v2beta1"));
+        assert!(aggregated(&[], true, "v2beta1").contains("\"apiVersion\":\"apidiscovery.k8s.io/v2beta1\""));
+        assert_eq!(agg_content_type("v2beta1"), "application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList");
     }
 }
