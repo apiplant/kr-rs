@@ -29,9 +29,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     The plan's dudect-style timing checks on x25519, P-256 signing, Ed25519 signing and the AEADs are still to do (phase 6 fuzz/timing harness).
 60. **P-256 scalar multiplication is a plain ladder (~0.8 ms sign, ~1.5 ms verify)** — *watch*
     That is fine per handshake. Fixed-base tables would speed up the apiserver when there are many clients.
-61. **No TLS 1.2 client** — *open*
-    Some CDNs only speak TLS 1.2: `production.cloudflare.docker.com` answers TLS 1.3 with `protocol_version`. Docker Hub currently redirects blobs here to CloudFront (TLS 1.3), but registries or regions that land on such a CDN will fail.
-    Plan: a client-only TLS 1.2 with ECDHE plus AEAD suites, Extended Master Secret required, and no renegotiation or resumption.
 
 ## Control plane (ADR-021)
 63. **No typed schemas or defaulting** — *partly fixed*
@@ -223,6 +220,8 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     - Honours resolv.conf `nameserver`, `search`, `ndots`, `timeout` and `attempts`.
     - Spoofing defences: random ids, connected sockets and question echo checks. Name decompression is strict, with backward-only pointers.
     - No caching yet.
+61. **No TLS 1.2 client** — *fixed* (commit: bb1ac93)
+    Client-only and opt-in (`ClientConfig::tls12`, enabled for registry pulls; kr's own connections stay TLS 1.3). ECDHE (X25519, P-256) with ECDSA or RSA certificates, AES-128-GCM or ChaCha20-Poly1305, SHA-256 PRF. Extended Master Secret is required and the RFC 8446 downgrade sentinel is checked; no renegotiation, no resumption, no client certificates. Tested against `openssl s_server -tls1_2`. Not offered: SHA-384 suites (AES-256-GCM), CBC suites.
 
 ## Control plane (ADR-021)
 64. **RBAC not implemented** — *fixed*
@@ -293,6 +292,12 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 ## kr-fmt
 18. **14 clippy style lints in kr-fmt** — *fixed* (commit: )
 
+## Echo server (cont.)
+14. **The lingering close holds each connection for up to 1 s after the response** — *fixed* (commit: )
+    Under heavy load this raises the number of concurrent connections. Plan: skip the drain when the request was fully read, and cap total lingering connections.
+91. **Datastore fsync blocked the event loop; log never compacted** — *fixed* (ADR-024)
+    Found in conformance run 3: kr sat in `D` state under write load and the log grew without bound. Writes now go through group commit, with fsync in a helper process, and the log is compacted periodically. Verified: no `D` states during a 300-write burst, and all acknowledged writes survive `kill -9`.
+
 ## kr-sys (cont.)
 35. **`syscall0..6` lack `# Safety` docs (clippy `missing_safety_doc`)** — *fixed (e64a857)*
 
@@ -300,9 +305,3 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 12. **The 431 path closes with unread data, so the client may see a TCP RST** — *fixed* (commit: 68940ad)
     Plan: lingering close. Send the response, `shutdown(SHUT_WR)`, then drain the input for up to 1 s and close.
     Fix: `linger_close` runs after every response (not only the 431) using the new `kr_sys::shutdown`. Note that a request whose headers are complete is answered 200 even if a large body follows, and the lingering close drains that body without a reset.
-
-## Echo server (cont.)
-14. **The lingering close holds each connection for up to 1 s after the response** — *fixed* (commit: )
-    Under heavy load this raises the number of concurrent connections. Plan: skip the drain when the request was fully read, and cap total lingering connections.
-91. **Datastore fsync blocked the event loop; log never compacted** — *fixed* (ADR-024)
-    Found in conformance run 3: kr sat in `D` state under write load and the log grew without bound. Writes now go through group commit, with fsync in a helper process, and the log is compacted periodically. Verified: no `D` states during a 300-write burst, and all acknowledged writes survive `kill -9`.
