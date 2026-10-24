@@ -62,7 +62,7 @@ pub enum Reply {
 }
 
 impl Reply {
-    fn err(e: ApiError) -> Reply {
+    pub(crate) fn err(e: ApiError) -> Reply {
         Reply::Json(e.code, e.to_status_json())
     }
     fn ok(v: &Value) -> Reply {
@@ -149,11 +149,11 @@ impl Query {
 }
 
 /// A parsed resource URL.
-struct Route {
-    res: &'static Resource,
-    namespace: Option<String>,
-    name: Option<String>,
-    sub: Option<String>,
+pub(crate) struct Route {
+    pub(crate) res: &'static Resource,
+    pub(crate) namespace: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) sub: Option<String>,
 }
 
 fn is_masters(u: &User) -> bool {
@@ -452,7 +452,7 @@ impl ApiServer {
     }
 
     /// Client certificate user, else a valid ServiceAccount token, else anonymous.
-    fn authenticate(&self, req: &Req) -> R<User> {
+    pub(crate) fn authenticate(&self, req: &Req) -> R<User> {
         if let Some(u) = &req.user {
             return Ok(u.clone());
         }
@@ -545,6 +545,35 @@ impl ApiServer {
             Ok(r) => r,
             Err(e) => Reply::err(e),
         }
+    }
+
+    /// Parses a resource URL (for the webhook layer).
+    pub(crate) fn wh_route(&self, path: &str) -> Option<Route> {
+        let path = path.trim_end_matches('/');
+        let segs: Vec<&str> = path.split('/').skip(1).collect();
+        let extra = self.extra();
+        match segs.as_slice() {
+            ["api", "v1", rest @ ..] if !rest.is_empty() => parse_route(&extra, "", "v1", rest),
+            ["apis", g, v, rest @ ..] if !rest.is_empty() => parse_route(&extra, g, v, rest),
+            _ => None,
+        }
+    }
+
+    /// A stored object by plural/namespace/name (core or any group).
+    pub(crate) fn wh_object(&self, group: &str, version: &str, plural: &str, ns: Option<&str>, name: &str) -> Option<Value> {
+        let r = resources::find(group, version, plural)?;
+        json::parse(&self.store.borrow().get(&r.key(ns, name))?.value).ok()
+    }
+
+    /// All stored objects of a cluster-scoped kind.
+    pub(crate) fn wh_list(&self, group: &str, version: &str, plural: &str) -> Vec<Value> {
+        let Some(r) = resources::find(group, version, plural) else { return Vec::new() };
+        let (items, _) = self.store.borrow().list(&r.prefix(), None, 0);
+        items.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect()
+    }
+
+    pub(crate) fn wh_uid(&self) -> String {
+        object::uuid4(self.rng)
     }
 
     fn route(&self, req: &Req) -> R<Reply> {
@@ -708,7 +737,7 @@ impl ApiServer {
         self.store.borrow().get(&rt.res.key(rt.namespace.as_deref(), name)).ok_or_else(|| ApiError::not_found(rt.res.singular, name))
     }
 
-    fn get_value(&self, rt: &Route, name: &str) -> R<(Kv, Value)> {
+    pub(crate) fn get_value(&self, rt: &Route, name: &str) -> R<(Kv, Value)> {
         let kv = self.get_kv(rt, name)?;
         let v = json::parse(&kv.value).map_err(|_| ApiError::new(500, "InternalError", "stored object is corrupt"))?;
         Ok((kv, v))
