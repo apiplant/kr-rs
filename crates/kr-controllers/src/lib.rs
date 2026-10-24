@@ -85,6 +85,7 @@ pub async fn run_all_with<C: Client + Clone + 'static>(c: C, cfg: Config) {
     let _guard = util::Guard(alloc::vec![
         spawn(scheduler::run(c.clone(), cfg)),
         spawn(replicaset::run(c.clone(), cfg)),
+        spawn(replicaset::run_rc(c.clone(), cfg)),
         spawn(deployment::run(c.clone(), cfg)),
         spawn(statefulset::run(c.clone(), cfg)),
         spawn(daemonset::run(c.clone(), cfg)),

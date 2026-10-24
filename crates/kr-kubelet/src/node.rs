@@ -15,11 +15,11 @@ fn read(path: &[u8]) -> String {
     kr_sys::fs::read_file(path, 1 << 20).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default()
 }
 
-fn cpus() -> usize {
+pub(crate) fn cpus() -> usize {
     read(b"/proc/cpuinfo\0").lines().filter(|l| l.starts_with("processor")).count().max(1)
 }
 
-fn memory_ki() -> u64 {
+pub(crate) fn memory_ki() -> u64 {
     read(b"/proc/meminfo\0").lines().find_map(|l| l.strip_prefix("MemTotal:")).and_then(|v| v.split_whitespace().next()?.parse().ok()).unwrap_or(0)
 }
 

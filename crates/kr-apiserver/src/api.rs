@@ -299,6 +299,17 @@ impl ApiServer {
             let body = alloc::format!(r#"{{"metadata":{{"name":"{name}","labels":{{"kubernetes.io/bootstrapping":"rbac-defaults"}}}},"roleRef":{{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"{role}"}},"subjects":{subjects}}}"#);
             self.bootstrap_object(crbr, None, name, "ClusterRoleBinding", &body);
         }
+        // The default ServiceCIDR (the allocator's range) and the mandatory API priority and
+        // fairness objects; kr does not enforce APF, these exist for API clients.
+        let scr = resources::find("networking.k8s.io", "v1", "servicecidrs").unwrap();
+        self.bootstrap_object(scr, None, "kubernetes", "ServiceCIDR", r#"{"metadata":{"name":"kubernetes"},"spec":{"cidrs":["10.96.0.0/16"]},"status":{"conditions":[{"type":"Ready","status":"True","reason":"","message":"Kubernetes Service CIDR is ready","lastTransitionTime":"1970-01-01T00:00:00Z"}]}}"#);
+        let plr = resources::find("flowcontrol.apiserver.k8s.io", "v1", "prioritylevelconfigurations").unwrap();
+        let fsr = resources::find("flowcontrol.apiserver.k8s.io", "v1", "flowschemas").unwrap();
+        let mandatory = r#"{"apf.kubernetes.io/autoupdate-spec":"true"}"#;
+        self.bootstrap_object(plr, None, "exempt", "PriorityLevelConfiguration", &alloc::format!(r#"{{"metadata":{{"name":"exempt","annotations":{mandatory}}},"spec":{{"type":"Exempt","exempt":{{"nominalConcurrencyShares":0,"lendablePercent":0}}}}}}"#));
+        self.bootstrap_object(plr, None, "catch-all", "PriorityLevelConfiguration", &alloc::format!(r#"{{"metadata":{{"name":"catch-all","annotations":{mandatory}}},"spec":{{"type":"Limited","limited":{{"nominalConcurrencyShares":5,"lendablePercent":0,"limitResponse":{{"type":"Reject"}}}}}}}}"#));
+        self.bootstrap_object(fsr, None, "exempt", "FlowSchema", &alloc::format!(r#"{{"metadata":{{"name":"exempt","annotations":{mandatory}}},"spec":{{"priorityLevelConfiguration":{{"name":"exempt"}},"matchingPrecedence":1,"rules":[{{"subjects":[{{"kind":"Group","group":{{"name":"system:masters"}}}}],"resourceRules":[{{"verbs":["*"],"apiGroups":["*"],"resources":["*"],"clusterScope":true,"namespaces":["*"]}}],"nonResourceRules":[{{"verbs":["*"],"nonResourceURLs":["*"]}}]}}]}}}}"#));
+        self.bootstrap_object(fsr, None, "catch-all", "FlowSchema", &alloc::format!(r#"{{"metadata":{{"name":"catch-all","annotations":{mandatory}}},"spec":{{"priorityLevelConfiguration":{{"name":"catch-all"}},"matchingPrecedence":10000,"distinguisherMethod":{{"type":"ByUser"}},"rules":[{{"subjects":[{{"kind":"Group","group":{{"name":"system:unauthenticated"}}}},{{"kind":"Group","group":{{"name":"system:authenticated"}}}}],"resourceRules":[{{"verbs":["*"],"apiGroups":["*"],"resources":["*"],"clusterScope":true,"namespaces":["*"]}}],"nonResourceRules":[{{"verbs":["*"],"nonResourceURLs":["*"]}}]}}]}}}}"#));
         let nsr = resources::find("", "v1", "namespaces").unwrap();
         let (namespaces, _) = self.store.borrow().list(&nsr.prefix(), None, 0);
         for kv in namespaces {
@@ -713,13 +724,17 @@ impl ApiServer {
     // ---- writes ----
 
     fn parse_body(&self, req: &Req) -> R<Value> {
+        self.parse_body_as(req, None)
+    }
+
+    fn parse_body_as(&self, req: &Req, fallback: Option<(&'static str, &'static str)>) -> R<Value> {
         let ct = req.content_type.unwrap_or("application/json");
         if ct.starts_with("application/cbor") {
             // No CBOR decoder; clients retry with JSON on 415.
             return Err(ApiError::new(415, "UnsupportedMediaType", alloc::format!("the body of the request was in an unknown format - accepted media types include: application/json, application/yaml, application/vnd.kubernetes.protobuf (got {ct})")));
         }
         let v = if ct.starts_with("application/vnd.kubernetes.protobuf") {
-            proto::decode_body(req.body).map_err(ApiError::bad_request)?
+            proto::decode_body_as(req.body, fallback).map_err(ApiError::bad_request)?
         } else if ct.starts_with("application/yaml") || ct.starts_with("application/apply-patch+yaml") {
             let s = core::str::from_utf8(req.body).map_err(|_| ApiError::bad_request("body is not UTF-8"))?;
             kr_fmt::yaml::parse(s).map_err(|_| ApiError::bad_request("invalid YAML body"))?
@@ -876,7 +891,7 @@ impl ApiServer {
     fn delete(&self, req: &Req, rt: &Route, name: &str, q: &Query) -> R<Reply> {
         let (kv, mut v) = self.get_value(rt, name)?;
         // DeleteOptions arrive as JSON or (client-go default for typed clients) protobuf.
-        let opts = if req.body.is_empty() { Value::Null } else { self.parse_body(req).map_err(|e| ApiError::bad_request(alloc::format!("invalid DeleteOptions: {}", e.message)))? };
+        let opts = if req.body.is_empty() { Value::Null } else { self.parse_body_as(req, Some(("v1", "DeleteOptions"))).map_err(|e| ApiError::bad_request(alloc::format!("invalid DeleteOptions: {}", e.message)))? };
         {
             if let Some(pre) = opts.get("preconditions") {
                 if let Some(uid) = pre.get("uid").and_then(Value::as_str) {
@@ -1004,6 +1019,15 @@ impl ApiServer {
         if ty == "ExternalName" {
             if spec.get("externalName").and_then(Value::as_str).is_none_or(str::is_empty) {
                 return Err(ApiError::invalid("spec.externalName: Required value"));
+            }
+            // No allocations for ExternalName (a type change releases them).
+            for k in ["clusterIP", "clusterIPs", "ipFamilies", "ipFamilyPolicy", "internalTrafficPolicy"] {
+                spec.remove(k);
+            }
+            if let Some(Value::Array(ports)) = spec.get_mut("ports") {
+                for p in ports.iter_mut() {
+                    p.remove("nodePort");
+                }
             }
             return Ok(());
         }

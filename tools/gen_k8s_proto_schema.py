@@ -21,7 +21,8 @@ import os, re, sys, urllib.request
 VERSION = "v0.37.0"
 RAW = "https://raw.githubusercontent.com/kubernetes/%s/" + VERSION + "/%s"
 API_GROUPS = ["core/v1", "apps/v1", "batch/v1", "coordination/v1", "discovery/v1", "networking/v1",
-              "policy/v1", "scheduling/v1", "rbac/v1", "autoscaling/v1", "authentication/v1", "authorization/v1", "scheduling/v1alpha3"]
+              "policy/v1", "scheduling/v1", "rbac/v1", "autoscaling/v1", "authentication/v1", "authorization/v1", "scheduling/v1alpha3",
+              "admissionregistration/v1", "certificates/v1", "flowcontrol/v1", "node/v1", "resource/v1", "storage/v1"]
 # local name -> (repo, path inside repo, proto package prefix, go package basename)
 SOURCES = {}
 for _g in API_GROUPS:
@@ -53,7 +54,7 @@ EXTRA_ROOTS = [("v1", "DeleteOptions", META + ".DeleteOptions"),
                ("authorization.k8s.io/v1", "SelfSubjectAccessReview", "k8s.io.api.authorization.v1.SelfSubjectAccessReview"),
                ("authorization.k8s.io/v1", "SubjectAccessReview", "k8s.io.api.authorization.v1.SubjectAccessReview")]
 # Fields whose JSON name legitimately differs from the proto name (message, number) -> json name.
-NAME_OVERRIDES = {("k8s.io.api.authentication.v1.BoundObjectReference", 4): "uid", ("k8s.io.api.networking.v1.IngressClassParametersReference", 1): "apiGroup"}
+NAME_OVERRIDES = {("k8s.io.api.admissionregistration.v1.Variable", 2): "expression", ("k8s.io.api.admissionregistration.v1.Variable", 1): "name", ("k8s.io.api.admissionregistration.v1.Validation", 1): "expression", ("k8s.io.api.admissionregistration.v1.MutatingWebhookConfiguration", 2): "webhooks", ("k8s.io.api.admissionregistration.v1.ValidatingWebhookConfiguration", 2): "webhooks", ("k8s.io.api.authentication.v1.BoundObjectReference", 4): "uid", ("k8s.io.api.networking.v1.IngressClassParametersReference", 1): "apiGroup"}
 
 SCALARS = {"string": "STRING", "bytes": "BYTES", "int32": "INT32", "int64": "INT64", "bool": "BOOL",
            "double": "DOUBLE", "float": "FLOAT", "uint32": "UINT32", "uint64": "UINT64"}

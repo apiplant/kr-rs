@@ -70,9 +70,14 @@ pub fn is_path_segment(s: &str) -> bool {
     !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '%']) && s.len() <= 253
 }
 
-/// DNS-1123 subdomain: dot-separated labels, at most 253 chars.
+/// DNS-1123 subdomain: dot-separated [a-z0-9-] parts, alphanumeric at both ends, at most
+/// 253 chars. Unlike labels, parts have no 63-char limit (upstream's regex has none).
 pub fn is_dns_subdomain(s: &str) -> bool {
-    s.len() <= 253 && s.split('.').all(is_dns_label)
+    s.len() <= 253
+        && s.split('.').all(|p| {
+            let b = p.as_bytes();
+            !b.is_empty() && is_alnum_lower(b[0]) && is_alnum_lower(b[b.len() - 1]) && b.iter().all(|&c| is_alnum_lower(c) || c == b'-')
+        })
 }
 
 /// Label/annotation key: optional DNS-subdomain prefix, then a "qualified name" (<= 63 chars,

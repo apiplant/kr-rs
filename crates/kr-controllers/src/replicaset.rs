@@ -28,14 +28,35 @@ use kr_fmt::json::Value;
 
 const MAX_BURST: usize = 500;
 
+/// What differs between ReplicaSets and ReplicationControllers.
+#[derive(Clone, Copy)]
+struct Kind {
+    kind: &'static str,
+    api_version: &'static str,
+    path: fn(Option<&str>) -> String,
+    /// `spec.selector` is a plain label map (defaulting to the template labels).
+    map_selector: bool,
+}
+
+const RS_KIND: Kind = Kind { kind: "ReplicaSet", api_version: "apps/v1", path: replicasets, map_selector: false };
+const RC_KIND: Kind = Kind { kind: "ReplicationController", api_version: "v1", path: replicationcontrollers, map_selector: true };
+
 pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config) {
+    run_kind(c, cfg, RS_KIND).await
+}
+
+pub async fn run_rc<C: Client + Clone + 'static>(c: C, cfg: Config) {
+    run_kind(c, cfg, RC_KIND).await
+}
+
+async fn run_kind<C: Client + Clone + 'static>(c: C, cfg: Config, k: Kind) {
     let q = Queue::new();
     let mut g = Guard::default();
     let q2 = q.clone();
-    g.0.push(kr_rt::exec::spawn(watch_loop(c.clone(), replicasets(None), String::new(), cfg, move |_, o| q2.add(&key_of(o)))));
+    g.0.push(kr_rt::exec::spawn(watch_loop(c.clone(), (k.path)(None), String::new(), cfg, move |_, o| q2.add(&key_of(o)))));
     let q2 = q.clone();
     g.0.push(kr_rt::exec::spawn(watch_loop(c.clone(), pods(None), String::new(), cfg, move |_, p| match controller_ref(p) {
-        Some(r) if str_at(r, &["kind"]) == "ReplicaSet" => q2.add(&alloc::format!("{}/{}", namespace(p), str_at(r, &["name"]))),
+        Some(r) if str_at(r, &["kind"]) == k.kind => q2.add(&alloc::format!("{}/{}", namespace(p), str_at(r, &["name"]))),
         Some(_) => {}
         None => q2.add(&alloc::format!("{}/*", namespace(p))),
     })));
@@ -49,19 +70,19 @@ pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config) {
             async move {
                 let (ns, n) = split_key(&key);
                 if n == "*" {
-                    for rs in items(&c.list(&replicasets(Some(ns)), "").await?) {
+                    for rs in items(&c.list(&(k.path)(Some(ns)), "").await?) {
                         q.add(&key_of(&rs));
                     }
                     return Ok(None);
                 }
-                reconcile(&c, ns, n).await?;
+                reconcile_kind(&c, k, ns, n).await?;
                 Ok(None)
             }
         },
         move || {
             let (c, q) = (c3.clone(), q3.clone());
             async move {
-                if let Ok(l) = c.list(&replicasets(None), "").await {
+                if let Ok(l) = c.list(&(k.path)(None), "").await {
                     for rs in items(&l) {
                         q.add(&key_of(&rs));
                     }
@@ -91,7 +112,11 @@ fn fully_labeled(rs: &Value, p: &Value) -> bool {
 }
 
 pub async fn reconcile<C: Client>(c: &C, ns: &str, name: &str) -> Result<()> {
-    let rs = match c.get(&alloc::format!("{}/{name}", replicasets(Some(ns)))).await {
+    reconcile_kind(c, RS_KIND, ns, name).await
+}
+
+async fn reconcile_kind<C: Client>(c: &C, k: Kind, ns: &str, name: &str) -> Result<()> {
+    let rs = match c.get(&alloc::format!("{}/{name}", (k.path)(Some(ns)))).await {
         Ok(r) => r,
         Err(e) if e.code == 404 => return Ok(()),
         Err(e) => return Err(e),
@@ -100,7 +125,13 @@ pub async fn reconcile<C: Client>(c: &C, ns: &str, name: &str) -> Result<()> {
         return Ok(());
     }
     let desired = int_at(&rs, &["spec", "replicas"], 1).max(0) as usize;
-    let Some((sel_str, sel)) = rs.get("spec").and_then(|s| s.get("selector")).and_then(parse_selector) else { return Ok(()) };
+    let parsed = if k.map_selector {
+        let m = rs.pointer(&["spec", "selector"]).or_else(|| rs.pointer(&["spec", "template", "metadata", "labels"]));
+        m.and_then(|m| parse_selector(&obj(alloc::vec![("matchLabels", m.clone())])))
+    } else {
+        rs.get("spec").and_then(|s| s.get("selector")).and_then(parse_selector)
+    };
+    let Some((sel_str, sel)) = parsed else { return Ok(()) };
     let list = c.list(&pods(Some(ns)), &alloc::format!("labelSelector={}", enc(&sel_str))).await?;
     let rs_uid = uid(&rs);
 
@@ -110,7 +141,7 @@ pub async fn reconcile<C: Client>(c: &C, ns: &str, name: &str) -> Result<()> {
             Some(r) if str_at(r, &["uid"]) == rs_uid => owned.push(p),
             Some(_) => {}
             None => {
-                if let Some(p) = adopt(c, &rs, &p).await? {
+                if let Some(p) = adopt(c, k, &rs, &p).await? {
                     owned.push(p);
                 }
             }
@@ -120,7 +151,7 @@ pub async fn reconcile<C: Client>(c: &C, ns: &str, name: &str) -> Result<()> {
     if owned.len() < desired {
         let tpl = rs.pointer(&["spec", "template"]).cloned().unwrap_or(Value::Null);
         for _ in 0..(desired - owned.len()).min(MAX_BURST) {
-            c.create(&pods(Some(ns)), &pod_from_template(&rs, &tpl)).await?;
+            c.create(&pods(Some(ns)), &pod_from_template(k, &rs, &tpl)).await?;
         }
     } else if owned.len() > desired {
         owned.sort_by_key(deletion_rank);
@@ -135,29 +166,29 @@ pub async fn reconcile<C: Client>(c: &C, ns: &str, name: &str) -> Result<()> {
 
     let ready = owned.iter().filter(|p| pod_ready(p)).count();
     let labeled = owned.iter().filter(|p| fully_labeled(&rs, p)).count();
-    write_status(c, ns, name, owned.len(), ready, labeled).await
+    write_status(c, k, ns, name, owned.len(), ready, labeled).await
 }
 
 fn name_of(p: &Value) -> &str {
     name(p)
 }
 
-fn pod_from_template(rs: &Value, tpl: &Value) -> Value {
+fn pod_from_template(k: Kind, rs: &Value, tpl: &Value) -> Value {
     let mut meta = alloc::vec![("generateName", Value::String(alloc::format!("{}-", name(rs)))), ("namespace", Value::from(namespace(rs)))];
     for f in ["labels", "annotations"] {
         if let Some(v) = tpl.pointer(&["metadata", f]) {
             meta.push((f, v.clone()));
         }
     }
-    meta.push(("ownerReferences", Value::Array(alloc::vec![owner_ref(rs, "apps/v1", "ReplicaSet")])));
+    meta.push(("ownerReferences", Value::Array(alloc::vec![owner_ref(rs, k.api_version, k.kind)])));
     obj(alloc::vec![("apiVersion", Value::from("v1")), ("kind", Value::from("Pod")), ("metadata", obj(meta)), ("spec", tpl.get("spec").cloned().unwrap_or(Value::Null))])
 }
 
 /// Adds the controller reference to an orphan. `None` when the pod vanished or was adopted by
 /// someone else in the meantime.
-async fn adopt<C: Client>(c: &C, rs: &Value, p: &Value) -> Result<Option<Value>> {
+async fn adopt<C: Client>(c: &C, k: Kind, rs: &Value, p: &Value) -> Result<Option<Value>> {
     let mut refs: Vec<Value> = p.pointer(&["metadata", "ownerReferences"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
-    refs.push(owner_ref(rs, "apps/v1", "ReplicaSet"));
+    refs.push(owner_ref(rs, k.api_version, k.kind));
     // Guard against a concurrent adoption with the pod's resourceVersion.
     let meta = obj(alloc::vec![("ownerReferences", Value::Array(refs)), ("resourceVersion", Value::from(str_at(p, &["metadata", "resourceVersion"])))]);
     match c.patch(&alloc::format!("{}/{}", pods(Some(namespace(p))), name(p)), MERGE, &obj(alloc::vec![("metadata", meta)])).await {
@@ -167,8 +198,8 @@ async fn adopt<C: Client>(c: &C, rs: &Value, p: &Value) -> Result<Option<Value>>
     }
 }
 
-async fn write_status<C: Client>(c: &C, ns: &str, name: &str, replicas: usize, ready: usize, labeled: usize) -> Result<()> {
-    let path = alloc::format!("{}/{name}", replicasets(Some(ns)));
+async fn write_status<C: Client>(c: &C, k: Kind, ns: &str, name: &str, replicas: usize, ready: usize, labeled: usize) -> Result<()> {
+    let path = alloc::format!("{}/{name}", (k.path)(Some(ns)));
     retry_conflict(|| async {
         let mut rs = match c.get(&path).await {
             Ok(r) => r,

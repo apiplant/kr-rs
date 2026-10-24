@@ -394,3 +394,30 @@ fn replicaset_adopts_orphans() {
         assert!(c.get(&alloc::format!("{PODS}/foreign")).await.is_ok());
     });
 }
+
+#[test]
+fn replicationcontroller_creates_pods() {
+    scenario(|c| async move {
+        c.create("/api/v1/nodes", &node("n1", "{}", "[]", "64")).await.unwrap();
+        let rc_path = "/api/v1/namespaces/default/replicationcontrollers";
+        let rc = c
+            .create(
+                rc_path,
+                &v(r#"{"metadata":{"name":"rc1"},"spec":{"replicas":2,"selector":{"app":"y"},"template":{"metadata":{"labels":{"app":"y"}},"spec":{"containers":[{"name":"c","image":"i"}]}}}}"#),
+            )
+            .await
+            .unwrap();
+        wait_until("2 pods", || async { live_pods(&c).await.len() == 2 }).await;
+        for p in live_pods(&c).await {
+            let r = controller_ref(&p).unwrap();
+            assert_eq!(str_at(r, &["kind"]), "ReplicationController");
+            assert_eq!(str_at(r, &["apiVersion"]), "v1");
+            assert_eq!(str_at(r, &["uid"]), uid(&rc));
+        }
+        wait_until("status", || async {
+            let r = c.get(&alloc::format!("{rc_path}/rc1")).await.unwrap();
+            int_at(&r, &["status", "replicas"], -1) == 2 && int_at(&r, &["status", "readyReplicas"], -1) == 2
+        })
+        .await;
+    });
+}

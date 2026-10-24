@@ -191,7 +191,7 @@ fn quantity(v: Option<&Value>) -> Option<Quantity> {
 }
 
 /// Writes a configMap/secret volume's files into `dir`.
-async fn materialize<C: Client>(c: &C, ns: &str, kind: &str, name: &str, src: &Value, dir: &str) -> Result<(), String> {
+async fn materialize<C: Client>(c: &C, ns: &str, kind: &str, name: &str, src: &Value, dir: &str, default_mode: u32) -> Result<(), String> {
     let optional = src.get("optional").and_then(Value::as_bool).unwrap_or(false);
     let obj = match c.get(&alloc::format!("/api/v1/namespaces/{ns}/{kind}/{name}")).await {
         Ok(o) => o,
@@ -207,33 +207,35 @@ async fn materialize<C: Client>(c: &C, ns: &str, kind: &str, name: &str, src: &V
         }
     }
     let items = src.get("items").and_then(Value::as_array);
-    let selected: Vec<(String, Vec<u8>)> = match items {
+    let selected: Vec<(String, Vec<u8>, u32)> = match items {
         Some(items) => items
             .iter()
             .filter_map(|it| {
                 let key = it.get("key")?.as_str()?;
                 let path = it.get("path")?.as_str()?;
-                files.iter().find(|(k, _)| k == key).map(|(_, v)| (path.to_string(), v.clone()))
+                files.iter().find(|(k, _)| k == key).map(|(_, v)| (path.to_string(), v.clone(), item_mode(it, default_mode)))
             })
             .collect(),
-        None => files,
+        None => files.into_iter().map(|(k, v)| (k, v, default_mode)).collect(),
     };
     kr_runtime::store::mkdir_p(dir, 0o755).map_err(|_| String::from("cannot create volume dir"))?;
-    for (path, data) in selected {
-        // Keys are validated by the API server; still refuse traversal here.
-        if path.is_empty() || path.starts_with('/') || path.split('/').any(|c| c == ".." || c.is_empty()) {
-            return Err(alloc::format!("invalid volume item path {path}"));
-        }
-        let full = alloc::format!("{dir}/{path}");
-        if let Some((parent, _)) = full.rsplit_once('/') {
-            let _ = kr_runtime::store::mkdir_p(parent, 0o755);
-        }
-        kr_runtime::store::write_file_atomic(&full, &data).map_err(|_| alloc::format!("cannot write {path}"))?;
+    for (path, data, mode) in selected {
+        write_item(dir, &path, &data, mode)?;
     }
     Ok(())
 }
 
-fn write_item(dir: &str, path: &str, data: &[u8]) -> Result<(), String> {
+/// A volume's `defaultMode` (0644 when unset).
+fn default_mode(src: &Value) -> u32 {
+    src.get("defaultMode").and_then(Value::as_u64).map_or(0o644, |m| m as u32 & 0o777)
+}
+
+fn item_mode(item: &Value, default: u32) -> u32 {
+    item.get("mode").and_then(Value::as_u64).map_or(default, |m| m as u32 & 0o777)
+}
+
+fn write_item(dir: &str, path: &str, data: &[u8], mode: u32) -> Result<(), String> {
+    // Paths are validated by the API server; still refuse traversal here.
     if path.is_empty() || path.starts_with('/') || path.split('/').any(|c| c == ".." || c.is_empty()) {
         return Err(alloc::format!("invalid volume item path {path}"));
     }
@@ -241,24 +243,53 @@ fn write_item(dir: &str, path: &str, data: &[u8]) -> Result<(), String> {
     if let Some((parent, _)) = full.rsplit_once('/') {
         let _ = kr_runtime::store::mkdir_p(parent, 0o755);
     }
-    kr_runtime::store::write_file_atomic(&full, data).map_err(|_| alloc::format!("cannot write {path}"))
+    kr_runtime::store::write_file_atomic(&full, data).map_err(|_| alloc::format!("cannot write {path}"))?;
+    let fd = kr_sys::ns::open(alloc::format!("{full}\0").as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::fs::O_NOFOLLOW | kr_sys::O_CLOEXEC, 0).map_err(|_| alloc::format!("cannot open {path}"))?;
+    kr_sys::fs::fchmod(fd.raw(), mode).map_err(|_| alloc::format!("cannot chmod {path}"))
 }
 
-/// downwardAPI items (fieldRef only; resourceFieldRef not yet).
-fn downward(pod: &Value, d: &Value, dir: &str) -> Result<(), String> {
+/// downwardAPI items: fieldRef and resourceFieldRef.
+fn downward(pod: &Value, d: &Value, dir: &str, default_mode: u32) -> Result<(), String> {
     for it in d.get("items").and_then(Value::as_array).unwrap_or(&[]) {
         let path = it.get("path").and_then(Value::as_str).unwrap_or("");
-        let Some(fp) = it.pointer(&["fieldRef", "fieldPath"]).and_then(Value::as_str) else { continue };
-        let val = match fp {
-            "metadata.labels" | "metadata.annotations" => {
-                let m = pod.pointer(&["metadata", &fp[9..]]).and_then(Value::as_object).unwrap_or(&[]);
-                m.iter().map(|(k, v)| alloc::format!("{k}=\"{}\"\n", v.as_str().unwrap_or(""))).collect::<String>()
+        let val = if let Some(fp) = it.pointer(&["fieldRef", "fieldPath"]).and_then(Value::as_str) {
+            match fp {
+                "metadata.labels" | "metadata.annotations" => {
+                    let m = pod.pointer(&["metadata", &fp[9..]]).and_then(Value::as_object).unwrap_or(&[]);
+                    m.iter().map(|(k, v)| alloc::format!("{k}=\"{}\"\n", v.as_str().unwrap_or(""))).collect::<String>()
+                }
+                other => field_ref(pod, other, None, "").unwrap_or_default(),
             }
-            other => field_ref(pod, other, None, "").unwrap_or_default(),
+        } else if let Some(rf) = it.get("resourceFieldRef") {
+            resource_field_ref(pod, None, rf).ok_or_else(|| alloc::format!("downwardAPI {path}: unsupported resourceFieldRef"))?
+        } else {
+            continue;
         };
-        write_item(dir, path, val.as_bytes())?;
+        write_item(dir, path, val.as_bytes(), item_mode(it, default_mode))?;
     }
     Ok(())
+}
+
+/// `resourceFieldRef`: a container's request or limit in units of `divisor` (rounded up).
+/// Unset limits report node allocatable, as upstream.
+fn resource_field_ref(pod: &Value, container: Option<&str>, rf: &Value) -> Option<String> {
+    let cname = rf.get("containerName").and_then(Value::as_str).filter(|n| !n.is_empty()).or(container)?;
+    let ctr = ["containers", "initContainers"].iter().flat_map(|k| pod.pointer(&["spec", k]).and_then(Value::as_array).unwrap_or(&[]).iter()).find(|c| c.get("name").and_then(Value::as_str) == Some(cname))?;
+    let (kind, res) = rf.get("resource").and_then(Value::as_str)?.split_once('.')?;
+    let set = quantity(ctr.pointer(&["resources", kind, res]));
+    let q = match (set, kind, res) {
+        (Some(q), _, _) => q,
+        (None, "limits", "cpu") => Quantity::from_i64(crate::node::cpus() as i64, kr_fmt::quantity::Format::DecimalSI),
+        (None, "limits", "memory") => Quantity::from_i64(crate::node::memory_ki() as i64 * 1024, kr_fmt::quantity::Format::BinarySI),
+        (None, "requests", "cpu" | "memory" | "ephemeral-storage") => return Some(String::from("0")),
+        _ => return None,
+    };
+    let divisor = quantity(rf.get("divisor")).unwrap_or_else(|| Quantity::from_i64(1, kr_fmt::quantity::Format::DecimalSI));
+    let (n, d) = if res == "cpu" { (q.milli_value()?, divisor.milli_value()?) } else { (q.value()?, divisor.value()?) };
+    if d <= 0 {
+        return None;
+    }
+    Some(alloc::format!("{}", (n + d - 1).div_euclid(d)))
 }
 
 /// Requests a pod-bound ServiceAccount token (TokenRequest API).
@@ -378,30 +409,31 @@ async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str
         }
         Ok(Some(path.to_string()))
     } else if let Some(cm) = vol.get("configMap") {
-        materialize(c, ns, "configmaps", cm.get("name").and_then(Value::as_str).unwrap_or(""), cm, &dir).await?;
+        materialize(c, ns, "configmaps", cm.get("name").and_then(Value::as_str).unwrap_or(""), cm, &dir, default_mode(cm)).await?;
         Ok(Some(dir))
     } else if let Some(sec) = vol.get("secret") {
-        materialize(c, ns, "secrets", sec.get("secretName").and_then(Value::as_str).unwrap_or(""), sec, &dir).await?;
+        materialize(c, ns, "secrets", sec.get("secretName").and_then(Value::as_str).unwrap_or(""), sec, &dir, default_mode(sec)).await?;
         Ok(Some(dir))
     } else if let Some(pj) = vol.get("projected") {
         let _ = kr_runtime::store::mkdir_p(&dir, 0o755);
+        let mode = default_mode(pj);
         for src in pj.get("sources").and_then(Value::as_array).unwrap_or(&[]) {
             if let Some(t) = src.get("serviceAccountToken") {
                 let token = request_token(c, pod, t).await?;
                 let path = t.get("path").and_then(Value::as_str).unwrap_or("token");
-                write_item(&dir, path, token.as_bytes())?;
+                write_item(&dir, path, token.as_bytes(), mode)?;
             } else if let Some(cm) = src.get("configMap") {
-                materialize(c, ns, "configmaps", cm.get("name").and_then(Value::as_str).unwrap_or(""), cm, &dir).await?;
+                materialize(c, ns, "configmaps", cm.get("name").and_then(Value::as_str).unwrap_or(""), cm, &dir, mode).await?;
             } else if let Some(sec) = src.get("secret") {
-                materialize(c, ns, "secrets", sec.get("name").and_then(Value::as_str).unwrap_or(""), sec, &dir).await?;
+                materialize(c, ns, "secrets", sec.get("name").and_then(Value::as_str).unwrap_or(""), sec, &dir, mode).await?;
             } else if let Some(d) = src.get("downwardAPI") {
-                downward(pod, d, &dir)?;
+                downward(pod, d, &dir, mode)?;
             }
         }
         Ok(Some(dir))
     } else if let Some(d) = vol.get("downwardAPI") {
         let _ = kr_runtime::store::mkdir_p(&dir, 0o755);
-        downward(pod, d, &dir)?;
+        downward(pod, d, &dir, default_mode(d))?;
         Ok(Some(dir))
     } else {
         // PVCs and other types: not yet (KNOWN_ISSUES); mounted as an empty dir.
@@ -448,8 +480,10 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
                 key_ref(c, ns, "configmaps", r).await?
             } else if let Some(r) = vf.get("secretKeyRef") {
                 key_ref(c, ns, "secrets", r).await?
+            } else if let Some(rf) = vf.get("resourceFieldRef") {
+                resource_field_ref(pod, ctr.get("name").and_then(Value::as_str), rf)
             } else {
-                None // resourceFieldRef: not yet
+                None
             }
         } else {
             Some(String::new())

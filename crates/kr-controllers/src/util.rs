@@ -229,6 +229,9 @@ pub fn pods(ns: Option<&str>) -> String {
 pub fn replicasets(ns: Option<&str>) -> String {
     api_path("apps", "v1", ns, "replicasets")
 }
+pub fn replicationcontrollers(ns: Option<&str>) -> String {
+    api_path("", "v1", ns, "replicationcontrollers")
+}
 pub fn deployments(ns: Option<&str>) -> String {
     api_path("apps", "v1", ns, "deployments")
 }

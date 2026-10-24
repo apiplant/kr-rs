@@ -35,6 +35,12 @@ fn wire_err(e: wire::Error) -> &'static str {
 /// Decodes a `k8s\0`-prefixed protobuf body into the equivalent JSON object, with `apiVersion`
 /// and `kind` taken from the envelope's `TypeMeta`.
 pub fn decode_body(body: &[u8]) -> R<Value> {
+    decode_body_as(body, None)
+}
+
+/// Like [`decode_body`]; `fallback` (apiVersion, kind) applies when the envelope's TypeMeta
+/// is empty (client-go sends DeleteOptions that way).
+pub fn decode_body_as(body: &[u8], fallback: Option<(&'static str, &'static str)>) -> R<Value> {
     let rest = body.strip_prefix(MAGIC).ok_or("protobuf: missing k8s magic prefix")?;
     let (mut api_version, mut kind, mut raw) = ("", "", None);
     let mut r = Reader::new(rest);
@@ -63,6 +69,9 @@ pub fn decode_body(body: &[u8]) -> R<Value> {
         }
     }
     let raw = raw.ok_or("protobuf: missing raw object")?;
+    if let (true, Some((av, k))) = (kind.is_empty(), fallback) {
+        (api_version, kind) = (av, k);
+    }
     let idx = s::KINDS.iter().find(|k| (k.0 == api_version || (api_version == "meta.k8s.io/v1" && k.0 == "v1" && kind == "DeleteOptions")) && k.1 == kind).map(|k| k.2).ok_or("protobuf: unsupported kind")?;
     let mut v = message(raw, idx, 0)?;
     if let Value::Object(o) = &mut v {
