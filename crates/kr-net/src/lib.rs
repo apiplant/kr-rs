@@ -11,6 +11,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod dns;
+pub mod dnsserver;
 pub mod http1;
 pub mod netlink;
 pub mod nft;

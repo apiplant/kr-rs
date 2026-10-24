@@ -12,9 +12,42 @@ use kr_sys::ns;
 use kr_sys::Errno;
 
 pub const BRIDGE: &[u8] = b"kr0";
+/// The cluster pod network; each node gets a /24 of it (`spec.podCIDR`).
+pub const CLUSTER_CIDR: ([u8; 4], u8) = ([10, 88, 0, 0], 16);
+/// Defaults for standalone use (`kr ctr`): the first /24.
 pub const SUBNET: [u8; 4] = [10, 88, 0, 0];
-pub const PREFIX: u8 = 16;
+pub const PREFIX: u8 = 24;
 pub const GATEWAY: [u8; 4] = [10, 88, 0, 1];
+
+/// A node's pod subnet: bridge gateway is the first address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PodNet {
+    pub subnet: [u8; 4],
+    pub prefix: u8,
+    pub gateway: [u8; 4],
+}
+
+impl Default for PodNet {
+    fn default() -> Self {
+        PodNet { subnet: SUBNET, prefix: PREFIX, gateway: GATEWAY }
+    }
+}
+
+impl PodNet {
+    /// Parses "a.b.c.d/len" (IPv4, prefix 8..=30).
+    pub fn parse(cidr: &str) -> Option<PodNet> {
+        let (ip, len) = cidr.split_once('/')?;
+        let prefix: u8 = len.parse().ok().filter(|l| (8..=30).contains(l))?;
+        let mut a = [0u8; 4];
+        let mut parts = ip.split('.');
+        for o in a.iter_mut() {
+            *o = parts.next()?.parse().ok()?;
+        }
+        let mask = u32::MAX << (32 - prefix);
+        let net = u32::from_be_bytes(a) & mask;
+        Some(PodNet { subnet: net.to_be_bytes(), prefix, gateway: (net + 1).to_be_bytes() })
+    }
+}
 const NFT_TABLE: &[u8] = b"kr";
 
 /// What the container child configures on its `eth0`.
@@ -34,13 +67,17 @@ fn exists_ok(r: Result<(), Errno>) -> Result<(), Errno> {
 
 /// Creates (idempotently) the bridge, its gateway address, IPv4 forwarding and the NAT table.
 pub fn setup_host() -> Result<(), Errno> {
+    setup_host_with(&PodNet::default())
+}
+
+pub fn setup_host_with(pn: &PodNet) -> Result<(), Errno> {
     let nl = Netlink::route()?;
     exists_ok(nl.bridge_add(BRIDGE))?;
     let br = netlink::ifindex(BRIDGE)?;
-    exists_ok(nl.addr_add(br, GATEWAY, PREFIX))?;
+    exists_ok(nl.addr_add(br, pn.gateway, pn.prefix))?;
     nl.link_up(br)?;
     ns::write_file(b"/proc/sys/net/ipv4/ip_forward\0", b"1")?;
-    kr_net::nft::ensure_masquerade(&kr_net::nft::Masquerade { table: NFT_TABLE, cidr: SUBNET, prefix: PREFIX, bridge: BRIDGE })
+    kr_net::nft::ensure_masquerade(&kr_net::nft::Masquerade { table: NFT_TABLE, cidr: CLUSTER_CIDR.0, prefix: CLUSTER_CIDR.1, bridge: BRIDGE })
 }
 
 /// Host-side veth name for a container: `krv` + 8 hex digits of an FNV-1a hash of its id.
@@ -119,9 +156,13 @@ fn dotted(ip: [u8; 4]) -> Vec<u8> {
 /// Allocates the lowest free address after the gateway. `dir` must exist; `owner` (the
 /// container id) is written into the lease for debugging.
 pub fn allocate(dir: &[u8], owner: &[u8]) -> Result<Lease, Errno> {
-    let base = u32::from_be_bytes(SUBNET);
-    let size = 1u32 << (32 - PREFIX);
-    let gw = u32::from_be_bytes(GATEWAY);
+    allocate_in(dir, owner, &PodNet::default())
+}
+
+pub fn allocate_in(dir: &[u8], owner: &[u8], pn: &PodNet) -> Result<Lease, Errno> {
+    let base = u32::from_be_bytes(pn.subnet);
+    let size = 1u32 << (32 - pn.prefix);
+    let gw = u32::from_be_bytes(pn.gateway);
     for host in 1..size - 1 {
         let ip = (base + host).to_be_bytes();
         if base + host == gw {
