@@ -339,18 +339,29 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         Some(uid)
     }
 
-    /// Adds or removes the memory-pressure NoSchedule taint (read-modify-write of spec.taints).
+    /// Adds or removes the memory-pressure NoSchedule taint. A PUT of the node as read (its
+    /// resourceVersion is the precondition), retried on conflict, so a taint someone else
+    /// changes at the same time is never overwritten.
     async fn set_memory_taint(&self, on: bool) {
         let path = alloc::format!("/api/v1/nodes/{}", self.cfg.node_name);
-        let Ok(node) = self.c.get(&path).await else { return };
-        let mut taints: Vec<Value> = node.pointer(&["spec", "taints"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
-        taints.retain(|t| t.get("key").and_then(Value::as_str) != Some(evict::TAINT_KEY));
-        if on {
-            let t = alloc::format!(r#"{{"key":"{}","effect":"NoSchedule"}}"#, evict::TAINT_KEY);
-            taints.push(json::parse(t.as_bytes()).unwrap_or(Value::Null));
+        for _ in 0..3 {
+            let Ok(mut node) = self.c.get(&path).await else { return };
+            let mut taints: Vec<Value> = node.pointer(&["spec", "taints"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+            let had = taints.iter().any(|t| t.get("key").and_then(Value::as_str) == Some(evict::TAINT_KEY));
+            if had == on {
+                return;
+            }
+            taints.retain(|t| t.get("key").and_then(Value::as_str) != Some(evict::TAINT_KEY));
+            if on {
+                let t = alloc::format!(r#"{{"key":"{}","effect":"NoSchedule"}}"#, evict::TAINT_KEY);
+                taints.push(json::parse(t.as_bytes()).unwrap_or(Value::Null));
+            }
+            node.entry_object("spec").set("taints", Value::Array(taints));
+            match self.c.update(&path, &node).await {
+                Err(e) if e.code == 409 => continue,
+                _ => return,
+            }
         }
-        let patch = Value::Object(alloc::vec![(String::from("spec"), Value::Object(alloc::vec![(String::from("taints"), Value::Array(taints))]))]);
-        let _ = self.c.patch(&path, "application/merge-patch+json", &patch).await;
     }
 
     /// VXLAN overlay (root mode): device `kr.vxlan`, and per peer node a route to its pod
