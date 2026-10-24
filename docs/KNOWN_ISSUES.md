@@ -22,7 +22,7 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 
 ## Build (cont.)
 53. **Binary size** — *watch*
-    The binary is 395 KB with TLS, X.509 and the crypto suite included. That is still far under the 2 MB agent budget. Avoid `{:?}` on hot or large types.
+    The single binary (server, agent, runtime, TLS/crypto, CRDs, webhooks) is ~1.8 MB, just under the 2 MB agent budget from PLAN.md. Measure before adding large features; avoid `{:?}` on large types, and keep `opt-level = "z"` + LTO + strip.
 
 ## kr-crypto / TLS (ADR-020)
 58. **Constant-time behaviour is by construction, not yet measured** — *open*
