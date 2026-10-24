@@ -571,3 +571,85 @@ fn write_out_persists_without_fsync_and_reopens() {
     assert_eq!(&*s.get("/a").unwrap().value, b"1");
     assert!(Store::in_memory().log_fd().is_none());
 }
+
+#[test]
+fn replicated_leader_and_follower_converge() {
+    let mut leader = Store::replicated();
+    let mut follower = Store::replicated();
+    leader.create("/a", b"1".to_vec()).unwrap();
+    leader.create("/b", b"2".to_vec()).unwrap();
+    let kv = leader.get("/a").unwrap();
+    leader.update("/a", b"3".to_vec(), Some(kv.mod_rev)).unwrap();
+    leader.delete("/b", None).unwrap();
+    // A precondition failure produces no record.
+    assert!(leader.update("/a", b"x".to_vec(), Some(1)).is_err());
+    let recs = leader.take_records();
+    assert!(leader.take_records().is_empty());
+    assert_eq!(follower.apply_records(&recs).unwrap(), 4);
+    assert_eq!(follower.revision(), leader.revision());
+    assert_eq!(&*follower.get("/a").unwrap().value, b"3");
+    assert_eq!(follower.get("/a").unwrap().create_rev, leader.get("/a").unwrap().create_rev);
+    assert!(follower.get("/b").is_none());
+    // The leader re-applying its own committed records is a no-op; applying records is not
+    // re-captured (a follower that becomes leader must not re-propose them).
+    assert_eq!(leader.apply_records(&recs).unwrap(), 4);
+    assert!(follower.take_records().is_empty());
+    // Records overlapping what a store already has: the known prefix is skipped.
+    let mut src = Store::replicated();
+    for i in 0..3 {
+        src.create(&alloc::format!("/k{i}"), b"v".to_vec()).unwrap();
+    }
+    let all = src.take_records();
+    let mut partial = Store::replicated();
+    partial.create("/k0", b"v".to_vec()).unwrap();
+    let first_len = partial.take_records().len();
+    assert_eq!(partial.apply_records(&all).unwrap(), 3);
+    // A gap (rev 2 onto an empty store) is refused.
+    let mut empty = Store::replicated();
+    assert!(matches!(empty.apply_records(&all[first_len..]), Err(Error::Corrupt(_))));
+}
+
+#[test]
+fn watch_events_wait_for_commit() {
+    let mut s = Store::replicated();
+    let mut w = s.watch("/", 0).unwrap();
+    s.create("/a", b"1".to_vec()).unwrap();
+    s.create("/b", b"1".to_vec()).unwrap();
+    assert!(w.try_next().is_none(), "uncommitted write must not be visible to watchers");
+    // A watcher created while events are held must not see them early either, nor twice.
+    let mut late = s.watch("/", 0).unwrap();
+    assert!(late.try_next().is_none());
+    s.set_visible(1);
+    assert_eq!(w.try_next().unwrap().rev, 1);
+    assert!(w.try_next().is_none());
+    s.set_visible(2);
+    assert_eq!(w.try_next().unwrap().rev, 2);
+    assert_eq!(late.try_next().unwrap().rev, 1);
+    assert_eq!(late.try_next().unwrap().rev, 2);
+    assert!(late.try_next().is_none());
+    // Non-replicated stores are not gated.
+    let mut plain = Store::in_memory();
+    let mut pw = plain.watch("/", 0).unwrap();
+    plain.create("/a", b"1".to_vec()).unwrap();
+    assert!(pw.try_next().is_some());
+}
+
+#[test]
+fn image_restore_roundtrip_closes_watchers() {
+    let mut a = Store::replicated();
+    for i in 0..5 {
+        a.create(&alloc::format!("/k{i}"), alloc::vec![i as u8]).unwrap();
+    }
+    a.delete("/k2", None).unwrap();
+    let img = a.image();
+    let mut b = Store::replicated();
+    b.create("/junk", b"x".to_vec()).unwrap();
+    let mut w = b.watch("/", 0).unwrap();
+    b.restore(&img).unwrap();
+    assert_eq!(b.revision(), 6);
+    assert_eq!(b.list("/", None, 0).0.len(), 4);
+    assert!(b.get("/junk").is_none());
+    assert!(w.try_next().is_none() && w.overflowed(), "watchers must re-list after a restore");
+    assert!(b.take_records().is_empty());
+    assert!(matches!(b.watch("/", 3), Err(Error::Compacted { .. })));
+}

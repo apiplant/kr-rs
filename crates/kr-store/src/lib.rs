@@ -128,6 +128,11 @@ pub struct Store {
     persist: Option<Persist>,
     auto_sync: bool,
     compact_min: u64,
+    /// Replicated mode (ADR-026): records of local mutations, taken by the Raft driver.
+    repl: Option<Vec<u8>>,
+    /// Watch events above this revision are held until it advances (committed revision).
+    visible: u64,
+    held: VecDeque<Event>,
     /// Approximate size of a snapshot of the live data.
     live_bytes: u64,
 }
@@ -172,6 +177,9 @@ impl Store {
             persist: None,
             auto_sync: false,
             compact_min: COMPACT_MIN_LOG,
+            repl: None,
+            visible: u64::MAX,
+            held: VecDeque::new(),
             live_bytes: 0,
         }
     }
@@ -179,6 +187,113 @@ impl Store {
     /// A store with no persistence (tests, ephemeral use). `sync` is a no-op.
     pub fn in_memory() -> Store {
         Store::empty()
+    }
+
+    /// In-memory store whose durability is Raft's (ADR-026): local mutations are captured as
+    /// records ([`Store::take_records`]) to be proposed, records committed elsewhere are applied
+    /// with [`Store::apply_records`], and watch events are released only up to the committed
+    /// revision ([`Store::set_visible`]).
+    pub fn replicated() -> Store {
+        let mut s = Store::empty();
+        s.repl = Some(Vec::new());
+        s.visible = 0;
+        s
+    }
+
+    /// Records of local mutations since the last call (the payload of a Raft proposal).
+    pub fn take_records(&mut self) -> Vec<u8> {
+        self.repl.as_mut().map(core::mem::take).unwrap_or_default()
+    }
+
+    /// Applies records (from a committed Raft entry, or recovery). Revisions already applied are
+    /// skipped, so the leader re-applying its own committed entries is a no-op; a gap is
+    /// `Corrupt`. Emits watch events like local mutations. Returns the new revision.
+    pub fn apply_records(&mut self, data: &[u8]) -> Result<u64, Error> {
+        let mut off = 0;
+        while off < data.len() {
+            match wal::parse(data, off) {
+                Parsed::Rec(rec) => {
+                    off = rec.end;
+                    if rec.rev <= self.rev {
+                        continue;
+                    }
+                    if rec.rev != self.rev + 1 {
+                        return Err(Error::Corrupt("replicated revision gap"));
+                    }
+                    let key: Rc<str> = Rc::from(rec.key);
+                    let prev = self.map.get(rec.key).cloned();
+                    if rec.op == OP_PUT {
+                        self.apply_event(EventKind::Put, key, Rc::from(rec.val), rec.create_rev, prev);
+                    } else {
+                        let Some(prev) = prev else { return Err(Error::Corrupt("replicated delete of a missing key")) };
+                        let value = prev.value.clone();
+                        self.apply_event(EventKind::Delete, key, value, rec.create_rev, Some(prev));
+                    }
+                }
+                Parsed::Torn => return Err(Error::Corrupt("truncated replicated records")),
+                Parsed::Corrupt(m) => return Err(Error::Corrupt(m)),
+            }
+        }
+        Ok(self.rev)
+    }
+
+    /// Releases watch events up to `rev` (the committed revision).
+    pub fn set_visible(&mut self, rev: u64) {
+        if rev <= self.visible && self.visible != u64::MAX {
+            return;
+        }
+        self.visible = rev;
+        while self.held.front().is_some_and(|e| e.rev <= rev) {
+            let ev = self.held.pop_front().unwrap();
+            self.notify(&ev);
+        }
+    }
+
+    pub fn visible(&self) -> u64 {
+        self.visible
+    }
+
+    /// A snapshot image of the live data (`KRSNAP` format, see the module docs).
+    pub fn image(&self) -> Vec<u8> {
+        let mut snap = Vec::with_capacity(16 + self.live_bytes as usize);
+        snap.extend_from_slice(wal::SNAP_MAGIC);
+        snap.extend_from_slice(&self.rev.to_le_bytes());
+        for kv in self.map.values() {
+            wal::encode(&mut snap, OP_PUT, kv.mod_rev, kv.create_rev, &kv.key, &kv.value);
+        }
+        snap
+    }
+
+    /// Replaces all data with `image` (a Raft snapshot, or a rollback rebuild). Watchers are
+    /// closed (clients re-list), history restarts at the image's revision, and nothing local
+    /// is left to propose.
+    pub fn restore(&mut self, image: &[u8]) -> Result<(), Error> {
+        let mut fresh = Store::empty();
+        fresh.load_snapshot(image)?;
+        self.map = core::mem::take(&mut fresh.map);
+        self.live_bytes = fresh.live_bytes;
+        self.rev = fresh.rev;
+        self.history.clear();
+        self.held.clear();
+        self.hist_floor = self.rev;
+        if self.visible != u64::MAX {
+            self.visible = self.rev;
+        }
+        if let Some(r) = &mut self.repl {
+            r.clear();
+        }
+        for w in self.watchers.drain(..) {
+            if let Some(rc) = w.upgrade() {
+                let mut st = rc.borrow_mut();
+                st.queue.clear();
+                st.closed = true;
+                st.overflowed = true;
+                if let Some(wk) = st.waker.take() {
+                    wk.wake();
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Opens (creating if missing) the store in `dir`, loading the snapshot and replaying the log.
@@ -402,13 +517,23 @@ impl Store {
         prev: Option<Kv>,
     ) -> Result<Kv, Error> {
         let rev = self.rev + 1;
-        let kv = Kv { key: key.clone(), value: value.clone(), create_rev, mod_rev: rev };
-        if let Some(p) = &mut self.persist {
+        for buf in [self.persist.as_mut().map(|p| &mut p.buf), self.repl.as_mut()].into_iter().flatten() {
             match kind {
-                EventKind::Put => wal::encode(&mut p.buf, OP_PUT, rev, create_rev, &key, &value),
-                EventKind::Delete => wal::encode(&mut p.buf, OP_DELETE, rev, create_rev, &key, &[]),
+                EventKind::Put => wal::encode(buf, OP_PUT, rev, create_rev, &key, &value),
+                EventKind::Delete => wal::encode(buf, OP_DELETE, rev, create_rev, &key, &[]),
             }
         }
+        let kv = self.apply_event(kind, key, value, create_rev, prev);
+        if self.auto_sync {
+            self.sync()?;
+        }
+        Ok(kv)
+    }
+
+    /// The in-memory effect of one mutation at `self.rev + 1`, plus its watch event.
+    fn apply_event(&mut self, kind: EventKind, key: Rc<str>, value: Rc<[u8]>, create_rev: u64, prev: Option<Kv>) -> Kv {
+        let rev = self.rev + 1;
+        let kv = Kv { key: key.clone(), value: value.clone(), create_rev, mod_rev: rev };
         match kind {
             EventKind::Put => {
                 self.live_bytes += Self::kv_size(&key, &value);
@@ -420,13 +545,14 @@ impl Store {
         }
         self.rev = rev;
         let ev = Event { kind, kv: kv.clone(), prev, rev };
-        self.notify(&ev);
+        if rev > self.visible {
+            self.held.push_back(ev.clone());
+        } else {
+            self.notify(&ev);
+        }
         self.history.push_back(ev);
         self.trim_history();
-        if self.auto_sync {
-            self.sync()?;
-        }
-        Ok(kv)
+        kv
     }
 
     fn trim_history(&mut self) {
@@ -472,7 +598,8 @@ impl Store {
             return Err(Error::Compacted { oldest: self.hist_floor + 1 });
         }
         let mut queue = VecDeque::new();
-        for e in self.history.iter().filter(|e| e.rev > after_rev && e.kv.key.starts_with(prefix)) {
+        // Only visible (committed) events; held ones are delivered to every watcher on release.
+        for e in self.history.iter().filter(|e| e.rev > after_rev && e.rev <= self.visible && e.kv.key.starts_with(prefix)) {
             queue.push_back(e.clone());
         }
         let state = Rc::new(RefCell::new(WatchState {
@@ -550,12 +677,7 @@ impl Store {
             return Ok(());
         }
         self.sync()?;
-        let mut snap = Vec::with_capacity(16 + self.live_bytes as usize);
-        snap.extend_from_slice(wal::SNAP_MAGIC);
-        snap.extend_from_slice(&self.rev.to_le_bytes());
-        for kv in self.map.values() {
-            wal::encode(&mut snap, OP_PUT, kv.mod_rev, kv.create_rev, &kv.key, &kv.value);
-        }
+        let snap = self.image();
         let Some(p) = &mut self.persist else { return Ok(()) };
         let d = p.dir.raw();
         {
