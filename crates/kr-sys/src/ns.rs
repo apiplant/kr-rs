@@ -591,3 +591,16 @@ pub fn send_to(sock: i32, data: &[u8], ip: [u8; 4], port: u16) -> Result<usize> 
     // SAFETY: data and addr are valid for the call.
     check(unsafe { super::syscall6(sock_nr::SENDTO, sock as usize, data.as_ptr() as usize, data.len(), MSG_NOSIGNAL, &addr as *const _ as usize, core::mem::size_of::<super::SockaddrIn>()) }).map(|n| n as usize)
 }
+
+/// IPv4 address of a connected socket's peer (getpeername), if it is AF_INET.
+pub fn peer_ipv4(fd: i32) -> Option<[u8; 4]> {
+    #[cfg(target_arch = "x86_64")]
+    const GETPEERNAME: usize = 52;
+    #[cfg(target_arch = "aarch64")]
+    const GETPEERNAME: usize = 205;
+    let mut addr = [0u8; 16];
+    let mut len: u32 = 16;
+    // SAFETY: addr/len describe a writable sockaddr buffer.
+    check(unsafe { syscall3(GETPEERNAME, fd as usize, addr.as_mut_ptr() as usize, &mut len as *mut u32 as usize) }).ok()?;
+    (u16::from_ne_bytes([addr[0], addr[1]]) == super::AF_INET as u16).then(|| [addr[4], addr[5], addr[6], addr[7]])
+}

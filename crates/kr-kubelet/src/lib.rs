@@ -17,6 +17,7 @@ extern crate alloc;
 
 pub mod node;
 mod probe;
+pub mod proxy;
 mod spec;
 pub mod stream;
 
@@ -217,6 +218,18 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 }
                 Err(e) => kr_rt::eprint(alloc::format!("kubelet: rootless pod network unavailable ({}: errno {})\n", e.step, e.errno.0).as_bytes()),
             }
+        }
+        // Service proxy in the node network namespace (host when root, infra when rootless).
+        let net = match self.infra.borrow().as_ref() {
+            Some(infra) => proxy::NodeNet::factory(infra).ok(),
+            None if self.cfg.network => Some(proxy::NodeNet::Host),
+            None => None,
+        };
+        match net {
+            Some(net) => {
+                kr_rt::exec::spawn(proxy::Proxy::new(self.c.clone(), net).run());
+            }
+            None => kr_rt::eprint(b"kubelet: no node network; Services are not proxied\n"),
         }
         node::register(&self.c, &self.cfg).await;
         let hb = self.clone();
