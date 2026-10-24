@@ -626,6 +626,7 @@ fn tls_serves_requests_and_exposes_client_certs() {
         roots: vec![ca.clone()],
         client_cert: with_cert.then(|| (vec![cli_cert.clone()], key(3))),
         alpn: vec![b"http/1.1".to_vec()],
+        tls12: false,
     };
     let handler = || sync_handler(|req| Response::new(200, format!("{} {} {}", req.path(), req.query(), who(&req.peer)).into_bytes()));
 

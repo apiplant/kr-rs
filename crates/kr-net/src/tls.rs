@@ -158,7 +158,7 @@ impl TlsConnector {
         let roots = kr_crypto::x509::pem_decode_all(pem, "CERTIFICATE").map_err(|_| Error::BadRef("bad CA bundle"))?;
         Ok(TlsConnector {
             resolver: SystemResolver::system(),
-            cfg: core::cell::RefCell::new(Rc::new(ClientConfig { pinned_ca: None, roots, client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()] })),
+            cfg: core::cell::RefCell::new(Rc::new(ClientConfig { pinned_ca: None, roots, client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()], tls12: true })),
         })
     }
 }

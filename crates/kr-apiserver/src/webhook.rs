@@ -521,7 +521,7 @@ impl Ctx<'_> {
             Some(b) => x509::pem_decode_all(core::str::from_utf8(&kr_fmt::base64::decode(b).map_err(|_| "invalid caBundle")?).map_err(|_| "invalid caBundle")?, "CERTIFICATE").map_err(|_| "invalid caBundle")?,
             None => Vec::new(),
         };
-        let cfg = Rc::new(ClientConfig { pinned_ca: None, roots, client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()] });
+        let cfg = Rc::new(ClientConfig { pinned_ca: None, roots, client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
         let secs = wh.get("timeoutSeconds").and_then(Value::as_u64).unwrap_or(10).clamp(1, 30);
         let http = Http::with_connector(
             TlsConnector::new(WhResolver(HostsResolver::from_contents(&hosts)), cfg),

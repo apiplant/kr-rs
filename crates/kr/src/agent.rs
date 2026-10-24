@@ -51,7 +51,7 @@ fn unhex32(s: &str) -> Option<[u8; 32]> {
 
 /// Fetches /cacerts trusting only a CA whose SHA-256 matches the token's pin.
 async fn fetch_ca(server: &str, pin: [u8; 32]) -> Result<Vec<u8>, String> {
-    let cfg = Rc::new(kr_crypto::tls::ClientConfig { roots: Vec::new(), pinned_ca: Some(pin), client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()] });
+    let cfg = Rc::new(kr_crypto::tls::ClientConfig { roots: Vec::new(), pinned_ca: Some(pin), client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
     let conn = kr_net::tls::TlsConnector::new(kr_net::dns::SystemResolver::system(), cfg);
     let client = kr_net::http1::Client::with_connector(conn, kr_net::http1::Config::default());
     let mut r = client.get(&format!("{server}/cacerts"), &[]).await.map_err(|_| String::from("cannot reach the server (or its CA does not match the token)"))?;

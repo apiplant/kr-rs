@@ -106,7 +106,7 @@ fn kr_client_vs_s_server(tag: &str, extra: &[&str], ed_server: bool, expect_suit
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().unwrap();
     let mut sock = (0..100).find_map(|_| { std::thread::sleep(Duration::from_millis(30)); TcpStream::connect(("127.0.0.1", port)).ok() }).expect("connect");
-    let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: vec![f.ca.clone()], client_cert: Some((vec![f.cli_cert.clone()], f.cli_key)), alpn: vec![b"http/1.1".to_vec()] });
+    let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: vec![f.ca.clone()], client_cert: Some((vec![f.cli_cert.clone()], f.cli_key)), alpn: vec![b"http/1.1".to_vec()], tls12: false });
     let mut c = Connection::client(cfg, b"localhost", rng, now());
     drive(&mut c, &mut sock, |c| !c.is_handshaking());
     assert_eq!(c.cipher_suite(), expect_suite);
@@ -287,7 +287,7 @@ fn client_vs_openssl_rsa_chain() {
         .spawn().unwrap();
     let mut sock = (0..100).find_map(|_| { std::thread::sleep(Duration::from_millis(30)); TcpStream::connect(("127.0.0.1", port)).ok() }).expect("connect");
     let ca = x509::pem_decode_all(&std::fs::read_to_string(dir.join("ca.pem")).unwrap(), "CERTIFICATE").unwrap();
-    let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: ca, client_cert: None, alpn: vec![] });
+    let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: ca, client_cert: None, alpn: vec![], tls12: false });
     let mut c = Connection::client(cfg, b"localhost", rng, now());
     drive(&mut c, &mut sock, |c| !c.is_handshaking());
     let leaf = x509::Certificate::parse(&c.peer_certificates()[0]).unwrap();
@@ -300,4 +300,90 @@ fn client_vs_openssl_rsa_chain() {
     drop(srv.stdin.take());
     let out = srv.wait_with_output().unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("rsa ok"));
+}
+
+// ---- TLS 1.2 client (opt-in) against `openssl s_server -tls1_2` ----
+
+/// An RSA CA and leaf for localhost, made with the openssl CLI (kr only verifies RSA).
+fn rsa_files(dir: &std::path::Path) -> Vec<u8> {
+    let run = |args: &[&str]| assert!(Command::new("openssl").args(args).current_dir(dir).output().unwrap().status.success(), "openssl {args:?}");
+    run(&["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "rca.key", "-out", "rca.pem", "-days", "1", "-subj", "/CN=kr-rsa-ca"]);
+    run(&["req", "-newkey", "rsa:2048", "-nodes", "-keyout", "rsrv.key", "-out", "rsrv.csr", "-subj", "/CN=localhost"]);
+    std::fs::write(dir.join("ext.cnf"), "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n").unwrap();
+    run(&["x509", "-req", "-in", "rsrv.csr", "-CA", "rca.pem", "-CAkey", "rca.key", "-CAcreateserial", "-out", "rsrv.pem", "-days", "1", "-extfile", "ext.cnf"]);
+    let pem = std::fs::read_to_string(dir.join("rca.pem")).unwrap();
+    x509::pem_decode_all(&pem, "CERTIFICATE").unwrap().remove(0)
+}
+
+/// Runs `s_server` with `args` (TLS 1.2 only) and a kr client with `tls12`; returns the
+/// connection after a round trip, or the handshake error.
+fn kr12_vs_s_server(tag: &str, rsa: bool, tls12: bool, extra: &[&str]) -> Result<u16, String> {
+    let f = setup(tag, false);
+    let (cert, key, ca) = if rsa {
+        let ca = rsa_files(&f.dir);
+        ("rsrv.pem", "rsrv.key", ca)
+    } else {
+        ("srv.pem", "srv.key", f.ca.clone())
+    };
+    let port = free_port();
+    let mut srv = Command::new("openssl")
+        .args(["s_server", "-quiet", "-tls1_2", "-accept", &port.to_string(), "-naccept", "1"])
+        .arg("-cert").arg(f.dir.join(cert)).arg("-key").arg(f.dir.join(key))
+        .args(extra)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    let mut sock = (0..100).find_map(|_| { std::thread::sleep(Duration::from_millis(30)); TcpStream::connect(("127.0.0.1", port)).ok() }).expect("connect");
+    let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: vec![ca], client_cert: None, alpn: vec![], tls12 });
+    let mut c = Connection::client(cfg, b"localhost", rng, now());
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drive(&mut c, &mut sock, |c| !c.is_handshaking());
+        c.write(b"hello from kr\n").unwrap();
+        drive(&mut c, &mut sock, |c| !c.has_output());
+        srv.stdin.as_mut().unwrap().write_all(b"hello from openssl\n").unwrap();
+        let mut got = Vec::new();
+        drive(&mut c, &mut sock, |c| {
+            let mut b = [0u8; 256];
+            let n = c.read(&mut b);
+            got.extend_from_slice(&b[..n]);
+            got.ends_with(b"\n")
+        });
+        assert_eq!(got, b"hello from openssl\n");
+    }));
+    let _ = srv.kill();
+    let out = srv.wait_with_output().unwrap();
+    match r {
+        Ok(()) => {
+            assert!(String::from_utf8_lossy(&out.stdout).contains("hello from kr"));
+            Ok(c.cipher_suite())
+        }
+        Err(e) => Err(e.downcast_ref::<String>().cloned().unwrap_or_default()),
+    }
+}
+
+#[test]
+fn tls12_client_ecdsa_chacha_and_aes() {
+    if have_openssl() {
+        assert_eq!(kr12_vs_s_server("12chacha", false, true, &["-cipher", "ECDHE-ECDSA-CHACHA20-POLY1305"]), Ok(0xcca9));
+        assert_eq!(kr12_vs_s_server("12aes", false, true, &["-cipher", "ECDHE-ECDSA-AES128-GCM-SHA256"]), Ok(0xc02b));
+        assert_eq!(kr12_vs_s_server("12p256", false, true, &["-groups", "P-256"]).map(|_| ()), Ok(()));
+    }
+}
+
+#[test]
+fn tls12_client_rsa_server() {
+    if have_openssl() {
+        assert_eq!(kr12_vs_s_server("12rsa", true, true, &["-cipher", "ECDHE-RSA-AES128-GCM-SHA256"]), Ok(0xc02f));
+        assert_eq!(kr12_vs_s_server("12rsacc", true, true, &["-cipher", "ECDHE-RSA-CHACHA20-POLY1305"]), Ok(0xcca8));
+    }
+}
+
+#[test]
+fn tls12_refused_unless_enabled_and_without_ems() {
+    if have_openssl() {
+        // A 1.3-only hello: the 1.2-only server answers protocol_version (70) itself.
+        let e = kr12_vs_s_server("12off", false, false, &[]).unwrap_err();
+        assert!(e.contains("ProtocolVersion") || e.contains("Peer(70)"), "{e}");
+        let e = kr12_vs_s_server("12noems", false, true, &["-no_ems"]).unwrap_err();
+        assert!(e.contains("HandshakeFailure"), "{e}");
+    }
 }

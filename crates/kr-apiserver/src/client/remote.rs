@@ -85,7 +85,7 @@ impl Remote {
             }
             RemoteAuth::ClientCert { chain, key } => (Some(client_cert(&chain, &key)?), None),
         };
-        let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: roots.clone(), client_cert, alpn: alloc::vec![b"http/1.1".to_vec()] });
+        let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: roots.clone(), client_cert, alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
         let unary = Http::with_connector(
             TlsConnector::new(SystemResolver::system(), cfg.clone()),
             HttpConfig { max_redirects: 0, user_agent: "kr-node/0.0.1".to_string(), ..HttpConfig::default() },
@@ -101,7 +101,7 @@ impl Remote {
     /// in-flight ones finish with the old one, which is still valid.
     pub fn set_client_cert(&self, chain: &str, key: &str) -> Result<()> {
         let cc = client_cert(chain, key)?;
-        let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: self.inner.roots.clone(), client_cert: Some(cc), alpn: alloc::vec![b"http/1.1".to_vec()] });
+        let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: self.inner.roots.clone(), client_cert: Some(cc), alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
         self.inner.unary.connector().set_config(cfg.clone());
         self.inner.watch.connector().set_config(cfg);
         Ok(())

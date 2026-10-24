@@ -216,7 +216,7 @@ pub fn main(mut args: Args) -> i32 {
         let chain = load_pem(&pki_dir, "kubelet-client.pem", "CERTIFICATE")?;
         let key = x509::private_key_from_pkcs8(&load_pem(&pki_dir, "kubelet-client.key", "PRIVATE KEY")?.pop().ok_or("empty key")?).map_err(|_| "bad kubelet-client key")?;
         let roots = load_pem(&pki_dir, "ca.pem", "CERTIFICATE")?;
-        Ok(Rc::new(kr_crypto::tls::ClientConfig { roots, pinned_ca: None, client_cert: Some((chain, key)), alpn: alloc::vec![b"http/1.1".to_vec()] }))
+        Ok(Rc::new(kr_crypto::tls::ClientConfig { roots, pinned_ca: None, client_cert: Some((chain, key)), alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false }))
     })() {
         Ok(c) => c,
         Err(e) => return fail(&e),

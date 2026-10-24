@@ -6,8 +6,14 @@
 //!
 //! Supported: TLS_CHACHA20_POLY1305_SHA256 (preferred) and TLS_AES_128_GCM_SHA256; X25519 and
 //! secp256r1 key exchange; ecdsa_secp256r1_sha256 and ed25519 signatures; mutual TLS; ALPN;
-//! KeyUpdate; middlebox-compatibility ChangeCipherSpec. Not supported: TLS 1.2, PSK/resumption,
-//! 0-RTT, HelloRetryRequest as a server (a client must offer a usable key share), RSA certs.
+//! KeyUpdate; middlebox-compatibility ChangeCipherSpec. Not supported: PSK/resumption, 0-RTT,
+//! HelloRetryRequest as a server (a client must offer a usable key share).
+//!
+//! TLS 1.2 (RFC 5246), client only and opt-in (`ClientConfig::tls12`), for servers that do not
+//! speak 1.3 (some registry CDNs): ECDHE (X25519, P-256) with ECDSA or RSA certificates and
+//! AES-128-GCM or ChaCha20-Poly1305, SHA-256 PRF. Extended Master Secret (RFC 7627) is
+//! required, the RFC 8446 downgrade sentinel is checked, and there is no renegotiation, no
+//! resumption and no client certificate (an empty Certificate answers a request).
 
 use crate::aes::AesGcm;
 use crate::hmac::{hkdf_expand, hkdf_extract, Hmac};
@@ -42,6 +48,27 @@ const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const EXT_KEY_SHARE: u16 = 51;
 
 const TLS13: u16 = 0x0304;
+const TLS12: u16 = 0x0303;
+pub const TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: u16 = 0xc02b;
+pub const TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256: u16 = 0xc02f;
+pub const TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256: u16 = 0xcca9;
+pub const TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256: u16 = 0xcca8;
+const TLS12_SUITES: [u16; 4] = [
+    TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+    TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+];
+const EXT_EC_POINT_FORMATS: u16 = 11;
+const EXT_EXTENDED_MASTER_SECRET: u16 = 23;
+const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
+const HT_HELLO_REQUEST: u8 = 0;
+const HT_SERVER_KEY_EXCHANGE: u8 = 12;
+const HT_SERVER_HELLO_DONE: u8 = 14;
+const HT_CLIENT_KEY_EXCHANGE: u8 = 16;
+const SIG_ECDSA_SHA512: u16 = 0x0603;
+/// RFC 8446 4.1.3: a TLS 1.3-capable server negotiating 1.2 (or below) says so here.
+const DOWNGRADE_SENTINEL: [u8; 7] = *b"DOWNGRD";
 pub const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
 pub const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 const GROUP_X25519: u16 = 0x001d;
@@ -241,6 +268,40 @@ fn finished_mac(base: &Secret, transcript_hash: &[u8; 32]) -> [u8; 32] {
     out
 }
 
+// ---- TLS 1.2 key schedule (RFC 5246 5, RFC 7627) ----
+
+fn is_chacha12(suite: u16) -> bool {
+    matches!(suite, TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 | TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256)
+}
+
+fn is_ecdsa12(suite: u16) -> bool {
+    matches!(suite, TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 | TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
+}
+
+fn hmac256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    let mut h = Hmac::<Sha256>::new(key);
+    for p in parts {
+        h.update(p);
+    }
+    let mut out = [0u8; 32];
+    h.finish_into(&mut out);
+    out
+}
+
+/// P_SHA256(secret, label + seed).
+fn prf12(secret: &[u8], label: &[u8], seed: &[u8], out: &mut [u8]) {
+    let mut a = hmac256(secret, &[label, seed]);
+    let mut pos = 0;
+    while pos < out.len() {
+        let block = hmac256(secret, &[&a, label, seed]);
+        let n = (out.len() - pos).min(32);
+        out[pos..pos + n].copy_from_slice(&block[..n]);
+        pos += n;
+        a = hmac256(secret, &[&a]);
+    }
+    crate::wipe(&mut a);
+}
+
 // ---- record protection ----
 
 enum Aead {
@@ -254,6 +315,8 @@ struct RecordKeys {
     seq: u64,
     secret: Secret,
     suite: u16,
+    /// TLS 1.2 record format: no inner content type, explicit nonce for GCM, AAD with seq.
+    v12: bool,
 }
 
 impl RecordKeys {
@@ -271,7 +334,74 @@ impl RecordKeys {
             crate::wipe(&mut k);
             a
         };
-        RecordKeys { aead, iv, seq: 0, secret, suite }
+        RecordKeys { aead, iv, seq: 0, secret, suite, v12: false }
+    }
+
+    /// TLS 1.2 keys from the key block. GCM keeps the 4-byte implicit IV in `iv[..4]` (the rest
+    /// zero), so `nonce()` yields implicit || seq; ChaCha20 uses the full 12-byte IV XOR seq.
+    fn new12(suite: u16, key: &[u8], iv: &[u8]) -> RecordKeys {
+        let mut iv12 = [0u8; 12];
+        iv12[..iv.len()].copy_from_slice(iv);
+        let aead = if is_chacha12(suite) { Aead::ChaCha(key.try_into().unwrap()) } else { Aead::Aes(AesGcm::new(key)) };
+        RecordKeys { aead, iv: iv12, seq: 0, secret: [0; 32], suite, v12: true }
+    }
+
+    fn aad12(&self, ty: u8, len: usize) -> [u8; 13] {
+        let mut a = [0u8; 13];
+        a[..8].copy_from_slice(&self.seq.to_be_bytes());
+        a[8] = ty;
+        a[9] = 3;
+        a[10] = 3;
+        a[11] = (len >> 8) as u8;
+        a[12] = len as u8;
+        a
+    }
+
+    fn seal12(&mut self, ty: u8, content: &[u8], out: &mut Vec<u8>) {
+        let gcm = !is_chacha12(self.suite);
+        let mut body = content.to_vec();
+        let aad = self.aad12(ty, content.len());
+        let nonce = self.nonce();
+        let tag = match &self.aead {
+            Aead::ChaCha(k) => chacha::seal(k, &nonce, &aad, &mut body),
+            Aead::Aes(g) => g.seal(&nonce, &aad, &mut body),
+        };
+        let len = if gcm { 8 } else { 0 } + body.len() + 16;
+        out.extend_from_slice(&[ty, 3, 3, (len >> 8) as u8, len as u8]);
+        if gcm {
+            out.extend_from_slice(&self.seq.to_be_bytes());
+        }
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&tag);
+        self.seq += 1;
+    }
+
+    /// Decrypts a TLS 1.2 record in place; returns (start, length) of the plaintext.
+    fn open12(&mut self, hdr: &[u8; 5], body: &mut [u8]) -> Result<(usize, usize)> {
+        let gcm = !is_chacha12(self.suite);
+        let explicit = if gcm { 8 } else { 0 };
+        if body.len() < explicit + 16 {
+            return fail(Alert::BadRecordMac);
+        }
+        let mut nonce = self.nonce();
+        if gcm {
+            nonce[4..].copy_from_slice(&body[..8]);
+        }
+        let n = body.len() - explicit - 16;
+        if n > MAX_PLAINTEXT {
+            return fail(Alert::RecordOverflow);
+        }
+        let aad = self.aad12(hdr[0], n);
+        let (ct, tag) = body[explicit..].split_at_mut(n);
+        let ok = match &self.aead {
+            Aead::ChaCha(k) => chacha::open(k, &nonce, &aad, ct, tag),
+            Aead::Aes(g) => g.open(&nonce, &aad, ct, tag),
+        };
+        if ok.is_err() {
+            return fail(Alert::BadRecordMac);
+        }
+        self.seq += 1;
+        Ok((explicit, n))
     }
 
     /// Keys for the next generation (KeyUpdate).
@@ -291,6 +421,9 @@ impl RecordKeys {
 
     /// Encrypts one record (`content` + inner type) and appends it to `out`.
     fn seal(&mut self, ty: u8, content: &[u8], out: &mut Vec<u8>) {
+        if self.v12 {
+            return self.seal12(ty, content, out);
+        }
         let mut body = Vec::with_capacity(content.len() + 1 + 16);
         body.extend_from_slice(content);
         body.push(ty);
@@ -375,6 +508,8 @@ pub struct ClientConfig {
     /// Certificate chain and key presented if the server asks.
     pub client_cert: Option<(Vec<Vec<u8>>, SigningKey)>,
     pub alpn: Vec<Vec<u8>>,
+    /// Also offer TLS 1.2 (client only; see the module docs). Off for kr's own connections.
+    pub tls12: bool,
 }
 
 /// Randomness source (getrandom in kr). Must fill the buffer with CSPRNG output.
@@ -427,6 +562,12 @@ enum State {
     CliWaitCert,
     CliWaitCertVerify,
     CliWaitFinished,
+    // client, TLS 1.2
+    Cli12WaitCert,
+    Cli12WaitKeyExchange,
+    Cli12WaitDone,
+    Cli12WaitCcs,
+    Cli12WaitFinished,
     // both
     Established,
     Closed,
@@ -467,6 +608,13 @@ pub struct Connection {
     peer_closed: bool,
     /// Bumped whenever the read keys change.
     read_epoch: u32,
+    /// TLS 1.2 was negotiated (client only).
+    tls12: bool,
+    client_random: [u8; 32],
+    server_random: [u8; 32],
+    /// TLS 1.2 server ECDHE (group, public point) from ServerKeyExchange.
+    kx12: Option<(u16, Vec<u8>)>,
+    master12: [u8; 48],
 }
 
 impl Connection {
@@ -498,6 +646,11 @@ impl Connection {
             ccs_allowed: true,
             peer_closed: false,
             read_epoch: 0,
+            tls12: false,
+            client_random: [0; 32],
+            server_random: [0; 32],
+            kx12: None,
+            master12: [0; 48],
         }
     }
 
@@ -671,6 +824,16 @@ impl Connection {
 
     fn record(&mut self, hdr: &[u8; 5], body: &mut [u8]) -> Result<()> {
         let ty = hdr[0];
+        if ty == CT_CCS && self.tls12 {
+            // TLS 1.2: the server's ChangeCipherSpec switches on its write keys, once.
+            if self.state != State::Cli12WaitCcs || body != [1] || !self.hs_buf.is_empty() {
+                return fail(Alert::UnexpectedMessage);
+            }
+            let k = self.pending_read.take();
+            self.set_read(k);
+            self.state = State::Cli12WaitFinished;
+            return Ok(());
+        }
         if ty == CT_CCS {
             // Middlebox compatibility: a single 0x01 is ignored during the handshake only.
             if self.ccs_allowed && self.is_handshaking() && body == [1] {
@@ -687,6 +850,10 @@ impl Connection {
                     return fail(Alert::UnexpectedMessage);
                 }
                 (ty, body)
+            }
+            Some(k) if k.v12 => {
+                let (start, n) = k.open12(hdr, body)?;
+                (ty, &body[start..start + n])
             }
             Some(k) => {
                 if ty != CT_APPDATA {
@@ -732,6 +899,9 @@ impl Connection {
             }
             return Ok(());
         }
+        if self.tls12 && body[0] == 1 && self.state == State::Established {
+            return Ok(()); // TLS 1.2 warning alert (e.g. no_renegotiation)
+        }
         // TLS 1.3: every other alert is fatal.
         self.state = State::Closed;
         Err(Error::Peer(body[1]))
@@ -772,6 +942,16 @@ impl Connection {
             (State::CliWaitCertOrRequest | State::CliWaitCert, HT_CERTIFICATE) => self.peer_certificate(msg, body),
             (State::CliWaitCertVerify, HT_CERTIFICATE_VERIFY) => self.peer_cert_verify(msg, body),
             (State::CliWaitFinished, HT_FINISHED) => self.cli_finished(msg, body),
+            (State::Cli12WaitCert, HT_CERTIFICATE) => self.cli12_certificate(msg, body),
+            (State::Cli12WaitKeyExchange, HT_SERVER_KEY_EXCHANGE) => self.cli12_server_key_exchange(msg, body),
+            (State::Cli12WaitDone, HT_CERTIFICATE_REQUEST) => {
+                self.transcript.update(msg);
+                self.cert_requested = true;
+                Ok(())
+            }
+            (State::Cli12WaitDone, HT_SERVER_HELLO_DONE) => self.cli12_server_hello_done(msg, body),
+            (State::Cli12WaitFinished, HT_FINISHED) => self.cli12_finished(msg, body),
+            (State::Established, HT_HELLO_REQUEST) if self.tls12 => Ok(()), // no renegotiation: ignored
             (State::Established, HT_KEY_UPDATE) => self.peer_key_update(body),
             (State::Established, HT_NEW_SESSION_TICKET) if matches!(self.role, Role::Client { .. }) => Ok(()), // no resumption
             _ => fail(Alert::UnexpectedMessage),
@@ -1121,6 +1301,8 @@ impl Connection {
             self.session_id = sid.to_vec();
         }
         let random = self.random32();
+        self.client_random = random;
+        let tls12 = cfg.tls12;
         let ch = handshake_msg(HT_CLIENT_HELLO, |m| {
             put_u16(m, 0x0303);
             m.extend_from_slice(&random);
@@ -1128,6 +1310,11 @@ impl Connection {
             put_vec(m, 2, |v| {
                 put_u16(v, TLS_CHACHA20_POLY1305_SHA256);
                 put_u16(v, TLS_AES_128_GCM_SHA256);
+                if tls12 {
+                    for s in TLS12_SUITES {
+                        put_u16(v, s);
+                    }
+                }
             });
             put_vec(m, 1, |v| v.push(0));
             put_vec(m, 2, |e| {
@@ -1137,7 +1324,17 @@ impl Connection {
                         put_vec(l, 2, |h| h.extend_from_slice(&sni));
                     }));
                 }
-                put_ext(e, EXT_SUPPORTED_VERSIONS, |v| put_vec(v, 1, |l| put_u16(l, TLS13)));
+                put_ext(e, EXT_SUPPORTED_VERSIONS, |v| put_vec(v, 1, |l| {
+                    put_u16(l, TLS13);
+                    if tls12 {
+                        put_u16(l, TLS12);
+                    }
+                }));
+                if tls12 {
+                    put_ext(e, EXT_EXTENDED_MASTER_SECRET, |_| {});
+                    put_ext(e, EXT_EC_POINT_FORMATS, |v| put_vec(v, 1, |l| l.push(0))); // uncompressed
+                    put_ext(e, EXT_RENEGOTIATION_INFO, |v| v.push(0)); // empty: initial handshake
+                }
                 put_ext(e, EXT_SUPPORTED_GROUPS, |v| put_vec(v, 2, |l| {
                     put_u16(l, GROUP_X25519);
                     put_u16(l, GROUP_P256);
@@ -1174,7 +1371,13 @@ impl Connection {
         let compression = r.u8()?;
         let exts = extensions(r.vec16()?)?;
         r.done()?;
-        if sid != &self.session_id[..] || compression != 0 {
+        if compression != 0 {
+            return fail(Alert::IllegalParameter);
+        }
+        if find_ext(&exts, EXT_SUPPORTED_VERSIONS).is_none() {
+            return self.cli12_server_hello(msg, random, suite, &exts);
+        }
+        if sid != &self.session_id[..] {
             return fail(Alert::IllegalParameter);
         }
         if suite != TLS_CHACHA20_POLY1305_SHA256 && suite != TLS_AES_128_GCM_SHA256 {
@@ -1286,6 +1489,192 @@ impl Connection {
     }
 }
 
+// ---- client, TLS 1.2 ----
+
+impl Connection {
+    fn cli12_server_hello(&mut self, msg: &[u8], random: &[u8], suite: u16, exts: &[(u16, &[u8])]) -> Result<()> {
+        let Role::Client { cfg, .. } = &self.role else { unreachable!() };
+        if !cfg.tls12 {
+            return fail(Alert::ProtocolVersion);
+        }
+        // We offered 1.3: a 1.3-capable server must not pick 1.2 (RFC 8446 4.1.3).
+        if random[24..31] == DOWNGRADE_SENTINEL && (random[31] == 0 || random[31] == 1) {
+            return fail(Alert::IllegalParameter);
+        }
+        if !TLS12_SUITES.contains(&suite) {
+            return fail(Alert::IllegalParameter);
+        }
+        // Extended Master Secret is mandatory: without it the master secret is not bound to the
+        // handshake (triple handshake attack).
+        if find_ext(exts, EXT_EXTENDED_MASTER_SECRET) != Some(&[][..]) {
+            return fail(Alert::HandshakeFailure);
+        }
+        if let Some(ri) = find_ext(exts, EXT_RENEGOTIATION_INFO) {
+            if ri != [0] {
+                return fail(Alert::HandshakeFailure);
+            }
+        }
+        if let Some(a) = find_ext(exts, EXT_ALPN) {
+            let mut ar = Rd::new(a);
+            let mut list = Rd::new(ar.vec16()?);
+            ar.done()?;
+            let p = list.vec8()?;
+            list.done()?;
+            if !cfg.alpn.iter().any(|x| x == p) {
+                return fail(Alert::IllegalParameter);
+            }
+            self.alpn = Some(p.to_vec());
+        }
+        self.tls12 = true;
+        self.ccs_allowed = false;
+        self.suite = suite;
+        self.server_random.copy_from_slice(random);
+        self.transcript.update(msg);
+        self.state = State::Cli12WaitCert;
+        Ok(())
+    }
+
+    fn cli12_certificate(&mut self, msg: &[u8], body: &[u8]) -> Result<()> {
+        let mut r = Rd::new(body);
+        let mut list = Rd::new(r.vec24()?);
+        r.done()?;
+        let mut chain = Vec::new();
+        while !list.b.is_empty() {
+            let cert = list.vec24()?;
+            if cert.is_empty() {
+                return fail(Alert::DecodeError);
+            }
+            chain.push(cert.to_vec());
+        }
+        if chain.is_empty() {
+            return fail(Alert::DecodeError);
+        }
+        let Role::Client { cfg, server_name, .. } = &self.role else { unreachable!() };
+        let refs: Vec<&[u8]> = chain.iter().map(|c| &c[..]).collect();
+        let mut roots: Vec<&[u8]> = cfg.roots.iter().map(|c| &c[..]).collect();
+        if let Some(pin) = cfg.pinned_ca {
+            if let Some(ca) = refs[1..].iter().find(|c| crate::sha2::sha256(c) == pin) {
+                roots.push(ca);
+            }
+        }
+        if let Err(e) = x509::verify_chain(&refs, &roots, self.now, Usage::Server(server_name)) {
+            return fail(match e {
+                VerifyError::Expired => Alert::CertificateExpired,
+                VerifyError::UnknownIssuer | VerifyError::NotCa => Alert::UnknownCa,
+                _ => Alert::BadCertificate,
+            });
+        }
+        let leaf = x509::Certificate::parse(&chain[0]).or(fail(Alert::BadCertificate))?;
+        // The suite fixes the certificate key type.
+        let ecdsa_key = matches!(leaf.public_key, Some(PublicKey::P256(_)) | Some(PublicKey::P384(_)));
+        if ecdsa_key != is_ecdsa12(self.suite) {
+            return fail(Alert::BadCertificate);
+        }
+        self.peer_key = leaf.public_key.clone();
+        self.peer_certs = chain;
+        self.transcript.update(msg);
+        self.state = State::Cli12WaitKeyExchange;
+        Ok(())
+    }
+
+    fn cli12_server_key_exchange(&mut self, msg: &[u8], body: &[u8]) -> Result<()> {
+        let mut r = Rd::new(body);
+        if r.u8()? != 3 {
+            return fail(Alert::IllegalParameter); // named_curve only
+        }
+        let group = r.u16()?;
+        let point = r.vec8()?;
+        let params_len = 4 + point.len();
+        let scheme = r.u16()?;
+        let sig = r.vec16()?;
+        r.done()?;
+        if group != GROUP_X25519 && group != GROUP_P256 {
+            return fail(Alert::IllegalParameter);
+        }
+        // TLS 1.2 ECDSA schemes name the hash only; the curve comes from the certificate.
+        let alg = match scheme {
+            SIG_ECDSA_P256_SHA256 => SigAlg::Ecdsa(crate::rsa::HashAlg::Sha256),
+            SIG_ECDSA_P384_SHA384 => SigAlg::Ecdsa(crate::rsa::HashAlg::Sha384),
+            SIG_ECDSA_SHA512 => SigAlg::Ecdsa(crate::rsa::HashAlg::Sha512),
+            SIG_RSA_PKCS1_SHA256 => SigAlg::RsaPkcs1(crate::rsa::HashAlg::Sha256),
+            SIG_RSA_PKCS1_SHA384 => SigAlg::RsaPkcs1(crate::rsa::HashAlg::Sha384),
+            SIG_RSA_PKCS1_SHA512 => SigAlg::RsaPkcs1(crate::rsa::HashAlg::Sha512),
+            SIG_RSA_PSS_RSAE_SHA256 => SigAlg::RsaPss(crate::rsa::HashAlg::Sha256, 32),
+            SIG_RSA_PSS_RSAE_SHA384 => SigAlg::RsaPss(crate::rsa::HashAlg::Sha384, 48),
+            SIG_RSA_PSS_RSAE_SHA512 => SigAlg::RsaPss(crate::rsa::HashAlg::Sha512, 64),
+            _ => return fail(Alert::IllegalParameter),
+        };
+        let mut signed = Vec::with_capacity(64 + params_len);
+        signed.extend_from_slice(&self.client_random);
+        signed.extend_from_slice(&self.server_random);
+        signed.extend_from_slice(&body[..params_len]);
+        let key = self.peer_key.as_ref().ok_or(Error::Local(Alert::BadCertificate))?;
+        if !key.verify(alg, &signed, sig) {
+            return fail(Alert::DecryptError);
+        }
+        self.kx12 = Some((group, point.to_vec()));
+        self.transcript.update(msg);
+        self.state = State::Cli12WaitDone;
+        Ok(())
+    }
+
+    fn cli12_server_hello_done(&mut self, msg: &[u8], body: &[u8]) -> Result<()> {
+        if !body.is_empty() {
+            return fail(Alert::DecodeError);
+        }
+        self.transcript.update(msg);
+        if self.cert_requested {
+            // No client certificates over TLS 1.2: an empty list.
+            self.send_hs(handshake_msg(HT_CERTIFICATE, |m| put_vec(m, 3, |_| {})));
+        }
+        let (group, point) = self.kx12.take().ok_or(Error::Local(Alert::UnexpectedMessage))?;
+        let share = if group == GROUP_P256 { KeyShare::P256(p256_key(self.rng)) } else {
+            let mut sk = [0u8; 32];
+            (self.rng)(&mut sk);
+            KeyShare::X25519(sk)
+        };
+        let mut pms = share.shared(&point)?;
+        let ours = share.public();
+        drop(share);
+        self.send_hs(handshake_msg(HT_CLIENT_KEY_EXCHANGE, |m| put_vec(m, 1, |v| v.extend_from_slice(&ours))));
+        // RFC 7627: master secret bound to the session hash (through ClientKeyExchange).
+        let session_hash = self.transcript_hash();
+        prf12(&pms, b"extended master secret", &session_hash, &mut self.master12);
+        crate::wipe(&mut pms);
+        let chacha = is_chacha12(self.suite);
+        let (kl, il) = if chacha { (32, 12) } else { (16, 4) };
+        let mut kb = [0u8; 88];
+        let mut seed = [0u8; 64];
+        seed[..32].copy_from_slice(&self.server_random);
+        seed[32..].copy_from_slice(&self.client_random);
+        prf12(&self.master12, b"key expansion", &seed, &mut kb[..2 * (kl + il)]);
+        let (ck, sk, ci, si) = (&kb[..kl], &kb[kl..2 * kl], &kb[2 * kl..2 * kl + il], &kb[2 * kl + il..2 * (kl + il)]);
+        let write = RecordKeys::new12(self.suite, ck, ci);
+        self.pending_read = Some(RecordKeys::new12(self.suite, sk, si));
+        crate::wipe(&mut kb);
+        // ChangeCipherSpec, then our Finished under the new keys.
+        self.out.extend_from_slice(&[CT_CCS, 3, 3, 0, 1, 1]);
+        self.write_keys = Some(write);
+        let mut vd = [0u8; 12];
+        prf12(&self.master12, b"client finished", &self.transcript_hash(), &mut vd);
+        self.send_hs(handshake_msg(HT_FINISHED, |m| m.extend_from_slice(&vd)));
+        self.state = State::Cli12WaitCcs;
+        Ok(())
+    }
+
+    fn cli12_finished(&mut self, msg: &[u8], body: &[u8]) -> Result<()> {
+        let mut expect = [0u8; 12];
+        prf12(&self.master12, b"server finished", &self.transcript_hash(), &mut expect);
+        if !ct_eq(&expect, body) {
+            return fail(Alert::DecryptError);
+        }
+        self.transcript.update(msg);
+        crate::wipe(&mut self.master12);
+        self.state = State::Established;
+        Ok(())
+    }
+}
+
 fn sig_scheme(k: &SigningKey) -> u16 {
     match k {
         SigningKey::P256(_) => SIG_ECDSA_P256_SHA256,
@@ -1308,4 +1697,74 @@ fn p256_key(rng: Rng) -> p256::SecretKey {
     let k = p256::SecretKey::from_seed(&seed);
     crate::wipe(&mut seed);
     k
+}
+
+#[cfg(test)]
+mod tls12_tests {
+    use super::*;
+
+    fn rng(b: &mut [u8]) {
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = i as u8 ^ 0x5a;
+        }
+    }
+
+    /// A plaintext ServerHello record choosing TLS 1.2 with `random` and EMS on/off.
+    fn server_hello12(random: [u8; 32], ems: bool) -> Vec<u8> {
+        let msg = handshake_msg(HT_SERVER_HELLO, |m| {
+            put_u16(m, TLS12);
+            m.extend_from_slice(&random);
+            put_vec(m, 1, |_| {});
+            put_u16(m, TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256);
+            m.push(0);
+            put_vec(m, 2, |e| {
+                if ems {
+                    put_ext(e, EXT_EXTENDED_MASTER_SECRET, |_| {});
+                }
+            });
+        });
+        let mut rec = alloc::vec![CT_HANDSHAKE, 3, 3, (msg.len() >> 8) as u8, msg.len() as u8];
+        rec.extend_from_slice(&msg);
+        rec
+    }
+
+    fn client(tls12: bool) -> Connection {
+        let cfg = Rc::new(ClientConfig { roots: Vec::new(), pinned_ca: None, client_cert: None, alpn: Vec::new(), tls12 });
+        let mut c = Connection::client(cfg, b"example.com", rng, 0);
+        let hello = c.take_output();
+        // Offers 1.2 suites and EMS only when enabled.
+        let has = |needle: &[u8]| hello.windows(needle.len()).any(|w| w == needle);
+        assert_eq!(has(&TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256.to_be_bytes()), tls12);
+        c
+    }
+
+    #[test]
+    fn downgrade_sentinel_is_rejected() {
+        let mut c = client(true);
+        let mut random = [7u8; 32];
+        random[24..32].copy_from_slice(b"DOWNGRD\x01");
+        assert_eq!(c.feed(&server_hello12(random, true)), Err(Error::Local(Alert::IllegalParameter)));
+    }
+
+    #[test]
+    fn tls12_requires_ems_and_opt_in() {
+        let mut c = client(true);
+        assert_eq!(c.feed(&server_hello12([7u8; 32], false)), Err(Error::Local(Alert::HandshakeFailure)));
+        let mut c = client(false);
+        assert_eq!(c.feed(&server_hello12([7u8; 32], true)), Err(Error::Local(Alert::ProtocolVersion)));
+        let mut c = client(true);
+        assert_eq!(c.feed(&server_hello12([7u8; 32], true)), Ok(()));
+        assert!(c.tls12 && c.state == State::Cli12WaitCert);
+    }
+
+    #[test]
+    fn prf12_matches_rfc_test_vector() {
+        // TLS 1.2 PRF (SHA-256) test vector (IETF TLS WG, "PRF Testvector").
+        let secret = [0x9b, 0xbe, 0x43, 0x6b, 0xa9, 0x40, 0xf0, 0x17, 0xb1, 0x76, 0x52, 0x84, 0x9a, 0x71, 0xdb, 0x35];
+        let seed = [0xa0, 0xba, 0x9f, 0x93, 0x6c, 0xda, 0x31, 0x18, 0x27, 0xa6, 0xf7, 0x96, 0xff, 0xd5, 0x19, 0x8c];
+        let mut out = [0u8; 100];
+        prf12(&secret, b"test label", &seed, &mut out);
+        assert_eq!(&out[..8], &[0xe3, 0xf2, 0x29, 0xba, 0x72, 0x7b, 0xe1, 0x7b]);
+        assert_eq!(&out[92..], &[0x10, 0xff, 0xf7, 0x01, 0x87, 0x34, 0x7b, 0x66]);
+    }
 }

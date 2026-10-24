@@ -71,7 +71,7 @@ fn server(p: &Pki, auth: ClientAuth, ed: bool, alpn: Vec<Vec<u8>>) -> Rc<ServerC
 }
 
 fn client(p: &Pki, cert: bool, alpn: Vec<Vec<u8>>) -> Rc<ClientConfig> {
-    Rc::new(ClientConfig { pinned_ca: None, roots: vec![p.ca.clone()], client_cert: cert.then(|| { let (c, k) = p.leaf("alice", false, false); (vec![c], k) }), alpn })
+    Rc::new(ClientConfig { pinned_ca: None, roots: vec![p.ca.clone()], client_cert: cert.then(|| { let (c, k) = p.leaf("alice", false, false); (vec![c], k) }), alpn, tls12: false })
 }
 
 #[test]
