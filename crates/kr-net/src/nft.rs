@@ -216,7 +216,7 @@ fn masquerade_batch(m: &Masquerade) -> NlBuf {
     new_table(&mut b, m.table, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
     new_chain(&mut b, m.table, b"postrouting", b"nat", NF_INET_POST_ROUTING, 100);
     new_chain(&mut b, m.table, b"forward", b"filter", NF_INET_FORWARD, 0);
-    // ip saddr <cidr> oifname != <bridge> masquerade
+    // ip saddr <cidr> ip daddr != <cidr> oifname != <bridge> masquerade
     rule(&mut b, m.table, b"postrouting", |b| {
         expr_begin(b, b"payload");
         b.attr_u32_be(NFTA_PAYLOAD_DREG, NFT_REG_1);
@@ -226,6 +226,15 @@ fn masquerade_batch(m: &Masquerade) -> NlBuf {
         expr_end(b);
         bitwise_and(b, &mask);
         cmp(b, NFT_CMP_EQ, &net);
+        // ip daddr & mask != net: traffic to other pods keeps its source address
+        expr_begin(b, b"payload");
+        b.attr_u32_be(NFTA_PAYLOAD_DREG, NFT_REG_1);
+        b.attr_u32_be(NFTA_PAYLOAD_BASE, NFT_PAYLOAD_NETWORK_HEADER);
+        b.attr_u32_be(NFTA_PAYLOAD_OFFSET, 16); // daddr in the IPv4 header
+        b.attr_u32_be(NFTA_PAYLOAD_LEN, 4);
+        expr_end(b);
+        bitwise_and(b, &mask);
+        cmp(b, NFT_CMP_NEQ, &net);
         meta(b, NFT_META_OIFNAME);
         cmp(b, NFT_CMP_NEQ, &bridge);
         expr_begin(b, b"masq");
@@ -334,6 +343,12 @@ mod tests {
         assert!(contains(r, &[255, 255, 0, 0]));
         assert!(contains(r, &[10, 88, 0, 0]));
         assert!(contains(r, b"masq\0"));
+        // daddr match: payload at offset 16 (daddr), compared with cmp NEQ against the network.
+        assert!(contains(r, &[0, 0, 0, 16]));
+        let neq = NFT_CMP_NEQ.to_be_bytes();
+        let pos = r.windows(4).position(|w| w == neq).unwrap();
+        assert_eq!(&r[pos..pos + 4], &neq);
+        assert_eq!(r.windows(4).filter(|w| *w == [10, 88, 0, 0]).count(), 2);
         assert!(contains(r, b"payload\0"));
         let mut name = [0u8; 16];
         name[..3].copy_from_slice(b"kr0");

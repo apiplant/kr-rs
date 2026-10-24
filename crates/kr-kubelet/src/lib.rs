@@ -284,8 +284,10 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     /// host-gw routing (root mode): a route to every other node's pod subnet via its
     /// InternalIP. Nodes must share an L2 segment (no overlay yet).
     async fn route_loop(&self) {
+        use kr_net::netlink::RTPROT_KR;
         loop {
             if let (Ok(list), Ok(nl)) = (self.c.list("/api/v1/nodes", "").await, kr_net::netlink::Netlink::route()) {
+                let mut want = Vec::new();
                 for n in list.get("items").and_then(Value::as_array).unwrap_or(&[]) {
                     if meta(n, "name") == self.cfg.node_name {
                         continue;
@@ -293,8 +295,16 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     let Some(pn) = n.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).and_then(network::PodNet::parse) else { continue };
                     let ip = n.pointer(&["status", "addresses"]).and_then(Value::as_array).and_then(|a| a.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("InternalIP"))).and_then(|x| x.get("address")).and_then(Value::as_str).and_then(kr_apiserver::object::parse_ipv4);
                     if let Some(gw) = ip {
-                        let _ = nl.route_add(pn.subnet, pn.prefix, Some(gw), 0);
+                        want.push((pn.subnet, pn.prefix, gw));
                     }
+                }
+                let have = nl.routes_by_proto(RTPROT_KR).unwrap_or_default();
+                let (add, del) = route_diff(&want, &have);
+                for (d, p) in del {
+                    let _ = nl.route_del(d, p, RTPROT_KR);
+                }
+                for (d, p, gw) in add {
+                    let _ = nl.route_add_proto(d, p, Some(gw), 0, RTPROT_KR);
                 }
             }
             kr_rt::exec::sleep(5000).await;
@@ -1074,5 +1084,30 @@ mod status_tests {
         assert_eq!(s(cond(&st, "Ready"), &["status"]), Some("True"));
         let st = status_json(&pod(vec![ctr("run1", false, false, run()), ctr("dbg", false, true, creating())]), "Always");
         assert_eq!(s(cond(&st, "Ready"), &["status"]), Some("True"));
+    }
+}
+
+/// Diff between wanted host-gw routes and the kr-installed ones: (to add or fix, to delete).
+/// A route whose gateway changed is deleted and re-added.
+fn route_diff(want: &[([u8; 4], u8, [u8; 4])], have: &[([u8; 4], u8, Option<[u8; 4]>)]) -> (Vec<([u8; 4], u8, [u8; 4])>, Vec<([u8; 4], u8)>) {
+    let add = want.iter().filter(|w| !have.iter().any(|h| h.0 == w.0 && h.1 == w.1 && h.2 == Some(w.2))).copied().collect();
+    let del = have.iter().filter(|h| !want.iter().any(|w| w.0 == h.0 && w.1 == h.1 && Some(w.2) == h.2)).map(|h| (h.0, h.1)).collect();
+    (add, del)
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::route_diff;
+
+    #[test]
+    fn diff() {
+        let a = ([10, 88, 1, 0], 24, [192, 168, 0, 2]);
+        let b = ([10, 88, 2, 0], 24, [192, 168, 0, 3]);
+        let (add, del) = route_diff(&[a, b], &[(a.0, 24, Some(a.2)), ([10, 88, 9, 0], 24, Some([1, 1, 1, 1]))]);
+        assert_eq!(add, [b]);
+        assert_eq!(del, [([10, 88, 9, 0], 24)]);
+        // gateway change: delete then re-add
+        let (add, del) = route_diff(&[a], &[(a.0, 24, Some([9, 9, 9, 9]))]);
+        assert_eq!((add.len(), del.len()), (1, 1));
     }
 }

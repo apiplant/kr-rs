@@ -54,8 +54,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 80. **host-gw networking only** — *open*
     - Nodes must share an L2 segment; VXLAN is planned.
     - Rootless agents have no cross-node pod networking.
-    - Cross-node pod traffic is masqueraded (the source pod IP is hidden); the nft rule should exclude the cluster CIDR.
-    - Routes of removed nodes are not deleted.
 87. **CustomResourceDefinitions are a subset** — *open*
     Served CRD versions become resources at runtime (JSON only; protobuf gets 415). Enforced schema subset: type, nullable, int-or-string, required, properties, additionalProperties, items, enum, minimum/maximum, min/maxLength, min/maxItems, `default`, and pruning (unless `x-kubernetes-preserve-unknown-fields`). Not enforced: pattern, format, allOf/anyOf/oneOf/not, uniqueItems, CEL `x-kubernetes-validations`, list-type semantics, embedded-resource checks, and CRD schema structural validation. Only `conversion.strategy: None` works (apiVersion is rewritten on get/list; watch events keep the stored apiVersion); Webhook conversion is not implemented. Deleting a CRD removes its objects synchronously (no finalizer); there is no aggregated discovery, and removed CRDs leak their small registration strings until restart. Namespaced CR creation is not blocked by `Terminating` CRDs, and CRD storage-version migration is not performed (storedVersions only grows).
 88. **Admission webhooks are a subset** — *open*
