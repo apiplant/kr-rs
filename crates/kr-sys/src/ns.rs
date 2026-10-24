@@ -1,6 +1,6 @@
 //! Namespace / process syscalls (clone3, mount, pivot_root, ...), used by kr-runtime::container.
 
-use super::{check, nr, syscall1, syscall2, syscall3, syscall4, syscall5, Errno, Fd, Result};
+use super::{check, nr, syscall0, syscall1, syscall2, syscall3, syscall4, syscall5, Errno, Fd, Result};
 
 #[cfg(target_arch = "x86_64")]
 mod n {
@@ -174,6 +174,52 @@ pub fn execve(path: &[u8], argv: &[*const u8], envp: &[*const u8]) -> Errno {
     // returns on failure.
     let r = unsafe { syscall3(n::EXECVE, p, argv.as_ptr() as usize, envp.as_ptr() as usize) };
     check(r).err().unwrap_or(Errno(0))
+}
+
+/// `execveat(fd, "", argv, envp, AT_EMPTY_PATH)`: executes the file behind `fd`. Returns only on failure.
+pub fn execveat_fd(fd: i32, argv: &[*const u8], envp: &[*const u8]) -> Errno {
+    if argv.last() != Some(&core::ptr::null()) || envp.last() != Some(&core::ptr::null()) {
+        return Errno(22);
+    }
+    #[cfg(target_arch = "x86_64")]
+    const EXECVEAT: usize = 322;
+    #[cfg(target_arch = "aarch64")]
+    const EXECVEAT: usize = 281;
+    // SAFETY: argv/envp are NULL-terminated arrays of NUL-terminated strings owned by the caller;
+    // the empty path is a static NUL-terminated string.
+    let r = unsafe { syscall5(EXECVEAT, fd as usize, b"\0".as_ptr() as usize, argv.as_ptr() as usize, envp.as_ptr() as usize, 0x1000) };
+    check(r).err().unwrap_or(Errno(0))
+}
+
+/// Closes every fd >= `first` except `keep` (close_range, Linux 5.9).
+pub fn close_from_except(first: u32, keep: u32) {
+    if keep < first {
+        close_from(first);
+        return;
+    }
+    if keep > first {
+        // SAFETY: plain integer arguments.
+        let _ = unsafe { syscall3(436, first as usize, (keep - 1) as usize, 0) };
+    }
+    if keep < u32::MAX {
+        // SAFETY: plain integer arguments.
+        let _ = unsafe { syscall3(436, (keep + 1) as usize, u32::MAX as usize, 0) };
+    }
+}
+
+/// Sleeps until a signal arrives; never allocates.
+pub fn pause_loop() -> ! {
+    #[cfg(target_arch = "x86_64")]
+    loop {
+        // SAFETY: pause takes no arguments (x86_64 syscall 34).
+        let _ = unsafe { syscall0(34) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    loop {
+        // aarch64 has no pause(2): ppoll(NULL, 0, NULL, NULL, 0) blocks until a signal.
+        // SAFETY: all-NULL arguments are valid for ppoll.
+        let _ = unsafe { syscall5(73, 0, 0, 0, 0, 0) };
+    }
 }
 
 /// `mount(2)`. `source`, `fstype` and `data` may be None (NULL).

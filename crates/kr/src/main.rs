@@ -30,6 +30,8 @@ static LINGERING: AtomicUsize = AtomicUsize::new(0);
 fn kr_main(mut args: Args) -> i32 {
     let _argv0 = args.next();
     match args.next() {
+        // Pod sandbox holder: no allocation, no output, just wait for a signal.
+        Some(b"pause") => kr_sys::ns::pause_loop(),
         Some(b"version") => {
             print(b"kr 0.0.1\n");
             0
