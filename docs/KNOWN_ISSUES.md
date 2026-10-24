@@ -49,7 +49,7 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     - projected, downwardAPI (fieldRef and resourceFieldRef), configMap and secret volumes work, with per-item modes.
     - They are republished every 20 s through an atomic `..data` symlink swap; the SA token is renewed at 80% of its lifetime.
     - subPath is resolved with RESOLVE_IN_ROOT inside the container mount namespace.
-    - Remaining: PVCs (no storage provisioner).
+    - PersistentVolumeClaims work with a built-in local-path provisioner (default StorageClass `local-path`, `WaitForFirstConsumer`, hostPath PVs under `/var/lib/kr/storage` pinned to a node, pvc-protection, static binding, Delete/Retain reclaim, kubelet GC of deleted PV directories; verified live on two nodes). Remaining: other volume types, volume expansion, snapshots, PV protection finalizer, storage capacity limits (no quota on the directories), and unbound Immediate claims do not block scheduling.
 75. **Resource requests are not enforced** — *partly fixed*
     CPU requests become `cpu.weight` (upstream formula); memory requests become `memory.min` (Guaranteed) or `memory.low` (Burstable), skipped silently when the memory controller is not delegated; `status.qosClass` is computed as upstream; the node `MemoryPressure` condition is True when MemAvailable < 100Mi. Remaining: eviction, a pod-level cgroup grouping (container cgroups are flat siblings), and live verification in docker.
 
@@ -293,6 +293,12 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 ## kr-fmt
 18. **14 clippy style lints in kr-fmt** — *fixed* (commit: )
 
+## Echo server (cont.)
+14. **The lingering close holds each connection for up to 1 s after the response** — *fixed* (commit: )
+    Under heavy load this raises the number of concurrent connections. Plan: skip the drain when the request was fully read, and cap total lingering connections.
+91. **Datastore fsync blocked the event loop; log never compacted** — *fixed* (ADR-024)
+    Found in conformance run 3: kr sat in `D` state under write load and the log grew without bound. Writes now go through group commit, with fsync in a helper process, and the log is compacted periodically. Verified: no `D` states during a 300-write burst, and all acknowledged writes survive `kill -9`.
+
 ## kr-sys (cont.)
 35. **`syscall0..6` lack `# Safety` docs (clippy `missing_safety_doc`)** — *fixed (e64a857)*
 
@@ -300,9 +306,3 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 12. **The 431 path closes with unread data, so the client may see a TCP RST** — *fixed* (commit: 68940ad)
     Plan: lingering close. Send the response, `shutdown(SHUT_WR)`, then drain the input for up to 1 s and close.
     Fix: `linger_close` runs after every response (not only the 431) using the new `kr_sys::shutdown`. Note that a request whose headers are complete is answered 200 even if a large body follows, and the lingering close drains that body without a reset.
-
-## Echo server (cont.)
-14. **The lingering close holds each connection for up to 1 s after the response** — *fixed* (commit: )
-    Under heavy load this raises the number of concurrent connections. Plan: skip the drain when the request was fully read, and cap total lingering connections.
-91. **Datastore fsync blocked the event loop; log never compacted** — *fixed* (ADR-024)
-    Found in conformance run 3: kr sat in `D` state under write load and the log grew without bound. Writes now go through group commit, with fsync in a helper process, and the log is compacted periodically. Verified: no `D` states during a 300-write burst, and all acknowledged writes survive `kill -9`.

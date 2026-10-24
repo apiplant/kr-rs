@@ -335,6 +335,13 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             }
             self.report_status(&uid, pod).await;
         }
+        // Directories of deleted local-path PVs, every 30 s.
+        static LAST_STORAGE_GC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let t = now_ms();
+        if t.saturating_sub(LAST_STORAGE_GC.load(core::sync::atomic::Ordering::Relaxed)) >= 30_000 {
+            LAST_STORAGE_GC.store(t, core::sync::atomic::Ordering::Relaxed);
+            spec::gc_storage(&self.c).await;
+        }
         // Pods deleted from the API: stop immediately (the object is already gone).
         let gone: Vec<String> = self.pods.borrow().keys().filter(|k| !seen.contains(k)).cloned().collect();
         for uid in gone {
@@ -549,7 +556,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let built = match spec::build(&self.c, pod, cspec.unwrap_or(&Value::Null), &img, &pod_dir, pod_ip, &self.cfg.node_name).await {
             Ok(b) => b,
             Err(msg) => {
-                self.set_waiting(uid, i, "CreateContainerConfigError", msg);
+                // A claim that is not bound yet is the pod waiting for its volume, not a config error.
+                let reason = if msg.starts_with("persistentvolumeclaim") { "ContainerCreating" } else { "CreateContainerConfigError" };
+                self.set_waiting(uid, i, reason, msg);
                 self.backoff(uid, i);
                 return;
             }
