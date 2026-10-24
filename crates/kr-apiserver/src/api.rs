@@ -434,6 +434,8 @@ impl ApiServer {
         self.bootstrap_object(plr, None, "catch-all", "PriorityLevelConfiguration", &alloc::format!(r#"{{"metadata":{{"name":"catch-all","annotations":{mandatory}}},"spec":{{"type":"Limited","limited":{{"nominalConcurrencyShares":5,"lendablePercent":0,"limitResponse":{{"type":"Reject"}}}}}}}}"#));
         self.bootstrap_object(fsr, None, "exempt", "FlowSchema", &alloc::format!(r#"{{"metadata":{{"name":"exempt","annotations":{mandatory}}},"spec":{{"priorityLevelConfiguration":{{"name":"exempt"}},"matchingPrecedence":1,"rules":[{{"subjects":[{{"kind":"Group","group":{{"name":"system:masters"}}}}],"resourceRules":[{{"verbs":["*"],"apiGroups":["*"],"resources":["*"],"clusterScope":true,"namespaces":["*"]}}],"nonResourceRules":[{{"verbs":["*"],"nonResourceURLs":["*"]}}]}}]}}}}"#));
         self.bootstrap_object(fsr, None, "catch-all", "FlowSchema", &alloc::format!(r#"{{"metadata":{{"name":"catch-all","annotations":{mandatory}}},"spec":{{"priorityLevelConfiguration":{{"name":"catch-all"}},"matchingPrecedence":10000,"distinguisherMethod":{{"type":"ByUser"}},"rules":[{{"subjects":[{{"kind":"Group","group":{{"name":"system:unauthenticated"}}}},{{"kind":"Group","group":{{"name":"system:authenticated"}}}}],"resourceRules":[{{"verbs":["*"],"apiGroups":["*"],"resources":["*"],"clusterScope":true,"namespaces":["*"]}}],"nonResourceRules":[{{"verbs":["*"],"nonResourceURLs":["*"]}}]}}]}}}}"#));
+        let scr = resources::find("storage.k8s.io", "v1", "storageclasses").unwrap();
+        self.bootstrap_object(scr, None, "local-path", "StorageClass", r#"{"metadata":{"name":"local-path","annotations":{"storageclass.kubernetes.io/is-default-class":"true"}},"provisioner":"kr.io/local-path","reclaimPolicy":"Delete","volumeBindingMode":"WaitForFirstConsumer"}"#);
         let nsr = resources::find("", "v1", "namespaces").unwrap();
         let (namespaces, _) = self.store.borrow().list(&nsr.prefix(), None, 0);
         for kv in namespaces {
@@ -1000,6 +1002,9 @@ impl ApiServer {
         if rt.res.plural == "nodes" {
             self.admit_node(o)?;
         }
+        if rt.res.plural == "persistentvolumeclaims" {
+            self.default_storage_class(o);
+        }
         if rt.res.plural == "namespaces" {
             o.entry_object("spec").set("finalizers", Value::Array(alloc::vec![Value::from("kubernetes")]));
             o.entry_object("status").set("phase", Value::from("Active"));
@@ -1348,6 +1353,26 @@ impl ApiServer {
     }
 
     /// Assigns each new Node a /24 of the cluster pod CIDR 10.88.0.0/16 (`spec.podCIDR`).
+    /// DefaultStorageClass admission: a PVC without `storageClassName` (unset, not "") gets the
+    /// default class (annotation `storageclass.kubernetes.io/is-default-class: "true"`).
+    fn default_storage_class(&self, o: &mut Value) {
+        if o.pointer(&["spec", "storageClassName"]).is_some() {
+            return;
+        }
+        let Some(r) = resources::find("storage.k8s.io", "v1", "storageclasses") else { return };
+        let (items, _) = self.store.borrow().list(&r.prefix(), None, 0);
+        let mut names: Vec<String> = items
+            .iter()
+            .filter_map(|kv| json::parse(&kv.value).ok())
+            .filter(|c| c.pointer(&["metadata", "annotations", "storageclass.kubernetes.io/is-default-class"]).and_then(Value::as_str) == Some("true"))
+            .filter_map(|c| c.pointer(&["metadata", "name"]).and_then(Value::as_str).map(String::from))
+            .collect();
+        names.sort();
+        if let Some(n) = names.into_iter().next() {
+            o.entry_object("spec").set("storageClassName", Value::String(n));
+        }
+    }
+
     fn admit_node(&self, o: &mut Value) -> R<()> {
         if o.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).is_some_and(|c| !c.is_empty()) {
             return Ok(());
@@ -1931,6 +1956,10 @@ impl crate::node_authz::Pods for StorePods<'_> {
     fn get(&self, ns: &str, name: &str) -> Option<Value> {
         let r = resources::find("", "v1", "pods")?;
         json::parse(&self.0.store.borrow().get(&r.key(Some(ns), name))?.value).ok()
+    }
+    fn persistent_volume(&self, name: &str) -> Option<Value> {
+        let r = resources::find("", "v1", "persistentvolumes")?;
+        json::parse(&self.0.store.borrow().get(&r.key(None, name))?.value).ok()
     }
     fn in_namespace(&self, ns: &str) -> Vec<Value> {
         let Some(r) = resources::find("", "v1", "pods") else { return Vec::new() };

@@ -47,7 +47,7 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     - projected, downwardAPI (fieldRef and resourceFieldRef), configMap and secret volumes work, with per-item modes.
     - They are republished every 20 s through an atomic `..data` symlink swap; the SA token is renewed at 80% of its lifetime.
     - subPath is resolved with RESOLVE_IN_ROOT inside the container mount namespace.
-    - Remaining: PVCs (no storage provisioner).
+    - PersistentVolumeClaims work with a built-in local-path provisioner (default StorageClass `local-path`, `WaitForFirstConsumer`, hostPath PVs under `/var/lib/kr/storage` pinned to a node, pvc-protection, static binding, Delete/Retain reclaim, kubelet GC of deleted PV directories; verified live on two nodes). Remaining: other volume types, volume expansion, snapshots, PV protection finalizer, storage capacity limits (no quota on the directories), and unbound Immediate claims do not block scheduling.
 75. **Resource requests are not enforced** — *partly fixed*
     CPU requests become `cpu.weight` (upstream formula); memory requests become `memory.min` (Guaranteed) or `memory.low` (Burstable), skipped silently when the memory controller is not delegated; `status.qosClass` is computed as upstream; the node `MemoryPressure` condition is True when MemAvailable < 100Mi. Remaining: eviction, a pod-level cgroup grouping (container cgroups are flat siblings), and live verification in docker.
 

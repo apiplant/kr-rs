@@ -524,6 +524,43 @@ pub async fn refresh_volumes<C: Client>(c: &C, pod: &Value, pod_dir: &str) {
     }
 }
 
+/// PVC -> bound PV -> host directory (`hostPath` or `local`). The directory is created when
+/// missing, world-writable like local-path-provisioner. An unbound claim is an error the caller
+/// retries (the pod stays in ContainerCreating).
+async fn pvc_source<C: Client>(c: &C, ns: &str, claim: &str) -> Result<String, String> {
+    let pvc = c.get(&alloc::format!("/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}")).await.map_err(|_| alloc::format!("persistentvolumeclaim \"{claim}\" not found"))?;
+    let pv_name = pvc.pointer(&["spec", "volumeName"]).and_then(Value::as_str).unwrap_or("");
+    if pv_name.is_empty() || pvc.pointer(&["status", "phase"]).and_then(Value::as_str) != Some("Bound") {
+        return Err(alloc::format!("persistentvolumeclaim \"{claim}\" not bound"));
+    }
+    let pv = c.get(&alloc::format!("/api/v1/persistentvolumes/{pv_name}")).await.map_err(|_| alloc::format!("persistentvolume \"{pv_name}\" not found"))?;
+    let path = ["hostPath", "local"].iter().find_map(|k| pv.pointer(&["spec", k, "path"]).and_then(Value::as_str)).ok_or_else(|| alloc::format!("persistentvolume \"{pv_name}\": unsupported volume source"))?;
+    if !path.starts_with('/') || path.split('/').any(|s| s == "..") {
+        return Err(alloc::format!("persistentvolume \"{pv_name}\": invalid path {path}"));
+    }
+    kr_runtime::store::mkdir_p(path, 0o755).map_err(|_| alloc::format!("cannot create {path}"))?;
+    if path.starts_with(kr_apiserver::client::STORAGE_ROOT) {
+        if let Ok(fd) = kr_sys::ns::open(alloc::format!("{path}\0").as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY | kr_sys::fs::O_NOFOLLOW, 0) {
+            let _ = kr_sys::fs::fchmod(fd.raw(), 0o777);
+        }
+    }
+    Ok(path.to_string())
+}
+
+/// Removes `pvc-*` directories under the storage root whose PersistentVolume no longer exists
+/// (reclaim policy Delete: the controller deleted the PV). Only direct children of the root are
+/// considered, removed through a directory fd so symlinks are never followed.
+pub async fn gc_storage<C: Client>(c: &C) {
+    let Ok(root) = kr_sys::ns::open(alloc::format!("{}\0", kr_apiserver::client::STORAGE_ROOT).as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY | kr_sys::O_CLOEXEC, 0) else { return };
+    let names: Vec<String> = kr_sys::fs::read_dir(&root).filter_map(|e| e.ok()).filter_map(|e| String::from_utf8(e.name).ok()).filter(|n| n.starts_with("pvc-") && !n.contains('/')).collect();
+    for n in names {
+        // Only a definite "not found" proves the volume is gone (anything else: keep the data).
+        if matches!(c.get(&alloc::format!("/api/v1/persistentvolumes/{n}")).await, Err(e) if e.code == 404) {
+            let _ = kr_sys::fs::remove_all(root.raw(), alloc::format!("{n}\0").as_bytes());
+        }
+    }
+}
+
 /// Resolves a pod volume to a host directory (creating/materializing it).
 async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str) -> Result<Option<String>, String> {
     let name = vol.get("name").and_then(Value::as_str).unwrap_or("");
@@ -558,8 +595,10 @@ async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str
             }
         }
         r.map(|()| Some(dir))
+    } else if let Some(p) = vol.get("persistentVolumeClaim") {
+        pvc_source(c, meta(pod, "namespace"), p.get("claimName").and_then(Value::as_str).unwrap_or("")).await.map(Some)
     } else {
-        // PVCs and other types: not yet (KNOWN_ISSUES); mounted as an empty dir.
+        // Other types: not yet (KNOWN_ISSUES); mounted as an empty dir.
         kr_runtime::store::mkdir_p(&dir, 0o755).map_err(|_| String::from("cannot create volume dir"))?;
         Ok(Some(dir))
     }

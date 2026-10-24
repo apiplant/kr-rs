@@ -77,7 +77,8 @@ async fn schedule_one<C: Client>(c: &C, cfg: &Config, ns: &str, name: &str) -> R
     }
     let nodes = items(&c.list("/api/v1/nodes", "").await?);
     let all_pods = items(&c.list(&pods(None), "").await?);
-    match pick(&pod, &nodes, &all_pods) {
+    let pinned = volume_affinity(c, ns, &pod).await?;
+    match pick(&pod, &nodes, &all_pods, &pinned) {
         Ok(node) => {
             let body = obj(alloc::vec![
                 ("apiVersion", Value::from("v1")),
@@ -96,6 +97,29 @@ async fn schedule_one<C: Client>(c: &C, cfg: &Config, ns: &str, name: &str) -> R
             Ok(Some(cfg.retry_ms))
         }
     }
+}
+
+/// Node affinities (as pod-spec style `affinity` holders) of the PVs bound to the pod's PVCs. An
+/// unbound claim (WaitForFirstConsumer) restricts nothing.
+async fn volume_affinity<C: Client>(c: &C, ns: &str, pod: &Value) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    for vol in pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]) {
+        let claim = str_at(vol, &["persistentVolumeClaim", "claimName"]);
+        if claim.is_empty() {
+            continue;
+        }
+        let Some(pvc) = get_opt(c, &alloc::format!("{}/{claim}", pvcs(Some(ns)))).await? else { continue };
+        let pv_name = str_at(&pvc, &["spec", "volumeName"]);
+        if pv_name.is_empty() {
+            continue;
+        }
+        let Some(pv) = get_opt(c, &alloc::format!("/api/v1/persistentvolumes/{pv_name}")).await? else { continue };
+        if let Some(req) = pv.pointer(&["spec", "nodeAffinity", "required"]) {
+            let na = obj(alloc::vec![("requiredDuringSchedulingIgnoredDuringExecution", req.clone())]);
+            out.push(obj(alloc::vec![("affinity", obj(alloc::vec![("nodeAffinity", na)]))]));
+        }
+    }
+    Ok(out)
 }
 
 async fn mark_unschedulable<C: Client>(c: &C, cfg: &Config, path: &str, pod: &Value, msg: &str) -> Result<()> {
@@ -228,9 +252,9 @@ fn port_conflict(pod: &Value, other: &Value) -> bool {
 }
 
 /// Chooses a node name, or explains (`0/N nodes are available: ...`) why none fits.
-fn pick(pod: &Value, nodes: &[Value], all_pods: &[Value]) -> core::result::Result<String, String> {
+fn pick(pod: &Value, nodes: &[Value], all_pods: &[Value], pinned: &[Value]) -> core::result::Result<String, String> {
     let want = requests(pod);
-    let (mut not_ready, mut taint, mut selector, mut cpu, mut mem, mut count, mut ports) = (0, 0, 0, 0, 0, 0, 0);
+    let (mut volume, mut not_ready, mut taint, mut selector, mut cpu, mut mem, mut count, mut ports) = (0, 0, 0, 0, 0, 0, 0, 0);
     let mut best: Option<(i128, usize, &str)> = None; // (score, pods on node, name)
     for n in nodes {
         let nname = name(n);
@@ -240,6 +264,10 @@ fn pick(pod: &Value, nodes: &[Value], all_pods: &[Value]) -> core::result::Resul
         }
         if !selector_matches(pod, n) {
             selector += 1;
+            continue;
+        }
+        if !pinned.iter().all(|s| node_affinity_matches(s, n)) {
+            volume += 1;
             continue;
         }
         if untolerated_taint(pod, n) {
@@ -292,6 +320,7 @@ fn pick(pod: &Value, nodes: &[Value], all_pods: &[Value]) -> core::result::Resul
     for (n, what) in [
         (not_ready, "node(s) were not ready"),
         (selector, "node(s) didn't match Pod's node selector"),
+        (volume, "node(s) had volume node affinity conflict"),
         (taint, "node(s) had untolerated taint"),
         (cpu, "Insufficient cpu"),
         (mem, "Insufficient memory"),
@@ -332,9 +361,20 @@ mod tests {
         let pod = v(r#"{"spec":{"containers":[{"resources":{"requests":{"cpu":"1","memory":"1Gi"}}}]}}"#);
         let busy = v(r#"{"spec":{"nodeName":"a","containers":[{"resources":{"requests":{"cpu":"2"}}}]}}"#);
         let nodes = [node("a"), node("b"), node("c")];
-        assert_eq!(pick(&pod, &nodes, &[busy]).unwrap(), "b"); // a is busier; b and c tie, name wins
+        assert_eq!(pick(&pod, &nodes, &[busy], &[]).unwrap(), "b"); // a is busier; b and c tie, name wins
         let big = v(r#"{"spec":{"containers":[{"resources":{"requests":{"cpu":"5"}}}]}}"#);
-        assert!(pick(&big, &nodes, &[]).unwrap_err().contains("Insufficient cpu"));
+        assert!(pick(&big, &nodes, &[], &[]).unwrap_err().contains("Insufficient cpu"));
+    }
+
+    #[test]
+    fn volume_node_affinity_pins_the_pod() {
+        let node = |n: &str| v(&alloc::format!(r#"{{"metadata":{{"name":"{n}","labels":{{"kubernetes.io/hostname":"{n}"}}}},"status":{{"conditions":[{{"type":"Ready","status":"True"}}],"allocatable":{{"cpu":"4","memory":"8Gi"}}}}}}"#));
+        let pod = v(r#"{"spec":{"containers":[{}]}}"#);
+        let nodes = [node("a"), node("b")];
+        let pin = |n: &str| v(&alloc::format!(r#"{{"affinity":{{"nodeAffinity":{{"requiredDuringSchedulingIgnoredDuringExecution":{{"nodeSelectorTerms":[{{"matchExpressions":[{{"key":"kubernetes.io/hostname","operator":"In","values":["{n}"]}}]}}]}}}}}}}}"#));
+        assert_eq!(pick(&pod, &nodes, &[], &[pin("b")]).unwrap(), "b");
+        assert!(pick(&pod, &nodes, &[], &[pin("b"), pin("a")]).unwrap_err().contains("volume node affinity conflict"));
+        assert!(pick(&pod, &nodes, &[], &[]).is_ok()); // unbound WaitForFirstConsumer claim: no pin
     }
 
     #[test]

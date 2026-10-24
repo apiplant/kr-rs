@@ -8,7 +8,7 @@
 //! every write it guards is identified by URL or the created object's name.
 
 use crate::rbac::Attrs;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use kr_fmt::json::Value;
 
@@ -29,6 +29,8 @@ pub fn node_name<'a>(user: &'a str, groups: &[String]) -> Option<&'a str> {
 pub trait Pods {
     fn get(&self, ns: &str, name: &str) -> Option<Value>;
     fn in_namespace(&self, ns: &str) -> Vec<Value>;
+    /// A PersistentVolume by name.
+    fn persistent_volume(&self, name: &str) -> Option<Value>;
 }
 
 fn bound_to(pod: &Value, node: &str) -> bool {
@@ -51,6 +53,18 @@ pub fn decide(node: &str, a: &Attrs, body_name: Option<&str>, pods: &dyn Pods) -
                 return if write { Decision::Deny } else { Decision::NoOpinion };
             }
             let used = pods.in_namespace(&a.namespace).iter().any(|p| bound_to(p, node) && references(p, kind, &a.name));
+            if used { Decision::Allow } else { Decision::NoOpinion }
+        }
+        ("", "persistentvolumes", "") if !write => {
+            // A PV is readable when its claim is used by a pod bound to this node. A missing PV
+            // is allowed through (the handler answers 404; nothing leaks).
+            if a.verb != "get" || a.name.is_empty() {
+                return Decision::NoOpinion;
+            }
+            let Some(pv) = pods.persistent_volume(&a.name) else { return Decision::Allow };
+            let s = |k: &str| pv.pointer(&["spec", "claimRef", k]).and_then(Value::as_str).unwrap_or("").to_string();
+            let (ns, claim) = (s("namespace"), s("name"));
+            let used = !claim.is_empty() && pods.in_namespace(&ns).iter().any(|p| bound_to(p, node) && references(p, "persistentvolumeclaims", &claim));
             if used { Decision::Allow } else { Decision::NoOpinion }
         }
         ("", "serviceaccounts", "token") => {
@@ -143,6 +157,9 @@ mod tests {
         fn get(&self, ns: &str, name: &str) -> Option<Value> {
             self.0.iter().find(|p| p.pointer(&["metadata", "namespace"]).and_then(Value::as_str) == Some(ns) && p.pointer(&["metadata", "name"]).and_then(Value::as_str) == Some(name)).cloned()
         }
+        fn persistent_volume(&self, name: &str) -> Option<Value> {
+            (name == "pv1").then(|| json::parse_str(r#"{"spec":{"claimRef":{"namespace":"a","name":"data"}}}"#).unwrap())
+        }
         fn in_namespace(&self, ns: &str) -> Vec<Value> {
             self.0.iter().filter(|p| p.pointer(&["metadata", "namespace"]).and_then(Value::as_str) == Some(ns)).cloned().collect()
         }
@@ -178,6 +195,17 @@ mod tests {
         assert_eq!(d("get", "secrets", "s3"), Decision::NoOpinion); // n2's pod
         assert_eq!(d("list", "secrets", ""), Decision::NoOpinion);
         assert_eq!(d("update", "secrets", "s1"), Decision::Deny);
+    }
+
+    #[test]
+    fn pv_reads_follow_claim() {
+        let mut p = pods();
+        p.0.push(json::parse_str(r#"{"metadata":{"namespace":"a","name":"st"},"spec":{"nodeName":"n1","volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"data"}}]}}"#).unwrap());
+        let d = |node: &str, name: &str| decide(node, &attrs("get", "", "persistentvolumes", "", "", name), None, &p);
+        assert_eq!(d("n1", "pv1"), Decision::Allow);
+        assert_eq!(d("n2", "pv1"), Decision::NoOpinion); // its pod does not use the claim
+        assert_eq!(d("n1", "gone"), Decision::Allow); // 404 from the handler
+        assert_eq!(decide("n1", &attrs("list", "", "persistentvolumes", "", "", ""), None, &p), Decision::NoOpinion);
     }
 
     #[test]

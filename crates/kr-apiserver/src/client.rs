@@ -156,3 +156,7 @@ impl Client for InProcess {
 pub fn meta<'a>(o: &'a Value, field: &str) -> &'a str {
     o.pointer(&["metadata", field]).and_then(Value::as_str).unwrap_or("")
 }
+
+/// Where the built-in local-path provisioner keeps volumes on a node (`<root>/pvc-<uid>`). The
+/// controller names the PV directories, the kubelet creates and garbage-collects them.
+pub const STORAGE_ROOT: &str = "/var/lib/kr/storage";

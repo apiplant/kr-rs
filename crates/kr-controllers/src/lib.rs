@@ -14,6 +14,7 @@
 //! * [`cronjob`]: cron parsing and Job creation with concurrency policies.
 //! * [`endpoints`]: Endpoints and EndpointSlices for Services with selectors.
 //! * [`namespace`]: finishes the deletion of Terminating namespaces (empties, then finalizes).
+//! * [`pvc`]: PVC/PV binding, a local-path provisioner and pvc-protection.
 //! * [`gc`]: deletes dependents whose owner no longer exists (background propagation).
 //!
 //! All of them are *level-triggered*. A watch (list, remember the list's `resourceVersion`,
@@ -41,6 +42,7 @@ pub mod endpoints;
 pub mod gc;
 pub mod job;
 pub mod namespace;
+pub mod pvc;
 pub mod quota;
 pub mod replicaset;
 pub mod scheduler;
@@ -100,6 +102,7 @@ pub async fn run_all_with<C: Client + Clone + 'static>(c: C, cfg: Config) {
         spawn(endpoints::run(c.clone(), cfg)),
         spawn(quota::run(c.clone(), cfg)),
         spawn(namespace::run(c.clone(), cfg)),
+        spawn(pvc::run(c.clone(), cfg)),
         spawn(gc::run(c, cfg)),
     ]);
     // A never-woken future would let the executor free this task (and abort the guard).
@@ -112,3 +115,5 @@ pub async fn run_all_with<C: Client + Clone + 'static>(c: C, cfg: Config) {
 mod tests;
 #[cfg(test)]
 mod tests_workloads;
+#[cfg(test)]
+mod tests_pvc;
