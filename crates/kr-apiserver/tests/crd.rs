@@ -27,6 +27,7 @@ fn call(api: &ApiServer, method: &str, path: &str, ct: &str, body: &str) -> (u16
         user: Some(User { name: "admin".into(), groups: vec!["system:masters".into()] }),
         bearer: None,
         headers: &[],
+        authz_verb: None,
     };
     match api.handle(&req) {
         Reply::Json(c, b) => (c, json::parse(b.as_bytes()).unwrap_or(Value::Null)),

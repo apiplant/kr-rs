@@ -26,3 +26,4 @@ pub mod quota;
 pub mod resources;
 pub mod server;
 pub mod tokens;
+pub mod webhook;

@@ -81,7 +81,7 @@ fn create_configmap_over_protobuf() {
     };
     let server = ApiServer::new(kr_store::Store::in_memory(), || 1_700_000_000, |b| b.fill(7), "127.0.0.1:6443".into()).unwrap();
     let body = unhex(include_str!("vectors/configmap.pb.hex"));
-    let req = |method, path, ct, body| Req { method, path, query: "", content_type: ct, accept: None, body, bearer: None, headers: &[], user: Some(User { name: "admin".into(), groups: vec!["system:masters".into()] }) };
+    let req = |method, path, ct, body| Req { method, path, query: "", content_type: ct, accept: None, body, bearer: None, authz_verb: None, headers: &[], user: Some(User { name: "admin".into(), groups: vec!["system:masters".into()] }) };
     let (code, text) = json_of(server.handle(&req("POST", "/api/v1/namespaces/default/configmaps", Some("application/vnd.kubernetes.protobuf"), &body)));
     assert_eq!(code, 201, "{text}");
     let (_, text) = json_of(server.handle(&req("GET", "/api/v1/namespaces/default/configmaps/x", None, b"")));

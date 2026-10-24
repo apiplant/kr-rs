@@ -27,7 +27,7 @@ impl ResponseStream for Watch {
     }
 }
 
-pub fn handle(api: &ApiServer, req: Request) -> Response {
+pub async fn handle(api: &ApiServer, req: Request) -> Response {
     let user = user_from_certs(req.peer.client_certs.as_deref());
     let r = Req {
         method: &req.method,
@@ -39,8 +39,22 @@ pub fn handle(api: &ApiServer, req: Request) -> Response {
         user,
         headers: &req.headers,
         bearer: req.header("authorization").and_then(|a| a.strip_prefix("Bearer ").or_else(|| a.strip_prefix("bearer "))).map(str::trim),
+        authz_verb: None,
     };
-    match api.handle(&r) {
+    let rewritten;
+    let r = match crate::webhook::run(api, &r).await {
+        Err(reply) => return respond(reply),
+        Ok(None) => r,
+        Ok(Some(w)) => {
+            rewritten = w;
+            Req { method: rewritten.method, content_type: Some("application/json"), body: &rewritten.body, authz_verb: (r.method == "PATCH").then_some("patch"), ..r }
+        }
+    };
+    respond(api.handle(&r))
+}
+
+fn respond(reply: Reply) -> Response {
+    match reply {
         Reply::Json(code, body) => {
             let ct = if body.contains("\"kind\":\"Table\"") && body.starts_with("{\"kind\":\"Table\"") { "application/json;as=Table;v=v1;g=meta.k8s.io" } else { "application/json" };
             Response::new(code, body.into_bytes()).with_header("Content-Type", ct)
@@ -55,8 +69,8 @@ pub async fn run(api: Rc<ApiServer>, addr: [u8; 4], port: u16, tls: Rc<kr_crypto
     let listener = server::listen(addr, port, 512)?;
     let cfg = Rc::new(ServerConfig { tls: Some(tls), idle_timeout_ms: 300_000, ..ServerConfig::default() });
     let handler = move |req: Request| -> HandlerFuture {
-        let resp = handle(&api, req);
-        Box::pin(async move { resp })
+        let api = api.clone();
+        Box::pin(async move { handle(&api, req).await })
     };
     server::serve(listener, cfg, Rc::new(handler)).await
 }

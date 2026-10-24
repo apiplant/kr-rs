@@ -99,7 +99,7 @@ impl InProcess {
             Some((p, q)) if query.is_empty() => (p, q),
             _ => (path, query),
         };
-        let req = Req { method, path, query, content_type: ct, accept: Some("application/json"), body, user: Some(self.user.clone()), bearer: None, headers: &[] };
+        let req = Req { method, path, query, content_type: ct, accept: Some("application/json"), body, user: Some(self.user.clone()), bearer: None, headers: &[], authz_verb: None };
         match self.api.handle(&req) {
             Reply::Json(code, s) => {
                 let v = json::parse(s.as_bytes()).unwrap_or(Value::Null);
@@ -143,7 +143,7 @@ impl Client for InProcess {
     }
     async fn watch(&self, path: &str, query: &str) -> Result<Watch> {
         let q = if query.is_empty() { String::from("watch=1") } else { alloc::format!("{query}&watch=1") };
-        let req = Req { method: "GET", path, query: &q, content_type: None, accept: Some("application/json"), body: b"", user: Some(self.user.clone()), bearer: None, headers: &[] };
+        let req = Req { method: "GET", path, query: &q, content_type: None, accept: Some("application/json"), body: b"", user: Some(self.user.clone()), bearer: None, headers: &[], authz_verb: None };
         match self.api.handle(&req) {
             Reply::Watch(w) => Ok(Watch { inner: Source::InProcess(w), buf: Vec::new() }),
             Reply::Json(code, s) => Err(ApiError::new(code, "Error", s)),
