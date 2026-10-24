@@ -362,9 +362,18 @@ impl ApiServer {
     }
 
     /// RBAC decision for `a` (system:masters short-circuits).
-    fn authorize(&self, user: &User, a: &crate::rbac::Attrs) -> bool {
+    /// `body_name`: the created object's name, for POSTs (node identities only).
+    fn authorize(&self, user: &User, a: &crate::rbac::Attrs, body_name: Option<&str>) -> bool {
+        use crate::node_authz::Decision;
         if is_masters(user) {
             return true;
+        }
+        if let Some(node) = crate::node_authz::node_name(&user.name, &user.groups) {
+            match crate::node_authz::decide(node, a, body_name, &StorePods(self)) {
+                Decision::Allow => return true,
+                Decision::Deny => return false,
+                Decision::NoOpinion => {}
+            }
         }
         let store = self.store.borrow();
         let list = |group: &str, plural: &str, ns: Option<&str>| -> Vec<Value> {
@@ -449,7 +458,13 @@ impl ApiServer {
             },
             None => crate::rbac::Attrs { verb: req.method.to_ascii_lowercase(), path: if path.is_empty() { "/".into() } else { path.into() }, ..Default::default() },
         };
-        if !self.authorize(&user, &attrs) {
+        let body_name = match &resource {
+            Some(rt) if req.method == "POST" && crate::node_authz::node_name(&user.name, &user.groups).is_some() => {
+                self.parse_body(req).ok().and_then(|v| v.pointer(&["metadata", "name"]).and_then(Value::as_str).map(String::from)).or_else(|| rt.name.clone())
+            }
+            _ => None,
+        };
+        if !self.authorize(&user, &attrs, body_name.as_deref()) {
             if user.name == "system:anonymous" {
                 return Err(ApiError::new(401, "Unauthorized", "Unauthorized"));
             }
@@ -1180,7 +1195,7 @@ impl ApiServer {
         } else {
             crate::rbac::Attrs { verb: s(&nra, "verb"), path: s(&nra, "path"), ..Default::default() }
         };
-        let ok = self.authorize(user, &attrs);
+        let ok = self.authorize(user, &attrs, None);
         r.set("apiVersion", Value::from("authorization.k8s.io/v1"));
         r.set("kind", Value::from("SelfSubjectAccessReview"));
         r.set("status", obj(alloc::vec![("allowed", Value::Bool(ok))]));
@@ -1521,5 +1536,20 @@ fn with_rv(kv: &Kv) -> Vec<u8> {
             json::to_string(&v).into_bytes()
         }
         Err(_) => kv.value.to_vec(),
+    }
+}
+
+/// Pod lookups for the Node authorizer, straight from the store.
+struct StorePods<'a>(&'a ApiServer);
+
+impl crate::node_authz::Pods for StorePods<'_> {
+    fn get(&self, ns: &str, name: &str) -> Option<Value> {
+        let r = resources::find("", "v1", "pods")?;
+        json::parse(&self.0.store.borrow().get(&r.key(Some(ns), name))?.value).ok()
+    }
+    fn in_namespace(&self, ns: &str) -> Vec<Value> {
+        let Some(r) = resources::find("", "v1", "pods") else { return Vec::new() };
+        let prefix = alloc::format!("{}{ns}/", r.prefix());
+        self.0.store.borrow().list(&prefix, None, 0).0.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect()
     }
 }

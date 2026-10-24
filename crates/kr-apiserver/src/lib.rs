@@ -13,6 +13,7 @@ pub mod api;
 pub mod client;
 pub mod defaults;
 pub mod discovery;
+pub mod node_authz;
 pub mod object;
 pub mod openapi;
 pub mod patch;

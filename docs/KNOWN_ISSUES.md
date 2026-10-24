@@ -259,12 +259,15 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
     - Rootless agents have no cross-node pod networking.
     - Cross-node pod traffic is masqueraded (the source pod IP is hidden); the nft rule should exclude the cluster CIDR.
     - Routes of removed nodes are not deleted.
-81. **No Node authorizer** — *open*
-    `system:nodes` may read every pod, secret and configmap. Upstream limits a node to objects referenced by its own pods.
+81. **No Node authorizer** — *fixed* (ADR-023)
+    Nodes read only the secrets/configmaps/PVCs of their own pods and write only their own Node, Lease and pods. Pods themselves remain readable cluster-wide (as upstream). Token requests are checked by service account, not by `boundObjectRef`.
 82. **Bootstrap token never expires** — *open*
     Planned: expiration and rotation. Node client certificates (1 year) are not rotated either.
 83. **Node-proxied logs report 200 before contacting the node** — *accepted*
-    Errors arrive in the body. A direct `Upgrade: SPDY/3.1` (non-WebSocket port-forward) to remote nodes is not proxied; kubectl's default WebSocket path is.
+    Errors arrive in the body. A direct `Upgrade: SPDY/3.1` (port-forward, or exec from client-go/sonobuoy) to *remote* nodes is not proxied; it works for pods on the server node, and kubectl's default WebSocket path works everywhere.
 84. **DNS: no negative caching or prefetch** — *accepted*
     The zone snapshot is rebuilt every second from full lists, which is fine for small clusters.
-
+85. **SPDY exec: no TTY resize, v4 only** — *accepted*
+    The `resize` stream is accepted and ignored; clients offering only v1–v3 are refused.
+86. **Defaulting is a subset** — *open*
+    Defaults cover core/apps/batch fields seen by clients; other groups (networking, policy, storage) store what was sent.

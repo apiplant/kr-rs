@@ -293,3 +293,17 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
   - **Pod subresources:** the API server reaches agents' kubelets at `:10250` with mTLS (`kube-apiserver-kubelet-client`). WebSocket upgrades are completed at the API server and replayed to the node with the client's key, then frames are pumped both ways.
 
 **Status:** accepted.
+
+## ADR-023: Conformance baseline (Kubernetes 1.37) and the Node authorizer
+
+**Context:** The first Sonobuoy run against the 1.37 conformance image surfaced gaps that client-go and the e2e framework depend on: SPDY exec (`sonobuoy retrieve`), protobuf DeleteOptions, API defaulting and field selectors. Also, `system:nodes` could read every secret.
+
+**Decision:**
+- **Exec over SPDY/3.1:** the kubelet accepts direct `Upgrade: SPDY/3.1` exec (remotecommand v4 only). It waits for the requested streams (`error`/`stdin`/`stdout`/`stderr`, `resize` ignored), then pumps them. With SPDY, query flags are strict: a stream absent from the query is off.
+- **Defaulting** (`defaults.rs`): upstream `SetDefaults_*` for the core/apps/batch fields clients observe. It runs on create and on every non-status update and fills only absent fields. Typed validation is still out of scope.
+- **Node authorizer** (`node_authz.rs`), ahead of RBAC, for `system:node:<n>` in `system:nodes`:
+  - get of secrets/configmaps/PVCs referenced by pods bound to `<n>`: Allow; other reads: defer to RBAC (which no longer grants them to nodes).
+  - writes to pods/pods-status not bound to `<n>`, other Nodes, other node Leases, pod creation, secret writes: Deny (NodeRestriction folded in; the created object's name is read from the body for POSTs).
+  - serviceaccounts/token: only for service accounts used by the node's pods.
+
+**Status:** accepted.

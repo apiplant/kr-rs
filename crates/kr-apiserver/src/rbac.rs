@@ -134,13 +134,13 @@ pub fn bootstrap_roles() -> Vec<(&'static str, String)> {
         ("system:discovery", alloc::format!("[{}]", nonres(&["/api", "/api/*", "/apis", "/apis/*", "/healthz", "/livez", "/readyz", "/openapi", "/openapi/*", "/version", "/version/"], &["get"]))),
         ("system:public-info-viewer", alloc::format!("[{}]", nonres(&["/healthz", "/livez", "/readyz", "/version", "/version/"], &["get"]))),
         ("system:basic-user", alloc::format!("[{}]", rule(&["authorization.k8s.io"], &["selfsubjectaccessreviews", "selfsubjectrulesreviews"], &["create"]))),
-        // Node agents (kubelet + proxy). Broad on reads: there is no Node authorizer yet that
-        // would limit a node to the objects of its own pods (KNOWN_ISSUES).
+        // Node agents (kubelet + proxy). Secrets, configmaps and PVCs come from the Node
+        // authorizer (node_authz), scoped to the node's own pods.
         (
             "system:node",
             alloc::format!(
                 "[{},{},{},{},{},{},{},{},{}]",
-                rule(&[""], &["pods", "services", "endpoints", "namespaces", "configmaps", "secrets", "persistentvolumeclaims", "persistentvolumes"], READ),
+                rule(&[""], &["pods", "services", "endpoints", "namespaces"], READ),
                 rule(&[""], &["pods"], &["delete"]),
                 rule(&[""], &["pods/status", "nodes/status"], &["get", "patch", "update"]),
                 rule(&[""], &["nodes"], &["get", "list", "watch", "create", "patch", "update"]),
