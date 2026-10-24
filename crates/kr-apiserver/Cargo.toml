@@ -11,6 +11,7 @@ kr-fmt = { path = "../kr-fmt" }
 kr-crypto = { path = "../kr-crypto" }
 kr-net = { path = "../kr-net" }
 kr-store = { path = "../kr-store" }
+kr-raft = { path = "../kr-raft" }
 
 [dev-dependencies]
 kr-rt = { path = "../kr-rt", features = ["host"] }

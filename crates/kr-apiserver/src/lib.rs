@@ -11,6 +11,7 @@ extern crate std;
 
 pub mod api;
 pub mod client;
+pub mod cluster;
 pub mod cel;
 pub mod crd;
 pub mod defaults;

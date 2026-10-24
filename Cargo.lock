@@ -25,6 +25,7 @@ dependencies = [
  "kr-crypto",
  "kr-fmt",
  "kr-net",
+ "kr-raft",
  "kr-rt",
  "kr-store",
  "kr-sys",
