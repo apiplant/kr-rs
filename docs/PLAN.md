@@ -82,3 +82,7 @@ Milestone: once the kubelet runs pods (phase 4), run Sonobuoy in CI and track th
 
 ## First implementation step (after approval)
 Scaffold the Cargo workspace and build phase 0: kr-sys syscalls, the kr-rt allocator and executor, and the static epoll HTTP echo server. Then measure its size and RSS as a baseline.
+
+## Test scripts
+- `tools/test/conformance.sh`: Sonobuoy conformance in a throwaway privileged container (`run quick|full`, `wait`, `results`).
+- `tools/test/two-node.sh`: server + agent in two containers.
