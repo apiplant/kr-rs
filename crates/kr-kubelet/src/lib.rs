@@ -64,6 +64,11 @@ fn remove_tree(path: &str) -> bool {
     kr_sys::fs::remove_all(fd.raw(), alloc::format!("{name}\0").as_bytes()).is_ok()
 }
 
+/// Pod uids are 36-char UUIDs (the owner recorded in kubelet IP leases).
+fn is_pod_uid(owner: &[u8]) -> bool {
+    owner.len() == 36 && owner.iter().filter(|b| **b == b'-').count() == 4
+}
+
 fn now_ms() -> u64 {
     kr_rt::exec::now_ms()
 }
@@ -192,8 +197,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
     pub async fn run(self: Rc<Self>) {
-        // All sandboxes died with the previous kr process: their IP leases are stale.
-        let _ = remove_tree(&alloc::format!("{}/ipam", self.cfg.root));
+        // Sandboxes die with the previous kr process (even after SIGKILL), so every pod lease is
+        // stale. Leases owned by anything but a pod uid (`kr ctr run` ids) are left alone.
+        network::gc(alloc::format!("{}/ipam", self.cfg.root).as_bytes(), |owner| !is_pod_uid(owner));
         node::register(&self.c, &self.cfg).await;
         // The API server assigns the pod subnet at registration.
         for _ in 0..30 {
@@ -834,6 +840,10 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let text = json::to_string(&status);
         if self.pods.borrow().get(uid).is_some_and(|p| p.last_status == text) {
             return;
+        }
+        let mut status = status;
+        if let Value::Object(f) = &mut status {
+            f.push((String::from("qosClass"), Value::from(spec::qos_class(pod))));
         }
         let patch = Value::Object(alloc::vec![(String::from("status"), status)]);
         if self.c.patch(&path, "application/merge-patch+json", &patch).await.is_ok() {

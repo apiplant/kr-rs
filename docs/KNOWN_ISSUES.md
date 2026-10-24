@@ -39,7 +39,7 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 50. **Container networking gaps** — *partly fixed* (ADR-019, ADR-022)
     Pods get a bridge network as root and rootless (an infra user+net namespace holds the bridge), and ports are published through hostPort/NodePort (userspace proxy).
     Remaining:
-    - IP leases leak if kr is SIGKILLed; a GC pass at startup is needed.
+    - Kubelet pod leases are garbage-collected at startup (`network::gc`; leases owned by pod uids are stale after a kr crash). Leases of standalone `kr ctr run` containers are not collected if that process is SIGKILLed.
     - IPv4 only.
     - Standalone `kr ctr run` containers are still loopback-only when rootless.
 
@@ -74,7 +74,7 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     - subPath is resolved with RESOLVE_IN_ROOT inside the container mount namespace.
     - Remaining: PVCs (no storage provisioner).
 75. **Resource requests are not enforced** — *partly fixed*
-    CPU requests become `cpu.weight` (upstream formula). Remaining: memory requests (memory.min/low), QoS classes and eviction.
+    CPU requests become `cpu.weight` (upstream formula); memory requests become `memory.min` (Guaranteed) or `memory.low` (Burstable), skipped silently when the memory controller is not delegated; `status.qosClass` is computed as upstream; the node `MemoryPressure` condition is True when MemAvailable < 100Mi. Remaining: eviction, a pod-level cgroup grouping (container cgroups are flat siblings), and live verification in docker.
 76. **Controllers are basic** — *mostly fixed*
     StatefulSet, DaemonSet, Job, CronJob and Endpoints/EndpointSlice controllers exist (49 tests), and Job admission defaulting is in.
     Remaining:

@@ -190,6 +190,34 @@ fn quantity(v: Option<&Value>) -> Option<Quantity> {
     v.and_then(Value::as_str).and_then(|s| Quantity::parse(s).ok()).or_else(|| v.and_then(Value::as_i64).map(|n| Quantity::from_i64(n, kr_fmt::quantity::Format::DecimalSI)))
 }
 
+/// Pod QoS class, as upstream: Guaranteed when every container (init included) has cpu and
+/// memory limits and any request equals its limit; BestEffort when no container sets any cpu or
+/// memory request or limit; otherwise Burstable.
+pub(crate) fn qos_class(pod: &Value) -> &'static str {
+    let (mut any, mut guaranteed, mut n) = (false, true, 0);
+    for key in ["initContainers", "containers"] {
+        for c in pod.pointer(&["spec", key]).and_then(Value::as_array).unwrap_or(&[]) {
+            n += 1;
+            for res in ["cpu", "memory"] {
+                let q = |kind: &str| quantity(c.pointer(&["resources", kind, res])).and_then(|q| q.milli_value());
+                let (req, lim) = (q("requests").filter(|v| *v != 0), q("limits").filter(|v| *v != 0));
+                any |= req.is_some() || lim.is_some();
+                match lim {
+                    None => guaranteed = false,
+                    Some(l) => guaranteed &= req.is_none_or(|r| r == l),
+                }
+            }
+        }
+    }
+    if n > 0 && guaranteed {
+        "Guaranteed"
+    } else if any {
+        "Burstable"
+    } else {
+        "BestEffort"
+    }
+}
+
 /// Writes a configMap/secret volume's files into `dir`.
 async fn materialize<C: Client>(c: &C, ns: &str, kind: &str, name: &str, src: &Value, dir: &str, default_mode: u32) -> Result<(), String> {
     let optional = src.get("optional").and_then(Value::as_bool).unwrap_or(false);
@@ -598,6 +626,8 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
     if let Some(cpu) = quantity(ctr.pointer(&["resources", "requests", "cpu"])).or_else(|| quantity(ctr.pointer(&["resources", "limits", "cpu"]))) {
         limits.cpu_request_milli = cpu.milli_value().and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
     }
+    limits.memory_request_bytes = quantity(ctr.pointer(&["resources", "requests", "memory"])).or_else(|| quantity(ctr.pointer(&["resources", "limits", "memory"]))).and_then(|m| m.value()).and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
+    limits.memory_guaranteed = qos_class(pod) == "Guaranteed";
     let vols = pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]);
     let mut mounts = alloc::vec![
         Mount { source: alloc::format!("{pod_dir}/etc-hosts").into_bytes(), sub_path: None, target: b"/etc/hosts".to_vec(), readonly: false },
@@ -645,4 +675,36 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         limits,
         extra_groups,
     })
+}
+
+#[cfg(test)]
+mod qos_tests {
+    use super::*;
+
+    fn pod(j: &str) -> Value {
+        kr_fmt::json::parse_str(j).unwrap()
+    }
+
+    #[test]
+    fn classes() {
+        let g = r#"{"spec":{"containers":[{"resources":{"limits":{"cpu":"1","memory":"1Gi"}}},{"resources":{"requests":{"cpu":"500m","memory":"1Mi"},"limits":{"cpu":"500m","memory":"1Mi"}}}]}}"#;
+        assert_eq!(qos_class(&pod(g)), "Guaranteed");
+        assert_eq!(qos_class(&pod(r#"{"spec":{"containers":[{},{"resources":{}}]}}"#)), "BestEffort");
+        assert_eq!(qos_class(&pod(r#"{"spec":{"containers":[{"resources":{"limits":{"cpu":"0"}}}]}}"#)), "BestEffort");
+        // Requests only, or cpu limit without memory limit: Burstable.
+        assert_eq!(qos_class(&pod(r#"{"spec":{"containers":[{"resources":{"requests":{"cpu":"1"}}}]}}"#)), "Burstable");
+        assert_eq!(qos_class(&pod(r#"{"spec":{"containers":[{"resources":{"limits":{"cpu":"1"}}}]}}"#)), "Burstable");
+        // Request differing from the limit.
+        assert_eq!(qos_class(&pod(r#"{"spec":{"containers":[{"resources":{"requests":{"cpu":"1","memory":"1Mi"},"limits":{"cpu":"2","memory":"1Mi"}}}]}}"#)), "Burstable");
+        // One container with no resources spoils Guaranteed.
+        let mixed = r#"{"spec":{"containers":[{"resources":{"limits":{"cpu":"1","memory":"1Mi"}}},{}]}}"#;
+        assert_eq!(qos_class(&pod(mixed)), "Burstable");
+        // Init containers count.
+        let init = r#"{"spec":{"initContainers":[{}],"containers":[{"resources":{"limits":{"cpu":"1","memory":"1Mi"}}}]}}"#;
+        assert_eq!(qos_class(&pod(init)), "Burstable");
+        let init_ok = r#"{"spec":{"initContainers":[{"resources":{"limits":{"cpu":"1","memory":"1Mi"}}}],"containers":[{"resources":{"limits":{"cpu":"1","memory":"1Mi"}}}]}}"#;
+        assert_eq!(qos_class(&pod(init_ok)), "Guaranteed");
+        // Only non-cpu/memory resources do not count.
+        assert_eq!(qos_class(&pod(r#"{"spec":{"containers":[{"resources":{"limits":{"ephemeral-storage":"1Gi"}}}]}}"#)), "BestEffort");
+    }
 }

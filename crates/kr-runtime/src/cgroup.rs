@@ -20,11 +20,22 @@ pub struct Limits {
     pub cpu_milli: Option<u64>,
     /// CPU request in millicores, written as cpu.weight (relative share under contention).
     pub cpu_request_milli: Option<u64>,
+    /// Memory request in bytes: memory.min when `memory_guaranteed`, else memory.low.
+    pub memory_request_bytes: Option<u64>,
+    /// The pod is QoS Guaranteed, so its request is a hard reservation (memory.min).
+    pub memory_guaranteed: bool,
 }
 
 impl Limits {
+    /// The memory request as a cgroup protection: `memory.min` for Guaranteed pods, `memory.low`
+    /// for Burstable ones. BestEffort (no request) gets none.
+    pub fn memory_protection(&self) -> Option<(&'static [u8], u64)> {
+        let r = self.memory_request_bytes.filter(|r| *r > 0)?;
+        Some((if self.memory_guaranteed { b"memory.min" } else { b"memory.low" }, r))
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.memory_bytes.is_none() && self.pids.is_none() && self.cpu_milli.is_none() && self.cpu_request_milli.is_none()
+        self.memory_bytes.is_none() && self.pids.is_none() && self.cpu_milli.is_none() && self.cpu_request_milli.is_none() && self.memory_request_bytes.is_none()
     }
 }
 
@@ -171,6 +182,14 @@ impl Cgroup {
             let shares = (r.saturating_mul(1024) / 1000).clamp(2, 262_144);
             self.set(b"cpu.weight", &dec(1 + (shares - 2) * 9999 / 262_142))?;
         }
+        if let Some((file, v)) = l.memory_protection() {
+            // Best effort: without the memory controller delegated (rootless) the file is missing
+            // or not writable, which only means no reservation.
+            match self.set(file, &dec(v)) {
+                Ok(()) | Err(Errno(1)) | Err(Errno(2)) | Err(Errno(13)) => {}
+                Err(e) => return Err(e),
+            }
+        }
         Ok(())
     }
 
@@ -196,5 +215,23 @@ impl Cgroup {
                 _ => return,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_protection_by_qos() {
+        let mut l = Limits::default();
+        assert_eq!(l.memory_protection(), None);
+        l.memory_request_bytes = Some(0);
+        assert_eq!(l.memory_protection(), None);
+        l.memory_request_bytes = Some(1 << 20);
+        assert_eq!(l.memory_protection(), Some((&b"memory.low"[..], 1 << 20)));
+        l.memory_guaranteed = true;
+        assert_eq!(l.memory_protection(), Some((&b"memory.min"[..], 1 << 20)));
+        assert!(!l.is_empty());
     }
 }
