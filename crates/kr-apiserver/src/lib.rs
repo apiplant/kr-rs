@@ -11,6 +11,7 @@ extern crate std;
 
 pub mod api;
 pub mod client;
+pub mod cel;
 pub mod crd;
 pub mod defaults;
 pub mod discovery;
@@ -25,6 +26,7 @@ pub mod rbac;
 pub mod proto;
 pub mod proto_schema;
 pub mod quota;
+pub mod regex;
 pub mod resources;
 pub mod server;
 pub mod tokens;

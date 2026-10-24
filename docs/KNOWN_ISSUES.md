@@ -51,23 +51,11 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     - Remaining: pod veth MTU is not lowered to the VXLAN MTU (uplink - 50), no IPv6, no encryption, all nodes must use the same backend, and the FDB reconcile was only checked by unit tests (not read back live).
     - Rootless agents have no cross-node pod networking.
 87. **CustomResourceDefinitions are a subset** — *open*
-    Served CRD versions become resources at runtime (JSON only; protobuf gets 415). Enforced schema subset: type, nullable, int-or-string, required, properties, additionalProperties, items, enum, minimum/maximum, min/maxLength, min/maxItems, `default`, and pruning (unless `x-kubernetes-preserve-unknown-fields`). Not enforced: pattern, format, allOf/anyOf/oneOf/not, uniqueItems, CEL `x-kubernetes-validations`, list-type semantics, embedded-resource checks, and CRD schema structural validation. Only `conversion.strategy: None` works (apiVersion is rewritten on get/list; watch events keep the stored apiVersion); Webhook conversion is not implemented. Deleting a CRD removes its objects synchronously (no finalizer); there is no aggregated discovery, and removed CRDs leak their small registration strings until restart. Namespaced CR creation is not blocked by `Terminating` CRDs, and CRD storage-version migration is not performed (storedVersions only grows).
+    Served CRD versions become resources at runtime (JSON only; protobuf gets 415). The CRD schema is checked for the main structural rules at create/update (types required, properties vs additionalProperties, no types inside allOf/anyOf/oneOf/not, no `$ref`, arrays need `items`, patterns and CEL rules must compile). Enforced on objects: type, nullable, int-or-string, required, properties, additionalProperties, items, enum, minimum/maximum (+exclusive, multipleOf), min/maxLength, `pattern` (small backtracking regex engine, 100k step limit; overflow is a validation error), `format` (date, date-time, byte, int32, int64, uuid, ipv4, ipv6, hostname, uri; loosely), min/maxItems, uniqueItems, min/maxProperties, allOf/anyOf/oneOf/not (value checks only), `x-kubernetes-list-type` set/map uniqueness, `default`, pruning (unless `x-kubernetes-preserve-unknown-fields`), and `x-kubernetes-validations` CEL rules with `self`/`oldSelf` (transition rules run only on update when the node existed; `message`/`messageExpression` supported). The CEL subset (shared with webhook matchConditions) has no `reason`/`fieldPath`, cost limits, maps/duration/timestamp/quantity/regex-capture/string-format libraries, `optional` types, or int/uint/double distinction. Not enforced: embedded-resource checks, pruning inside allOf/anyOf, ratcheting, `x-kubernetes-map-type`, and the rest of upstream's structural rules (metadata restrictions, default pruning/validation, int-or-string anyOf shape, cost estimation). Only `conversion.strategy: None` works (apiVersion is rewritten on get/list/watch); Webhook conversion is not implemented. Deleting a CRD removes its objects synchronously (no finalizer); there is no aggregated discovery, and removed CRDs leak their small registration strings until restart. Namespaced CR creation is not blocked by `Terminating` CRDs, and CRD storage-version migration is not performed (storedVersions only grows).
 88. **Admission webhooks are a subset** — *open*
     Mutating then validating webhooks (admission.k8s.io/v1) run for CREATE/UPDATE/DELETE of resources, `/status`, `*/scale` updates, DELETE collection (per item), and CONNECT for `pods/exec|attach|portforward` (options from the query); `pods/binding` and `serviceaccounts/token` run on the request body. The write path stays synchronous: the request is dry-run through the built-in handler, the webhooks run (the only awaits) on that result, then the real request executes (with the mutated object as the body if patched), so built-in admission runs twice, webhooks see the object after built-in admission, and the dry-run and the write are not atomic. CONNECT and body-only subresources reach webhooks before RBAC/existence checks (no dry-run), and `pods/eviction` is not served at all. Webhooks run sequentially; only `JSONPatch` patches are supported, `caBundle` is required (no system roots), and `matchPolicy: Equivalent` just ignores the rule's version (no conversion; one version per resource). matchConditions use a small CEL subset: `== != < <= > >= ! && || in +`, field/index access, `has()`, `size()`, string `startsWith/endsWith/contains`, literals and lists; any other expression is an evaluation error handled by `failurePolicy`. admissionregistration.k8s.io objects are never sent to webhooks.
 
 # Accepted limitations (by design, or not planned for now)
-
-## kr-net
-28. **HTTP/1.1 client limits** — *accepted*
-    No request body streaming (the body is a `&[u8]`; `body::encode_chunk` exists but the client does not send chunked requests), no proxies, no `Expect: 100-continue`, no response decompression (`Accept-Encoding: identity` is sent), no HTTP/1.0 keep-alive negotiation beyond `Connection: keep-alive`. Responses with `Transfer-Encoding` AND `Content-Length` are rejected rather than handled per the RFC's "TE wins" rule.
-29. **Bare LF line endings are rejected, even though RFC 9112 allows recipients to accept them** — *accepted*
-    Deliberate (ADR-015). A buggy server that sends LF-only heads will fail with `Parse("bare LF")`.
-32. **Registry client is pull-only** — *accepted*
-    No push, no tags/catalog listing, no referrers, no resumable or range blob download. Schema-1 manifests are rejected. A sink that has already received data from a blob with a digest mismatch must be discarded by the caller (the mismatch is only known at the end).
-33. **`kr-rt` `host` feature for host tests** — *accepted*
-    It removes `_start`/panic handler/allocator/`mem*` so `cargo test` works for crates that use the executor. It is enabled only via `kr-net` dev-dependencies, but cargo feature unification means `cargo test --workspace` would enable it for `kr` too; run tests per package. `Async::wait_writable` was added to `kr-rt` for non-blocking connect.
-34. **Integration test with a real registry is `#[ignore]`d** — *accepted*
-    `cargo test -p kr-net -- --ignored` runs `registry:2` under docker/podman on 127.0.0.1:5000, pushes busybox (needs network for the first pull) and pulls it through the client; it skips when offline or port 5000 is busy and falls back to the std fake registry when no container tool exists. The always-on tests use that std fake server.
 
 ## kr-runtime: isolation (container.rs, security.rs, cgroup.rs)
 45. **The seccomp profile is a deny-list, not Docker's allow-list** — *accepted for now*
@@ -113,6 +101,18 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     The zone snapshot is rebuilt every second from full lists, which is fine for small clusters.
 85. **SPDY exec: no TTY resize, v4 only** — *accepted*
     The `resize` stream is accepted and ignored; clients offering only v1–v3 are refused.
+
+## kr-net
+28. **HTTP/1.1 client limits** — *accepted*
+    No request body streaming (the body is a `&[u8]`; `body::encode_chunk` exists but the client does not send chunked requests), no proxies, no `Expect: 100-continue`, no response decompression (`Accept-Encoding: identity` is sent), no HTTP/1.0 keep-alive negotiation beyond `Connection: keep-alive`. Responses with `Transfer-Encoding` AND `Content-Length` are rejected rather than handled per the RFC's "TE wins" rule.
+29. **Bare LF line endings are rejected, even though RFC 9112 allows recipients to accept them** — *accepted*
+    Deliberate (ADR-015). A buggy server that sends LF-only heads will fail with `Parse("bare LF")`.
+32. **Registry client is pull-only** — *accepted*
+    No push, no tags/catalog listing, no referrers, no resumable or range blob download. Schema-1 manifests are rejected. A sink that has already received data from a blob with a digest mismatch must be discarded by the caller (the mismatch is only known at the end).
+33. **`kr-rt` `host` feature for host tests** — *accepted*
+    It removes `_start`/panic handler/allocator/`mem*` so `cargo test` works for crates that use the executor. It is enabled only via `kr-net` dev-dependencies, but cargo feature unification means `cargo test --workspace` would enable it for `kr` too; run tests per package. `Async::wait_writable` was added to `kr-rt` for non-blocking connect.
+34. **Integration test with a real registry is `#[ignore]`d** — *accepted*
+    `cargo test -p kr-net -- --ignored` runs `registry:2` under docker/podman on 127.0.0.1:5000, pushes busybox (needs network for the first pull) and pulls it through the client; it skips when offline or port 5000 is busy and falls back to the std fake registry when no container tool exists. The always-on tests use that std fake server.
 
 ## Runtime (kr-rt)
 3. **Allocator is single-threaded** — *accepted (phase 0)*
@@ -171,18 +171,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     Controllers and the server's kubelet call the API in-process. A crash can lose their last ~1 s of writes, which they then re-derive. Watch events are also delivered before the fsync.
 
 # Resolved
-
-## kr-net
-25. **No DNS: only IP literals, `/etc/hosts` and a built-in `localhost`** — *fixed*
-    kr-net has a UDP/TCP stub resolver (`dns.rs`, `SystemResolver`: /etc/hosts then resolv.conf nameservers). IPv6 zone ids are still not parsed.
-26. **TLS is not implemented; `https` URLs fail with `Error::TlsUnsupported`** — *fixed (ADR-020)*
-    `kr-net::tls::TlsConnector` serves `https`, and image pulls use it. Trust anchors come from `KR_CA_BUNDLE` or the system bundle.
-27. **Interim SHA-256 in `kr-net/src/sha256.rs`** — *fixed*
-    It now re-exports `kr_crypto::sha2`.
-30. **Keep-alive pool has no idle timeout** — *fixed* (13ba669)
-    `Config::idle_timeout_ms` (default 90 s): idle connections older than that are dropped, never reused. Remaining: no proactive EOF/readability probe before reuse (a server-closed connection is still found on use, with the existing one retry for GET/HEAD) and no background eviction timer (expiry runs on pool take/put).
-31. **Registry auth** — *fixed* (commits: 13ba669, 169b2e7)
-    Basic and Bearer-with-credentials (`token`/`access_token`, `expires_in` honoured), docker `identitytoken` (refresh_token POST), `imagePullSecrets` (dockerconfigjson/dockercfg, pod and ServiceAccount), keys matched like the kubelet (repository path prefixes on `/` boundaries, `*.` one-label wildcards, docker.io aliases; most specific wins); `kr ctr pull` reads `$DOCKER_CONFIG/config.json` or `~/.docker/config.json`. Not supported: docker credential helpers (`credsStore`/`credHelpers`); the identitytoken path is untested against a real registry.
 
 ## kr-runtime: isolation (container.rs, security.rs, cgroup.rs)
 43. **Rootless maps a single uid/gid** — *fixed*
@@ -261,6 +249,18 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     `kr agent --token VALUE` exposed the token in /proc/<pid>/cmdline. Use `--token-file` (must be mode 600) or `KR_TOKEN`; `--token` still works but warns.
 90. **Pod sandbox holder costs ~0.6–0.9 MB PSS per pod** — *fixed* (commits: 8f76327, bfd9d3e)
     After setup the holder execveats kr (O_PATH|O_CLOEXEC fd of /proc/self/exe) as `kr pause` with an empty environment and all other fds closed: ~77 kB PSS per pod instead of ~700 kB. If the exec fails it silently falls back to the old in-process pause.
+
+## kr-net
+25. **No DNS: only IP literals, `/etc/hosts` and a built-in `localhost`** — *fixed*
+    kr-net has a UDP/TCP stub resolver (`dns.rs`, `SystemResolver`: /etc/hosts then resolv.conf nameservers). IPv6 zone ids are still not parsed.
+26. **TLS is not implemented; `https` URLs fail with `Error::TlsUnsupported`** — *fixed (ADR-020)*
+    `kr-net::tls::TlsConnector` serves `https`, and image pulls use it. Trust anchors come from `KR_CA_BUNDLE` or the system bundle.
+27. **Interim SHA-256 in `kr-net/src/sha256.rs`** — *fixed*
+    It now re-exports `kr_crypto::sha2`.
+30. **Keep-alive pool has no idle timeout** — *fixed* (13ba669)
+    `Config::idle_timeout_ms` (default 90 s): idle connections older than that are dropped, never reused. Remaining: no proactive EOF/readability probe before reuse (a server-closed connection is still found on use, with the existing one retry for GET/HEAD) and no background eviction timer (expiry runs on pool take/put).
+31. **Registry auth** — *fixed* (commits: 13ba669, 169b2e7)
+    Basic and Bearer-with-credentials (`token`/`access_token`, `expires_in` honoured), docker `identitytoken` (refresh_token POST), `imagePullSecrets` (dockerconfigjson/dockercfg, pod and ServiceAccount), keys matched like the kubelet (repository path prefixes on `/` boundaries, `*.` one-label wildcards, docker.io aliases; most specific wins); `kr ctr pull` reads `$DOCKER_CONFIG/config.json` or `~/.docker/config.json`. Not supported: docker credential helpers (`credsStore`/`credHelpers`); the identitytoken path is untested against a real registry.
 
 ## Runtime (kr-rt)
 1. **Pending task + Async forms an Rc cycle** — *fixed* (commit: 68940ad)
