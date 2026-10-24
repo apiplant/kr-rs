@@ -4,14 +4,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 
 # Needs work (open or partial)
 
-## Runtime (kr-rt)
-4. **Allocator never returns small blocks to the OS** — *open*
-   RSS grows to peak usage and stays there. Fine for the agent, but it could matter for a long-running server. Plan: return a chunk with `madvise(MADV_DONTNEED)` once it is fully empty.
-6. **Large allocations with alignment above 4096 are not honoured** — *open*
-   They go through mmap, which only guarantees page alignment. Plan: over-allocate and trim.
-10. **mem\* are byte-by-byte on non-x86_64, and memcmp/bcmp everywhere** — *open (perf)*
-    Plan: word-at-a-time versions once there are benchmarks.
-
 ## kr-sys
 11. **aarch64 path is untested** — *open*
     It compiles under cfg but has never run. Plan: a qemu-user CI job.
@@ -27,9 +19,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     Stale connections are detected only when reused (one retry for GET/HEAD). Add a timer-based eviction if long-lived clients appear.
 31. **Registry auth supports anonymous Bearer tokens only** — *open*
     No Basic auth, no credentials (`~/.docker/config.json`), no token refresh by expiry (a token is retried once after a 401), and `scope` is taken from the challenge or defaults to `repository:<repo>:pull`.
-
-## kr-sys (cont.)
-35. **`syscall0..6` lack `# Safety` docs (clippy `missing_safety_doc`)** — *open (cleanup)*
 
 ## kr-runtime store / unpack / pull
 39. **Layer diff_ids are not verified; only blob digests are** — *open*
@@ -98,18 +87,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     The holder is a fork of kr and keeps ~570 kB of private copy-on-write memory. Plan: after setup, execveat the kr binary as `kr pause` (fresh tiny address space, empty environment, fds closed).
 
 # Accepted limitations (by design, or not planned for now)
-
-## Runtime (kr-rt)
-3. **Allocator is single-threaded** — *accepted (phase 0)*
-   UB if threads are ever added. It must get per-thread slabs or a lock before N-worker mode lands.
-5. **Chunk tail waste** — *accepted*
-   Up to 2 KiB is lost per 64 KiB chunk when a class is refilled.
-7. **Wakers are `Send + Sync` by type but not thread-safe** — *accepted*
-   They wrap a non-atomic `Rc`. Sending one to another thread is UB. Must be revisited together with #3.
-8. **Stale epoll events after a slot is reused** — *accepted*
-   A stale event only sets a readiness flag spuriously, and EAGAIN handling absorbs it. Plan: add generation tags if this ever causes trouble.
-9. **`block_on` panics with "deadlock" when there is no work** — *accepted*
-   This is intended, but it is a panic rather than an error.
 
 ## kr-archive
 19. **Tar: no sparse files, unknown type flags are errors, strings must be UTF-8** — *accepted*
@@ -193,6 +170,18 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 85. **SPDY exec: no TTY resize, v4 only** — *accepted*
     The `resize` stream is accepted and ignored; clients offering only v1–v3 are refused.
 
+## Runtime (kr-rt)
+3. **Allocator is single-threaded** — *accepted (phase 0)*
+   UB if threads are ever added. It must get per-thread slabs or a lock before N-worker mode lands.
+5. **Chunk tail waste** — *accepted*
+   Up to 2 KiB is lost per 64 KiB chunk when a class is refilled.
+7. **Wakers are `Send + Sync` by type but not thread-safe** — *accepted*
+   They wrap a non-atomic `Rc`. Sending one to another thread is UB. Must be revisited together with #3.
+8. **Stale epoll events after a slot is reused** — *accepted*
+   A stale event only sets a readiness flag spuriously, and EAGAIN handling absorbs it. Plan: add generation tags if this ever causes trouble.
+9. **`block_on` panics with "deadlock" when there is no work** — *accepted*
+   This is intended, but it is a panic rather than an error.
+
 ## Build
 13. **Linker passes `-pie` alongside `-static`** — *accepted*
     The output is `ET_EXEC` with no relocations, which was verified. Re-check after toolchain bumps, since a static-pie would need self-relocation in `_start`.
@@ -211,15 +200,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     `1e40` is OutOfRange. k8s has the same practical bounds.
 
 # Resolved
-
-## Runtime (kr-rt)
-1. **Pending task + Async forms an Rc cycle** — *fixed* (commit: 68940ad)
-   The task owns the future, the future owns the `Async`, the `Async`'s I/O slot owns a waker, and the waker owns the task. A task that never completes is never freed.
-   Plan: add `JoinHandle::abort()` to drop the future and break the cycle, and add a live-task counter for leak detection. Rule: every network wait must have a deadline.
-   Fix: `JoinHandle::abort()` drops the future immediately, and the handle then resolves to `Err(Aborted)` (the output is now `Result<T, Aborted>`, and there is also `is_finished()`). `exec::live_tasks()` counts tasks until their `Task` is freed, and `kr sleep-test` asserts on it (`live_tasks_ok`). A task that never completes and has no deadline or abort is still a leak hazard by design.
-2. **`sleep` can fire up to 1 ms early** — *fixed* (commit: 68940ad)
-   The millisecond clock is truncated. Plan: round deadlines up, so a sleep never fires before it was asked to.
-   Fix: deadlines are computed in ns (`now_ns`), `Sleep` completes only when `now_ns >= deadline`, and the wheel entry uses `ceil(deadline_ns / 1e6)`. `kr sleep-test` verifies every elapsed time is >= the requested one.
 
 ## kr-net
 25. **No DNS: only IP literals, `/etc/hosts` and a built-in `localhost`** — *fixed*
@@ -294,8 +274,26 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 89. **Agent join token visible in the process list** — *fixed* (commit: b37c07d)
     `kr agent --token VALUE` exposed the token in /proc/<pid>/cmdline. Use `--token-file` (must be mode 600) or `KR_TOKEN`; `--token` still works but warns.
 
+## Runtime (kr-rt)
+1. **Pending task + Async forms an Rc cycle** — *fixed* (commit: 68940ad)
+   The task owns the future, the future owns the `Async`, the `Async`'s I/O slot owns a waker, and the waker owns the task. A task that never completes is never freed.
+   Plan: add `JoinHandle::abort()` to drop the future and break the cycle, and add a live-task counter for leak detection. Rule: every network wait must have a deadline.
+   Fix: `JoinHandle::abort()` drops the future immediately, and the handle then resolves to `Err(Aborted)` (the output is now `Result<T, Aborted>`, and there is also `is_finished()`). `exec::live_tasks()` counts tasks until their `Task` is freed, and `kr sleep-test` asserts on it (`live_tasks_ok`). A task that never completes and has no deadline or abort is still a leak hazard by design.
+2. **`sleep` can fire up to 1 ms early** — *fixed* (commit: 68940ad)
+   The millisecond clock is truncated. Plan: round deadlines up, so a sleep never fires before it was asked to.
+   Fix: deadlines are computed in ns (`now_ns`), `Sleep` completes only when `now_ns >= deadline`, and the wheel entry uses `ceil(deadline_ns / 1e6)`. `kr sleep-test` verifies every elapsed time is >= the requested one.
+4. **Allocator never returns small blocks to the OS** — *fixed (1f4d20c)*
+   RSS grows to peak usage and stays there. Fine for the agent, but it could matter for a long-running server. Fix: 64 KiB-aligned per-class chunks with live counts; an emptied non-current chunk is madvised (header page kept) and reused, with no re-mmap.
+6. **Large allocations with alignment above 4096 are not honoured** — *fixed (1f4d20c)*
+   They go through mmap, which only guarantees page alignment. Fix: over-allocate with mmap and munmap the head/tail so the pointer has the requested alignment.
+10. **mem\* are byte-by-byte on non-x86_64, and memcmp/bcmp everywhere** — *fixed (1f4d20c)*
+    Fix: word-at-a-time memcpy/memmove/memset (non-x86_64) and memcmp/bcmp, volatile stores keep them from becoming self-calls; exhaustive tests.
+
 ## kr-fmt
 18. **14 clippy style lints in kr-fmt** — *fixed* (commit: )
+
+## kr-sys (cont.)
+35. **`syscall0..6` lack `# Safety` docs (clippy `missing_safety_doc`)** — *fixed (1f4d20c)*
 
 ## Echo server (demo only)
 12. **The 431 path closes with unread data, so the client may see a TCP RST** — *fixed* (commit: 68940ad)

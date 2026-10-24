@@ -44,6 +44,7 @@ pub const PROT_WRITE: usize = 2;
 pub const PROT_EXEC: usize = 4;
 pub const MAP_PRIVATE: usize = 0x02;
 pub const MAP_ANONYMOUS: usize = 0x20;
+pub const MADV_DONTNEED: usize = 4;
 pub const SHUT_WR: i32 = 1;
 pub const O_NONBLOCK: i32 = 0o4000;
 pub const O_CLOEXEC: i32 = 0o2000000;
@@ -55,6 +56,7 @@ mod nr {
     pub const CLOSE: usize = 3;
     pub const MMAP: usize = 9;
     pub const MUNMAP: usize = 11;
+    pub const MADVISE: usize = 28;
     pub const SOCKET: usize = 41;
     pub const CONNECT: usize = 42;
     pub const GETSOCKOPT: usize = 55;
@@ -80,6 +82,7 @@ mod nr {
     pub const CLOSE: usize = 57;
     pub const MMAP: usize = 222;
     pub const MUNMAP: usize = 215;
+    pub const MADVISE: usize = 233;
     pub const SOCKET: usize = 198;
     pub const CONNECT: usize = 203;
     pub const GETSOCKOPT: usize = 209;
@@ -105,42 +108,84 @@ mod raw {
     use super::asm;
     // SAFETY (all): the caller guarantees the syscall number and arguments are valid for the
     // kernel ABI; rcx and r11 are clobbered by `syscall` and declared as such.
+    /// Raw Linux system call.
+    ///
+    /// # Safety
+    /// The caller must ensure `n` is a valid syscall number and that the arguments satisfy that
+    /// syscall's contract (pointers valid for the access the kernel performs, lengths in range,
+    /// ownership of any fds or memory it releases).
     #[inline(always)]
     pub unsafe fn syscall0(n: usize) -> isize {
         let r;
         asm!("syscall", inlateout("rax") n => r, out("rcx") _, out("r11") _, options(nostack));
         r
     }
+    /// Raw Linux system call.
+    ///
+    /// # Safety
+    /// The caller must ensure `n` is a valid syscall number and that the arguments satisfy that
+    /// syscall's contract (pointers valid for the access the kernel performs, lengths in range,
+    /// ownership of any fds or memory it releases).
     #[inline(always)]
     pub unsafe fn syscall1(n: usize, a: usize) -> isize {
         let r;
         asm!("syscall", inlateout("rax") n => r, in("rdi") a, out("rcx") _, out("r11") _, options(nostack));
         r
     }
+    /// Raw Linux system call.
+    ///
+    /// # Safety
+    /// The caller must ensure `n` is a valid syscall number and that the arguments satisfy that
+    /// syscall's contract (pointers valid for the access the kernel performs, lengths in range,
+    /// ownership of any fds or memory it releases).
     #[inline(always)]
     pub unsafe fn syscall2(n: usize, a: usize, b: usize) -> isize {
         let r;
         asm!("syscall", inlateout("rax") n => r, in("rdi") a, in("rsi") b, out("rcx") _, out("r11") _, options(nostack));
         r
     }
+    /// Raw Linux system call.
+    ///
+    /// # Safety
+    /// The caller must ensure `n` is a valid syscall number and that the arguments satisfy that
+    /// syscall's contract (pointers valid for the access the kernel performs, lengths in range,
+    /// ownership of any fds or memory it releases).
     #[inline(always)]
     pub unsafe fn syscall3(n: usize, a: usize, b: usize, c: usize) -> isize {
         let r;
         asm!("syscall", inlateout("rax") n => r, in("rdi") a, in("rsi") b, in("rdx") c, out("rcx") _, out("r11") _, options(nostack));
         r
     }
+    /// Raw Linux system call.
+    ///
+    /// # Safety
+    /// The caller must ensure `n` is a valid syscall number and that the arguments satisfy that
+    /// syscall's contract (pointers valid for the access the kernel performs, lengths in range,
+    /// ownership of any fds or memory it releases).
     #[inline(always)]
     pub unsafe fn syscall4(n: usize, a: usize, b: usize, c: usize, d: usize) -> isize {
         let r;
         asm!("syscall", inlateout("rax") n => r, in("rdi") a, in("rsi") b, in("rdx") c, in("r10") d, out("rcx") _, out("r11") _, options(nostack));
         r
     }
+    /// Raw Linux system call.
+    ///
+    /// # Safety
+    /// The caller must ensure `n` is a valid syscall number and that the arguments satisfy that
+    /// syscall's contract (pointers valid for the access the kernel performs, lengths in range,
+    /// ownership of any fds or memory it releases).
     #[inline(always)]
     pub unsafe fn syscall5(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize) -> isize {
         let r;
         asm!("syscall", inlateout("rax") n => r, in("rdi") a, in("rsi") b, in("rdx") c, in("r10") d, in("r8") e, out("rcx") _, out("r11") _, options(nostack));
         r
     }
+    /// Raw Linux system call.
+    ///
+    /// # Safety
+    /// The caller must ensure `n` is a valid syscall number and that the arguments satisfy that
+    /// syscall's contract (pointers valid for the access the kernel performs, lengths in range,
+    /// ownership of any fds or memory it releases).
     #[inline(always)]
     pub unsafe fn syscall6(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize, f: usize) -> isize {
         let r;
@@ -154,42 +199,84 @@ mod raw {
     use super::asm;
     // SAFETY (all): caller guarantees valid syscall number/arguments; `svc 0` follows the
     // aarch64 Linux ABI (x8 = number, x0..x5 = args, x0 = result).
+    /// Raw Linux system call.
+    ///
+    /// # Safety
+    /// The caller must ensure `n` is a valid syscall number and that the arguments satisfy that
+    /// syscall's contract (pointers valid for the access the kernel performs, lengths in range,
+    /// ownership of any fds or memory it releases).
     #[inline(always)]
     pub unsafe fn syscall0(n: usize) -> isize {
         let r;
         asm!("svc 0", in("x8") n, lateout("x0") r, options(nostack));
         r
     }
+    /// Raw Linux system call.
+    ///
+    /// # Safety
+    /// The caller must ensure `n` is a valid syscall number and that the arguments satisfy that
+    /// syscall's contract (pointers valid for the access the kernel performs, lengths in range,
+    /// ownership of any fds or memory it releases).
     #[inline(always)]
     pub unsafe fn syscall1(n: usize, a: usize) -> isize {
         let r;
         asm!("svc 0", in("x8") n, inlateout("x0") a => r, options(nostack));
         r
     }
+    /// Raw Linux system call.
+    ///
+    /// # Safety
+    /// The caller must ensure `n` is a valid syscall number and that the arguments satisfy that
+    /// syscall's contract (pointers valid for the access the kernel performs, lengths in range,
+    /// ownership of any fds or memory it releases).
     #[inline(always)]
     pub unsafe fn syscall2(n: usize, a: usize, b: usize) -> isize {
         let r;
         asm!("svc 0", in("x8") n, inlateout("x0") a => r, in("x1") b, options(nostack));
         r
     }
+    /// Raw Linux system call.
+    ///
+    /// # Safety
+    /// The caller must ensure `n` is a valid syscall number and that the arguments satisfy that
+    /// syscall's contract (pointers valid for the access the kernel performs, lengths in range,
+    /// ownership of any fds or memory it releases).
     #[inline(always)]
     pub unsafe fn syscall3(n: usize, a: usize, b: usize, c: usize) -> isize {
         let r;
         asm!("svc 0", in("x8") n, inlateout("x0") a => r, in("x1") b, in("x2") c, options(nostack));
         r
     }
+    /// Raw Linux system call.
+    ///
+    /// # Safety
+    /// The caller must ensure `n` is a valid syscall number and that the arguments satisfy that
+    /// syscall's contract (pointers valid for the access the kernel performs, lengths in range,
+    /// ownership of any fds or memory it releases).
     #[inline(always)]
     pub unsafe fn syscall4(n: usize, a: usize, b: usize, c: usize, d: usize) -> isize {
         let r;
         asm!("svc 0", in("x8") n, inlateout("x0") a => r, in("x1") b, in("x2") c, in("x3") d, options(nostack));
         r
     }
+    /// Raw Linux system call.
+    ///
+    /// # Safety
+    /// The caller must ensure `n` is a valid syscall number and that the arguments satisfy that
+    /// syscall's contract (pointers valid for the access the kernel performs, lengths in range,
+    /// ownership of any fds or memory it releases).
     #[inline(always)]
     pub unsafe fn syscall5(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize) -> isize {
         let r;
         asm!("svc 0", in("x8") n, inlateout("x0") a => r, in("x1") b, in("x2") c, in("x3") d, in("x4") e, options(nostack));
         r
     }
+    /// Raw Linux system call.
+    ///
+    /// # Safety
+    /// The caller must ensure `n` is a valid syscall number and that the arguments satisfy that
+    /// syscall's contract (pointers valid for the access the kernel performs, lengths in range,
+    /// ownership of any fds or memory it releases).
     #[inline(always)]
     pub unsafe fn syscall6(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize, f: usize) -> isize {
         let r;
@@ -333,6 +420,14 @@ pub unsafe fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: i32, 
 pub unsafe fn munmap(addr: usize, len: usize) -> Result<()> {
     // SAFETY: forwarded to the caller's contract.
     check(unsafe { syscall2(nr::MUNMAP, addr, len) }).map(|_| ())
+}
+
+/// # Safety
+/// `addr..addr+len` must be page-aligned memory owned by the caller. With `MADV_DONTNEED`,
+/// private anonymous pages read back as zero afterwards, so the caller must not need their contents.
+pub unsafe fn madvise(addr: usize, len: usize, advice: usize) -> Result<()> {
+    // SAFETY: forwarded to the caller's contract.
+    check(unsafe { syscall3(nr::MADVISE, addr, len, advice) }).map(|_| ())
 }
 
 pub fn socket(domain: i32, ty: i32, proto: i32) -> Result<Fd> {
