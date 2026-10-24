@@ -4,14 +4,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 
 # Needs work (open or partial)
 
-## Runtime (kr-rt)
-4. **Allocator never returns small blocks to the OS** — *open*
-   RSS grows to peak usage and stays there. Fine for the agent, but it could matter for a long-running server. Plan: return a chunk with `madvise(MADV_DONTNEED)` once it is fully empty.
-6. **Large allocations with alignment above 4096 are not honoured** — *open*
-   They go through mmap, which only guarantees page alignment. Plan: over-allocate and trim.
-10. **mem\* are byte-by-byte on non-x86_64, and memcmp/bcmp everywhere** — *open (perf)*
-    Plan: word-at-a-time versions once there are benchmarks.
-
 ## kr-sys
 11. **aarch64 path is untested** — *open*
     It compiles under cfg but has never run. Plan: a qemu-user CI job.
@@ -19,9 +11,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 ## kr-net
 31. **Registry auth supports anonymous Bearer tokens only** — *mostly fixed* (13ba669)
     Basic and Bearer-with-credentials (`token`/`access_token`), docker `identitytoken` (refresh_token POST), `imagePullSecrets` (dockerconfigjson/dockercfg, pod and ServiceAccount) with docker.io alias matching, `kr_runtime::pull::pull_auth`; kubelet pulls are keyed by image+credential identity. Remaining: matching is by registry host only (no per-repo path prefixes), no `~/.docker/config.json` / credential helpers for `kr ctr pull`, no token refresh by expiry (retried once after a 401), identitytoken path is untested against a real registry.
-
-## kr-sys (cont.)
-35. **`syscall0..6` lack `# Safety` docs (clippy `missing_safety_doc`)** — *open (cleanup)*
 
 ## kr-runtime: isolation (container.rs, security.rs, cgroup.rs)
 50. **Container networking gaps** — *partly fixed* (ADR-019, ADR-022)
@@ -109,20 +98,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 34. **Integration test with a real registry is `#[ignore]`d** — *accepted*
     `cargo test -p kr-net -- --ignored` runs `registry:2` under docker/podman on 127.0.0.1:5000, pushes busybox (needs network for the first pull) and pulls it through the client; it skips when offline or port 5000 is busy and falls back to the std fake registry when no container tool exists. The always-on tests use that std fake server.
 
-## kr-runtime store / unpack / pull
-36. **Store root env is read from `/proc/self/environ`** — *accepted*
-    `kr-rt` has no environment accessor, so `store::env_var` parses `/proc/self/environ` (the startup environment; later `setenv` calls are not seen). Without procfs, only the explicit `Store::open(Some(root))` works.
-37. **Rootless unpack normalises ownership, setuid/setgid and directory permissions** — *accepted*
-    Ownership is not preserved (chown failures with EPERM/EINVAL are ignored), setuid/setgid bits are stripped, and directories get `|0700` so later layers, whiteouts and `rm -rf` of the store keep working (a `0555` dir becomes `0755`). As real root, modes are exact. Revisit with subuid ranges.
-38. **Unpack uses O(depth) kernel path walks per entry and a recursion depth limit of 512 for removals** — *accepted*
-    Each entry resolves its parent with `openat2` (no fd cache). `fs::remove_all` holds one fd per level and fails with ELOOP past depth 512. A directory with mode `000` that was not created by us cannot be emptied rootless (no `/proc/self/fd` chmod fallback).
-40. **Whiteout/created-path tracking uses 64-bit FNV hashes** — *accepted*
-    The per-layer set of created paths (so a layer's own entries survive its own whiteouts/opaque markers) stores hashes, not strings, to bound memory at ~8 MiB per million entries. A crafted collision can only make a layer keep a lower-layer path it meant to delete; it cannot escape the root.
-41. **Pull/unpack are blocking inside the async executor** — *accepted*
-    Layer unpack is synchronous file I/O and CPU (inflate) on the single-threaded executor, so other tasks stall while a layer extracts. Concurrent pulls of one image race on `rootfs.tmp` (the loser is cleaned up, but there is no lock).
-42. **FIFOs are created, devices are skipped, tar xattrs on symlinks are dropped** — *accepted*
-    `trusted.overlay.*` / `user.overlay.*` xattrs from layers are always ignored so an image cannot forge overlayfs markers.
-
 ## kr-runtime: isolation (container.rs, security.rs, cgroup.rs)
 45. **The seccomp profile is a deny-list, not Docker's allow-list** — *accepted for now*
     It is defence in depth on top of the reduced capabilities. Only the summary state has been checked: `Seccomp: 2`, and unshare/mount are refused. Plan: per-syscall tests, then consider an allow-list.
@@ -170,6 +145,20 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 85. **SPDY exec: no TTY resize, v4 only** — *accepted*
     The `resize` stream is accepted and ignored; clients offering only v1–v3 are refused.
 
+## kr-runtime store / unpack / pull
+36. **Store root env is read from `/proc/self/environ`** — *accepted*
+    `kr-rt` has no environment accessor, so `store::env_var` parses `/proc/self/environ` (the startup environment; later `setenv` calls are not seen). Without procfs, only the explicit `Store::open(Some(root))` works.
+37. **Rootless unpack normalises ownership, setuid/setgid and directory permissions** — *accepted*
+    Ownership is not preserved (chown failures with EPERM/EINVAL are ignored), setuid/setgid bits are stripped, and directories get `|0700` so later layers, whiteouts and `rm -rf` of the store keep working (a `0555` dir becomes `0755`). As real root, modes are exact. Revisit with subuid ranges.
+38. **Unpack uses O(depth) kernel path walks per entry and a recursion depth limit of 512 for removals** — *accepted*
+    Each entry resolves its parent with `openat2` (no fd cache). `fs::remove_all` holds one fd per level and fails with ELOOP past depth 512. A directory with mode `000` that was not created by us cannot be emptied rootless (no `/proc/self/fd` chmod fallback).
+40. **Whiteout/created-path tracking uses 64-bit FNV hashes** — *accepted*
+    The per-layer set of created paths (so a layer's own entries survive its own whiteouts/opaque markers) stores hashes, not strings, to bound memory at ~8 MiB per million entries. A crafted collision can only make a layer keep a lower-layer path it meant to delete; it cannot escape the root.
+41. **Pull/unpack are blocking inside the async executor** — *accepted*
+    Layer unpack is synchronous file I/O and CPU (inflate) on the single-threaded executor, so other tasks stall while a layer extracts. Concurrent pulls of one image race on `rootfs.tmp` (the loser is cleaned up, but there is no lock).
+42. **FIFOs are created, devices are skipped, tar xattrs on symlinks are dropped** — *accepted*
+    `trusted.overlay.*` / `user.overlay.*` xattrs from layers are always ignored so an image cannot forge overlayfs markers.
+
 ## kr-archive
 19. **Tar: no sparse files, unknown type flags are errors, strings must be UTF-8** — *accepted*
     GNU sparse (`S`, pax `GNU.sparse.*`) and any non-standard typeflag fail with `UnsupportedType`. Non-UTF-8 names, link targets or pax values fail with `InvalidUtf8`. Container image layers do not use these. Revisit if a real layer hits them.
@@ -206,6 +195,12 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 2. **`sleep` can fire up to 1 ms early** — *fixed* (commit: 68940ad)
    The millisecond clock is truncated. Plan: round deadlines up, so a sleep never fires before it was asked to.
    Fix: deadlines are computed in ns (`now_ns`), `Sleep` completes only when `now_ns >= deadline`, and the wheel entry uses `ceil(deadline_ns / 1e6)`. `kr sleep-test` verifies every elapsed time is >= the requested one.
+4. **Allocator never returns small blocks to the OS** — *fixed (e64a857)*
+   RSS grows to peak usage and stays there. Fine for the agent, but it could matter for a long-running server. Fix: 64 KiB-aligned per-class chunks with live counts; an emptied non-current chunk is madvised (header page kept) and reused, with no re-mmap.
+6. **Large allocations with alignment above 4096 are not honoured** — *fixed (e64a857)*
+   They go through mmap, which only guarantees page alignment. Fix: over-allocate with mmap and munmap the head/tail so the pointer has the requested alignment.
+10. **mem\* are byte-by-byte on non-x86_64, and memcmp/bcmp everywhere** — *fixed (e64a857)*
+    Fix: word-at-a-time memcpy/memmove/memset (non-x86_64) and memcmp/bcmp, volatile stores keep them from becoming self-calls; exhaustive tests.
 
 ## kr-net
 25. **No DNS: only IP literals, `/etc/hosts` and a built-in `localhost`** — *fixed*
@@ -217,9 +212,8 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 30. **Keep-alive pool has no idle timeout** — *fixed* (13ba669)
     `Config::idle_timeout_ms` (default 90 s): idle connections older than that are dropped, never reused. Remaining: no proactive EOF/readability probe before reuse (a server-closed connection is still found on use, with the existing one retry for GET/HEAD) and no background eviction timer (expiry runs on pool take/put).
 
-## kr-runtime store / unpack / pull
-39. **Layer diff_ids are verified** — *fixed* (commit: 38ed253)
-    The pull hashes each uncompressed layer tar while inflating and compares it with `rootfs.diff_ids[i]`, failing on mismatch. Still open: zstd layers (`+zstd`) are rejected with `Error::Image`. Pulled-image refs are never refreshed (a moved `:latest` is not re-fetched once present).
+## kr-sys (cont.)
+35. **`syscall0..6` lack `# Safety` docs (clippy `missing_safety_doc`)** — *fixed (e64a857)*
 
 ## kr-runtime: isolation (container.rs, security.rs, cgroup.rs)
 43. **Rootless maps a single uid/gid** — *fixed*
@@ -287,6 +281,10 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     `kr agent --token VALUE` exposed the token in /proc/<pid>/cmdline. Use `--token-file` (must be mode 600) or `KR_TOKEN`; `--token` still works but warns.
 90. **Pod sandbox holder costs ~0.6–0.9 MB PSS per pod** — *fixed* (commits: 8f76327, bfd9d3e)
     After setup the holder execveats kr (O_PATH|O_CLOEXEC fd of /proc/self/exe) as `kr pause` with an empty environment and all other fds closed: ~77 kB PSS per pod instead of ~700 kB. If the exec fails it silently falls back to the old in-process pause.
+
+## kr-runtime store / unpack / pull
+39. **Layer diff_ids are verified** — *fixed* (commit: 38ed253)
+    The pull hashes each uncompressed layer tar while inflating and compares it with `rootfs.diff_ids[i]`, failing on mismatch. Still open: zstd layers (`+zstd`) are rejected with `Error::Image`. Pulled-image refs are never refreshed (a moved `:latest` is not re-fetched once present).
 
 ## kr-archive
 21. **Hardlink/symlink targets and the symlink-traversal check** — *fixed* (commit: 38ed253)
