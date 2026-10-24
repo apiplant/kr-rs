@@ -75,12 +75,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     - Remaining: PVCs (no storage provisioner).
 75. **Resource requests are not enforced** — *partly fixed*
     CPU requests become `cpu.weight` (upstream formula). Remaining: memory requests (memory.min/low), QoS classes and eviction.
-76. **Controllers are basic** — *mostly fixed*
-    StatefulSet, DaemonSet, Job, CronJob and Endpoints/EndpointSlice controllers exist (49 tests), and Job admission defaulting is in.
-    Remaining:
-    - Deployment pause/progress deadline/minReadySeconds;
-    - Job backoff delay;
-    - the namespace controller (deletion is still synchronous).
 
 ## Services, DNS, multi-node (phase 5, ADR-022)
 80. **host-gw networking only** — *open*
@@ -176,8 +170,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     After a restart, watching from an older resourceVersion returns 410 and clients relist, which is standard Kubernetes recovery.
 67. **No aggregated discovery, no HTTP/2, no OpenAPI schemas** — *accepted for now*
     kubectl falls back to legacy discovery and HTTP/1.1. `kubectl explain` does not work.
-68. **Namespace deletion is synchronous** — *accepted*
-    Contents are deleted inline rather than by a namespace controller, and finalizers inside the namespace are not honoured during this cascade.
 
 ## Node agent and controllers (phase 4)
 78. **exec/probe processes join the container cgroup slightly late** — *accepted*
@@ -267,6 +259,8 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     - ServiceAccount tokens: ES256 JWTs via TokenRequest, optionally pod-bound; revoked when the SA or pod is deleted.
     - Bearer authentication; `kubectl auth can-i` works via SelfSubjectAccessReview.
     - Remaining: aggregated ClusterRoles (aggregationRule), bootstrap tokens for joining nodes, and the TokenReview/SubjectAccessReview APIs.
+68. **Namespace deletion is synchronous** — *fixed* (kr-controllers `namespace`)
+    DELETE now sets `Terminating`; the namespace controller empties it (built-in and CRD resources, honouring finalizers and graceful pod deletion) and finalizes it.
 69. **No garbage collection by ownerReferences** — *fixed*
     `kr-controllers/src/gc.rs` deletes dependents whose owners are gone (background propagation) and honours orphan/foreground deletion.
 
@@ -283,6 +277,9 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     Remaining limits:
     - The host cannot reach pod IPs directly (use port-forward).
     - Pods have no outbound internet rootless; that needs a user-mode network stack (slirp/pasta-like).
+76. **Controllers are basic** — *fixed*
+    Deployment (pause, progress deadline, minReadySeconds), StatefulSet, DaemonSet, Job (with pod failure backoff), CronJob, Endpoints/EndpointSlice and the namespace controller exist.
+    Remaining gaps: no proportional scaling during a rollout, no adoption of orphan ReplicaSets, namespace deletion conditions are limited to `NamespaceContentRemaining`.
 77. **Image pulls block the kubelet sync loop** — *fixed*
     Pulls run as background tasks; failures back off and are reported as `ImagePullBackOff`.
 

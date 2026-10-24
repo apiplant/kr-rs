@@ -1020,3 +1020,68 @@ fn endpoints_leave_selectorless_services_alone() {
         assert!(all.iter().all(|s| str_at(s, &["metadata", "labels", "kubernetes.io/service-name"]) == "web"), "no slice for the selectorless service");
     });
 }
+
+#[test]
+fn job_failed_pod_replacement_backs_off_exponentially() {
+    scenario_with(|c| crate::Config { job_backoff_ms: 2000, ..c }, |c| async move {
+        c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
+        FINISH.store(true, Ordering::SeqCst);
+        c.create(JOBS, &job("slow", r#""backoffLimit":5,"completions":1,"#, "Never", "fail")).await.unwrap();
+        wait_until("first failure", || async { job_pods(&c, "slow").await.len() == 1 && jstat(&c, "slow", "failed").await == 1 }).await;
+        sleep(400).await;
+        assert_eq!(job_pods(&c, "slow").await.len(), 1, "2 s delay after the first failure");
+        advance_clock(1);
+        sleep(400).await;
+        assert_eq!(job_pods(&c, "slow").await.len(), 1);
+        advance_clock(1);
+        wait_until("second pod", || async { job_pods(&c, "slow").await.len() == 2 }).await;
+        // Second failure: 4 s.
+        wait_until("second failure", || async { jstat(&c, "slow", "failed").await == 2 }).await;
+        advance_clock(3);
+        sleep(400).await;
+        assert_eq!(job_pods(&c, "slow").await.len(), 2, "4 s delay after the second failure");
+        advance_clock(1);
+        wait_until("third pod", || async { job_pods(&c, "slow").await.len() == 3 }).await;
+    });
+}
+
+const NS_DOOMED: &str = "/api/v1/namespaces/doomed";
+
+#[test]
+fn namespace_deletion_is_asynchronous_and_empties_everything() {
+    scenario(|c| async move {
+        c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
+        c.create("/api/v1/namespaces", &v(r#"{"metadata":{"name":"doomed"}}"#)).await.unwrap();
+        let crd = v(r#"{"metadata":{"name":"widgets.x.io"},"spec":{"group":"x.io","scope":"Namespaced","names":{"plural":"widgets","singular":"widget","kind":"Widget"},
+            "versions":[{"name":"v1","served":true,"storage":true,"schema":{"openAPIV3Schema":{"type":"object","x-kubernetes-preserve-unknown-fields":true}}}]}}"#);
+        c.create("/apis/apiextensions.k8s.io/v1/customresourcedefinitions", &crd).await.unwrap();
+        c.create("/apis/x.io/v1/namespaces/doomed/widgets", &v(r#"{"apiVersion":"x.io/v1","kind":"Widget","metadata":{"name":"w1"},"spec":{"a":1}}"#)).await.unwrap();
+        c.create("/api/v1/namespaces/doomed/configmaps", &v(r#"{"metadata":{"name":"cm"},"data":{"a":"b"}}"#)).await.unwrap();
+        let dep = v(r#"{"metadata":{"name":"web"},"spec":{"replicas":2,"selector":{"matchLabels":{"app":"web"}},"template":{"metadata":{"labels":{"app":"web"}},"spec":{"containers":[{"name":"c","image":"i"}]}}}}"#);
+        c.create("/apis/apps/v1/namespaces/doomed/deployments", &dep).await.unwrap();
+        let pods_path = "/api/v1/namespaces/doomed/pods";
+        wait_until("2 running pods", || async { items(&c.list(pods_path, "").await.unwrap()).iter().filter(|p| str_at(p, &["status", "phase"]) == "Running").count() == 2 }).await;
+        let names: Vec<String> = items(&c.list(pods_path, "").await.unwrap()).iter().map(|p| name(p).to_string()).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        hold_delete(&refs);
+
+        let r = c.delete(NS_DOOMED).await.unwrap();
+        assert!(r.pointer(&["metadata", "deletionTimestamp"]).is_some());
+        assert_eq!(str_at(&r, &["status", "phase"]), "Terminating");
+        let e = c.create("/api/v1/namespaces/doomed/configmaps", &v(r#"{"metadata":{"name":"late"}}"#)).await.unwrap_err();
+        assert_eq!(e.code, 403);
+        assert!(e.message.contains("unable to create new content in namespace doomed because it is being terminated"), "{}", e.message);
+
+        wait_until("content deleted except terminating pods", || async {
+            c.get("/apis/x.io/v1/namespaces/doomed/widgets/w1").await.is_err() && c.get("/api/v1/namespaces/doomed/configmaps/cm").await.is_err() && c.get("/apis/apps/v1/namespaces/doomed/deployments/web").await.is_err()
+        })
+        .await;
+        sleep(400).await;
+        let ns = c.get(NS_DOOMED).await.unwrap();
+        assert_eq!(str_at(&ns, &["status", "phase"]), "Terminating", "waits for the pods");
+        assert!(!items(&c.list(pods_path, "").await.unwrap()).is_empty());
+        release_delete(&refs);
+        wait_until("namespace gone", || async { c.get(NS_DOOMED).await.is_err() }).await;
+        assert_eq!(c.get(NS_DOOMED).await.unwrap_err().code, 404);
+    });
+}

@@ -400,6 +400,25 @@ pub fn pod_ready(p: &Value) -> bool {
     p.pointer(&["status", "conditions"]).and_then(Value::as_array).is_some_and(|c| c.iter().any(|x| str_at(x, &["type"]) == "Ready" && str_at(x, &["status"]) == "True"))
 }
 
+/// True when the pod is Ready and has been for `min_ready` seconds (the Ready condition's
+/// `lastTransitionTime`; without one a pod only counts when `min_ready` is 0).
+pub fn pod_available(p: &Value, min_ready: i64, now: i64) -> bool {
+    pod_ready(p) && (min_ready <= 0 || ready_since(p).is_some_and(|t| now - t >= min_ready))
+}
+
+/// Seconds until a Ready pod becomes available (`None` when it already is, or is not ready).
+pub fn available_in(p: &Value, min_ready: i64, now: i64) -> Option<i64> {
+    if !pod_ready(p) || pod_available(p, min_ready, now) {
+        return None;
+    }
+    Some(ready_since(p).map_or(min_ready, |t| t + min_ready - now).max(0))
+}
+
+fn ready_since(p: &Value) -> Option<i64> {
+    let c = p.pointer(&["status", "conditions"])?.as_array()?.iter().find(|x| str_at(x, &["type"]) == "Ready")?;
+    parse_time(str_at(c, &["lastTransitionTime"]))
+}
+
 pub fn pod_terminal(p: &Value) -> bool {
     matches!(str_at(p, &["status", "phase"]), "Succeeded" | "Failed")
 }
