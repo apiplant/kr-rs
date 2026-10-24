@@ -51,6 +51,8 @@ pub struct RunSpec<'a> {
     pub mounts: &'a [Mount],
     /// If set, stdout and stderr go to this fd and stdin is /dev/null (else inherited).
     pub log_fd: Option<i32>,
+    /// Supplementary groups added to the user's (pod fsGroup / supplementalGroups).
+    pub extra_groups: &'a [u32],
 }
 
 /// A bind mount of a host path into the container.
@@ -85,6 +87,7 @@ pub struct ExecSpec<'a> {
     pub stdout: Option<i32>,
     pub stderr: Option<i32>,
     pub maps: &'a IdMaps,
+    pub extra_groups: &'a [u32],
 }
 
 const ALL_NS: u64 = ns::CLONE_NEWUSER | ns::CLONE_NEWNS | ns::CLONE_NEWPID | ns::CLONE_NEWNET | ns::CLONE_NEWIPC | ns::CLONE_NEWUTS | ns::CLONE_NEWCGROUP;
@@ -162,7 +165,7 @@ pub fn exec_in(target: &ExecTarget, spec: &ExecSpec) -> Result<Running, RunError
                 return 126;
             }
         }
-        let _ = drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env);
+        let _ = drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups);
         127
     })
 }
@@ -1039,12 +1042,12 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
             step!(11, ns::sethostname(spec.hostname));
         }
     }
-    drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env)
+    drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups)
 }
 
 /// The common tail of every process start inside a container: cwd, user, capabilities,
 /// NO_NEW_PRIVS, seccomp, execve. Only returns on failure.
-fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env: &[Vec<u8>]) -> (u8, Errno) {
+fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env: &[Vec<u8>], extra_groups: &[u32]) -> (u8, Errno) {
     macro_rules! step {
         ($i:expr, $e:expr) => {
             if let Err(e) = $e {
@@ -1060,7 +1063,16 @@ fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env:
         Err(e) => return (21, e),
     };
     step!(16, security::drop_caps(security::DEFAULT_CAPS));
-    if let Some((uid, gid, groups)) = ids {
+    let ids = match (ids, extra_groups.is_empty()) {
+        (None, false) => Some((0, 0, alloc::vec![0])),
+        (ids, _) => ids,
+    };
+    if let Some((uid, gid, mut groups)) = ids {
+        for g in extra_groups {
+            if !groups.contains(g) {
+                groups.push(*g);
+            }
+        }
         // setgroups is denied under a single-id mapping; only root exists there anyway.
         if full_map {
             step!(22, ns::setgroups(&groups));

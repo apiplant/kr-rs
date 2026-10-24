@@ -97,7 +97,7 @@ fn net_check(port: u16, http_path: Option<&str>, timeout_ms: u64) -> i32 {
         return 1;
     }
     let Some(path) = http_path else { return 0 };
-    let req = alloc::format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: kube-probe/1.31\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+    let req = alloc::format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: kube-probe/1.37\r\nAccept: */*\r\nConnection: close\r\n\r\n");
     if kr_sys::write(fd.raw(), req.as_bytes()).is_err() {
         return 1;
     }
@@ -129,7 +129,7 @@ pub async fn run(spec: &Value, ctr: &Value, ctr_target: &ExecTarget, pod_target:
         }
         let env = [b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_vec()];
         let user = ctr.pointer(&["securityContext", "runAsUser"]).and_then(Value::as_i64).map(|u| alloc::format!("{u}")).unwrap_or_default();
-        container::exec_in(ctr_target, &ExecSpec { argv: &argv, env: &env, cwd: b"/", user: user.as_bytes(), stdin: None, stdout: None, stderr: None, maps })
+        container::exec_in(ctr_target, &ExecSpec { argv: &argv, env: &env, cwd: b"/", user: user.as_bytes(), stdin: None, stdout: None, stderr: None, maps, extra_groups: &[] })
     } else {
         let (net, path): (Option<&Value>, Option<String>) = if let Some(h) = spec.get("httpGet") {
             (Some(h), Some(String::from(h.get("path").and_then(Value::as_str).unwrap_or("/"))))

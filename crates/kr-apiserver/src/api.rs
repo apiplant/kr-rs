@@ -170,7 +170,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.31.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None) };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None) };
         for ns in SYSTEM_NAMESPACES {
             api.ensure_default_sa(ns);
         }
@@ -460,7 +460,7 @@ impl ApiServer {
             "/version" => {
                 return Ok(Reply::ok(&obj(alloc::vec![
                     ("major", Value::from("1")),
-                    ("minor", Value::from("31")),
+                    ("minor", Value::from("37")),
                     ("gitVersion", Value::from(self.version.as_str())),
                     ("platform", Value::from(if cfg!(target_arch = "aarch64") { "linux/arm64" } else { "linux/amd64" })),
                 ])))

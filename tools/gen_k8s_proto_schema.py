@@ -18,10 +18,10 @@ SCRATCH_DIR must be outside the repository.
 """
 import os, re, sys, urllib.request
 
-VERSION = "v0.31.0"
+VERSION = "v0.37.0"
 RAW = "https://raw.githubusercontent.com/kubernetes/%s/" + VERSION + "/%s"
 API_GROUPS = ["core/v1", "apps/v1", "batch/v1", "coordination/v1", "discovery/v1", "networking/v1",
-              "policy/v1", "scheduling/v1", "rbac/v1", "autoscaling/v1", "authentication/v1", "authorization/v1"]
+              "policy/v1", "scheduling/v1", "rbac/v1", "autoscaling/v1", "authentication/v1", "authorization/v1", "scheduling/v1alpha3"]
 # local name -> (repo, path inside repo, proto package prefix, go package basename)
 SOURCES = {}
 for _g in API_GROUPS:
@@ -138,7 +138,10 @@ def parse_go(path, package):
         if not pb or not js:
             continue
         parts = js.group(1).split(",")
-        inline = "inline" in parts[1:]
+        # Embedded struct fields are inlined by encoding/json; newer k8s tags them `json:""`
+        # instead of `json:",inline"`. An embedded field has only a type before the tag.
+        embedded = bool(re.match(r"\s*\*?[\w.]+\s+`", line))
+        inline = "inline" in parts[1:] or (embedded and parts[0] == "")
         pointer = bool(re.match(r"\s*\w+\s+\*", line))
         cur[int(pb.group(1))] = (parts[0] or None, inline, pointer or "omitempty" not in parts[1:])
     return out

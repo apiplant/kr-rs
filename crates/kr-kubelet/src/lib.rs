@@ -507,6 +507,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 return;
             }
         };
+        spec::apply_fs_group(&self.maps, pod, &pod_dir);
         let seq = self.pods.borrow()[uid].ctrs[i].seq + 1;
         let cid = alloc::format!("{uid}-{name}-{seq}");
         // A previous kubelet run (killed with its containers) may have left this id behind.
@@ -540,6 +541,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             sandbox: p.sandbox.as_ref(),
             mounts: &built.mounts,
             log_fd: log.as_ref().map(|f| f.raw()),
+            extra_groups: &built.extra_groups,
         };
         let r = container::start(&run);
         drop(pods);

@@ -312,6 +312,7 @@ async fn exec_session(conn: Box<dyn Conn>, proto: Protocol, target: ExecTarget, 
         stdout: out_child.as_ref().map(|f| f.raw()),
         stderr: err_child.as_ref().map(|f| f.raw()),
         maps: &maps,
+        extra_groups: &[],
     };
     let running = match container::exec_in(&target, &spec) {
         Ok(r) => r,

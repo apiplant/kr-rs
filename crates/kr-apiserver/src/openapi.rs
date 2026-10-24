@@ -51,7 +51,7 @@ pub fn group_version(path: &str) -> Option<String> {
     }
     Some(json::to_string(&o(alloc::vec![
         ("openapi", Value::from("3.0.0")),
-        ("info", o(alloc::vec![("title", Value::from("Kubernetes")), ("version", Value::from("v1.31.0-kr"))])),
+        ("info", o(alloc::vec![("title", Value::from("Kubernetes")), ("version", Value::from("v1.37.0-kr"))])),
         ("paths", Value::Object(paths)),
         ("components", o(alloc::vec![("schemas", Value::Object(Vec::new()))])),
     ])))

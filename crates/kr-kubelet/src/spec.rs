@@ -18,6 +18,8 @@ pub struct Built {
     pub user: String,
     pub mounts: Vec<Mount>,
     pub limits: Limits,
+    /// fsGroup + supplementalGroups.
+    pub extra_groups: Vec<u32>,
 }
 
 pub fn find_container<'a>(pod: &'a Value, name: &str) -> Option<&'a Value> {
@@ -295,6 +297,55 @@ fn create_beneath(root: &kr_sys::Fd, rel: &str) -> Option<kr_sys::Fd> {
     cur
 }
 
+/// fsGroup ownership: volumes become group-owned by `gid` with the setgid bit (and group
+/// write for emptyDir), like the kubelet's volume ownership management. Runs inside a user
+/// namespace with the pod's maps so container ids are mapped (works rootless).
+pub fn apply_fs_group(maps: &kr_runtime::container::IdMaps, pod: &Value, pod_dir: &str) {
+    let Some(gid) = pod.pointer(&["spec", "securityContext", "fsGroup"]).and_then(Value::as_u64).map(|g| g as u32) else { return };
+    let vols: Vec<String> = pod
+        .pointer(&["spec", "volumes"])
+        .and_then(Value::as_array)
+        .unwrap_or(&[])
+        .iter()
+        .filter(|v| ["emptyDir", "configMap", "secret", "projected", "downwardAPI"].iter().any(|k| v.get(k).is_some()))
+        .filter_map(|v| v.get("name").and_then(Value::as_str).map(|n| alloc::format!("{pod_dir}/volumes/{n}")))
+        .collect();
+    let _ = maps.run_as_root(|| {
+        for d in &vols {
+            chown_tree(d, gid, 0);
+        }
+        true
+    });
+}
+
+/// Recursively sets group `gid` (uid unchanged) and setgid on directories.
+fn chown_tree(path: &str, gid: u32, depth: u32) {
+    if depth > 16 {
+        return;
+    }
+    let p = alloc::format!("{path}\0");
+    let _ = kr_sys::fs::fchownat(kr_sys::ns::AT_FDCWD, p.as_bytes(), u32::MAX, gid, 0x100); // AT_SYMLINK_NOFOLLOW
+    let Ok(fd) = kr_sys::ns::open(p.as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY | kr_sys::fs::O_NOFOLLOW, 0) else { return };
+    if let Ok(st) = kr_sys::fs::fstat(fd.raw()) {
+        let _ = kr_sys::fs::fchmod(fd.raw(), (st.mode & 0o7777) | 0o2070);
+    }
+    let names: Vec<Vec<u8>> = kr_sys::fs::read_dir(&fd).filter_map(|e| e.ok()).map(|e| e.name).collect();
+    for name in names {
+        let n = String::from_utf8_lossy(&name).into_owned();
+        if n == "." || n == ".." {
+            continue;
+        }
+        let child = alloc::format!("{path}/{n}");
+        let c = alloc::format!("{child}\0");
+        let is_dir = kr_sys::ns::open(c.as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY | kr_sys::fs::O_NOFOLLOW, 0).is_ok();
+        if is_dir {
+            chown_tree(&child, gid, depth + 1);
+        } else {
+            let _ = kr_sys::fs::fchownat(kr_sys::ns::AT_FDCWD, c.as_bytes(), u32::MAX, gid, 0x100);
+        }
+    }
+}
+
 /// Re-materializes configMap/secret/projected/downwardAPI volumes of a running pod (live
 /// updates and token rotation). Files are replaced atomically.
 pub async fn refresh_volumes<C: Client>(c: &C, pod: &Value, pod_dir: &str) {
@@ -312,6 +363,10 @@ async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str
     let dir = alloc::format!("{pod_dir}/volumes/{name}");
     if vol.get("emptyDir").is_some() {
         kr_runtime::store::mkdir_p(&dir, 0o777).map_err(|_| String::from("cannot create emptyDir"))?;
+        // World-writable like upstream (mkdir is subject to the umask).
+        if let Ok(fd) = kr_sys::ns::open(alloc::format!("{dir}\0").as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY, 0) {
+            let _ = kr_sys::fs::fchmod(fd.raw(), 0o777);
+        }
         Ok(Some(dir))
     } else if let Some(h) = vol.get("hostPath") {
         let path = h.get("path").and_then(Value::as_str).unwrap_or("");
@@ -480,6 +535,10 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         let ro = vm.get("readOnly").and_then(Value::as_bool).unwrap_or(false) || ["configMap", "secret", "projected", "downwardAPI"].iter().any(|k| vol.get(k).is_some());
         mounts.push(Mount { source: src.into_bytes(), sub_path, target: target.as_bytes().to_vec(), readonly: ro });
     }
+    let mut extra_groups: Vec<u32> = pod.pointer(&["spec", "securityContext", "supplementalGroups"]).and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_u64).map(|g| g as u32).collect();
+    if let Some(fg) = pod.pointer(&["spec", "securityContext", "fsGroup"]).and_then(Value::as_u64) {
+        extra_groups.push(fg as u32);
+    }
     let cwd = ctr.get("workingDir").and_then(Value::as_str).filter(|w| !w.is_empty()).map(String::from).unwrap_or_else(|| img.working_dir.clone());
     Ok(Built {
         argv: argv.into_iter().map(String::into_bytes).collect(),
@@ -488,5 +547,6 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         user,
         mounts,
         limits,
+        extra_groups,
     })
 }

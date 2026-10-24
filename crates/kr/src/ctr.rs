@@ -170,6 +170,7 @@ fn run(mut args: Args) -> i32 {
         sandbox: None,
         mounts: &[],
         log_fd: None,
+        extra_groups: &[],
     };
     if let Some(l) = &lease {
         let ip = l.ip;
@@ -312,6 +313,7 @@ fn run_dir(mut args: Args) -> i32 {
         sandbox: None,
         mounts: &[],
         log_fd: None,
+        extra_groups: &[],
     };
     supervise(&spec)
 }
@@ -381,6 +383,7 @@ fn pod_demo(mut args: Args) -> i32 {
             sandbox: Some(&sb),
             mounts: &mounts,
             log_fd: None,
+            extra_groups: &[],
         };
         match container::start(&spec) {
             Ok(r) => started.push(r),
