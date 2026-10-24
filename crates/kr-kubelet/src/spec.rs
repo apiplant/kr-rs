@@ -292,6 +292,82 @@ fn resource_field_ref(pod: &Value, container: Option<&str>, rf: &Value) -> Optio
     Some(alloc::format!("{}", (n + d - 1).div_euclid(d)))
 }
 
+/// Writes a configMap/secret/projected/downwardAPI volume's files into `stage`.
+async fn stage_volume<C: Client>(c: &C, pod: &Value, vol: &Value, dir: &str, stage: &str) -> Result<(), String> {
+    let ns = meta(pod, "namespace");
+    if let Some(cm) = vol.get("configMap") {
+        materialize(c, ns, "configmaps", cm.get("name").and_then(Value::as_str).unwrap_or(""), cm, stage, default_mode(cm)).await
+    } else if let Some(sec) = vol.get("secret") {
+        materialize(c, ns, "secrets", sec.get("secretName").and_then(Value::as_str).unwrap_or(""), sec, stage, default_mode(sec)).await
+    } else if let Some(pj) = vol.get("projected") {
+        let mode = default_mode(pj);
+        for src in pj.get("sources").and_then(Value::as_array).unwrap_or(&[]) {
+            if let Some(t) = src.get("serviceAccountToken") {
+                let path = t.get("path").and_then(Value::as_str).unwrap_or("token");
+                // Reuse the current token until 80% of its lifetime.
+                let exp = t.get("expirationSeconds").and_then(Value::as_i64).unwrap_or(3600);
+                let cur = alloc::format!("{dir}/..data/{path}\0");
+                let fresh = kr_sys::fs::newfstatat(kr_sys::fs::AT_FDCWD, cur.as_bytes(), 0).ok().filter(|st| now_secs() - st.mtime_sec < exp * 8 / 10);
+                let token = match fresh.and_then(|_| kr_sys::fs::read_file(cur.as_bytes(), 1 << 16).ok()) {
+                    Some(t) => t,
+                    None => request_token(c, pod, t).await?.into_bytes(),
+                };
+                write_item(stage, path, &token, mode)?;
+            } else if let Some(cm) = src.get("configMap") {
+                materialize(c, ns, "configmaps", cm.get("name").and_then(Value::as_str).unwrap_or(""), cm, stage, mode).await?;
+            } else if let Some(sec) = src.get("secret") {
+                materialize(c, ns, "secrets", sec.get("name").and_then(Value::as_str).unwrap_or(""), sec, stage, mode).await?;
+            } else if let Some(d) = src.get("downwardAPI") {
+                downward(pod, d, stage, mode)?;
+            }
+        }
+        Ok(())
+    } else if let Some(d) = vol.get("downwardAPI") {
+        downward(pod, d, stage, default_mode(d))
+    } else {
+        Ok(())
+    }
+}
+
+fn now_secs() -> i64 {
+    kr_sys::clock_gettime(0).map(|t| t.tv_sec).unwrap_or(0)
+}
+
+/// Points `dir/..data` at `stage_name`, links each top-level entry through it, and removes
+/// stale entries and old stages.
+fn publish(dir: &str, stage_name: &str) -> Result<(), String> {
+    use kr_sys::fs::{self, AT_FDCWD};
+    let c = |s: &str| alloc::format!("{s}\0").into_bytes();
+    let swap_link = |target: &str, link: &str| -> Result<(), String> {
+        let tmp = alloc::format!("{dir}/..tmp_link");
+        let _ = fs::unlinkat(AT_FDCWD, &c(&tmp), 0);
+        fs::symlinkat(&c(target), AT_FDCWD, &c(&tmp)).map_err(|e| alloc::format!("symlink {link}: errno {}", e.0))?;
+        fs::renameat2(AT_FDCWD, &c(&tmp), AT_FDCWD, &c(&alloc::format!("{dir}/{link}")), 0).map_err(|e| alloc::format!("rename {link}: errno {}", e.0))
+    };
+    let names = |path: &str| -> Vec<String> {
+        let Ok(fd) = kr_sys::ns::open(&c(path), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY | kr_sys::O_CLOEXEC, 0) else { return Vec::new() };
+        fs::read_dir(&fd).filter_map(|e| e.ok()).filter_map(|e| String::from_utf8(e.name).ok()).collect()
+    };
+    let dfd = kr_sys::ns::open(&c(dir), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY | kr_sys::O_CLOEXEC, 0).map_err(|e| alloc::format!("open {dir}: errno {}", e.0))?;
+    swap_link(stage_name, "..data")?;
+    let top: Vec<String> = names(&alloc::format!("{dir}/{stage_name}"));
+    for n in &top {
+        let p = c(&alloc::format!("{dir}/{n}"));
+        // A real file or dir from an older layout is replaced by the link.
+        if fs::newfstatat(AT_FDCWD, &p, fs::AT_SYMLINK_NOFOLLOW).is_ok_and(|st| !st.is_symlink()) {
+            let _ = fs::remove_all(dfd.raw(), &c(n));
+        }
+        swap_link(&alloc::format!("..data/{n}"), n)?;
+    }
+    for n in names(dir) {
+        let stale = if n.starts_with("..") { n != "..data" && n != stage_name } else { !top.contains(&n) };
+        if stale {
+            let _ = fs::remove_all(dfd.raw(), &c(&n));
+        }
+    }
+    Ok(())
+}
+
 /// Requests a pod-bound ServiceAccount token (TokenRequest API).
 async fn request_token<C: Client>(c: &C, pod: &Value, src: &Value) -> Result<String, String> {
     let ns = meta(pod, "namespace");
@@ -390,7 +466,6 @@ pub async fn refresh_volumes<C: Client>(c: &C, pod: &Value, pod_dir: &str) {
 /// Resolves a pod volume to a host directory (creating/materializing it).
 async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str) -> Result<Option<String>, String> {
     let name = vol.get("name").and_then(Value::as_str).unwrap_or("");
-    let ns = meta(pod, "namespace");
     let dir = alloc::format!("{pod_dir}/volumes/{name}");
     if vol.get("emptyDir").is_some() {
         kr_runtime::store::mkdir_p(&dir, 0o777).map_err(|_| String::from("cannot create emptyDir"))?;
@@ -408,33 +483,20 @@ async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str
             let _ = kr_runtime::store::mkdir_p(path, 0o755);
         }
         Ok(Some(path.to_string()))
-    } else if let Some(cm) = vol.get("configMap") {
-        materialize(c, ns, "configmaps", cm.get("name").and_then(Value::as_str).unwrap_or(""), cm, &dir, default_mode(cm)).await?;
-        Ok(Some(dir))
-    } else if let Some(sec) = vol.get("secret") {
-        materialize(c, ns, "secrets", sec.get("secretName").and_then(Value::as_str).unwrap_or(""), sec, &dir, default_mode(sec)).await?;
-        Ok(Some(dir))
-    } else if let Some(pj) = vol.get("projected") {
-        let _ = kr_runtime::store::mkdir_p(&dir, 0o755);
-        let mode = default_mode(pj);
-        for src in pj.get("sources").and_then(Value::as_array).unwrap_or(&[]) {
-            if let Some(t) = src.get("serviceAccountToken") {
-                let token = request_token(c, pod, t).await?;
-                let path = t.get("path").and_then(Value::as_str).unwrap_or("token");
-                write_item(&dir, path, token.as_bytes(), mode)?;
-            } else if let Some(cm) = src.get("configMap") {
-                materialize(c, ns, "configmaps", cm.get("name").and_then(Value::as_str).unwrap_or(""), cm, &dir, mode).await?;
-            } else if let Some(sec) = src.get("secret") {
-                materialize(c, ns, "secrets", sec.get("name").and_then(Value::as_str).unwrap_or(""), sec, &dir, mode).await?;
-            } else if let Some(d) = src.get("downwardAPI") {
-                downward(pod, d, &dir, mode)?;
+    } else if ["configMap", "secret", "projected", "downwardAPI"].iter().any(|k| vol.get(k).is_some()) {
+        // Atomic writer (as upstream): files go to a fresh `..<ts>` dir, `..data` is swapped to
+        // it, and top-level names are symlinks through `..data`. A reader never sees a mix.
+        kr_runtime::store::mkdir_p(&dir, 0o755).map_err(|_| String::from("cannot create volume dir"))?;
+        let stage_name = alloc::format!("..{}", kr_rt::exec::now_ns());
+        let stage = alloc::format!("{dir}/{stage_name}");
+        kr_runtime::store::mkdir_p(&stage, 0o755).map_err(|_| String::from("cannot create volume dir"))?;
+        let r = stage_volume(c, pod, vol, &dir, &stage).await.and_then(|()| publish(&dir, &stage_name));
+        if r.is_err() {
+            if let Ok(fd) = kr_sys::ns::open(alloc::format!("{dir}\0").as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY | kr_sys::O_CLOEXEC, 0) {
+                let _ = kr_sys::fs::remove_all(fd.raw(), alloc::format!("{stage_name}\0").as_bytes());
             }
         }
-        Ok(Some(dir))
-    } else if let Some(d) = vol.get("downwardAPI") {
-        let _ = kr_runtime::store::mkdir_p(&dir, 0o755);
-        downward(pod, d, &dir, default_mode(d))?;
-        Ok(Some(dir))
+        r.map(|()| Some(dir))
     } else {
         // PVCs and other types: not yet (KNOWN_ISSUES); mounted as an empty dir.
         kr_runtime::store::mkdir_p(&dir, 0o755).map_err(|_| String::from("cannot create volume dir"))?;

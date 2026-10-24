@@ -633,10 +633,10 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         });
     }
 
-    /// Every 5 minutes: rewrite configMap/secret/projected volumes (picks up ConfigMap edits and
-    /// rotates the 1 h ServiceAccount token well before it expires).
+    /// Every 20 s: republish configMap/secret/projected/downwardAPI volumes (ConfigMap and
+    /// label edits; the ServiceAccount token is renewed at 80% of its lifetime).
     async fn refresh_volumes(&self, uid: &str, pod: &Value) {
-        const EVERY_MS: u64 = 300_000;
+        const EVERY_MS: u64 = 20_000;
         let dir = {
             let mut pods = self.pods.borrow_mut();
             let Some(p) = pods.get_mut(uid) else { return };
@@ -647,6 +647,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             p.dir.clone()
         };
         spec::refresh_volumes(&self.c, pod, &dir).await;
+        spec::apply_fs_group(&self.maps, pod, &dir);
     }
 
     /// Starts any due probes as background tasks; results arrive via `probe_done`.
