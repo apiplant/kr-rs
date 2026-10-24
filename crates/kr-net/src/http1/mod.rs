@@ -35,7 +35,8 @@ impl Transport for Async<Fd> {
         Async::read(self, buf).await.map_err(Error::Io)
     }
     async fn write_all(&mut self, buf: &[u8]) -> Result<()> {
-        Async::write_all(self, buf).await.map_err(Error::Io)
+        // MSG_NOSIGNAL: a peer that vanished must not kill the process with SIGPIPE.
+        crate::tcp::write_all_nosignal(self, buf).await.map_err(Error::Io)
     }
 }
 

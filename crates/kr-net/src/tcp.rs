@@ -284,3 +284,41 @@ mod tests {
         assert!(IpAddr::parse("::1").unwrap().is_loopback());
     }
 }
+
+// ---------- SIGPIPE-free writes ----------
+
+#[cfg(target_arch = "x86_64")]
+const SYS_SENDTO: usize = 44;
+#[cfg(target_arch = "aarch64")]
+const SYS_SENDTO: usize = 206;
+const MSG_NOSIGNAL: usize = 0x4000;
+const ENOTSOCK: i32 = 88;
+
+/// `send(2)` with `MSG_NOSIGNAL`: a write to a socket whose peer is gone fails with `EPIPE`
+/// instead of raising SIGPIPE (which would kill the whole server). Stream sockets only.
+fn send_nosignal(fd: i32, buf: &[u8]) -> core::result::Result<usize, Errno> {
+    // SAFETY: sendto(fd, buf, len, MSG_NOSIGNAL, NULL, 0) reads at most `buf.len()` bytes from
+    // the valid slice and has no other memory effects.
+    let r = unsafe { sys::syscall6(SYS_SENDTO, fd as usize, buf.as_ptr() as usize, buf.len(), MSG_NOSIGNAL, 0, 0) };
+    if r < 0 {
+        Err(Errno(-r as i32))
+    } else {
+        Ok(r as usize)
+    }
+}
+
+/// Writes all of `buf` to a non-blocking stream socket (e.g. one end of a socketpair), never
+/// raising SIGPIPE. `Err` once the peer is gone or the socket failed.
+pub async fn write_all_nosignal(sock: &Async<Fd>, mut buf: &[u8]) -> core::result::Result<(), Errno> {
+    while !buf.is_empty() {
+        match send_nosignal(sock.get_ref().raw(), buf) {
+            Ok(0) => return Err(Errno(sys::EPIPE)),
+            Ok(n) => buf = &buf[n..],
+            Err(Errno(sys::EAGAIN)) => sock.wait_writable().await,
+            Err(Errno(sys::EINTR)) => {}
+            Err(Errno(ENOTSOCK)) => return sock.write_all(buf).await, // a pipe: no SIGPIPE-free send
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}

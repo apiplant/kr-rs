@@ -9,6 +9,7 @@ kr-sys = { path = "../kr-sys" }
 kr-rt = { path = "../kr-rt" }
 kr-fmt = { path = "../kr-fmt" }
 kr-crypto = { path = "../kr-crypto" }
+kr-archive = { path = "../kr-archive" }
 
 [dev-dependencies]
 # `host` drops _start/panic handler/allocator/mem* so the std test harness can link (ADR-015).

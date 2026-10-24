@@ -231,6 +231,25 @@ impl Inflater {
         self.full = false;
     }
 
+    /// Preloads the sliding window with a preset dictionary (zlib FDICT). Only valid before the
+    /// first `feed` of a stream (after `new`/`reset`); the dictionary is never emitted. Only the
+    /// last 32 KiB of `dict` can be referenced. Returns false if called too late.
+    pub fn set_dictionary(&mut self, dict: &[u8]) -> bool {
+        if self.pos != 0 || self.full || !matches!(self.state, State::Header) || self.nbits != 0 {
+            return false;
+        }
+        let d = &dict[dict.len().saturating_sub(WSIZE)..];
+        self.win[..d.len()].copy_from_slice(d);
+        // A full window of dictionary: the next byte wraps to 0, so mark it full.
+        if d.len() == WSIZE {
+            self.full = true;
+        } else {
+            self.pos = d.len();
+            self.start = d.len();
+        }
+        true
+    }
+
     /// True once the final block has been fully decoded.
     pub fn is_done(&self) -> bool {
         matches!(self.state, State::Done)
@@ -625,5 +644,35 @@ impl Error<()> {
             Error::IncompleteCode => Error::IncompleteCode,
             _ => Error::InvalidCode,
         }
+    }
+}
+
+#[cfg(test)]
+mod dict_tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    // Raw deflate made by zlib (`compressobj(9, DEFLATED, -15, 9, 0, zdict)`, sync flush).
+    const DICT: &[u8] = b"hello world, hello dictionary";
+    const STREAM: [u8; 13] = [0x42, 0xe7, 0xc3, 0x54, 0x80, 0x95, 0x2b, 0x02, 0x00, 0x00, 0x00, 0xff, 0xff];
+
+    #[test]
+    fn preset_dictionary() {
+        let mut inf = Inflater::new();
+        assert!(inf.set_dictionary(DICT));
+        let mut out = Vec::new();
+        let r = inf.feed::<()>(&STREAM, &mut |b| {
+            out.extend_from_slice(b);
+            Ok(())
+        });
+        assert_eq!(r.unwrap(), Status::NeedInput);
+        assert_eq!(out, b"hello dictionary, hello world!");
+        // Without the dictionary the back-references reach before the start of output.
+        let mut inf = Inflater::new();
+        assert!(inf.feed::<()>(&STREAM, &mut |_| Ok(())).is_err());
+        // Too late to set one.
+        let mut inf = Inflater::new();
+        let _ = inf.feed::<()>(&STREAM[..2], &mut |_| Ok(()));
+        assert!(!inf.set_dictionary(DICT));
     }
 }

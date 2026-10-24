@@ -222,12 +222,11 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
 
 71. **No probes** — *fixed*
     exec, tcpSocket and httpGet as startup, liveness and readiness probes, with upstream thresholds. Network probes run inside the pod network namespace (they work rootless). HTTPS httpGet probes are treated as TCP probes.
-72. **No `kubectl logs/exec/attach/port-forward`** — *mostly fixed*
-    - logs (`--tail`, `-f`), exec (WebSocket v4/v5, stdin, exit codes) and attach work via the node proxy.
-    - Port-forward needs SPDY tunneled over WebSocket and is in progress.
-    - No TTY yet: `exec -t` runs without a terminal.
-    - attach is output-only.
-    - `logs --previous` returns the same file.
+72. **No `kubectl logs/exec/attach/port-forward`** — *fixed*
+    - logs (`--tail`, `-f`), exec (WebSocket v4/v5, stdin, exit codes) and attach work.
+    - port-forward works over SPDY/3.1, both tunneled in WebSocket and as a direct upgrade, verified with kubectl 1.37.
+    - Remaining: no TTY (`exec -t` runs without a terminal); attach is output-only; `logs --previous` returns the current file.
+    - Port-forward does not enforce SPDY flow control, because kubectl ignores it; backpressure comes from the transport instead.
 73. **Volume and token gaps** — *mostly fixed*
     - projected and downwardAPI volumes work (pod-bound SA token, configMap, secret, fieldRef items).
     - configMap, secret and projected volumes are refreshed every 5 minutes, which also rotates tokens.

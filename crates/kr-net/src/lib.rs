@@ -16,6 +16,8 @@ pub mod netlink;
 pub mod nft;
 pub mod registry;
 pub mod sha256;
+pub mod spdy;
+mod spdy_dict;
 pub mod tcp;
 pub mod tls;
 

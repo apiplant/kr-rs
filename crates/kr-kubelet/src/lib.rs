@@ -182,6 +182,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
     pub async fn run(self: Rc<Self>) {
+        // All sandboxes died with the previous kr process: their IP leases are stale.
+        let _ = remove_tree(&alloc::format!("{}/ipam", self.cfg.root));
         if self.cfg.network {
             if let Err(e) = network::setup_host() {
                 kr_rt::eprint(alloc::format!("kubelet: network setup failed (errno {}); pods get no IP\n", e.0).as_bytes());
@@ -449,6 +451,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         };
         let seq = self.pods.borrow()[uid].ctrs[i].seq + 1;
         let cid = alloc::format!("{uid}-{name}-{seq}");
+        // A previous kubelet run (killed with its containers) may have left this id behind.
+        let _ = self.maps.run_as_root(|| self.store.delete_container(&cid).is_ok());
         let dirs = match self.store.create_container(&cid) {
             Ok(d) => d,
             Err(_) => {

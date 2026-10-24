@@ -7,12 +7,15 @@
 //!   as a Status on channel 3. TTYs are not supported yet: `-t` runs without a terminal.
 //! - attach: follows the container's output (stdin is not attachable: container stdio goes
 //!   to the log file).
-//! - portforward: WebSocket (`v2.portforward.k8s.io`); each port's connection is a relay
-//!   process inside the pod's network namespace, joined to kr by a socketpair, so it works
+//! - portforward: SPDY/3.1 (what kubectl speaks), either tunneled in WebSocket binary messages
+//!   (`SPDY/3.1+portforward.k8s.io`, kubectl >= 1.31) or after a plain `Upgrade: SPDY/3.1`, plus
+//!   the WebSocket channel protocol (`v2.portforward.k8s.io`). Each forwarded connection is a
+//!   relay process inside the pod's network namespace, joined to kr by a socketpair, so it works
 //!   without a pod IP (rootless).
 
 use crate::{Client, Kubelet};
 use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -25,6 +28,7 @@ use kr_net::http1::channel::{self, ClientMsg, PortForward, Protocol};
 use kr_net::http1::server::{Body, PeerInfo, Request, Response, ResponseStream};
 use kr_net::http1::upgrade::Conn;
 use kr_net::http1::websocket::{self, Message, WebSocket, WsConfig};
+use kr_net::spdy::{self, Event as SpdyEvent, Session};
 use kr_rt::exec::{Async, Sleep};
 use kr_runtime::container::{self, ExecSpec, ExecTarget};
 use kr_sys::{ns, Fd};
@@ -126,7 +130,25 @@ impl<C: Client + Clone + 'static> NodeProxy for Proxy<C> {
             }
             "portforward" => {
                 let target = v.pod_target.clone().ok_or_else(|| ApiError::bad_request("pod sandbox is not running"))?;
-                let hs = websocket::handshake(&ws_request("/portforward", headers), &channel::PORTFORWARD_PROTOCOLS).map_err(|_| ApiError::bad_request("portforward requires a WebSocket upgrade"))?;
+                let hdr = |n: &str| headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(n)).flat_map(|(_, v)| v.split(',')).map(str::trim).collect::<Vec<_>>();
+                let ws = hdr("upgrade").iter().any(|t| t.eq_ignore_ascii_case("websocket"));
+                if !ws && hdr("upgrade").iter().any(|t| t.eq_ignore_ascii_case("SPDY/3.1")) {
+                    // Direct SPDY upgrade (kubectl before 1.31, or with websockets disabled).
+                    let handler = move |conn: Box<dyn Conn>| -> Pin<Box<dyn Future<Output = ()>>> { Box::pin(spdy_portforward(PfIo::Raw { conn, wbuf: Vec::new() }, target)) };
+                    return Ok(Response {
+                        status: 101,
+                        headers: alloc::vec![("Upgrade".into(), "SPDY/3.1".into()), ("X-Stream-Protocol-Version".into(), channel::PORTFORWARD_V1.into())],
+                        body: Body::Upgrade(Box::new(handler)),
+                    });
+                }
+                let protos = [channel::PORTFORWARD_SPDY_TUNNEL, channel::PORTFORWARD_V2, channel::PORTFORWARD_V1];
+                let hs = websocket::handshake(&ws_request("/portforward", headers), &protos).map_err(|_| ApiError::bad_request("portforward requires a WebSocket or SPDY/3.1 upgrade"))?;
+                if hs.protocol.as_deref() == Some(channel::PORTFORWARD_SPDY_TUNNEL) {
+                    let handler = move |conn: Box<dyn Conn>| -> Pin<Box<dyn Future<Output = ()>>> {
+                        Box::pin(spdy_portforward(PfIo::Ws(Box::new(WebSocket::new(conn, WsConfig::default()))), target))
+                    };
+                    return Ok(hs.into_response(Box::new(handler)));
+                }
                 let pf = PortForward::from_query(query).map_err(|_| ApiError::bad_request("invalid ports"))?;
                 let handler = move |conn: Box<dyn Conn>| -> Pin<Box<dyn Future<Output = ()>>> { Box::pin(portforward_session(conn, pf, target)) };
                 Ok(hs.into_response(Box::new(handler)))
@@ -413,8 +435,24 @@ async fn attach_session(conn: Box<dyn Conn>, proto: Protocol, path: String, runn
     }
 }
 
-/// One forwarded port: a relay process in the pod netns, bridged over a socketpair.
-fn open_relay(target: &ExecTarget, port: u16) -> Option<Rc<Async<Fd>>> {
+/// One forwarded connection: a relay process in the pod netns, bridged over a socketpair.
+/// Dropping it kills the relay.
+struct Relay {
+    fd: Rc<Async<Fd>>,
+    sig: container::Signaller,
+    /// The relay's exit code: 1 = no socket, 2 = connect failed (it never reads then).
+    exit: Option<kr_rt::exec::JoinHandle<i32>>,
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        let _ = self.sig.send(ns::SIGKILL);
+    }
+}
+
+/// Starts the relay. EOF from kr half-closes the pod side (the reply direction keeps flowing);
+/// the relay ends when the pod side closes.
+fn open_relay(target: &ExecTarget, port: u16) -> Option<Relay> {
     let (ours, theirs) = ns::socketpair().ok()?;
     let theirs_raw = theirs.raw();
     let r = container::in_pod_net(target, move || {
@@ -422,15 +460,20 @@ fn open_relay(target: &ExecTarget, port: u16) -> Option<Rc<Async<Fd>>> {
         if kr_sys::connect(sock.raw(), &kr_sys::SockaddrIn::new([127, 0, 0, 1], port)).is_err() {
             return 2;
         }
-        // Copy both ways until either side closes.
+        // Copy both ways until the pod side closes.
         let mut buf = [0u8; 32 * 1024];
+        let mut theirs_open = true;
         loop {
-            let Ok((a, b, hup)) = ns::poll2(sock.raw(), theirs_raw, -1) else { return 3 };
+            let Ok((a, b, hup)) = ns::poll2(sock.raw(), if theirs_open { theirs_raw } else { -1 }, -1) else { return 3 };
             for (from, to, ready) in [(sock.raw(), theirs_raw, a), (theirs_raw, sock.raw(), b)] {
                 if !ready {
                     continue;
                 }
                 match kr_sys::read(from, &mut buf) {
+                    Ok(0) | Err(_) if from == theirs_raw => {
+                        let _ = kr_sys::shutdown(sock.raw(), kr_sys::SHUT_WR);
+                        theirs_open = false;
+                    }
                     Ok(0) | Err(_) => return 0,
                     Ok(n) => {
                         let mut off = 0;
@@ -450,12 +493,11 @@ fn open_relay(target: &ExecTarget, port: u16) -> Option<Rc<Async<Fd>>> {
     });
     let running = r.ok()?;
     drop(theirs);
+    let sig = running.signaller();
     // Reap the relay whenever it ends.
-    kr_rt::exec::spawn(async move {
-        let _ = running.wait().await;
-    });
+    let exit = kr_rt::exec::spawn(async move { running.wait().await.map(|e| e.code).unwrap_or(1) });
     ns::set_nonblocking(ours.raw()).ok()?;
-    Some(Rc::new(Async::new(ours).ok()?))
+    Some(Relay { fd: Rc::new(Async::new(ours).ok()?), sig, exit: Some(exit) })
 }
 
 async fn portforward_session(conn: Box<dyn Conn>, mut pf: PortForward, target: ExecTarget) {
@@ -465,7 +507,7 @@ async fn portforward_session(conn: Box<dyn Conn>, mut pf: PortForward, target: E
     }
     let _ = ws.flush().await;
     let ports: Vec<u16> = pf.ports.clone();
-    let mut relays: Vec<Option<Rc<Async<Fd>>>> = alloc::vec![None; ports.len()];
+    let mut relays: Vec<Option<Relay>> = (0..ports.len()).map(|_| None).collect();
     let mut reads: Vec<Option<ChunkFut>> = (0..ports.len()).map(|_| None).collect();
     loop {
         let ev = poll_fn(|cx| {
@@ -492,9 +534,9 @@ async fn portforward_session(conn: Box<dyn Conn>, mut pf: PortForward, target: E
                 }
                 if relays[i].is_none() {
                     match open_relay(&target, ports[i]) {
-                        Some(a) => {
-                            reads[i] = Some(Box::pin(read_chunk(a.clone())));
-                            relays[i] = Some(a);
+                        Some(r) => {
+                            reads[i] = Some(Box::pin(read_chunk(r.fd.clone())));
+                            relays[i] = Some(r);
                         }
                         None => {
                             let msg = alloc::format!("error forwarding port {} to pod: connection failed", ports[i]);
@@ -503,8 +545,8 @@ async fn portforward_session(conn: Box<dyn Conn>, mut pf: PortForward, target: E
                         }
                     }
                 }
-                if let Some(a) = &relays[i] {
-                    let _ = a.write_all(data).await;
+                if let Some(r) = &relays[i] {
+                    let _ = kr_net::tcp::write_all_nosignal(&r.fd, data).await;
                 }
             }
             Err(Ok(_)) => {}
@@ -514,9 +556,304 @@ async fn portforward_session(conn: Box<dyn Conn>, mut pf: PortForward, target: E
                     relays[i] = None; // connection closed; a new client stream reopens it
                 } else {
                     let _ = ws.queue_binary(&channel::encode(pf.data_channel(i), &d));
-                    reads[i] = relays[i].clone().map(|a| Box::pin(read_chunk(a)) as ChunkFut);
+                    reads[i] = relays[i].as_ref().map(|r| Box::pin(read_chunk(r.fd.clone())) as ChunkFut);
                 }
             }
+        }
+    }
+}
+
+// ---------- SPDY/3.1 port-forward ----------
+
+/// The byte stream under a SPDY session: WebSocket binary messages (KEP-4006 tunneling) or the
+/// raw upgraded connection.
+enum PfIo {
+    Ws(Box<WebSocket<Box<dyn Conn>>>),
+    Raw { conn: Box<dyn Conn>, wbuf: Vec<u8> },
+}
+
+impl PfIo {
+    /// The next chunk of SPDY bytes; `None` once the peer is gone.
+    fn poll_read(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+        match self {
+            PfIo::Ws(ws) => loop {
+                match ws.poll_recv(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(Message::Binary(b))) => return Poll::Ready(Some(b)),
+                    Poll::Ready(Ok(Message::Text(_))) => {}
+                    Poll::Ready(_) => return Poll::Ready(None),
+                }
+            },
+            PfIo::Raw { conn, .. } => {
+                let mut b = alloc::vec![0u8; 16 * 1024];
+                match conn.poll_read(cx, &mut b) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Ok(n)) if n > 0 => {
+                        b.truncate(n);
+                        Poll::Ready(Some(b))
+                    }
+                    Poll::Ready(_) => Poll::Ready(None),
+                }
+            }
+        }
+    }
+
+    /// Output is queued that the transport has not taken yet.
+    fn backlogged(&self) -> bool {
+        match self {
+            PfIo::Ws(ws) => ws.has_pending_output(),
+            PfIo::Raw { wbuf, .. } => !wbuf.is_empty(),
+        }
+    }
+
+    fn queue(&mut self, bytes: &[u8]) {
+        match self {
+            PfIo::Ws(ws) => {
+                let _ = ws.queue_binary(bytes);
+            }
+            PfIo::Raw { wbuf, .. } => wbuf.extend_from_slice(bytes),
+        }
+    }
+
+    /// Ready once queued output reached the transport (or it failed).
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        match self {
+            PfIo::Ws(ws) => ws.poll_flush(cx).map(|_| ()),
+            PfIo::Raw { conn, wbuf } => {
+                if !wbuf.is_empty() {
+                    match conn.poll_write(cx, wbuf) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(_) => wbuf.clear(),
+                    }
+                }
+                conn.poll_flush(cx).map(|_| ())
+            }
+        }
+    }
+
+    async fn finish(mut self) {
+        let _ = poll_fn(|cx| self.poll_flush(cx)).await;
+        match self {
+            PfIo::Ws(mut ws) => {
+                let _ = ws.close(1000, "").await;
+            }
+            PfIo::Raw { mut conn, .. } => {
+                let _ = poll_fn(|cx| conn.poll_close(cx)).await;
+            }
+        }
+    }
+}
+
+type WriteFut = Pin<Box<dyn Future<Output = (usize, bool)>>>;
+
+/// One SPDY data stream and its relay.
+struct Fwd {
+    relay: Relay,
+    /// Request id shared with the paired error stream.
+    req: String,
+    port: u16,
+    read: Option<ChunkFut>,
+    write: Option<WriteFut>,
+    /// Client data waiting for the relay.
+    wq: VecDeque<Vec<u8>>,
+    /// The client finished sending and its half is closed towards the relay.
+    client_fin: bool,
+    shut: bool,
+    /// The relay finished (EOF or failure); FINs went out.
+    eof: bool,
+    got_bytes: bool,
+}
+
+#[derive(Default)]
+struct Pair {
+    err: Option<u32>,
+    data: Option<u32>,
+}
+
+enum PfEv {
+    Io(Option<Vec<u8>>),
+    Read(u32, Vec<u8>),
+    Wrote(u32, usize, bool),
+    /// Output drained: reads held back by a backlog may start again.
+    Kick,
+}
+
+fn header_of<'a>(h: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    h.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+}
+
+/// Server side of `kubectl port-forward`: for every connection the client opens an error
+/// stream and a data stream (`streamtype`, `port`, `requestid` headers); the data stream is
+/// bridged to a relay in the pod's netns, connect errors go to the error stream as text.
+async fn spdy_portforward(mut io: PfIo, target: ExecTarget) {
+    let mut sess = Session::new();
+    // kubectl (moby/spdystream) ignores SPDY windows in both directions, so they cannot pace
+    // anything: output backlog gates relay reads, queued relay writes gate reading the client.
+    sess.set_flow_control_enforced(false);
+    let mut pairs: BTreeMap<String, Pair> = BTreeMap::new();
+    let mut fwds: BTreeMap<u32, Fwd> = BTreeMap::new();
+    loop {
+        // Sync pump: start reads/writes, half-close finished clients, drop dead streams.
+        if sess.has_output() {
+            io.queue(&sess.take_output());
+        }
+        let gated = io.backlogged();
+        let queued_in: usize = fwds.values().map(|f| f.wq.iter().map(Vec::len).sum::<usize>()).sum();
+        let read_io = queued_in < 1024 * 1024;
+        fwds.retain(|id, _| sess.has_stream(*id));
+        pairs.retain(|_, p| p.err.is_some_and(|e| sess.has_stream(e)) || p.data.is_some_and(|d| sess.has_stream(d)));
+        for (id, f) in fwds.iter_mut() {
+            if f.write.is_none() {
+                if let Some(chunk) = f.wq.pop_front() {
+                    let fd = f.relay.fd.clone();
+                    f.write = Some(Box::pin(async move { (chunk.len(), kr_net::tcp::write_all_nosignal(&fd, &chunk).await.is_ok()) }));
+                } else if f.client_fin && !f.shut {
+                    f.shut = true;
+                    let _ = kr_sys::shutdown(f.relay.fd.get_ref().raw(), kr_sys::SHUT_WR);
+                }
+            }
+            if f.read.is_none() && !f.eof && !gated && sess.pending(*id) < 128 * 1024 {
+                f.read = Some(Box::pin(read_chunk(f.relay.fd.clone())));
+            }
+        }
+        if sess.is_closed() && fwds.is_empty() {
+            break;
+        }
+        let ev = poll_fn(|cx| {
+            if read_io {
+                if let Poll::Ready(r) = io.poll_read(cx) {
+                    return Poll::Ready(PfEv::Io(r));
+                }
+            }
+            for (id, f) in fwds.iter_mut() {
+                if let Some(w) = f.write.as_mut() {
+                    if let Poll::Ready((n, ok)) = w.as_mut().poll(cx) {
+                        f.write = None;
+                        return Poll::Ready(PfEv::Wrote(*id, n, ok));
+                    }
+                }
+                if let Some(r) = f.read.as_mut() {
+                    if let Poll::Ready(d) = r.as_mut().poll(cx) {
+                        f.read = None;
+                        return Poll::Ready(PfEv::Read(*id, d));
+                    }
+                }
+            }
+            if io.poll_flush(cx).is_ready() && gated {
+                return Poll::Ready(PfEv::Kick);
+            }
+            Poll::Pending
+        })
+        .await;
+        match ev {
+            PfEv::Kick => {}
+            PfEv::Io(None) => break,
+            PfEv::Io(Some(bytes)) => {
+                if sess.feed(&bytes).is_err() {
+                    io.queue(&sess.take_output());
+                    break;
+                }
+                while let Some(e) = sess.poll_event() {
+                    match e {
+                        SpdyEvent::StreamOpened { id, headers, .. } => spdy_open(&mut sess, &mut pairs, &mut fwds, &target, id, &headers),
+                        SpdyEvent::Data { id, bytes, fin } => match fwds.get_mut(&id) {
+                            Some(f) => {
+                                if !bytes.is_empty() {
+                                    f.wq.push_back(bytes);
+                                }
+                                f.client_fin |= fin;
+                            }
+                            None => sess.consume(id, bytes.len()), // error stream: nothing to say
+                        },
+                        SpdyEvent::Reset { .. } => {} // pruned at the top of the loop
+                        SpdyEvent::GoAway { .. } => {
+                            io.queue(&sess.take_output());
+                            io.finish().await;
+                            return;
+                        }
+                    }
+                }
+            }
+            PfEv::Wrote(id, n, ok) => {
+                sess.consume(id, n);
+                if !ok {
+                    // The relay is gone; its read side reports EOF.
+                    if let Some(f) = fwds.get_mut(&id) {
+                        f.wq.clear();
+                        f.client_fin = true;
+                    }
+                }
+            }
+            PfEv::Read(id, chunk) => {
+                let Some(f) = fwds.get_mut(&id) else { continue };
+                if !chunk.is_empty() {
+                    f.got_bytes = true;
+                    sess.data(id, &chunk, false);
+                    continue;
+                }
+                f.eof = true;
+                let (req, port, got) = (f.req.clone(), f.port, f.got_bytes);
+                // A relay that never connected exits with 1 or 2: report it on the error stream.
+                let mut failure = None;
+                if !got {
+                    if let Some(h) = f.relay.exit.take() {
+                        if let Ok(Ok(code @ (1 | 2))) = kr_rt::exec::timeout(1000, h).await {
+                            failure = Some(code);
+                        }
+                    }
+                }
+                let err = pairs.get(&req).and_then(|p| p.err);
+                if let (Some(_), Some(e)) = (failure, err) {
+                    let msg = alloc::format!("error forwarding port {port} to pod: connection refused or unreachable");
+                    sess.data(e, msg.as_bytes(), true);
+                } else if let Some(e) = err {
+                    sess.data(e, b"", true);
+                }
+                sess.data(id, b"", true);
+            }
+        }
+    }
+    if sess.has_output() {
+        io.queue(&sess.take_output());
+    }
+    io.finish().await;
+}
+
+/// Handles a `SYN_STREAM`: pairs error and data streams by `requestid`, starts the relay once
+/// the data stream arrives.
+fn spdy_open(sess: &mut Session, pairs: &mut BTreeMap<String, Pair>, fwds: &mut BTreeMap<u32, Fwd>, target: &ExecTarget, id: u32, headers: &[(String, String)]) {
+    let port = header_of(headers, "port").and_then(|p| p.trim().parse::<u16>().ok()).filter(|p| *p != 0);
+    let is_err = match header_of(headers, "streamtype") {
+        Some("error") => true,
+        Some("data") => false,
+        _ => {
+            sess.reset_with(id, spdy::status::PROTOCOL_ERROR);
+            return;
+        }
+    };
+    let Some(port) = port else {
+        sess.reset_with(id, spdy::status::PROTOCOL_ERROR);
+        return;
+    };
+    // Without a request id, clients open (error, data) back to back: ids 1,3 / 5,7 / ...
+    let req = header_of(headers, "requestid").map(|r| r.trim().to_string()).unwrap_or_else(|| alloc::format!("auto{}", id.saturating_sub(1) / 4));
+    sess.reply(id, &[]);
+    let pair = pairs.entry(req.clone()).or_default();
+    if is_err {
+        pair.err = Some(id);
+        return;
+    }
+    pair.data = Some(id);
+    match open_relay(target, port) {
+        Some(relay) => {
+            fwds.insert(id, Fwd { relay, req, port, read: None, write: None, wq: VecDeque::new(), client_fin: false, shut: false, eof: false, got_bytes: false });
+        }
+        None => {
+            if let Some(e) = pair.err {
+                let msg = alloc::format!("error forwarding port {port} to pod: cannot start relay");
+                sess.data(e, msg.as_bytes(), true);
+            }
+            sess.data(id, b"", true);
         }
     }
 }

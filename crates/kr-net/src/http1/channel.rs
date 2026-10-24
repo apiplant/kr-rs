@@ -26,6 +26,9 @@ pub const V5: &str = "v5.channel.k8s.io";
 pub const V4: &str = "v4.channel.k8s.io";
 pub const PORTFORWARD_V2: &str = "v2.portforward.k8s.io";
 pub const PORTFORWARD_V1: &str = "portforward.k8s.io";
+/// SPDY/3.1 tunneled in binary WebSocket messages (KEP-4006; no channel byte, the message
+/// payloads are the SPDY byte stream). What `kubectl port-forward` offers since 1.31.
+pub const PORTFORWARD_SPDY_TUNNEL: &str = "SPDY/3.1+portforward.k8s.io";
 
 /// Exec/attach subprotocols in server preference order, for [`super::websocket::handshake`].
 pub const EXEC_PROTOCOLS: [&str; 2] = [V5, V4];
