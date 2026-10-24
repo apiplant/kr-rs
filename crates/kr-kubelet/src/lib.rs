@@ -113,6 +113,7 @@ struct Ctr {
     name: String,
     image: String,
     init: bool,
+    eph: bool,
     restart_count: u32,
     state: CState,
     last_term: Option<Term>,
@@ -381,6 +382,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         let n = self.pods.borrow()[uid].ctrs.len();
         for i in n_init..n {
+            if self.pods.borrow()[uid].ctrs[i].eph {
+                continue;
+            }
             let state = self.pods.borrow()[uid].ctrs[i].state.clone();
             let start = match &state {
                 CState::Waiting(..) => true,
@@ -389,6 +393,25 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             };
             if start {
                 self.maybe_start(uid, pod, i).await;
+            }
+        }
+        // Ephemeral containers: added to a running pod, started once, never restarted.
+        for e in pod.pointer(&["spec", "ephemeralContainers"]).and_then(Value::as_array).unwrap_or(&[]) {
+            let name = e.get("name").and_then(Value::as_str).unwrap_or("");
+            let idx = {
+                let mut pods = self.pods.borrow_mut();
+                let p = pods.get_mut(uid).unwrap();
+                match p.ctrs.iter().position(|c| c.name == name) {
+                    Some(i) => i,
+                    None => {
+                        p.ctrs.push(Ctr { name: name.into(), image: e.get("image").and_then(Value::as_str).unwrap_or("").into(), init: false, eph: true, restart_count: 0, state: CState::Waiting("ContainerCreating", String::new()), last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: false, ready: false });
+                        p.ctrs.len() - 1
+                    }
+                }
+            };
+            let c_eph = self.pods.borrow()[uid].ctrs[idx].eph;
+            if c_eph && matches!(self.pods.borrow()[uid].ctrs[idx].state, CState::Waiting(..)) {
+                self.maybe_start(uid, pod, idx).await;
             }
         }
     }
@@ -403,6 +426,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     name: c.get("name").and_then(Value::as_str).unwrap_or("").into(),
                     image: c.get("image").and_then(Value::as_str).unwrap_or("").into(),
                     init,
+                    eph: false,
                     restart_count: 0,
                     state: CState::Waiting("ContainerCreating", String::new()),
                     last_term: None,
@@ -564,7 +588,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     let cs = cspec.cloned().unwrap_or(Value::Null);
                     c.probes = [probe::Kind::Startup, probe::Kind::Liveness, probe::Kind::Readiness]
                         .into_iter()
-                        .filter(|_| !c.init)
+                        .filter(|_| !c.init && !c.eph)
                         .filter_map(|k| cs.get(k.field()).map(|p| (k, probe::State::new(p.clone(), now_ms()))))
                         .collect();
                     c.started = !c.probes.iter().any(|(k, _)| *k == probe::Kind::Startup);
@@ -830,6 +854,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 )]),
             }
         };
+        let inits_done = p.ctrs.iter().filter(|c| c.init).all(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code == 0));
         let cstat = |c: &Ctr| -> Value {
             let id = match &c.state {
                 CState::Running { id, .. } => alloc::format!("kr://{id}"),
@@ -842,16 +867,18 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 ("image", Value::from(c.image.as_str())),
                 ("imageID", Value::from("")),
                 ("containerID", Value::String(id)),
-                ("ready", Value::Bool(ready && !c.init)),
+                ("ready", Value::Bool(if c.init { matches!(&c.state, CState::Terminated(t) if t.exit_code == 0) } else { ready && !c.eph })),
                 ("started", Value::Bool(running && c.started)),
                 ("restartCount", Value::Number(Number::from_u64(c.restart_count as u64))),
-                ("state", state_json(&c.state)),
+                ("state", match &c.state {
+                    CState::Waiting("ContainerCreating", m) if !c.init && !c.eph && !inits_done => state_json(&CState::Waiting("PodInitializing", m.clone())),
+                    s => state_json(s),
+                }),
             ];
             f.push(("lastState", c.last_term.as_ref().filter(|_| !matches!(c.state, CState::Terminated(_))).map(|tm| state_json(&CState::Terminated(tm.clone()))).unwrap_or(o(Vec::new()))));
             o(f)
         };
-        let apps: Vec<&Ctr> = p.ctrs.iter().filter(|c| !c.init).collect();
-        let inits_done = p.ctrs.iter().filter(|c| c.init).all(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code == 0));
+        let apps: Vec<&Ctr> = p.ctrs.iter().filter(|c| !c.init && !c.eph).collect();
         let all_running = !apps.is_empty() && apps.iter().all(|c| matches!(c.state, CState::Running { .. }) && c.started && c.ready);
         let all_done = !apps.is_empty() && apps.iter().all(|c| matches!(c.state, CState::Terminated(_)));
         let failed = apps.iter().any(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code != 0)) || p.ctrs.iter().any(|c| c.init && matches!(&c.state, CState::Terminated(t) if t.exit_code != 0) && policy == "Never");
@@ -866,11 +893,26 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         } else {
             "Pending"
         };
-        let cond = |ty: &str, ok: bool| o(alloc::vec![("type", Value::from(ty)), ("status", Value::from(if ok { "True" } else { "False" })), ("lastTransitionTime", t(p.start_time))]);
+        let cond = |ty: &str, ok: bool, why: Option<(&str, String)>| {
+            let mut f = alloc::vec![("type", Value::from(ty)), ("status", Value::from(if ok { "True" } else { "False" })), ("lastTransitionTime", t(p.start_time))];
+            if let (false, Some((r, m))) = (ok, why) {
+                f.push(("reason", Value::from(r)));
+                if !m.is_empty() {
+                    f.push(("message", Value::String(m)));
+                }
+            }
+            o(f)
+        };
+        let incomplete: Vec<&str> = p.ctrs.iter().filter(|c| c.init && !matches!(&c.state, CState::Terminated(t) if t.exit_code == 0)).map(|c| c.name.as_str()).collect();
+        let init_why = Some(("ContainersNotInitialized", alloc::format!("containers with incomplete status: [{}]", incomplete.join(" "))));
+        let notready = || Some(("ContainersNotReady", {
+            let n: Vec<&str> = apps.iter().filter(|c| !(matches!(c.state, CState::Running { .. }) && c.started && c.ready)).map(|c| c.name.as_str()).collect();
+            if n.is_empty() { String::new() } else { alloc::format!("containers with unready status: [{}]", n.join(" ")) }
+        }));
         let ip = p.ip.map(|a| alloc::format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]));
         let mut f = alloc::vec![
             ("phase", Value::from(phase)),
-            ("conditions", Value::Array(alloc::vec![cond("PodScheduled", true), cond("Initialized", inits_done), cond("ContainersReady", all_running), cond("Ready", all_running)])),
+            ("conditions", Value::Array(alloc::vec![cond("PodScheduled", true, None), cond("Initialized", inits_done, init_why), cond("Ready", all_running, notready()), cond("ContainersReady", all_running, notready())])),
             ("hostIP", Value::from("127.0.0.1")),
             ("startTime", t(p.start_time)),
             ("containerStatuses", Value::Array(apps.iter().map(|c| cstat(c)).collect())),
@@ -878,6 +920,10 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let inits: Vec<Value> = p.ctrs.iter().filter(|c| c.init).map(cstat).collect();
         if !inits.is_empty() {
             f.push(("initContainerStatuses", Value::Array(inits)));
+        }
+        let ephs: Vec<Value> = p.ctrs.iter().filter(|c| c.eph).map(cstat).collect();
+        if !ephs.is_empty() {
+            f.push(("ephemeralContainerStatuses", Value::Array(ephs)));
         }
         if let Some(ip) = ip {
             f.push(("podIP", Value::from(ip.as_str())));
