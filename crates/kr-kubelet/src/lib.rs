@@ -542,6 +542,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             mounts: &built.mounts,
             log_fd: log.as_ref().map(|f| f.raw()),
             extra_groups: &built.extra_groups,
+            readonly_root: cspec.and_then(|c| c.pointer(&["securityContext", "readOnlyRootFilesystem"])).and_then(Value::as_bool).unwrap_or(false),
         };
         let r = container::start(&run);
         drop(pods);
@@ -568,6 +569,17 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                         .collect();
                     c.started = !c.probes.iter().any(|(k, _)| *k == probe::Kind::Startup);
                     c.ready = !c.probes.iter().any(|(k, _)| *k == probe::Kind::Readiness);
+                }
+                // postStart: a failing hook kills the container (restartPolicy decides the rest).
+                if let Some(hook) = cspec.and_then(|c| c.pointer(&["lifecycle", "postStart"])).cloned() {
+                    let (sig, target, ctr) = (running.signaller(), running.target(), cspec.cloned().unwrap_or(Value::Null));
+                    let pod_target = self.pods.borrow().get(uid).and_then(|p| p.sandbox.as_ref().and_then(|s| s.target().ok()));
+                    let me = self.clone();
+                    kr_rt::exec::spawn(async move {
+                        if !probe::run_handler(&hook, &ctr, &target, pod_target.as_ref(), &me.maps, 120_000).await {
+                            let _ = sig.send(kr_sys::ns::SIGKILL);
+                        }
+                    });
                 }
                 self.spawn_waiter(uid.to_string(), name, cid, running, started);
             }
@@ -727,9 +739,23 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let p = pods.get_mut(uid).unwrap();
             if p.kill_at.is_none() {
                 p.kill_at = Some(now_ms() + grace * 1000);
+                let pod_target = p.sandbox.as_ref().and_then(|s| s.target().ok());
                 for c in &p.ctrs {
-                    if let Some(s) = &c.signaller {
-                        let _ = s.send(kr_sys::ns::SIGTERM);
+                    let Some(s) = c.signaller.clone() else { continue };
+                    let cspec = ["containers", "initContainers"].iter().flat_map(|k| pod.pointer(&["spec", k]).and_then(Value::as_array).unwrap_or(&[]).iter()).find(|cs| cs.get("name").and_then(Value::as_str) == Some(c.name.as_str())).cloned();
+                    let hook = cspec.as_ref().and_then(|cs| cs.pointer(&["lifecycle", "preStop"])).cloned();
+                    match (hook, c.target.clone()) {
+                        // preStop runs first (bounded by the grace period), then SIGTERM.
+                        (Some(hook), Some(target)) => {
+                            let (ctr, pod_target, maps) = (cspec.unwrap_or(Value::Null), pod_target.clone(), self.maps.clone());
+                            kr_rt::exec::spawn(async move {
+                                let _ = probe::run_handler(&hook, &ctr, &target, pod_target.as_ref(), &maps, grace * 1000).await;
+                                let _ = s.send(kr_sys::ns::SIGTERM);
+                            });
+                        }
+                        _ => {
+                            let _ = s.send(kr_sys::ns::SIGTERM);
+                        }
                     }
                 }
             }

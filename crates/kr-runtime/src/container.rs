@@ -53,6 +53,8 @@ pub struct RunSpec<'a> {
     pub log_fd: Option<i32>,
     /// Supplementary groups added to the user's (pod fsGroup / supplementalGroups).
     pub extra_groups: &'a [u32],
+    /// `readOnlyRootFilesystem`: the root mount becomes read-only (volumes stay as mounted).
+    pub readonly_root: bool,
 }
 
 /// A bind mount of a host path into the container.
@@ -369,6 +371,7 @@ const STEPS: &[&str] = &[
     "join sandbox",
     "volume mount",
     "stdio",
+    "read-only rootfs",
 ];
 
 /// NUL-terminated concatenation of `parts`.
@@ -1029,6 +1032,9 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
     }
 
     step!(25, mount_volumes(spec.mounts));
+    if spec.readonly_root {
+        step!(27, ns::mount(None, b"/\0", None, ns::MS_BIND | ns::MS_REMOUNT | ns::MS_RDONLY, None));
+    }
     step!(10, ns::umount2(b"/.oldroot\0", ns::MNT_DETACH));
     let _ = ns::rmdir(b"/.oldroot\0");
 

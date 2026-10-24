@@ -85,7 +85,7 @@ fn port(p: &Value, ctr: &Value) -> Option<u16> {
 
 /// Blocking TCP connect (and optional HTTP GET) with timeouts; runs in the pod netns child.
 /// Returns the process exit code: 0 success, 1 failure.
-fn net_check(port: u16, http_path: Option<&str>, timeout_ms: u64) -> i32 {
+fn net_check(host: [u8; 4], port: u16, http_path: Option<&str>, timeout_ms: u64) -> i32 {
     let Ok(fd) = kr_sys::socket(kr_sys::AF_INET, kr_sys::SOCK_STREAM | kr_sys::SOCK_CLOEXEC, 0) else { return 1 };
     // struct timeval { tv_sec, tv_usec }: bounds connect (SO_SNDTIMEO) and reads.
     let mut tv = [0u8; 16];
@@ -93,11 +93,11 @@ fn net_check(port: u16, http_path: Option<&str>, timeout_ms: u64) -> i32 {
     tv[8..].copy_from_slice(&(((timeout_ms % 1000) * 1000) as i64).to_ne_bytes());
     let _ = kr_sys::setsockopt(fd.raw(), 1, 20, &tv); // SO_RCVTIMEO
     let _ = kr_sys::setsockopt(fd.raw(), 1, 21, &tv); // SO_SNDTIMEO
-    if kr_sys::connect(fd.raw(), &kr_sys::SockaddrIn::new([127, 0, 0, 1], port)).is_err() {
+    if kr_sys::connect(fd.raw(), &kr_sys::SockaddrIn::new(host, port)).is_err() {
         return 1;
     }
     let Some(path) = http_path else { return 0 };
-    let req = alloc::format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: kube-probe/1.37\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+    let req = alloc::format!("GET {path} HTTP/1.1\r\nHost: {}.{}.{}.{}:{port}\r\nUser-Agent: kube-probe/1.37\r\nAccept: */*\r\nConnection: close\r\n\r\n", host[0], host[1], host[2], host[3]);
     if kr_sys::write(fd.raw(), req.as_bytes()).is_err() {
         return 1;
     }
@@ -117,6 +117,25 @@ fn net_check(port: u16, http_path: Option<&str>, timeout_ms: u64) -> i32 {
         }
     }
     1
+}
+
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut it = s.split('.');
+    for o in out.iter_mut() {
+        *o = it.next()?.parse().ok()?;
+    }
+    it.next().is_none().then_some(out)
+}
+
+/// Runs a lifecycle hook handler (`exec`, `httpGet`, `tcpSocket` or `sleep`); true = success.
+pub async fn run_handler(spec: &Value, ctr: &Value, ctr_target: &ExecTarget, pod_target: Option<&ExecTarget>, maps: &IdMaps, timeout_ms: u64) -> bool {
+    if let Some(s) = spec.get("sleep") {
+        let secs = s.get("seconds").and_then(Value::as_u64).unwrap_or(0);
+        kr_rt::exec::sleep((secs * 1000).min(timeout_ms)).await;
+        return true;
+    }
+    run(spec, ctr, ctr_target, pod_target, maps, timeout_ms).await
 }
 
 /// Runs one probe; true = success. `ctr_target` enters the container (exec probes),
@@ -142,7 +161,9 @@ pub async fn run(spec: &Value, ctr: &Value, ctr_target: &ExecTarget, pod_target:
         let https = net.get("scheme").and_then(Value::as_str) == Some("HTTPS");
         let Some(p) = port(net, ctr) else { return false };
         let path = if https { None } else { path };
-        container::in_pod_net(target, move || net_check(p, path.as_deref(), timeout_ms))
+        // `host` (an IP) defaults to the pod itself.
+        let host = net.get("host").and_then(Value::as_str).and_then(parse_ipv4).unwrap_or([127, 0, 0, 1]);
+        container::in_pod_net(target, move || net_check(host, p, path.as_deref(), timeout_ms))
     };
     let Ok(running) = started else { return false };
     let (sig, pid) = (running.signaller(), running.pid);
