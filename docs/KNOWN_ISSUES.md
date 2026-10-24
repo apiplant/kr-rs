@@ -5,8 +5,9 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 # Needs work (open or partial)
 
 ## kr-sys
-11. **aarch64 path is untested** — *open*
-    It compiles under cfg but has never run. Plan: a qemu-user CI job.
+11. **aarch64 path is only partly exercised** — *mostly fixed*
+    `tools/test/aarch64.sh` cross-builds `kr` (aarch64-unknown-linux-gnu, rust-lld shim, no cross gcc) and runs under `qemu-aarch64`: `version`, `sleep-test` and the HTTP `echo` server pass; unit tests of kr-sys, kr-rt, kr-fmt, kr-crypto, kr-archive, kr-store and kr-net pass (aarch64 musl, self-contained). Fixed: missing `getauxval` (compiler_builtins outline atomics) broke linking.
+    Remaining: `kr ctr`/kubelet/apiserver paths (namespaces, cgroups, clone3, mounts) are not run under qemu-user and need a real aarch64 host; no CI job yet.
 
 ## kr-net
 31. **Registry auth supports anonymous Bearer tokens only** — *mostly fixed* (13ba669)
@@ -293,6 +294,12 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 ## kr-fmt
 18. **14 clippy style lints in kr-fmt** — *fixed* (commit: )
 
+## Echo server (cont.)
+14. **The lingering close holds each connection for up to 1 s after the response** — *fixed* (commit: )
+    Under heavy load this raises the number of concurrent connections. Plan: skip the drain when the request was fully read, and cap total lingering connections.
+91. **Datastore fsync blocked the event loop; log never compacted** — *fixed* (ADR-024)
+    Found in conformance run 3: kr sat in `D` state under write load and the log grew without bound. Writes now go through group commit, with fsync in a helper process, and the log is compacted periodically. Verified: no `D` states during a 300-write burst, and all acknowledged writes survive `kill -9`.
+
 ## kr-sys (cont.)
 35. **`syscall0..6` lack `# Safety` docs (clippy `missing_safety_doc`)** — *fixed (e64a857)*
 
@@ -300,9 +307,3 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 12. **The 431 path closes with unread data, so the client may see a TCP RST** — *fixed* (commit: 68940ad)
     Plan: lingering close. Send the response, `shutdown(SHUT_WR)`, then drain the input for up to 1 s and close.
     Fix: `linger_close` runs after every response (not only the 431) using the new `kr_sys::shutdown`. Note that a request whose headers are complete is answered 200 even if a large body follows, and the lingering close drains that body without a reset.
-
-## Echo server (cont.)
-14. **The lingering close holds each connection for up to 1 s after the response** — *fixed* (commit: )
-    Under heavy load this raises the number of concurrent connections. Plan: skip the drain when the request was fully read, and cap total lingering connections.
-91. **Datastore fsync blocked the event loop; log never compacted** — *fixed* (ADR-024)
-    Found in conformance run 3: kr sat in `D` state under write load and the log grew without bound. Writes now go through group commit, with fsync in a helper process, and the log is compacted periodically. Verified: no `D` states during a 300-write burst, and all acknowledged writes survive `kill -9`.
