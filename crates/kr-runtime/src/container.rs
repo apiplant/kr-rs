@@ -255,7 +255,7 @@ static EXE_FD: AtomicI32 = AtomicI32::new(-1);
 
 fn init_exe_fd() {
     if EXE_FD.load(Ordering::Relaxed) < 0 {
-        if let Ok(fd) = ns::open(b"/proc/self/exe\0", kr_sys::fs::O_PATH, 0) {
+        if let Ok(fd) = ns::open(b"/proc/self/exe\0", kr_sys::fs::O_PATH | kr_sys::O_CLOEXEC, 0) {
             EXE_FD.store(fd.into_raw(), Ordering::Relaxed);
         }
     }
@@ -305,8 +305,7 @@ fn sandbox_inner(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfi
         }
         drop(rep_w);
         drop(go_r);
-        // Never execs: drop every inherited descriptor (sockets, store files) explicitly.
-        // Re-exec kr as a tiny "pause" process for a fresh address space (no COW heap copy);
+        // Drop every inherited descriptor (sockets, store files), then re-exec kr as a tiny "pause" process for a fresh address space (no COW heap copy);
         // the exe fd survives until execveat. Empty environment: the agent's may hold secrets.
         let exe = EXE_FD.load(Ordering::Relaxed);
         if exe >= 3 {
