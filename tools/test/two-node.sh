@@ -14,7 +14,8 @@ for n in kr1 kr2; do
     archlinux:base-devel sleep infinity >/dev/null
 done
 docker exec -d kr1 sh -c "${KR_SERVER_ENV:-} KR_ROOT=/store /krbin/kr server --data /var/tmp/srv > /tmp/srv.log 2>&1"
-for _ in $(seq 30); do docker exec kr1 test -f /var/tmp/srv/node-token && break; sleep 1; done
+# node-token is written before the API listens: wait for the API itself.
+for _ in $(seq 60); do docker exec -e KUBECONFIG=/var/tmp/srv/admin.kubeconfig kr1 kubectl get --raw /healthz >/dev/null 2>&1 && break; sleep 1; done
 TOKEN=$(docker exec kr1 cat /var/tmp/srv/node-token)
 IP1=$(docker inspect -f '{{.NetworkSettings.Networks.krnet.IPAddress}}' kr1)
 docker exec -d kr2 sh -c "KR_ROOT=/store /krbin/kr agent --server https://$IP1:6443 --token $TOKEN > /tmp/agent.log 2>&1"
