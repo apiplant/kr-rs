@@ -135,11 +135,21 @@ fn base() -> Result<Vec<u8>, Errno> {
 impl Cgroup {
     /// Creates `<base>/<name>` with `limits` applied.
     pub fn create(name: &[u8], limits: &Limits) -> Result<Cgroup, Errno> {
+        Cgroup::create_in(b"", name, limits)
+    }
+
+    /// Creates `<base>/<parent>/<name>` (`parent` is a pod cgroup made by [`PodCgroup::create`],
+    /// or empty for a flat container cgroup).
+    pub fn create_in(parent: &[u8], name: &[u8], limits: &Limits) -> Result<Cgroup, Errno> {
         if name.is_empty() || name.iter().any(|&b| b == b'/' || b == 0) || name == b"." || name == b".." || name == SUPERVISOR {
             return Err(Errno(22));
         }
         let base = base()?;
         let mut path = base;
+        if !parent.is_empty() {
+            path.push(b'/');
+            path.extend_from_slice(parent);
+        }
         path.push(b'/');
         path.extend_from_slice(name);
         match ns::mkdir(&nul(&[&path]), 0o755) {
@@ -205,22 +215,187 @@ impl Cgroup {
     /// Removes the cgroup. It must be empty, which it is once the container's pid 1 has exited,
     /// since that tears down the whole pid namespace. Retries briefly while the kernel reaps it.
     pub fn remove(&self) {
-        let p = nul(&[&self.path]);
-        for _ in 0..100 {
-            match ns::rmdir(&p) {
-                Err(Errno(16)) => {
-                    let ts = kr_sys::Timespec { tv_sec: 0, tv_nsec: 1_000_000 };
-                    let _ = ns::nanosleep(&ts);
+        rmdir_retry(&self.path);
+    }
+}
+
+fn rmdir_retry(path: &[u8]) {
+    let p = nul(&[path]);
+    for _ in 0..100 {
+        match ns::rmdir(&p) {
+            Err(Errno(16)) => {
+                let ts = kr_sys::Timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+                let _ = ns::nanosleep(&ts);
+            }
+            _ => return,
+        }
+    }
+}
+
+/// Sums container limits for the pod cgroup: a limit is set only when every container has one.
+pub fn sum_limits(containers: &[Limits]) -> Limits {
+    let sum = |f: fn(&Limits) -> Option<u64>| -> Option<u64> {
+        if containers.is_empty() {
+            return None;
+        }
+        containers.iter().try_fold(0u64, |a, l| f(l).map(|v| a.saturating_add(v)))
+    };
+    Limits { memory_bytes: sum(|l| l.memory_bytes), pids: sum(|l| l.pids), cpu_milli: sum(|l| l.cpu_milli), ..Default::default() }
+}
+
+/// Path of a pod's cgroup relative to the delegated base, mirroring upstream's kubepods layout:
+/// `kr-pods/<uid>` (Guaranteed), `kr-pods/burstable/<uid>`, `kr-pods/besteffort/<uid>`.
+pub fn pod_rel_path(qos: &str, uid: &str) -> Vec<u8> {
+    let mut v = b"kr-pods/".to_vec();
+    match qos {
+        "Burstable" => v.extend_from_slice(b"burstable/"),
+        "BestEffort" => v.extend_from_slice(b"besteffort/"),
+        _ => {}
+    }
+    v.extend_from_slice(uid.as_bytes());
+    v
+}
+
+/// A pod's cgroup. It holds no processes itself: the sandbox lives in the `pause` leaf and each
+/// container in its own child, so the pod cgroup may enable controllers for them.
+pub struct PodCgroup {
+    rel: Vec<u8>,
+    path: Vec<u8>,
+}
+
+impl PodCgroup {
+    /// Creates the pod cgroup (and `kr-pods` and QoS parents) with the summed `limits`.
+    pub fn create(qos: &str, uid: &str, limits: &Limits) -> Result<PodCgroup, Errno> {
+        if uid.is_empty() || uid.bytes().any(|b| b == b'/' || b == 0 || b == b'.') {
+            return Err(Errno(22));
+        }
+        let rel = pod_rel_path(qos, uid);
+        let mut path = base()?;
+        for comp in rel.split(|&b| b == b'/') {
+            path.push(b'/');
+            path.extend_from_slice(comp);
+            match ns::mkdir(&nul(&[&path]), 0o755) {
+                Ok(()) | Err(Errno(17)) => {}
+                Err(e) => return Err(e),
+            }
+            ns::write_file(&nul(&[&path, b"/cgroup.subtree_control"]), b"+cpu +memory +pids")?;
+        }
+        let pod = PodCgroup { rel, path };
+        let cg = Cgroup { path: pod.path.clone(), dir: ns::open(&nul(&[&pod.path]), ns::O_RDONLY | ns::O_DIRECTORY, 0)? };
+        if let Err(e) = cg.apply(limits) {
+            pod.remove();
+            return Err(e);
+        }
+        Ok(pod)
+    }
+
+    /// Path relative to the base; the `parent` argument of [`Cgroup::create_in`].
+    pub fn rel(&self) -> &[u8] {
+        &self.rel
+    }
+
+    /// Moves `pid` (the sandbox) into the pod's `pause` leaf.
+    pub fn add_sandbox(&self, pid: i32) -> Result<(), Errno> {
+        match ns::mkdir(&nul(&[&self.path, b"/pause"]), 0o755) {
+            Ok(()) | Err(Errno(17)) => {}
+            Err(e) => return Err(e),
+        }
+        ns::write_file(&nul(&[&self.path, b"/pause/cgroup.procs"]), &dec(pid as u64))
+    }
+
+    /// Current memory usage of the whole pod (memory.current).
+    pub fn memory_current(&self) -> Option<u64> {
+        let v = read_small(&nul(&[&self.path, b"/memory.current"])).ok()?;
+        v.iter().take_while(|b| b.is_ascii_digit()).try_fold(0u64, |a, &d| a.checked_mul(10)?.checked_add((d - b'0') as u64))
+    }
+
+    /// Removes the (empty) pod cgroup and its `pause` leaf; the QoS parents stay.
+    pub fn remove(&self) {
+        let mut leaf = self.path.clone();
+        leaf.extend_from_slice(b"/pause");
+        rmdir_retry(&leaf);
+        rmdir_retry(&self.path);
+    }
+}
+
+/// Directories of the tree under `root`, children before their parent. `list` returns the
+/// child directory paths of a directory.
+fn post_order(root: &[u8], list: &dyn Fn(&[u8]) -> Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for child in list(root) {
+        out.extend(post_order(&child, list));
+    }
+    out.push(root.to_vec());
+    out
+}
+
+fn list_subdirs(path: &[u8]) -> Vec<Vec<u8>> {
+    let Ok(fd) = ns::open(&nul(&[path]), ns::O_RDONLY | ns::O_DIRECTORY, 0) else { return Vec::new() };
+    kr_sys::fs::read_dir(&fd)
+        .filter_map(Result::ok)
+        .filter(|e| e.kind == 4) // DT_DIR
+        .map(|e| {
+            let mut p = path.to_vec();
+            p.push(b'/');
+            p.extend_from_slice(&e.name);
+            p
+        })
+        .collect()
+}
+
+/// Startup cleanup: kills every process left in the `kr-pods` tree by a previous kr run
+/// (containers outlive a killed kubelet as orphans) and removes the cgroups. Does nothing when
+/// cgroups are unavailable or not delegated.
+pub fn kill_stale_pods() {
+    let Ok(mut root) = base() else { return };
+    root.extend_from_slice(b"/kr-pods");
+    if ns::open(&nul(&[&root]), ns::O_RDONLY | ns::O_DIRECTORY, 0).is_err() {
+        return;
+    }
+    let dirs = post_order(&root, &list_subdirs);
+    for _ in 0..50 {
+        let mut alive = false;
+        for d in &dirs {
+            // cgroup.kill (Linux 5.14+) kills the whole subtree; older kernels get SIGKILL per pid.
+            if ns::write_file(&nul(&[d, b"/cgroup.kill"]), b"1").is_err() {
+                if let Ok(procs) = read_small(&nul(&[d, b"/cgroup.procs"])) {
+                    for pid in procs.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+                        let n = pid.iter().take_while(|b| b.is_ascii_digit()).fold(0i32, |a, &c| a * 10 + (c - b'0') as i32);
+                        let _ = ns::kill(n, ns::SIGKILL);
+                    }
                 }
-                _ => return,
+            }
+            if read_small(&nul(&[d, b"/cgroup.procs"])).is_ok_and(|p| !p.is_empty()) {
+                alive = true;
             }
         }
+        if !alive {
+            break;
+        }
+        let ts = kr_sys::Timespec { tv_sec: 0, tv_nsec: 20_000_000 };
+        let _ = ns::nanosleep(&ts);
+    }
+    for d in &dirs {
+        rmdir_retry(d);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn children_before_parents() {
+        let list = |p: &[u8]| -> Vec<Vec<u8>> {
+            match p {
+                b"/r" => alloc::vec![b"/r/a".to_vec(), b"/r/b".to_vec()],
+                b"/r/a" => alloc::vec![b"/r/a/x".to_vec()],
+                _ => Vec::new(),
+            }
+        };
+        let order = post_order(b"/r", &list);
+        assert_eq!(order, alloc::vec![b"/r/a/x".to_vec(), b"/r/a".to_vec(), b"/r/b".to_vec(), b"/r".to_vec()]);
+    }
 
     #[test]
     fn memory_protection_by_qos() {
@@ -233,5 +408,21 @@ mod tests {
         l.memory_guaranteed = true;
         assert_eq!(l.memory_protection(), Some((&b"memory.min"[..], 1 << 20)));
         assert!(!l.is_empty());
+    }
+
+    #[test]
+    fn pod_layout() {
+        assert_eq!(pod_rel_path("Guaranteed", "u1"), b"kr-pods/u1");
+        assert_eq!(pod_rel_path("Burstable", "u1"), b"kr-pods/burstable/u1");
+        assert_eq!(pod_rel_path("BestEffort", "u1"), b"kr-pods/besteffort/u1");
+    }
+
+    #[test]
+    fn summed_limits() {
+        let a = Limits { memory_bytes: Some(100), cpu_milli: Some(500), pids: Some(10), ..Default::default() };
+        let b = Limits { memory_bytes: Some(50), cpu_milli: None, pids: Some(10), ..Default::default() };
+        let s = sum_limits(&[a, b]);
+        assert_eq!((s.memory_bytes, s.cpu_milli, s.pids), (Some(150), None, Some(20)));
+        assert!(sum_limits(&[]).is_empty());
     }
 }

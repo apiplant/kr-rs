@@ -24,20 +24,15 @@ pub(crate) fn memory_ki() -> u64 {
 }
 
 /// MemAvailable in KiB (None if unreadable).
-fn memory_available_ki() -> Option<u64> {
+pub(crate) fn memory_available_ki() -> Option<u64> {
     read(b"/proc/meminfo\0").lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|v| v.split_whitespace().next()?.parse().ok())
-}
-
-/// Upstream's default hard eviction threshold: memory.available < 100Mi.
-fn memory_pressure(available_ki: Option<u64>) -> bool {
-    available_ki.is_some_and(|a| a < 100 * 1024)
 }
 
 fn status(cfg: &Config) -> String {
     let t = rfc3339(now());
     let (cpu, mem) = (cpus(), memory_ki());
     let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
-    let (mp, mp_reason) = if memory_pressure(memory_available_ki()) { ("True", "KubeletHasInsufficientMemory") } else { ("False", "KubeletHasSufficientMemory") };
+    let (mp, mp_reason) = if crate::evict::under_pressure(memory_available_ki(), cfg.eviction_memory_bytes) { ("True", "KubeletHasInsufficientMemory") } else { ("False", "KubeletHasSufficientMemory") };
     let kernel = read(b"/proc/sys/kernel/osrelease\0");
     alloc::format!(
         r#"{{"capacity":{{"cpu":"{cpu}","memory":"{mem}Ki","pods":"110"}},"allocatable":{{"cpu":"{cpu}","memory":"{mem}Ki","pods":"110"}},
@@ -92,15 +87,5 @@ pub async fn heartbeat_loop<C: Client>(c: &C, cfg: &Config) {
         if ticks % 6 == 0 {
             update_status(c, cfg).await;
         }
-    }
-}
-
-#[cfg(test)]
-mod pressure_tests {
-    #[test]
-    fn memory_pressure_threshold() {
-        assert!(super::memory_pressure(Some(100 * 1024 - 1)));
-        assert!(!super::memory_pressure(Some(100 * 1024)));
-        assert!(!super::memory_pressure(None));
     }
 }
