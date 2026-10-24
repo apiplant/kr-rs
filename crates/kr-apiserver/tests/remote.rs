@@ -232,3 +232,46 @@ fn transport_errors_are_503() {
         assert!(Remote::new("https://x", RemoteAuth::Bearer("t".into()), "garbage").is_err());
     });
 }
+
+#[test]
+fn pods_ephemeralcontainers_subresource() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    block_on(async {
+        let e = setup().await;
+        let c = cert_client(&e);
+        let pods = "/api/v1/namespaces/default/pods";
+        c.create(pods, &v(r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"p"},"spec":{"containers":[{"name":"app","image":"busybox"}]}}"#)).await.unwrap();
+        let sub = format!("{pods}/p/ephemeralcontainers");
+        let mp = "application/merge-patch+json";
+        let eph = |n: &str, img: &str| format!(r#"{{"name":"{n}","image":"{img}"}}"#);
+
+        // add one; unrelated spec/metadata changes in the same patch are ignored
+        let body = format!(r#"{{"metadata":{{"labels":{{"x":"y"}}}},"spec":{{"activeDeadlineSeconds":5,"ephemeralContainers":[{}]}}}}"#, eph("dbg", "busybox"));
+        let r = c.patch(&sub, mp, &v(&body)).await.unwrap();
+        assert_eq!(r.pointer(&["spec", "ephemeralContainers"]).and_then(Value::as_array).map(|a| a.len()), Some(1));
+        assert!(r.pointer(&["spec", "activeDeadlineSeconds"]).is_none());
+        assert!(r.pointer(&["metadata", "labels"]).is_none());
+
+        // adding a second keeps the first
+        let body = format!(r#"{{"spec":{{"ephemeralContainers":[{},{}]}}}}"#, eph("dbg", "busybox"), eph("dbg2", "busybox"));
+        let r = c.patch(&sub, mp, &v(&body)).await.unwrap();
+        assert_eq!(r.pointer(&["spec", "ephemeralContainers"]).and_then(Value::as_array).map(|a| a.len()), Some(2));
+
+        // modify existing -> 422
+        let body = format!(r#"{{"spec":{{"ephemeralContainers":[{},{}]}}}}"#, eph("dbg", "other"), eph("dbg2", "busybox"));
+        assert_eq!(c.patch(&sub, mp, &v(&body)).await.unwrap_err().code, 422);
+        // remove existing -> 422
+        let body = format!(r#"{{"spec":{{"ephemeralContainers":[{}]}}}}"#, eph("dbg", "busybox"));
+        assert_eq!(c.patch(&sub, mp, &v(&body)).await.unwrap_err().code, 422);
+        // name clash with a regular container -> 422
+        let body = format!(r#"{{"spec":{{"ephemeralContainers":[{},{},{}]}}}}"#, eph("dbg", "busybox"), eph("dbg2", "busybox"), eph("app", "busybox"));
+        assert_eq!(c.patch(&sub, mp, &v(&body)).await.unwrap_err().code, 422);
+
+        // PUT through the subresource: only ephemeralContainers is taken from the body
+        let mut cur = c.get(&format!("{pods}/p")).await.unwrap();
+        cur.entry_object("spec").set("activeDeadlineSeconds", Value::Number(kr_fmt::json::Number::from_u64(9)));
+        let r = c.update(&sub, &cur).await.unwrap();
+        assert!(r.pointer(&["spec", "activeDeadlineSeconds"]).is_none());
+        assert_eq!(r.pointer(&["spec", "ephemeralContainers"]).and_then(Value::as_array).map(|a| a.len()), Some(2));
+    });
+}

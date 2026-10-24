@@ -1709,7 +1709,7 @@ fn eph_only(old: &Value, new: &mut Value) -> R<()> {
     let now = ephs.as_ref().and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
     for p in &prev {
         let n = p.get("name").and_then(Value::as_str);
-        if !now.iter().any(|c| c.get("name").and_then(Value::as_str) == n && c == p) {
+        if !now.iter().any(|c| c.get("name").and_then(Value::as_str) == n && c.as_object().is_some_and(|o| o.iter().all(|(k, v)| p.get(k) == Some(v)))) {
             return Err(ApiError::invalid("Forbidden: existing ephemeral containers may not be changed or removed"));
         }
     }
