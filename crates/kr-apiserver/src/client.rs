@@ -99,6 +99,13 @@ impl InProcess {
             Some((p, q)) if query.is_empty() => (p, q),
             _ => (path, query),
         };
+        let q2;
+        let query = if query.contains("fieldValidation=") {
+            query
+        } else {
+            q2 = if query.is_empty() { String::from("fieldValidation=Ignore") } else { alloc::format!("{query}&fieldValidation=Ignore") };
+            &q2
+        };
         let req = Req { method, path, query, content_type: ct, accept: Some("application/json"), body, user: Some(self.user.clone()), bearer: None, headers: &[], authz_verb: None };
         match self.api.handle(&req) {
             Reply::Json(code, s) => {

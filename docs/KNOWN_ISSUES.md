@@ -34,7 +34,7 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 ## Control plane (ADR-021)
 63. **No typed schemas or defaulting** — *partly fixed*
     - Defaulting for core/apps/batch is in (`defaults.rs`, see #86). Defaulted fields are loose: a mismatched `status.phase` on a fresh PV can make the PV controller rewrite it right back (`Available` ⇄ `Pending`), see `sync_pv`.
-    - kr still accepts unknown fields even with `fieldValidation=Strict`, and per-kind validation is minimal.
+    - `fieldValidation` is implemented (`fieldval.rs`): unknown fields of built-in kinds are found with the generated protobuf field tables, those of custom resources are what CRD pruning would drop, and duplicate keys are reported. `Strict` answers 400 `strict decoding error: unknown field "spec.containers[0].imagee"`, `Warn` (the default) adds `Warning: 299` headers, `Ignore` is silent. For PATCH the merged object is checked (fields the stored object already had are not reported). In-process clients use `Ignore`. Per-kind value validation is still minimal.
     - Plan: generate schemas from the upstream OpenAPI, as the protobuf table does.
 65. **Server-side apply is approximate** — *open*
     `application/apply-patch+yaml` is treated as create-or-strategic-merge: there are no managedFields, no field ownership and no conflict detection. Client-side `kubectl apply` is fully supported.
