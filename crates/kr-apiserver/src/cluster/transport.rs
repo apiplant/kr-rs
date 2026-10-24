@@ -77,6 +77,8 @@ impl Notify {
 pub struct Inbox {
     pub msgs: RefCell<VecDeque<Message>>,
     pub notify: Notify,
+    /// Set on shutdown: connection tasks stop delivering and close.
+    pub closed: Cell<bool>,
 }
 
 async fn read_exact<T: Transport>(s: &mut T, buf: &mut [u8]) -> bool {
@@ -115,6 +117,9 @@ pub async fn serve(listener: Async<Fd>, tls: Rc<ServerConfig>, me: NodeId, inbox
                     return;
                 }
                 // Only well-formed messages, addressed to us, from the authenticated sender.
+                if inbox.closed.get() {
+                    return;
+                }
                 match codec::decode_message(&buf) {
                     Some(m) if m.from == from && m.to == me => {
                         inbox.msgs.borrow_mut().push_back(m);

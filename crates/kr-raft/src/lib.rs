@@ -298,6 +298,22 @@ impl Raft {
         self.snap_index
     }
 
+    /// Term of the last applied entry. A leader whose applied term is its own term has applied
+    /// every entry committed before its election (it may then accept writes).
+    pub fn applied_term(&self) -> Option<u64> {
+        self.term_at(self.applied)
+    }
+
+    /// The latest snapshot (received or compacted), if any.
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        self.snap.as_ref()
+    }
+
+    /// Log entries with index in `from..=to` still held in memory (after the snapshot).
+    pub fn entries(&self, from: u64, to: u64) -> Vec<Entry> {
+        (from.max(self.snap_index + 1)..=to.min(self.last_index())).filter_map(|i| self.entry(i).cloned()).collect()
+    }
+
     fn last_term(&self) -> u64 {
         self.log.last().map_or(self.snap_term, |e| e.term)
     }

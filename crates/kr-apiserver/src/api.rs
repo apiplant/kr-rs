@@ -87,7 +87,7 @@ impl Reply {
 }
 
 pub struct ApiServer {
-    store: RefCell<Store>,
+    pub(crate) store: RefCell<Store>,
     now: fn() -> i64,
     rng: fn(&mut [u8]),
     server_address: String,
@@ -103,6 +103,11 @@ pub struct ApiServer {
     custom: RefCell<Vec<crate::crd::Custom>>,
     /// Group commit: writes reach the log synchronously, fsync happens off the event loop.
     committer: crate::durable::Committer,
+    /// HA mode (ADR-026): the store is replicated by this Raft driver.
+    cluster: RefCell<Option<alloc::rc::Rc<crate::cluster::Cluster>>>,
+    /// Bootstrap parameters, re-applied by every new leader ([`ApiServer::bootstrap_all`]).
+    boot_token: RefCell<Option<(String, String)>>,
+    boot_services: core::cell::Cell<Option<([u8; 4], u16)>>,
     /// `fieldValidation` of the request being handled (`Ignore` outside `handle`).
     fv_mode: core::cell::Cell<crate::fieldval::Mode>,
     /// Warnings for the response of the request being handled.
@@ -191,7 +196,9 @@ impl ApiServer {
     pub fn new(mut store: Store, now: fn() -> i64, rng: fn(&mut [u8]), server_address: String) -> Result<ApiServer, ApiError> {
         let ns = resources::find("", "v1", "namespaces").unwrap();
         let clock = Clock { now: now(), rng };
-        for name in SYSTEM_NAMESPACES {
+        // A replicated store starts empty: its leader bootstraps through Raft (bootstrap_all).
+        let replicated = store.is_replicated();
+        for name in SYSTEM_NAMESPACES.iter().filter(|_| !replicated) {
             let key = ns.key(None, name);
             if store.get(&key).is_some() {
                 continue;
@@ -202,7 +209,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), wh_cache: RefCell::new(None) };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), wh_cache: RefCell::new(None) };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -211,8 +218,10 @@ impl ApiServer {
                 }
             }
         }
-        for ns in SYSTEM_NAMESPACES {
-            api.ensure_default_sa(ns);
+        if !replicated {
+            for ns in SYSTEM_NAMESPACES {
+                api.ensure_default_sa(ns);
+            }
         }
         api.sync()?;
         Ok(api)
@@ -341,6 +350,7 @@ impl ApiServer {
 
     /// Creates a bootstrap token Secret (`<id>.<secret>`) if it does not exist.
     pub fn ensure_bootstrap_token(&self, id: &str, secret: &str) -> Result<(), ApiError> {
+        *self.boot_token.borrow_mut() = Some((id.into(), secret.into()));
         let r = resources::find("", "v1", "secrets").unwrap();
         let b64 = |v: &str| kr_fmt::base64::encode(v.as_bytes());
         let body = alloc::format!(
@@ -439,6 +449,12 @@ impl ApiServer {
     /// bootstrap RBAC policy and kube-root-ca.crt ConfigMaps.
     pub fn set_service_accounts(&self, signer: crate::tokens::Signer, ca_pem: String) -> Result<(), ApiError> {
         *self.sa.borrow_mut() = Some((signer, ca_pem));
+        self.bootstrap_policy();
+        self.sync()
+    }
+
+    /// RBAC defaults, ServiceCIDR, APF objects, the default StorageClass, root CA ConfigMaps.
+    fn bootstrap_policy(&self) {
         let crr = resources::find("rbac.authorization.k8s.io", "v1", "clusterroles").unwrap();
         let crbr = resources::find("rbac.authorization.k8s.io", "v1", "clusterrolebindings").unwrap();
         for (name, rules) in crate::rbac::bootstrap_roles() {
@@ -469,11 +485,13 @@ impl ApiServer {
                 self.ensure_root_ca(name);
             }
         }
-        self.sync()
     }
 
     /// Creates an object if missing (bootstrap data; never overwrites user changes).
     fn bootstrap_object(&self, res: &Resource, ns: Option<&str>, name: &str, kind: &str, body: &str) {
+        if !self.writable() {
+            return; // HA follower: the leader bootstraps
+        }
         let key = res.key(ns, name);
         if self.store.borrow().get(&key).is_some() {
             return;
@@ -607,12 +625,39 @@ impl ApiServer {
         let mode = if write { crate::fieldval::Mode::parse(Query::parse(req.query).ok().as_ref().and_then(|q| q.get("fieldValidation"))) } else { crate::fieldval::Mode::Ignore };
         self.fv_mode.set(mode);
         self.warnings.borrow_mut().clear();
+        if !self.writable() && Self::mutates(req) {
+            let leader = self.cluster.borrow().as_ref().and_then(|c| c.leader());
+            return (Reply::err(not_leader(leader)), Vec::new());
+        }
+        let before = self.store.borrow().revision();
         let reply = match self.route(req) {
             Ok(r) => r,
             Err(e) => Reply::err(e),
         };
+        if !self.writable() && self.store.borrow().revision() != before {
+            // A follower's store must equal the committed log: undo and report the bug.
+            kr_rt::eprint(b"kr server: BUG: a follower request changed the store; rebuilding\n");
+            if let Some(c) = self.cluster.borrow().clone() {
+                c.rebuild(self);
+            }
+        }
         self.fv_mode.set(crate::fieldval::Mode::Ignore);
         (reply, core::mem::take(&mut *self.warnings.borrow_mut()))
+    }
+
+    /// Whether `req` may change the store (forwarded to the leader in HA mode). Review APIs,
+    /// streaming subresources and dry runs only read.
+    fn mutates(req: &Req) -> bool {
+        if !matches!(req.method, "POST" | "PUT" | "PATCH" | "DELETE") {
+            return false;
+        }
+        if req.query.split('&').any(|p| p == "dryRun=All") {
+            return false;
+        }
+        let p = req.path.trim_end_matches('/');
+        let review = ["tokenreviews", "subjectaccessreviews", "selfsubjectaccessreviews", "selfsubjectrulesreviews", "localsubjectaccessreviews", "selfsubjectreviews"].iter().any(|r| p.ends_with(r));
+        let stream = ["/exec", "/attach", "/portforward", "/proxy"].iter().any(|s| p.ends_with(s) || p.contains("/proxy/"));
+        !(review || stream)
     }
 
     /// Applies `fieldValidation` to unknown/duplicate field messages: reject (Strict), warn
@@ -1057,7 +1102,74 @@ impl ApiServer {
     }
 
     pub fn durable_rev(&self) -> u64 {
-        self.committer.durable_rev()
+        match self.cluster.borrow().as_ref() {
+            Some(c) => c.committed_rev(),
+            None => self.committer.durable_rev(),
+        }
+    }
+
+    /// Switches to HA mode: the store must be [`Store::replicated`].
+    pub fn set_cluster(&self, c: alloc::rc::Rc<crate::cluster::Cluster>) {
+        *self.cluster.borrow_mut() = Some(c);
+    }
+
+    pub fn cluster(&self) -> Option<alloc::rc::Rc<crate::cluster::Cluster>> {
+        self.cluster.borrow().clone()
+    }
+
+    /// In HA mode only the leader may change the store (a follower's store is exactly the
+    /// committed log); writes elsewhere are forwarded to the leader.
+    fn writable(&self) -> bool {
+        self.cluster.borrow().as_ref().is_none_or(|c| c.ready())
+    }
+
+    /// Idempotent bootstrap objects (system namespaces, default service accounts, RBAC policy,
+    /// built-in services, the node token, root CA ConfigMaps). In HA mode every newly ready
+    /// leader runs it (through Raft); elsewhere it is a no-op.
+    pub fn bootstrap_all(&self) {
+        if !self.writable() {
+            return;
+        }
+        let ns = resources::find("", "v1", "namespaces").unwrap();
+        for name in SYSTEM_NAMESPACES {
+            self.bootstrap_object(ns, None, name, "Namespace", &alloc::format!(r#"{{"metadata":{{"name":"{name}"}},"spec":{{"finalizers":["kubernetes"]}},"status":{{"phase":"Active"}}}}"#));
+        }
+        for n in SYSTEM_NAMESPACES {
+            self.ensure_default_sa(n);
+        }
+        if self.sa.borrow().is_some() {
+            self.bootstrap_policy();
+        }
+        let tok = self.boot_token.borrow().clone();
+        if let Some((id, secret)) = tok {
+            let _ = self.ensure_bootstrap_token(&id, &secret);
+        }
+        if let Some((ip, port)) = self.boot_services.get() {
+            let _ = self.ensure_builtin_services(ip, port);
+        }
+    }
+
+    /// Rebuilds the CRD registry from the store (after replicated changes or a restore).
+    pub fn reload_crds(&self) {
+        let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") else { return };
+        let (crds, _) = self.store.borrow().list(&r.prefix(), None, 0);
+        let crds: Vec<Value> = crds.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect();
+        let names: Vec<String> = crds.iter().filter_map(|v| v.pointer(&["metadata", "name"]).and_then(Value::as_str).map(String::from)).collect();
+        self.custom.borrow_mut().retain(|c| names.iter().any(|n| *n == c.crd));
+        for v in &crds {
+            self.register_crd(v);
+        }
+    }
+
+    /// Store key prefix of CRD objects.
+    pub fn crd_prefix() -> String {
+        resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions").map(|r| r.prefix()).unwrap_or_default()
+    }
+
+    /// SHA-256 of the full store image (keys, values, revisions): equal on every HA server once
+    /// they applied the same log.
+    pub fn store_digest(&self) -> [u8; 32] {
+        kr_crypto::sha2::sha256(&self.store.borrow().image())
     }
 
     /// The store's current revision (a request that advanced it wrote something).
@@ -1065,8 +1177,17 @@ impl ApiServer {
         self.store.borrow().revision()
     }
 
-    /// Resolves once every write up to `rev` is fsynced (group commit, fsync off the event loop).
+    /// Resolves once every write up to `rev` is durable: fsynced locally (group commit, fsync off
+    /// the event loop), or in HA mode committed by a majority of servers.
     pub async fn commit(&self, rev: u64) -> Result<(), ()> {
+        let cluster = self.cluster.borrow().clone();
+        if let Some(c) = cluster {
+            let recs = self.store.borrow_mut().take_records();
+            if !recs.is_empty() {
+                c.propose(recs).map_err(|_| ())?;
+            }
+            return c.wait_rev(rev).await.map_err(|_| ());
+        }
         let fd = self.store.borrow().log_fd();
         let written = || self.store.borrow_mut().write_out().unwrap_or(0);
         if self.store.borrow_mut().write_out().is_err() {
@@ -1078,6 +1199,9 @@ impl ApiServer {
     /// Rewrites the log into a snapshot when it has grown far beyond the live data. Blocking
     /// (snapshot write + fsyncs); call it rarely, from a background task.
     pub fn maybe_compact(&self) {
+        if self.cluster.borrow().is_some() {
+            return; // HA: Raft snapshots replace store compaction
+        }
         let mut s = self.store.borrow_mut();
         if s.log_oversized() {
             let _ = s.compact(0);
@@ -1715,6 +1839,10 @@ impl ApiServer {
 
     /// Creates `default/kubernetes` (pointing at `advertise:port`) and `kube-system/kube-dns`.
     pub fn ensure_builtin_services(&self, advertise: [u8; 4], port: u16) -> Result<(), ApiError> {
+        self.boot_services.set(Some((advertise, port)));
+        if !self.writable() {
+            return Ok(());
+        }
         let svc = resources::find("", "v1", "services").unwrap();
         let ep = resources::find("", "v1", "endpoints").unwrap();
         let ip = alloc::format!("{}.{}.{}.{}", advertise[0], advertise[1], advertise[2], advertise[3]);
@@ -1855,6 +1983,9 @@ impl ApiServer {
 
     /// Creates the `default` ServiceAccount in a namespace (the ServiceAccount controller's job).
     fn ensure_default_sa(&self, ns: &str) {
+        if !self.writable() {
+            return;
+        }
         let Some(sa) = resources::find("", "v1", "serviceaccounts") else { return };
         let key = sa.key(Some(ns), "default");
         if self.store.borrow().get(&key).is_some() {
@@ -2222,4 +2353,10 @@ fn eph_only(old: &Value, new: &mut Value) -> R<()> {
     }
     *new = out;
     Ok(())
+}
+
+/// 503 for a write that reached a follower; the HTTP layer forwards it to the leader.
+pub(crate) fn not_leader(leader: Option<u64>) -> ApiError {
+    let hint = leader.map(|l| alloc::format!(" (leader: server {l})")).unwrap_or_default();
+    ApiError::new(503, "ServiceUnavailable", alloc::format!("this server is not the leader{hint}; retry"))
 }

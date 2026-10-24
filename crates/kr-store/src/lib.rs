@@ -237,6 +237,42 @@ impl Store {
         Ok(self.rev)
     }
 
+    pub fn is_replicated(&self) -> bool {
+        self.repl.is_some()
+    }
+
+    /// Whether any record in `data` touches a key under `prefix`.
+    pub fn records_touch(data: &[u8], prefix: &str) -> bool {
+        let mut off = 0;
+        while off < data.len() {
+            match wal::parse(data, off) {
+                Parsed::Rec(rec) => {
+                    if rec.key.starts_with(prefix) {
+                        return true;
+                    }
+                    off = rec.end;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// The revision of the last record in `data` (a Raft entry's payload), if any.
+    pub fn records_last_rev(data: &[u8]) -> Option<u64> {
+        let (mut off, mut last) = (0, None);
+        while off < data.len() {
+            match wal::parse(data, off) {
+                Parsed::Rec(rec) => {
+                    last = Some(rec.rev);
+                    off = rec.end;
+                }
+                _ => return last,
+            }
+        }
+        last
+    }
+
     /// Releases watch events up to `rev` (the committed revision).
     pub fn set_visible(&mut self, rev: u64) {
         if rev <= self.visible && self.visible != u64::MAX {

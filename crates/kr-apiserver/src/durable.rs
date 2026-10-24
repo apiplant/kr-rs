@@ -95,6 +95,11 @@ impl Committer {
         }
     }
 
+    /// fsyncs `fd` off the event loop (the helper process), falling back to inline.
+    pub async fn fsync_fd(&self, fd: i32) -> bool {
+        self.fsync(fd).await
+    }
+
     async fn fsync(&self, fd: i32) -> bool {
         if self.want_helper.get() && self.helper.borrow().is_none() {
             *self.helper.borrow_mut() = spawn_helper().map(Rc::new);
