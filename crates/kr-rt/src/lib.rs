@@ -39,6 +39,14 @@ core::arch::global_asm!(
     "brk #0",
 );
 
+/// compiler_builtins' aarch64 outline atomics probe HWCAP_ATOMICS through libc's `getauxval`.
+/// Reporting no capabilities selects the always-correct LL/SC fallback paths.
+#[cfg(all(target_arch = "aarch64", not(any(test, feature = "host"))))]
+#[no_mangle]
+pub extern "C" fn getauxval(_ty: usize) -> usize {
+    0
+}
+
 /// Iterator over argv entries (without the trailing NUL).
 #[derive(Clone)]
 pub struct Args {

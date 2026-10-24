@@ -5,8 +5,9 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 # Needs work (open or partial)
 
 ## kr-sys
-11. **aarch64 path is untested** — *open*
-    It compiles under cfg but has never run. Plan: a qemu-user CI job.
+11. **aarch64 path is only partly exercised** — *mostly fixed*
+    `tools/test/aarch64.sh` cross-builds `kr` (aarch64-unknown-linux-gnu, rust-lld shim, no cross gcc) and runs under `qemu-aarch64`: `version`, `sleep-test` and the HTTP `echo` server pass; unit tests of kr-sys, kr-rt, kr-fmt, kr-crypto, kr-archive, kr-store and kr-net pass (aarch64 musl, self-contained). Fixed: missing `getauxval` (compiler_builtins outline atomics) broke linking.
+    Remaining: `kr ctr`/kubelet/apiserver paths (namespaces, cgroups, clone3, mounts) are not run under qemu-user and need a real aarch64 host; no CI job yet.
 
 ## kr-net
 31. **Registry auth supports anonymous Bearer tokens only** — *mostly fixed* (13ba669)
