@@ -1,6 +1,6 @@
 //! Namespace / process syscalls (clone3, mount, pivot_root, ...), used by kr-runtime::container.
 
-use super::{check, nr, syscall0, syscall1, syscall2, syscall3, syscall4, syscall5, Errno, Fd, Result};
+use super::{check, nr, syscall1, syscall2, syscall3, syscall4, syscall5, Errno, Fd, Result};
 
 #[cfg(target_arch = "x86_64")]
 mod n {
@@ -213,7 +213,7 @@ pub fn pause_loop() -> ! {
     #[cfg(target_arch = "x86_64")]
     loop {
         // SAFETY: pause takes no arguments (x86_64 syscall 34).
-        let _ = unsafe { syscall0(34) };
+        let _ = unsafe { super::syscall0(34) };
     }
     #[cfg(target_arch = "aarch64")]
     loop {

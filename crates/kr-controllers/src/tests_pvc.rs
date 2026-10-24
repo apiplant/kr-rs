@@ -46,7 +46,7 @@ fn dynamic_provisioning_and_delete_reclaim() {
         assert!(get_opt(&c, &alloc::format!("{PVS}/{pv_name}")).await.unwrap().is_none());
         let cur = c.get(&alloc::format!("{CLAIMS}/data")).await.unwrap();
         assert_eq!(cur.pointer(&["metadata", "finalizers"]).and_then(Value::as_array).map(|a| a.len()), Some(1));
-        assert_eq!(str_at(&cur, &["status", "phase"]), "");
+        assert_eq!(str_at(&cur, &["status", "phase"]), "Pending"); // API default until bound
 
         c.create(PODS, &pod_with("app", "data")).await.unwrap();
         wait_until("claim bound", || async { phase(&c, &alloc::format!("{CLAIMS}/data")).await == "Bound" }).await;
@@ -110,7 +110,7 @@ fn static_binding_picks_the_smallest_fit() {
         let huge = v(r#"{"metadata":{"name":"c3"},"spec":{"storageClassName":"manual","accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"100Gi"}}}}"#);
         c.create(CLAIMS, &huge).await.unwrap();
         sleep(400).await;
-        assert_eq!(phase(&c, &alloc::format!("{CLAIMS}/c3")).await, "");
+        assert_eq!(phase(&c, &alloc::format!("{CLAIMS}/c3")).await, "Pending");
         // Deleting a claim releases a Retain-less static PV (default policy Retain).
         c.delete(&alloc::format!("{CLAIMS}/c1")).await.unwrap();
         wait_until("released", || async { phase(&c, &alloc::format!("{PVS}/small")).await == "Released" }).await;

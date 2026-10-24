@@ -249,7 +249,8 @@ async fn sync_pv<C: Client>(c: &C, pv: &Value, claims: &[Value]) -> Result<()> {
     let path = alloc::format!("{PVS}/{}", name(pv));
     let phase = str_at(pv, &["status", "phase"]);
     if str_at(pv, &["spec", "claimRef", "name"]).is_empty() {
-        if phase.is_empty() {
+        // New PVs start Pending (API defaulting); unclaimed ones become Available.
+        if phase.is_empty() || phase == "Pending" {
             set_phase(c, &path, "Available").await?;
         }
         return Ok(());
