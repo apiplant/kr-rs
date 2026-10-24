@@ -16,7 +16,9 @@
 //!   free indexes are started first. `status.completedIndexes` lists the succeeded ones.
 //! * **backoffLimit** (default 6): the job fails with `BackoffLimitExceeded` when the failed
 //!   pods (plus container restarts of active pods when `restartPolicy` is OnFailure) exceed it.
-//!   Replacement pods are created immediately (the exponential delay is not modelled).
+//!   Replacement pods are delayed like upstream: `Config::job_backoff_ms` (10 s) times
+//!   2^(failures - 1), capped at 6 minutes, counted from the latest pod failure (the newest
+//!   container `finishedAt`, else the pod's deletion/creation time).
 //! * **activeDeadlineSeconds**: measured from `status.startTime`; exceeding it fails the job with
 //!   `DeadlineExceeded`. The check is re-run when the deadline is due.
 //! * **suspend**: active pods are deleted, `startTime` cleared, condition `Suspended`; resuming
@@ -95,6 +97,14 @@ fn pod_index(p: &Value) -> Option<i64> {
 
 fn restarts(p: &Value) -> i64 {
     p.pointer(&["status", "containerStatuses"]).and_then(Value::as_array).map(|a| a.iter().map(|s| int_at(s, &["restartCount"], 0)).sum()).unwrap_or(0)
+}
+
+const MAX_BACKOFF_MS: u64 = 360_000;
+
+/// Unix seconds at which the pod failed.
+fn failure_time(p: &Value) -> i64 {
+    let finished = p.pointer(&["status", "containerStatuses"]).and_then(Value::as_array).into_iter().flatten().filter_map(|s| parse_time(str_at(s, &["state", "terminated", "finishedAt"]))).max();
+    finished.or_else(|| parse_time(str_at(p, &["metadata", "creationTimestamp"]))).unwrap_or(0)
 }
 
 fn ms_until(secs: i64) -> u64 {
@@ -255,7 +265,18 @@ pub async fn reconcile<C: Client>(c: &C, cfg: &Config, ns: &str, jname: &str) ->
             None if succeeded > 0 => 0,
             None => parallelism,
         };
-        let missing = want_active - active_pods.len() as i64;
+        let mut missing = want_active - active_pods.len() as i64;
+        if missing > 0 && failed_pods > 0 {
+            // Back off after failures: wait base * 2^(failures-1) since the last one.
+            let last = mine.iter().filter(|p| str_at(p, &["status", "phase"]) == "Failed").map(failure_time).max().unwrap_or(0);
+            let delay = cfg.job_backoff_ms.saturating_mul(1u64 << (failed_pods - 1).min(20)).min(MAX_BACKOFF_MS);
+            let due = (last.max(0) as u64) * 1000 + delay;
+            let now_ms = now.max(0) as u64 * 1000;
+            if now_ms < due {
+                wait = Some(due - now_ms + 50);
+                missing = 0;
+            }
+        }
         if missing > 0 {
             if indexed {
                 let n = completions.unwrap_or(0);
@@ -278,7 +299,8 @@ pub async fn reconcile<C: Client>(c: &C, cfg: &Config, ns: &str, jname: &str) ->
             }
         }
         if let (Some(d), Some(s)) = (deadline, started) {
-            wait = Some(ms_until(s + d - now));
+            let w = ms_until(s + d - now);
+            wait = Some(wait.map_or(w, |b| b.min(w)));
         }
     }
 

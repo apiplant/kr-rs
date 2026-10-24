@@ -52,12 +52,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     - Remaining: PVCs (no storage provisioner).
 75. **Resource requests are not enforced** — *partly fixed*
     CPU requests become `cpu.weight` (upstream formula); memory requests become `memory.min` (Guaranteed) or `memory.low` (Burstable), skipped silently when the memory controller is not delegated; `status.qosClass` is computed as upstream; the node `MemoryPressure` condition is True when MemAvailable < 100Mi. Remaining: eviction, a pod-level cgroup grouping (container cgroups are flat siblings), and live verification in docker.
-76. **Controllers are basic** — *mostly fixed*
-    StatefulSet, DaemonSet, Job, CronJob and Endpoints/EndpointSlice controllers exist (49 tests), and Job admission defaulting is in.
-    Remaining:
-    - Deployment pause/progress deadline/minReadySeconds;
-    - Job backoff delay;
-    - the namespace controller (deletion is still synchronous).
 
 ## Services, DNS, multi-node (phase 5, ADR-022)
 80. **host-gw networking only** — *open*
@@ -73,18 +67,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     Mutating then validating webhooks (admission.k8s.io/v1) run for CREATE/UPDATE/DELETE of resources and `/status` (not other subresources, not DELETE collection, no CONNECT). The write path stays synchronous: the request is dry-run through the built-in handler, the webhooks run (the only awaits) on that result, then the real request executes (with the mutated object as the body if patched), so built-in admission runs twice, webhooks see the object after built-in admission, and the dry-run and the write are not atomic. Webhooks run sequentially; `reinvocationPolicy` and `matchPolicy: Equivalent` are ignored, response `warnings` are dropped, only `JSONPatch` patches are supported, `caBundle` is required (no system roots), and configurations are read from the store per request (no cache). matchConditions use a small CEL subset: `== != < <= > >= ! && || in +`, field/index access, `has()`, `size()`, string `startsWith/endsWith/contains`, literals and lists; any other expression is an evaluation error handled by `failurePolicy`. admissionregistration.k8s.io objects are never sent to webhooks.
 
 # Accepted limitations (by design, or not planned for now)
-
-## Runtime (kr-rt)
-3. **Allocator is single-threaded** — *accepted (phase 0)*
-   UB if threads are ever added. It must get per-thread slabs or a lock before N-worker mode lands.
-5. **Chunk tail waste** — *accepted*
-   Up to 2 KiB is lost per 64 KiB chunk when a class is refilled.
-7. **Wakers are `Send + Sync` by type but not thread-safe** — *accepted*
-   They wrap a non-atomic `Rc`. Sending one to another thread is UB. Must be revisited together with #3.
-8. **Stale epoll events after a slot is reused** — *accepted*
-   A stale event only sets a readiness flag spuriously, and EAGAIN handling absorbs it. Plan: add generation tags if this ever causes trouble.
-9. **`block_on` panics with "deadlock" when there is no work** — *accepted*
-   This is intended, but it is a panic rather than an error.
 
 ## kr-net
 28. **HTTP/1.1 client limits** — *accepted*
@@ -128,8 +110,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     After a restart, watching from an older resourceVersion returns 410 and clients relist, which is standard Kubernetes recovery.
 67. **No aggregated discovery, no HTTP/2, no OpenAPI schemas** — *accepted for now*
     kubectl falls back to legacy discovery and HTTP/1.1. `kubectl explain` does not work.
-68. **Namespace deletion is synchronous** — *accepted*
-    Contents are deleted inline rather than by a namespace controller, and finalizers inside the namespace are not honoured during this cascade.
 
 ## Node agent and controllers (phase 4)
 78. **exec/probe processes join the container cgroup slightly late** — *accepted*
@@ -144,6 +124,18 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     The zone snapshot is rebuilt every second from full lists, which is fine for small clusters.
 85. **SPDY exec: no TTY resize, v4 only** — *accepted*
     The `resize` stream is accepted and ignored; clients offering only v1–v3 are refused.
+
+## Runtime (kr-rt)
+3. **Allocator is single-threaded** — *accepted (phase 0)*
+   UB if threads are ever added. It must get per-thread slabs or a lock before N-worker mode lands.
+5. **Chunk tail waste** — *accepted*
+   Up to 2 KiB is lost per 64 KiB chunk when a class is refilled.
+7. **Wakers are `Send + Sync` by type but not thread-safe** — *accepted*
+   They wrap a non-atomic `Rc`. Sending one to another thread is UB. Must be revisited together with #3.
+8. **Stale epoll events after a slot is reused** — *accepted*
+   A stale event only sets a readiness flag spuriously, and EAGAIN handling absorbs it. Plan: add generation tags if this ever causes trouble.
+9. **`block_on` panics with "deadlock" when there is no work** — *accepted*
+   This is intended, but it is a panic rather than an error.
 
 ## kr-runtime store / unpack / pull
 36. **Store root env is read from `/proc/self/environ`** — *accepted*
@@ -187,21 +179,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 
 # Resolved
 
-## Runtime (kr-rt)
-1. **Pending task + Async forms an Rc cycle** — *fixed* (commit: 68940ad)
-   The task owns the future, the future owns the `Async`, the `Async`'s I/O slot owns a waker, and the waker owns the task. A task that never completes is never freed.
-   Plan: add `JoinHandle::abort()` to drop the future and break the cycle, and add a live-task counter for leak detection. Rule: every network wait must have a deadline.
-   Fix: `JoinHandle::abort()` drops the future immediately, and the handle then resolves to `Err(Aborted)` (the output is now `Result<T, Aborted>`, and there is also `is_finished()`). `exec::live_tasks()` counts tasks until their `Task` is freed, and `kr sleep-test` asserts on it (`live_tasks_ok`). A task that never completes and has no deadline or abort is still a leak hazard by design.
-2. **`sleep` can fire up to 1 ms early** — *fixed* (commit: 68940ad)
-   The millisecond clock is truncated. Plan: round deadlines up, so a sleep never fires before it was asked to.
-   Fix: deadlines are computed in ns (`now_ns`), `Sleep` completes only when `now_ns >= deadline`, and the wheel entry uses `ceil(deadline_ns / 1e6)`. `kr sleep-test` verifies every elapsed time is >= the requested one.
-4. **Allocator never returns small blocks to the OS** — *fixed (e64a857)*
-   RSS grows to peak usage and stays there. Fine for the agent, but it could matter for a long-running server. Fix: 64 KiB-aligned per-class chunks with live counts; an emptied non-current chunk is madvised (header page kept) and reused, with no re-mmap.
-6. **Large allocations with alignment above 4096 are not honoured** — *fixed (e64a857)*
-   They go through mmap, which only guarantees page alignment. Fix: over-allocate with mmap and munmap the head/tail so the pointer has the requested alignment.
-10. **mem\* are byte-by-byte on non-x86_64, and memcmp/bcmp everywhere** — *fixed (e64a857)*
-    Fix: word-at-a-time memcpy/memmove/memset (non-x86_64) and memcmp/bcmp, volatile stores keep them from becoming self-calls; exhaustive tests.
-
 ## kr-net
 25. **No DNS: only IP literals, `/etc/hosts` and a built-in `localhost`** — *fixed*
     kr-net has a UDP/TCP stub resolver (`dns.rs`, `SystemResolver`: /etc/hosts then resolv.conf nameservers). IPv6 zone ids are still not parsed.
@@ -211,9 +188,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     It now re-exports `kr_crypto::sha2`.
 30. **Keep-alive pool has no idle timeout** — *fixed* (13ba669)
     `Config::idle_timeout_ms` (default 90 s): idle connections older than that are dropped, never reused. Remaining: no proactive EOF/readability probe before reuse (a server-closed connection is still found on use, with the existing one retry for GET/HEAD) and no background eviction timer (expiry runs on pool take/put).
-
-## kr-sys (cont.)
-35. **`syscall0..6` lack `# Safety` docs (clippy `missing_safety_doc`)** — *fixed (e64a857)*
 
 ## kr-runtime: isolation (container.rs, security.rs, cgroup.rs)
 43. **Rootless maps a single uid/gid** — *fixed*
@@ -253,6 +227,8 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     - ServiceAccount tokens: ES256 JWTs via TokenRequest, optionally pod-bound; revoked when the SA or pod is deleted.
     - Bearer authentication; `kubectl auth can-i` works via SelfSubjectAccessReview.
     - Remaining: aggregated ClusterRoles (aggregationRule), bootstrap tokens for joining nodes, and the TokenReview/SubjectAccessReview APIs.
+68. **Namespace deletion is synchronous** — *fixed* (kr-controllers `namespace`)
+    DELETE now sets `Terminating`; the namespace controller empties it (built-in and CRD resources, honouring finalizers and graceful pod deletion) and finalizes it.
 69. **No garbage collection by ownerReferences** — *fixed*
     `kr-controllers/src/gc.rs` deletes dependents whose owners are gone (background propagation) and honours orphan/foreground deletion.
 
@@ -269,6 +245,9 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     Remaining limits:
     - The host cannot reach pod IPs directly (use port-forward).
     - Pods have no outbound internet rootless; that needs a user-mode network stack (slirp/pasta-like).
+76. **Controllers are basic** — *fixed*
+    Deployment (pause, progress deadline, minReadySeconds), StatefulSet, DaemonSet, Job (with pod failure backoff), CronJob, Endpoints/EndpointSlice and the namespace controller exist.
+    Remaining gaps: no proportional scaling during a rollout, no adoption of orphan ReplicaSets, namespace deletion conditions are limited to `NamespaceContentRemaining`.
 77. **Image pulls block the kubelet sync loop** — *fixed*
     Pulls run as background tasks; failures back off and are reported as `ImagePullBackOff`.
 
@@ -282,6 +261,21 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 90. **Pod sandbox holder costs ~0.6–0.9 MB PSS per pod** — *fixed* (commits: 8f76327, bfd9d3e)
     After setup the holder execveats kr (O_PATH|O_CLOEXEC fd of /proc/self/exe) as `kr pause` with an empty environment and all other fds closed: ~77 kB PSS per pod instead of ~700 kB. If the exec fails it silently falls back to the old in-process pause.
 
+## Runtime (kr-rt)
+1. **Pending task + Async forms an Rc cycle** — *fixed* (commit: 68940ad)
+   The task owns the future, the future owns the `Async`, the `Async`'s I/O slot owns a waker, and the waker owns the task. A task that never completes is never freed.
+   Plan: add `JoinHandle::abort()` to drop the future and break the cycle, and add a live-task counter for leak detection. Rule: every network wait must have a deadline.
+   Fix: `JoinHandle::abort()` drops the future immediately, and the handle then resolves to `Err(Aborted)` (the output is now `Result<T, Aborted>`, and there is also `is_finished()`). `exec::live_tasks()` counts tasks until their `Task` is freed, and `kr sleep-test` asserts on it (`live_tasks_ok`). A task that never completes and has no deadline or abort is still a leak hazard by design.
+2. **`sleep` can fire up to 1 ms early** — *fixed* (commit: 68940ad)
+   The millisecond clock is truncated. Plan: round deadlines up, so a sleep never fires before it was asked to.
+   Fix: deadlines are computed in ns (`now_ns`), `Sleep` completes only when `now_ns >= deadline`, and the wheel entry uses `ceil(deadline_ns / 1e6)`. `kr sleep-test` verifies every elapsed time is >= the requested one.
+4. **Allocator never returns small blocks to the OS** — *fixed (e64a857)*
+   RSS grows to peak usage and stays there. Fine for the agent, but it could matter for a long-running server. Fix: 64 KiB-aligned per-class chunks with live counts; an emptied non-current chunk is madvised (header page kept) and reused, with no re-mmap.
+6. **Large allocations with alignment above 4096 are not honoured** — *fixed (e64a857)*
+   They go through mmap, which only guarantees page alignment. Fix: over-allocate with mmap and munmap the head/tail so the pointer has the requested alignment.
+10. **mem\* are byte-by-byte on non-x86_64, and memcmp/bcmp everywhere** — *fixed (e64a857)*
+    Fix: word-at-a-time memcpy/memmove/memset (non-x86_64) and memcmp/bcmp, volatile stores keep them from becoming self-calls; exhaustive tests.
+
 ## kr-runtime store / unpack / pull
 39. **Layer diff_ids are verified** — *fixed* (commit: 38ed253)
     The pull hashes each uncompressed layer tar while inflating and compares it with `rootfs.diff_ids[i]`, failing on mismatch. Still open: zstd layers (`+zstd`) are rejected with `Error::Image`. Pulled-image refs are never refreshed (a moved `:latest` is not re-fetched once present).
@@ -294,6 +288,9 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 
 ## kr-fmt
 18. **14 clippy style lints in kr-fmt** — *fixed* (commit: )
+
+## kr-sys (cont.)
+35. **`syscall0..6` lack `# Safety` docs (clippy `missing_safety_doc`)** — *fixed (e64a857)*
 
 ## Echo server (demo only)
 12. **The 431 path closes with unread data, so the client may see a TCP RST** — *fixed* (commit: 68940ad)

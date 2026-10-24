@@ -69,7 +69,7 @@ pub(crate) fn rng(b: &mut [u8]) {
 }
 
 pub(crate) fn cfg() -> Config {
-    Config { resync_ms: 150, gc_ms: 60, backoff_ms: 30, retry_ms: 60, now: || CLOCK.load(Ordering::SeqCst) }
+    Config { resync_ms: 150, gc_ms: 60, backoff_ms: 30, retry_ms: 60, job_backoff_ms: 0, now: || CLOCK.load(Ordering::SeqCst) }
 }
 
 pub(crate) fn v(s: &str) -> Value {
@@ -78,6 +78,15 @@ pub(crate) fn v(s: &str) -> Value {
 
 /// Runs `f` with the controllers and a fake kubelet running; stops them afterwards.
 pub(crate) fn scenario<F, Fut>(f: F)
+where
+    F: FnOnce(InProcess) -> Fut + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    scenario_with(|c| c, f)
+}
+
+/// Like [`scenario`] with the timing config adjusted by `tweak`.
+pub(crate) fn scenario_with<F, Fut>(tweak: fn(Config) -> Config, f: F)
 where
     F: FnOnce(InProcess) -> Fut + 'static,
     Fut: Future<Output = ()> + 'static,
@@ -92,7 +101,7 @@ where
     let api = Rc::new(ApiServer::new(kr_store::Store::in_memory(), || CLOCK.load(Ordering::SeqCst), rng, "127.0.0.1:6443".to_string()).unwrap());
     let c = InProcess::new(api, "test");
     block_on(async move {
-        let ctl = spawn(run_all_with(c.clone(), cfg()));
+        let ctl = spawn(run_all_with(c.clone(), tweak(cfg())));
         let kubelet = spawn(kubelet(c.clone()));
         f(c).await;
         ctl.abort();
@@ -122,7 +131,8 @@ async fn kubelet(c: InProcess) {
                 match str_at(&p, &["status", "phase"]) {
                     "" | "Pending" => {
                         let ip = alloc::format!("10.244.0.{}", NEXT_IP.fetch_add(1, Ordering::SeqCst));
-                        let st = v(&alloc::format!(r#"{{"status":{{"phase":"Running","podIP":"{ip}","podIPs":[{{"ip":"{ip}"}}],"conditions":[{{"type":"Ready","status":"True"}}]}}}}"#));
+                        let ready_at = rfc3339(CLOCK.load(Ordering::SeqCst));
+                        let st = v(&alloc::format!(r#"{{"status":{{"phase":"Running","podIP":"{ip}","podIPs":[{{"ip":"{ip}"}}],"conditions":[{{"type":"Ready","status":"True","lastTransitionTime":"{ready_at}"}}]}}}}"#));
                         let _ = c.patch(&alloc::format!("{path}/status"), MERGE, &st).await;
                     }
                     "Running" if FINISH.load(Ordering::SeqCst) => {
@@ -131,7 +141,8 @@ async fn kubelet(c: InProcess) {
                             "fail" => "Failed",
                             _ => continue,
                         };
-                        let st = v(&alloc::format!(r#"{{"status":{{"phase":"{phase}","conditions":[{{"type":"Ready","status":"False"}}]}}}}"#));
+                        let fin = rfc3339(CLOCK.load(Ordering::SeqCst));
+                        let st = v(&alloc::format!(r#"{{"status":{{"phase":"{phase}","conditions":[{{"type":"Ready","status":"False"}}],"containerStatuses":[{{"name":"c","state":{{"terminated":{{"exitCode":1,"finishedAt":"{fin}"}}}}}}]}}}}"#));
                         let _ = c.patch(&alloc::format!("{path}/status"), MERGE, &st).await;
                     }
                     _ => {}
@@ -484,5 +495,65 @@ fn quota_scopes_select_pods() {
         c.create(pp, &v(r#"{"metadata":{"name":"best"},"spec":{"containers":[{"name":"c","image":"i"}]}}"#)).await.unwrap();
         c.create(pp, &v(r#"{"metadata":{"name":"burst"},"spec":{"containers":[{"name":"c","image":"i","resources":{"requests":{"cpu":"100m"}}}]}}"#)).await.unwrap();
         wait_until("only the best-effort pod counts", || async { quota_used(&c.get(&alloc::format!("{qp}/be")).await.unwrap(), "pods").as_deref() == Some("1") }).await;
+    });
+}
+
+#[test]
+fn deployment_paused_blocks_rollout_until_resumed() {
+    scenario(|c| async move {
+        c.create("/api/v1/nodes", &node("n1", "{}", "[]", "4")).await.unwrap();
+        c.create(DEPLOYMENTS, &deployment(2, "app:1", "")).await.unwrap();
+        wait_until("complete at 2", || complete(&c, 2)).await;
+        c.patch(&alloc::format!("{DEPLOYMENTS}/web"), MERGE, &v(r#"{"spec":{"paused":true}}"#)).await.unwrap();
+        set_image(&c, "app:2").await;
+        wait_until("DeploymentPaused", || async { cond(&deployment_status(&c).await, "Progressing").is_some_and(|p| str_at(p, &["reason"]) == "DeploymentPaused") }).await;
+        sleep(400).await;
+        assert_eq!(replicasets_now(&c).await.len(), 1, "no new ReplicaSet while paused");
+        // Scaling still works while paused.
+        scale_to(&c, 3).await;
+        wait_until("scaled while paused", || async { live_pods(&c).await.len() == 3 && int_at(&replicasets_now(&c).await[0], &["spec", "replicas"], 0) == 3 }).await;
+        assert_eq!(replicasets_now(&c).await.len(), 1);
+        c.patch(&alloc::format!("{DEPLOYMENTS}/web"), MERGE, &v(r#"{"spec":{"paused":false}}"#)).await.unwrap();
+        wait_until("rolled out after resume", || async { replicasets_now(&c).await.len() == 2 && complete(&c, 3).await }).await;
+        assert!(live_pods(&c).await.iter().all(|p| p.pointer(&["spec", "containers"]).and_then(Value::as_array).is_some_and(|cs| str_at(&cs[0], &["image"]) == "app:2")));
+    });
+}
+
+#[test]
+fn deployment_progress_deadline_exceeded_then_recovers() {
+    scenario(|c| async move {
+        c.create("/api/v1/nodes", &node("n1", "{}", "[]", "4")).await.unwrap();
+        HOLD_ALL.store(true, Ordering::SeqCst);
+        c.create(DEPLOYMENTS, &deployment(2, "app:1", r#","progressDeadlineSeconds":20"#)).await.unwrap();
+        wait_until("Progressing=True", || async { cond(&deployment_status(&c).await, "Progressing").is_some_and(|p| str_at(p, &["status"]) == "True" && str_at(p, &["reason"]) != "NewReplicaSetAvailable") }).await;
+        let d = deployment_status(&c).await;
+        assert_eq!(str_at(cond(&d, "Available").unwrap(), &["reason"]), "MinimumReplicasUnavailable");
+        advance_clock(10);
+        sleep(400).await;
+        assert_eq!(str_at(cond(&deployment_status(&c).await, "Progressing").unwrap(), &["status"]), "True", "not yet due");
+        advance_clock(15);
+        wait_until("deadline exceeded", || async { cond(&deployment_status(&c).await, "Progressing").is_some_and(|p| str_at(p, &["status"]) == "False" && str_at(p, &["reason"]) == "ProgressDeadlineExceeded") }).await;
+        HOLD_ALL.store(false, Ordering::SeqCst);
+        wait_until("recovered", || complete(&c, 2)).await;
+    });
+}
+
+#[test]
+fn deployment_min_ready_seconds_gates_availability() {
+    scenario(|c| async move {
+        c.create("/api/v1/nodes", &node("n1", "{}", "[]", "4")).await.unwrap();
+        c.create(DEPLOYMENTS, &deployment(2, "app:1", r#","minReadySeconds":30"#)).await.unwrap();
+        wait_until("2 ready, none available", || async {
+            let d = deployment_status(&c).await;
+            int_at(&d, &["status", "readyReplicas"], 0) == 2 && int_at(&d, &["status", "availableReplicas"], -1) == 0
+        })
+        .await;
+        sleep(300).await;
+        let d = deployment_status(&c).await;
+        assert_eq!(int_at(&d, &["status", "availableReplicas"], -1), 0);
+        assert_eq!(str_at(cond(&d, "Available").unwrap(), &["status"]), "False");
+        assert_eq!(int_at(&replicasets_now(&c).await[0], &["status", "availableReplicas"], -1), 0);
+        advance_clock(31);
+        wait_until("available after minReadySeconds", || complete(&c, 2)).await;
     });
 }

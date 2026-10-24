@@ -15,17 +15,24 @@
 //!   surge rounded up and unavailable rounded down; both 0 means unavailable 1. Like upstream:
 //!   first scale the new ReplicaSet up within `desired + maxSurge` in total, otherwise first
 //!   clean up unhealthy old replicas and then scale old ReplicaSets down (oldest first) while
-//!   `available >= desired - maxUnavailable`, using the ready counts from ReplicaSet status.
+//!   `available >= desired - maxUnavailable`, using the available counts from ReplicaSet status
+//!   (a pod is available after being Ready for `minReadySeconds`; the ReplicaSets compute it and
+//!   inherit `spec.minReadySeconds`).
 //!   One step per reconcile; the resulting ReplicaSet events trigger the next.
 //! * **History.** Old ReplicaSets at 0 replicas and 0 pods beyond `revisionHistoryLimit`
 //!   (default 10) are deleted, oldest revision first.
 //! * **Status.** `replicas`, `updatedReplicas`, `readyReplicas`, `availableReplicas`,
-//!   `unavailableReplicas`, `observedGeneration` and conditions `Available` and `Progressing`
-//!   (`NewReplicaSetAvailable` once complete), written through `deployments/{name}/status`
-//!   only when something other than a timestamp changed.
+//!   `unavailableReplicas`, `observedGeneration` and conditions `Available` and `Progressing`,
+//!   written through `deployments/{name}/status` only when something other than a timestamp
+//!   changed. `Progressing` follows upstream: `NewReplicaSetCreated` / `FoundNewReplicaSet` /
+//!   `ReplicaSetUpdated` (True, `lastUpdateTime` refreshed whenever the replica counts move),
+//!   `NewReplicaSetAvailable` once complete, `ProgressDeadlineExceeded` (False) when no
+//!   progress was made for `progressDeadlineSeconds` (default 600), and `DeploymentPaused`
+//!   (Unknown) while paused.
+//! * **Pause.** With `spec.paused` no ReplicaSet is created and no rollout step is taken; only a
+//!   plain scale of the single live ReplicaSet to `spec.replicas` happens. Resuming continues.
 //!
-//! Not modelled: pausing, progress deadlines, proportional scaling during a rollout, adoption
-//! of orphan ReplicaSets.
+//! Not modelled: proportional scaling during a rollout, adoption of orphan ReplicaSets.
 
 use crate::util::*;
 use crate::Config;
@@ -184,6 +191,8 @@ pub async fn reconcile<C: Client>(c: &C, cfg: &Config, ns: &str, dname: &str) ->
     olds.sort_by(|a, b| (str_at(a, &["metadata", "creationTimestamp"]), revision_of(a), name(a)).cmp(&(str_at(b, &["metadata", "creationTimestamp"]), revision_of(b), name(b))));
     let want_rev = olds.iter().map(revision_of).max().unwrap_or(0) + 1;
 
+    let paused = d.pointer(&["spec", "paused"]).and_then(Value::as_bool) == Some(true);
+    let mut created = false;
     let mut new_rs = match new_rs {
         Some(mut rs) => {
             if revision_of(&rs) < want_rev {
@@ -191,42 +200,71 @@ pub async fn reconcile<C: Client>(c: &C, cfg: &Config, ns: &str, dname: &str) ->
                 c.patch(&alloc::format!("{}/{}", replicasets(Some(ns)), name(&rs)), MERGE, &patch).await?;
                 rs.entry_object("metadata").entry_object("annotations").set(REVISION, Value::String(want_rev.to_string()));
             }
-            rs
+            let min_ready = d.pointer(&["spec", "minReadySeconds"]).cloned().unwrap_or(num(0));
+            if rs.pointer(&["spec", "minReadySeconds"]).and_then(Value::as_i64).unwrap_or(0) != min_ready.as_i64().unwrap_or(0) {
+                let patch = obj(alloc::vec![("spec", obj(alloc::vec![("minReadySeconds", min_ready.clone())]))]);
+                c.patch(&alloc::format!("{}/{}", replicasets(Some(ns)), name(&rs)), MERGE, &patch).await?;
+                rs.entry_object("spec").set("minReadySeconds", min_ready);
+            }
+            Some(rs)
         }
+        None if paused => None,
         None => match c.create(&replicasets(Some(ns)), &new_replicaset(&d, &hash, want_rev)).await {
-            Ok(rs) => rs,
+            Ok(rs) => {
+                created = true;
+                Some(rs)
+            }
             Err(e) if e.code == 409 => return Ok(Some(0)), // stale list; look again
             Err(e) => return Err(e),
         },
     };
 
     // The Deployment mirrors its new ReplicaSet's revision (kubectl rollout and clients read it).
-    let rev = revision_of(&new_rs).to_string();
-    if str_at(&d, &["metadata", "annotations", REVISION]) != rev {
+    let rev = new_rs.as_ref().map_or(want_rev - 1, revision_of).to_string();
+    if new_rs.is_some() && str_at(&d, &["metadata", "annotations", REVISION]) != rev {
         let patch = obj(alloc::vec![("metadata", obj(alloc::vec![("annotations", obj(alloc::vec![(REVISION, Value::String(rev))]))]))]);
         c.patch(&alloc::format!("{}/{dname}", deployments(Some(ns))), MERGE, &patch).await?;
     }
 
     let recreate = str_at(&d, &["spec", "strategy", "type"]) == "Recreate";
     let mut wait = None;
-    if recreate {
-        for old in olds.iter_mut().filter(|o| spec_replicas(o) > 0) {
-            scale(c, ns, old, 0).await?;
+    if paused {
+        // No rollout: only a plain scale when a single ReplicaSet is live.
+        let live = olds.iter().filter(|o| spec_replicas(o) > 0).count() + new_rs.as_ref().map_or(0, |n| (spec_replicas(n) > 0) as usize);
+        if live <= 1 {
+            match new_rs.as_mut().filter(|n| spec_replicas(n) > 0 || live == 0) {
+                Some(n) if spec_replicas(n) != desired => scale(c, ns, n, desired).await?,
+                Some(_) => {}
+                None => {
+                    if let Some(o) = olds.iter_mut().find(|o| spec_replicas(o) > 0).filter(|o| spec_replicas(o) != desired) {
+                        scale(c, ns, o, desired).await?;
+                    }
+                }
+            }
         }
-        let old_uids: Vec<&str> = olds.iter().map(uid).collect();
-        let left = items(&c.list(&pods(Some(ns)), "").await?).iter().filter(|p| !pod_terminal(p) && controller_ref(p).is_some_and(|r| old_uids.contains(&str_at(r, &["uid"])))).count();
-        if left > 0 {
-            wait = Some(cfg.retry_ms);
-        } else if spec_replicas(&new_rs) != desired {
-            scale(c, ns, &mut new_rs, desired).await?;
+    } else if let Some(new_rs) = new_rs.as_mut() {
+        if recreate {
+            for old in olds.iter_mut().filter(|o| spec_replicas(o) > 0) {
+                scale(c, ns, old, 0).await?;
+            }
+            let old_uids: Vec<&str> = olds.iter().map(uid).collect();
+            let left = items(&c.list(&pods(Some(ns)), "").await?).iter().filter(|p| !pod_terminal(p) && controller_ref(p).is_some_and(|r| old_uids.contains(&str_at(r, &["uid"])))).count();
+            if left > 0 {
+                wait = Some(cfg.retry_ms);
+            } else if spec_replicas(new_rs) != desired {
+                scale(c, ns, new_rs, desired).await?;
+            }
+        } else {
+            rolling(c, ns, &d, desired, new_rs, &mut olds).await?;
         }
-    } else {
-        rolling(c, ns, &d, desired, &mut new_rs, &mut olds).await?;
     }
 
     cleanup_history(c, ns, &d, &olds).await?;
-    write_status(c, cfg, ns, dname, desired, &new_rs, &olds).await?;
-    Ok(wait)
+    let w = write_status(c, cfg, ns, dname, desired, new_rs.as_ref(), &olds, paused, created).await?;
+    Ok(match (wait, w) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    })
 }
 
 /// One rolling-update step (see the module docs).
@@ -302,13 +340,16 @@ fn cond_same(a: &Value, b: &Value) -> bool {
     ["type", "status", "reason", "message"].iter().all(|f| str_at(a, &[f]) == str_at(b, &[f]))
 }
 
-async fn write_status<C: Client>(c: &C, cfg: &Config, ns: &str, dname: &str, desired: i64, new_rs: &Value, olds: &[Value]) -> Result<()> {
-    let all = || olds.iter().chain(core::iter::once(new_rs));
+/// Writes the status; returns when to look again (the progress deadline).
+#[allow(clippy::too_many_arguments)]
+async fn write_status<C: Client>(c: &C, cfg: &Config, ns: &str, dname: &str, desired: i64, new_rs: Option<&Value>, olds: &[Value], paused: bool, created: bool) -> Result<Option<u64>> {
+    let all = || olds.iter().chain(new_rs);
     let replicas: i64 = all().map(|r| status_of(r, "replicas")).sum();
     let ready: i64 = all().map(|r| status_of(r, "readyReplicas")).sum();
     let available: i64 = all().map(|r| status_of(r, "availableReplicas")).sum();
-    let updated = status_of(new_rs, "replicas");
+    let updated = new_rs.map_or(0, |r| status_of(r, "replicas"));
     let path = alloc::format!("{}/{dname}", deployments(Some(ns)));
+    let wait = core::cell::Cell::new(None);
     retry_conflict(|| async {
         let mut d = match c.get(&path).await {
             Ok(d) => d,
@@ -317,38 +358,63 @@ async fn write_status<C: Client>(c: &C, cfg: &Config, ns: &str, dname: &str, des
         };
         let (_, max_unavail) = fenceposts(&d, desired);
         let max_unavail = if str_at(&d, &["spec", "strategy", "type"]) == "Recreate" { 0 } else { max_unavail };
-        let now = kr_apiserver::object::rfc3339((cfg.now)());
-        let complete = updated == desired && replicas == desired && available == desired && spec_replicas(new_rs) == desired;
+        let now_s = (cfg.now)();
+        let now = kr_apiserver::object::rfc3339(now_s);
+        let complete = new_rs.is_some_and(|n| updated == desired && replicas == desired && available == desired && spec_replicas(n) == desired);
         let avail_ok = available >= desired - max_unavail;
-        let rs_name = name(new_rs);
+        let rs_name = new_rs.map_or("", name);
         let old_conds: Vec<Value> = d.pointer(&["status", "conditions"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
         let mut conds = old_conds.clone();
-        for (ty, status, reason, msg) in [
-            (
-                "Available",
-                avail_ok,
-                if avail_ok { "MinimumReplicasAvailable" } else { "MinimumReplicasUnavailable" },
-                if avail_ok { "Deployment has minimum availability." } else { "Deployment does not have minimum availability." }.to_string(),
-            ),
-            (
-                "Progressing",
-                true,
-                if complete { "NewReplicaSetAvailable" } else { "ReplicaSetUpdated" },
-                if complete { alloc::format!("ReplicaSet \"{rs_name}\" has successfully progressed.") } else { alloc::format!("ReplicaSet \"{rs_name}\" is progressing.") },
-            ),
-        ] {
-            let status = if status { "True" } else { "False" };
-            let mut cond = obj(alloc::vec![("type", Value::from(ty)), ("status", Value::from(status)), ("reason", Value::from(reason)), ("message", Value::String(msg)), ("lastUpdateTime", Value::String(now.clone())), ("lastTransitionTime", Value::String(now.clone()))]);
-            if let Some(old) = old_conds.iter().find(|o| str_at(o, &["type"]) == ty) {
-                if cond_same(old, &cond) {
-                    continue; // unchanged: keep the stored timestamps
-                }
-                if str_at(old, &["status"]) == status {
-                    cond.set("lastTransitionTime", Value::from(str_at(old, &["lastTransitionTime"])));
-                }
+        let cond = obj(alloc::vec![
+            ("type", Value::from("Available")),
+            ("status", Value::from(if avail_ok { "True" } else { "False" })),
+            ("reason", Value::from(if avail_ok { "MinimumReplicasAvailable" } else { "MinimumReplicasUnavailable" })),
+            ("message", Value::from(if avail_ok { "Deployment has minimum availability." } else { "Deployment does not have minimum availability." })),
+            ("lastUpdateTime", Value::String(now.clone())),
+            ("lastTransitionTime", Value::String(now.clone())),
+        ]);
+        let cond = merge_cond(&old_conds, cond);
+        set_condition(&mut conds, cond);
+
+        // Progressing.
+        let old_prog = old_conds.iter().find(|o| str_at(o, &["type"]) == "Progressing");
+        let old_reason = old_prog.map_or("", |o| str_at(o, &["reason"]));
+        let moved = [("replicas", replicas), ("updatedReplicas", updated), ("readyReplicas", ready), ("availableReplicas", available)].iter().any(|(f, v)| d.pointer(&["status", f]).and_then(Value::as_i64).unwrap_or(0) != *v);
+        let progress = created || moved || old_prog.is_none() || matches!(old_reason, "NewReplicaSetAvailable" | "DeploymentPaused");
+        let deadline = int_at(&d, &["spec", "progressDeadlineSeconds"], 600).max(1);
+        let (status, reason, msg, fresh) = if paused {
+            ("Unknown", "DeploymentPaused", "Deployment is paused".to_string(), false)
+        } else if complete {
+            ("True", "NewReplicaSetAvailable", alloc::format!("ReplicaSet \"{rs_name}\" has successfully progressed."), false)
+        } else if progress {
+            wait.set(Some(deadline as u64 * 1000 + 50));
+            let (r, m) = if created {
+                ("NewReplicaSetCreated", alloc::format!("Created new replica set \"{rs_name}\""))
+            } else if old_prog.is_none() {
+                ("FoundNewReplicaSet", alloc::format!("Found new replica set \"{rs_name}\""))
+            } else {
+                ("ReplicaSetUpdated", alloc::format!("ReplicaSet \"{rs_name}\" is progressing."))
+            };
+            ("True", r, m, true)
+        } else {
+            let last = old_prog.and_then(|o| parse_time(str_at(o, &["lastUpdateTime"]))).unwrap_or(now_s);
+            if old_reason == "ProgressDeadlineExceeded" || now_s - last >= deadline {
+                ("False", "ProgressDeadlineExceeded", alloc::format!("ReplicaSet \"{rs_name}\" has timed out progressing."), false)
+            } else {
+                wait.set(Some(((last + deadline - now_s).max(0) as u64) * 1000 + 50));
+                let o = old_prog.cloned().unwrap_or(Value::Null);
+                (if str_at(&o, &["status"]) == "False" { "False" } else { "True" }, if old_reason.is_empty() { "ReplicaSetUpdated" } else { old_reason }, str_at(&o, &["message"]).to_string(), false)
             }
-            set_condition(&mut conds, cond);
+        };
+        let mut cond = obj(alloc::vec![("type", Value::from("Progressing")), ("status", Value::from(status)), ("reason", Value::from(reason)), ("message", Value::String(msg)), ("lastUpdateTime", Value::String(now.clone())), ("lastTransitionTime", Value::String(now.clone()))]);
+        if let Some(old) = old_prog {
+            if !fresh && cond_same(old, &cond) {
+                cond = old.clone();
+            } else if str_at(old, &["status"]) == status {
+                cond.set("lastTransitionTime", Value::from(str_at(old, &["lastTransitionTime"])));
+            }
         }
+        set_condition(&mut conds, cond);
         let gen = int_at(&d, &["metadata", "generation"], 0);
         let nums = [("replicas", replicas), ("updatedReplicas", updated), ("readyReplicas", ready), ("availableReplicas", available), ("unavailableReplicas", (desired - available).max(0)), ("observedGeneration", gen)];
         let same = nums.iter().all(|(f, v)| d.pointer(&["status", f]).and_then(Value::as_i64) == Some(*v)) && conds.len() == old_conds.len() && conds.iter().zip(&old_conds).all(|(a, b)| a == b);
@@ -362,7 +428,22 @@ async fn write_status<C: Client>(c: &C, cfg: &Config, ns: &str, dname: &str, des
         st.set("conditions", Value::Array(conds));
         c.update(&alloc::format!("{path}/status"), &d).await.map(|_| ())
     })
-    .await
+    .await?;
+    Ok(wait.get())
+}
+
+/// A condition keeping the stored one (timestamps included) while nothing but timestamps differ.
+fn merge_cond(old: &[Value], mut cond: Value) -> Value {
+    let ty = str_at(&cond, &["type"]);
+    if let Some(o) = old.iter().find(|o| str_at(o, &["type"]) == ty) {
+        if cond_same(o, &cond) {
+            return o.clone();
+        }
+        if str_at(o, &["status"]) == str_at(&cond, &["status"]) {
+            cond.set("lastTransitionTime", Value::from(str_at(o, &["lastTransitionTime"])));
+        }
+    }
+    cond
 }
 
 #[cfg(test)]

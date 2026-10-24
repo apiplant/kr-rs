@@ -10,7 +10,7 @@ use crate::discovery;
 use crate::object::{self, obj, ApiError, Clock, FieldSelector, Selector, Target};
 use crate::patch;
 use crate::proto;
-use crate::resources::{self, Resource, RESOURCES};
+use crate::resources::{self, Resource};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
@@ -1032,7 +1032,8 @@ impl ApiServer {
         // Finalizers removed from an object that is being deleted: complete the deletion.
         let deleting = new.pointer(&["metadata", "deletionTimestamp"]).is_some();
         let no_finalizers = new.pointer(&["metadata", "finalizers"]).and_then(Value::as_array).is_none_or(|f| f.is_empty());
-        if deleting && no_finalizers && rt.res.plural != "namespaces" {
+        let no_spec_finalizers = rt.res.plural != "namespaces" || new.pointer(&["spec", "finalizers"]).and_then(Value::as_array).is_none_or(|f| f.is_empty());
+        if deleting && no_finalizers && no_spec_finalizers {
             self.store.borrow_mut().delete(&kv.key, Some(kv.mod_rev)).map_err(|e| store_err(e, rt.res.singular, name))?;
             self.sync()?;
             return Ok(Reply::ok(&new));
@@ -1153,23 +1154,23 @@ impl ApiServer {
         Ok(Reply::ok(&v))
     }
 
-    /// Namespace deletion: everything inside is removed synchronously (there is no namespace
-    /// controller yet), then the namespace itself.
-    fn delete_namespace(&self, kv: &Kv, v: Value, name: &str) -> R<Reply> {
+    /// Namespace deletion (upstream semantics): the namespace only becomes `Terminating`
+    /// (`deletionTimestamp`, `status.phase`). The namespace controller empties it and removes
+    /// the `kubernetes` finalizer through `namespaces/{name}/finalize`; `update` then deletes it.
+    fn delete_namespace(&self, kv: &Kv, mut v: Value, name: &str) -> R<Reply> {
         if SYSTEM_NAMESPACES.contains(&name) && name != "kube-public" {
             return Err(ApiError::new(403, "Forbidden", alloc::format!("namespace {name} is a system namespace and cannot be deleted")));
         }
-        let mut store = self.store.borrow_mut();
-        let extra = self.extra();
-        for r in RESOURCES.iter().chain(extra.iter().copied()).filter(|r| r.namespaced) {
-            let prefix = alloc::format!("{}{name}/", r.prefix());
-            let (items, _) = store.list(&prefix, None, 0);
-            for it in items {
-                let _ = store.delete(&it.key, None);
-            }
+        if v.pointer(&["metadata", "deletionTimestamp"]).is_some() {
+            return Ok(Reply::ok(&v));
         }
-        store.delete(&kv.key, None).map_err(|e| store_err(e, "namespace", name))?;
-        drop(store);
+        let rev = self.store.borrow().revision() + 1;
+        let m = v.entry_object("metadata");
+        m.set("deletionTimestamp", Value::String(object::rfc3339((self.now)())));
+        m.set("deletionGracePeriodSeconds", Value::Number(Number::from_u64(0)));
+        m.set("resourceVersion", Value::String(rev.to_string()));
+        v.entry_object("status").set("phase", Value::from("Terminating"));
+        self.store.borrow_mut().update(&kv.key, json::to_string(&v).into_bytes(), Some(kv.mod_rev)).map_err(|e| store_err(e, "namespace", name))?;
         self.sync()?;
         Ok(Reply::ok(&v))
     }

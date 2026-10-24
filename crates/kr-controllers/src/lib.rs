@@ -13,6 +13,7 @@
 //! * [`job`]: run-to-completion pods (completions, parallelism, indexed, backoff, TTL).
 //! * [`cronjob`]: cron parsing and Job creation with concurrency policies.
 //! * [`endpoints`]: Endpoints and EndpointSlices for Services with selectors.
+//! * [`namespace`]: finishes the deletion of Terminating namespaces (empties, then finalizes).
 //! * [`gc`]: deletes dependents whose owner no longer exists (background propagation).
 //!
 //! All of them are *level-triggered*. A watch (list, remember the list's `resourceVersion`,
@@ -39,6 +40,7 @@ pub mod deployment;
 pub mod endpoints;
 pub mod gc;
 pub mod job;
+pub mod namespace;
 pub mod quota;
 pub mod replicaset;
 pub mod scheduler;
@@ -60,6 +62,9 @@ pub struct Config {
     /// Delay before re-checking something that cannot progress yet (unschedulable pod,
     /// Recreate waiting for old pods to go away).
     pub retry_ms: u64,
+    /// Base delay (ms) before replacing a failed Job pod; doubles per further failure, capped at
+    /// 6 minutes (upstream: 10 s).
+    pub job_backoff_ms: u64,
     /// Unix time in seconds, for condition timestamps. The default always returns 0; the
     /// binary passes its real clock.
     pub now: fn() -> i64,
@@ -71,7 +76,7 @@ fn zero_clock() -> i64 {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { resync_ms: 30_000, gc_ms: 5_000, backoff_ms: 1_000, retry_ms: 5_000, now: zero_clock }
+        Config { resync_ms: 30_000, gc_ms: 5_000, backoff_ms: 1_000, retry_ms: 5_000, job_backoff_ms: 10_000, now: zero_clock }
     }
 }
 
@@ -94,6 +99,7 @@ pub async fn run_all_with<C: Client + Clone + 'static>(c: C, cfg: Config) {
         spawn(cronjob::run(c.clone(), cfg)),
         spawn(endpoints::run(c.clone(), cfg)),
         spawn(quota::run(c.clone(), cfg)),
+        spawn(namespace::run(c.clone(), cfg)),
         spawn(gc::run(c, cfg)),
     ]);
     // A never-woken future would let the executor free this task (and abort the guard).

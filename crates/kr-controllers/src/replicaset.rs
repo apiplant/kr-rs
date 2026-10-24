@@ -12,8 +12,9 @@
 //!    (unscheduled, then not running, then not ready, then newest);
 //! 4. write `status` (`replicas`, `readyReplicas`, `availableReplicas`, `fullyLabeledReplicas`,
 //!    `observedGeneration`) with a PUT of the full object to `replicasets/{name}/status`, only
-//!    if it differs from what is stored. `availableReplicas` equals `readyReplicas`
-//!    (`minReadySeconds` is not modelled).
+//!    if it differs from what is stored. `availableReplicas` counts the ready pods that have been
+//!    ready for `spec.minReadySeconds` (Ready condition's `lastTransitionTime`); the reconcile
+//!    is repeated when the first of the others gets there.
 //!
 //! Pod events map to the owning ReplicaSet; events of orphan pods wake every ReplicaSet in the
 //! namespace (key `<ns>/*`) so that adoption happens.
@@ -75,8 +76,7 @@ async fn run_kind<C: Client + Clone + 'static>(c: C, cfg: Config, k: Kind) {
                     }
                     return Ok(None);
                 }
-                reconcile_kind(&c, k, ns, n).await?;
-                Ok(None)
+                reconcile_kind(&c, &cfg, k, ns, n).await
             }
         },
         move || {
@@ -111,18 +111,18 @@ fn fully_labeled(rs: &Value, p: &Value) -> bool {
     rs.pointer(&["spec", "template", "metadata", "labels"]).and_then(Value::as_object).unwrap_or(&[]).iter().all(|(k, v)| p.pointer(&["metadata", "labels", k]) == Some(v))
 }
 
-pub async fn reconcile<C: Client>(c: &C, ns: &str, name: &str) -> Result<()> {
-    reconcile_kind(c, RS_KIND, ns, name).await
+pub async fn reconcile<C: Client>(c: &C, cfg: &Config, ns: &str, name: &str) -> Result<Option<u64>> {
+    reconcile_kind(c, cfg, RS_KIND, ns, name).await
 }
 
-async fn reconcile_kind<C: Client>(c: &C, k: Kind, ns: &str, name: &str) -> Result<()> {
+async fn reconcile_kind<C: Client>(c: &C, cfg: &Config, k: Kind, ns: &str, name: &str) -> Result<Option<u64>> {
     let rs = match c.get(&alloc::format!("{}/{name}", (k.path)(Some(ns)))).await {
         Ok(r) => r,
-        Err(e) if e.code == 404 => return Ok(()),
+        Err(e) if e.code == 404 => return Ok(None),
         Err(e) => return Err(e),
     };
     if deleting(&rs) {
-        return Ok(());
+        return Ok(None);
     }
     let desired = int_at(&rs, &["spec", "replicas"], 1).max(0) as usize;
     let parsed = if k.map_selector {
@@ -131,7 +131,7 @@ async fn reconcile_kind<C: Client>(c: &C, k: Kind, ns: &str, name: &str) -> Resu
     } else {
         rs.get("spec").and_then(|s| s.get("selector")).and_then(parse_selector)
     };
-    let Some((sel_str, sel)) = parsed else { return Ok(()) };
+    let Some((sel_str, sel)) = parsed else { return Ok(None) };
     let list = c.list(&pods(Some(ns)), &alloc::format!("labelSelector={}", enc(&sel_str))).await?;
     let rs_uid = uid(&rs);
 
@@ -166,7 +166,11 @@ async fn reconcile_kind<C: Client>(c: &C, k: Kind, ns: &str, name: &str) -> Resu
 
     let ready = owned.iter().filter(|p| pod_ready(p)).count();
     let labeled = owned.iter().filter(|p| fully_labeled(&rs, p)).count();
-    write_status(c, k, ns, name, owned.len(), ready, labeled).await
+    let (now, min_ready) = ((cfg.now)(), int_at(&rs, &["spec", "minReadySeconds"], 0));
+    let available = owned.iter().filter(|p| pod_available(p, min_ready, now)).count();
+    let soonest = owned.iter().filter_map(|p| available_in(p, min_ready, now)).min();
+    write_status(c, k, ns, name, [owned.len(), ready, available, labeled]).await?;
+    Ok(soonest.map(|s| s as u64 * 1000 + 50))
 }
 
 fn name_of(p: &Value) -> &str {
@@ -198,7 +202,7 @@ async fn adopt<C: Client>(c: &C, k: Kind, rs: &Value, p: &Value) -> Result<Optio
     }
 }
 
-async fn write_status<C: Client>(c: &C, k: Kind, ns: &str, name: &str, replicas: usize, ready: usize, labeled: usize) -> Result<()> {
+async fn write_status<C: Client>(c: &C, k: Kind, ns: &str, name: &str, [replicas, ready, available, labeled]: [usize; 4]) -> Result<()> {
     let path = alloc::format!("{}/{name}", (k.path)(Some(ns)));
     retry_conflict(|| async {
         let mut rs = match c.get(&path).await {
@@ -211,7 +215,7 @@ async fn write_status<C: Client>(c: &C, k: Kind, ns: &str, name: &str, replicas:
             ("replicas", num(replicas as i64)),
             ("fullyLabeledReplicas", num(labeled as i64)),
             ("readyReplicas", num(ready as i64)),
-            ("availableReplicas", num(ready as i64)),
+            ("availableReplicas", num(available as i64)),
             ("observedGeneration", num(gen)),
         ]);
         if let Some(conds) = rs.pointer(&["status", "conditions"]) {
