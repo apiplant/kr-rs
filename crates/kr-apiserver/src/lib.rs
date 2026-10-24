@@ -11,6 +11,7 @@ extern crate std;
 
 pub mod api;
 pub mod client;
+pub mod defaults;
 pub mod discovery;
 pub mod object;
 pub mod openapi;

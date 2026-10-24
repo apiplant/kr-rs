@@ -740,6 +740,7 @@ impl ApiServer {
         let rev = self.store.borrow().revision() + 1;
         let name = object::prepare_create(o, &t, &self.clock(), rev)?;
         self.check_namespace(rt, &name)?;
+        crate::defaults::apply(rt.res.group, rt.res.plural, o);
         if rt.res.plural == "pods" {
             let ns = rt.namespace.clone().unwrap_or_default();
             self.admit_pod(o, &ns)?;
@@ -787,6 +788,9 @@ impl ApiServer {
         let rev = self.store.borrow().revision() + 1;
         let has_status = rt.res.subresources.contains(&"status");
         object::prepare_update(&old, &mut new, &t, rev, has_status, status)?;
+        if !status {
+            crate::defaults::apply(rt.res.group, rt.res.plural, &mut new);
+        }
         if rt.res.plural == "services" && !status {
             self.admit_service(&mut new, Some(&old))?;
         }
@@ -844,8 +848,9 @@ impl ApiServer {
 
     fn delete(&self, req: &Req, rt: &Route, name: &str, q: &Query) -> R<Reply> {
         let (kv, mut v) = self.get_value(rt, name)?;
-        if !req.body.is_empty() {
-            let opts = json::parse(req.body).map_err(|_| ApiError::bad_request("invalid DeleteOptions"))?;
+        // DeleteOptions arrive as JSON or (client-go default for typed clients) protobuf.
+        let opts = if req.body.is_empty() { Value::Null } else { self.parse_body(req).map_err(|e| ApiError::bad_request(alloc::format!("invalid DeleteOptions: {}", e.message)))? };
+        {
             if let Some(pre) = opts.get("preconditions") {
                 if let Some(uid) = pre.get("uid").and_then(Value::as_str) {
                     if v.pointer(&["metadata", "uid"]).and_then(Value::as_str) != Some(uid) {
@@ -867,7 +872,6 @@ impl ApiServer {
         }
         // Graceful pod deletion: a bound pod only gets a deletionTimestamp; its kubelet stops
         // the containers and then deletes it with gracePeriodSeconds=0.
-        let opts = if req.body.is_empty() { Value::Null } else { json::parse(req.body).unwrap_or(Value::Null) };
         let grace = q.get("gracePeriodSeconds").and_then(|g| g.parse::<i64>().ok()).or_else(|| opts.get("gracePeriodSeconds").and_then(Value::as_i64));
         let bound = v.pointer(&["spec", "nodeName"]).and_then(Value::as_str).is_some_and(|n| !n.is_empty());
         if rt.res.plural == "pods" && bound && grace != Some(0) {

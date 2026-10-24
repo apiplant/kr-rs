@@ -63,7 +63,7 @@ pub fn decode_body(body: &[u8]) -> R<Value> {
         }
     }
     let raw = raw.ok_or("protobuf: missing raw object")?;
-    let idx = s::KINDS.iter().find(|k| k.0 == api_version && k.1 == kind).map(|k| k.2).ok_or("protobuf: unsupported kind")?;
+    let idx = s::KINDS.iter().find(|k| (k.0 == api_version || (api_version == "meta.k8s.io/v1" && k.0 == "v1" && kind == "DeleteOptions")) && k.1 == kind).map(|k| k.2).ok_or("protobuf: unsupported kind")?;
     let mut v = message(raw, idx, 0)?;
     if let Value::Object(o) = &mut v {
         o.retain(|e| e.0 != "kind" && e.0 != "apiVersion");

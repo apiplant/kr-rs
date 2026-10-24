@@ -110,10 +110,26 @@ impl<C: Client + Clone + 'static> NodeProxy for Proxy<C> {
                 if argv.is_empty() {
                     return Err(ApiError::bad_request("you must specify at least 1 command"));
                 }
-                let hs = websocket::handshake(&ws_request("/exec", headers), &channel::EXEC_PROTOCOLS).map_err(|_| ApiError::bad_request("exec requires a WebSocket upgrade (v4/v5.channel.k8s.io)"))?;
-                let proto = hs.protocol.as_deref().and_then(Protocol::from_token).ok_or_else(|| ApiError::bad_request("no supported streaming protocol"))?;
                 let (stdin, stdout, stderr) = (q.flag("stdin"), q.get("stdout").is_none_or(|s| s != "false"), q.flag("stderr") || (!q.flag("tty") && q.get("stderr").is_none()));
                 let maps = self.0.maps.clone();
+                let hdr = |n: &str| headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(n)).flat_map(|(_, v)| v.split(',')).map(str::trim).collect::<Vec<_>>();
+                if !hdr("upgrade").iter().any(|t| t.eq_ignore_ascii_case("websocket")) && hdr("upgrade").iter().any(|t| t.eq_ignore_ascii_case("SPDY/3.1")) {
+                    // client-go remotecommand over SPDY (sonobuoy, older kubectl): v4 only.
+                    if !hdr("x-stream-protocol-version").contains(&"v4.channel.k8s.io") {
+                        return Err(ApiError::bad_request("SPDY exec requires X-Stream-Protocol-Version v4.channel.k8s.io"));
+                    }
+                    // client-go sends every enabled stream explicitly; absent means false.
+                    let tty = q.flag("tty");
+                    let want = (q.flag("stdin"), q.flag("stdout"), q.flag("stderr") && !tty, tty);
+                    let handler = move |conn: Box<dyn Conn>| -> Pin<Box<dyn Future<Output = ()>>> { Box::pin(spdy_exec(PfIo::Raw { conn, wbuf: Vec::new() }, target, argv, maps, want)) };
+                    return Ok(Response {
+                        status: 101,
+                        headers: alloc::vec![("Upgrade".into(), "SPDY/3.1".into()), ("X-Stream-Protocol-Version".into(), "v4.channel.k8s.io".into())],
+                        body: Body::Upgrade(Box::new(handler)),
+                    });
+                }
+                let hs = websocket::handshake(&ws_request("/exec", headers), &channel::EXEC_PROTOCOLS).map_err(|_| ApiError::bad_request("exec requires a WebSocket or SPDY/3.1 upgrade"))?;
+                let proto = hs.protocol.as_deref().and_then(Protocol::from_token).ok_or_else(|| ApiError::bad_request("no supported streaming protocol"))?;
                 let handler = move |conn: Box<dyn Conn>| -> Pin<Box<dyn Future<Output = ()>>> { Box::pin(exec_session(conn, proto, target, argv, maps, stdin, stdout, stderr)) };
                 Ok(hs.into_response(Box::new(handler)))
             }
@@ -855,6 +871,212 @@ fn spdy_open(sess: &mut Session, pairs: &mut BTreeMap<String, Pair>, fwds: &mut 
                 sess.data(e, msg.as_bytes(), true);
             }
             sess.data(id, b"", true);
+        }
+    }
+}
+
+// ---------- SPDY/3.1 exec ----------
+
+enum SxEv {
+    Io(Option<Vec<u8>>),
+    Out(u32, Vec<u8>),
+    Exit(i32),
+    Kick,
+}
+
+/// Server side of client-go's SPDY exec (`remotecommand` v4): the client opens `error`,
+/// `stdin`, `stdout`, `stderr` and `resize` streams (`streamtype` header); the process starts
+/// once all requested streams are open, its exit Status goes to the error stream as JSON.
+async fn spdy_exec(mut io: PfIo, target: ExecTarget, argv: Vec<Vec<u8>>, maps: kr_runtime::container::IdMaps, want: (bool, bool, bool, bool)) {
+    let (want_stdin, want_stdout, want_stderr, tty) = want;
+    let mut sess = Session::new();
+    sess.set_flow_control_enforced(false);
+    let expected = 1 + want_stdin as usize + want_stdout as usize + want_stderr as usize;
+    let (mut err_s, mut in_s, mut out_s, mut errout_s) = (None::<u32>, None::<u32>, None::<u32>, None::<u32>);
+    let mut got = 0usize;
+    // Phase 1: collect streams (bounded wait).
+    let deadline = kr_rt::exec::now_ms() + 30_000;
+    while got < expected {
+        if sess.has_output() {
+            io.queue(&sess.take_output());
+        }
+        let left = deadline.saturating_sub(kr_rt::exec::now_ms());
+        if left == 0 {
+            io.finish().await;
+            return;
+        }
+        let r = kr_rt::exec::timeout(left, poll_fn(|cx| {
+            let _ = io.poll_flush(cx);
+            io.poll_read(cx)
+        }))
+        .await;
+        let Ok(Some(bytes)) = r else {
+            io.finish().await;
+            return;
+        };
+        if sess.feed(&bytes).is_err() {
+            io.queue(&sess.take_output());
+            io.finish().await;
+            return;
+        }
+        while let Some(e) = sess.poll_event() {
+            if let SpdyEvent::StreamOpened { id, headers, .. } = e {
+                sess.reply(id, &[]);
+                let slot = match header_of(&headers, "streamtype") {
+                    Some("error") => &mut err_s,
+                    Some("stdin") => &mut in_s,
+                    Some("stdout") => &mut out_s,
+                    Some("stderr") => &mut errout_s,
+                    Some("resize") => continue,
+                    _ => {
+                        sess.reset_with(id, spdy::status::PROTOCOL_ERROR);
+                        continue;
+                    }
+                };
+                if slot.is_none() {
+                    *slot = Some(id);
+                    got += 1;
+                }
+            }
+        }
+    }
+    let _ = tty;
+    let err_id = err_s.unwrap_or(0);
+    let stdin_pipe = if in_s.is_some() { kr_sys::pipe2(kr_sys::O_CLOEXEC).ok() } else { None };
+    let (out_child, out_kr) = match out_s.and_then(|_| pipe_pair()) {
+        Some((c, k)) => (Some(c), Some(k)),
+        None => (None, None),
+    };
+    let (err_child, err_kr) = match errout_s.and_then(|_| pipe_pair()) {
+        Some((c, k)) => (Some(c), Some(k)),
+        None => (None, None),
+    };
+    let env = [b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_vec(), b"TERM=xterm".to_vec()];
+    let spec = ExecSpec {
+        argv: &argv,
+        env: &env,
+        cwd: b"",
+        user: b"",
+        stdin: stdin_pipe.as_ref().map(|(r, _)| r.raw()),
+        stdout: out_child.as_ref().map(|f| f.raw()),
+        stderr: err_child.as_ref().map(|f| f.raw()),
+        maps: &maps,
+        extra_groups: &[],
+    };
+    let running = match container::exec_in(&target, &spec) {
+        Ok(r) => r,
+        Err(e) => {
+            let st = channel::status_failure(&alloc::format!("exec failed: {}: errno {}", e.step, e.errno.0), "InternalError");
+            sess.data(err_id, st.as_bytes(), true);
+            io.queue(&sess.take_output());
+            io.finish().await;
+            return;
+        }
+    };
+    drop(out_child);
+    drop(err_child);
+    let mut stdin_w = stdin_pipe.map(|(r, w)| {
+        drop(r);
+        w
+    });
+    let sig = running.signaller();
+    let mut exit_fut: Option<Pin<Box<dyn Future<Output = i32>>>> = Some(Box::pin(async move { running.wait().await.map(|e| e.code).unwrap_or(1) }));
+    let mut reads: Vec<(u32, Rc<Async<Fd>>, Option<ChunkFut>)> = Vec::new();
+    if let (Some(id), Some(f)) = (out_s, out_kr) {
+        reads.push((id, f.clone(), Some(Box::pin(read_chunk(f)))));
+    }
+    if let (Some(id), Some(f)) = (errout_s, err_kr) {
+        reads.push((id, f.clone(), Some(Box::pin(read_chunk(f)))));
+    }
+    let mut exit: Option<i32> = None;
+    loop {
+        if sess.has_output() {
+            io.queue(&sess.take_output());
+        }
+        if let Some(code) = exit.filter(|_| reads.iter().all(|r| r.2.is_none())) {
+            let st = if code == 0 { channel::status_success() } else { channel::status_exit(code) };
+            sess.data(err_id, st.as_bytes(), true);
+            io.queue(&sess.take_output());
+            io.finish().await;
+            return;
+        }
+        let gated = io.backlogged();
+        let ev = poll_fn(|cx| {
+            if let Poll::Ready(r) = io.poll_read(cx) {
+                return Poll::Ready(SxEv::Io(r));
+            }
+            if !gated {
+                for (id, _, f) in reads.iter_mut() {
+                    if let Some(fut) = f.as_mut() {
+                        if let Poll::Ready(d) = fut.as_mut().poll(cx) {
+                            *f = None;
+                            return Poll::Ready(SxEv::Out(*id, d));
+                        }
+                    }
+                }
+            }
+            if let Some(fut) = exit_fut.as_mut() {
+                if let Poll::Ready(c) = fut.as_mut().poll(cx) {
+                    exit_fut = None;
+                    return Poll::Ready(SxEv::Exit(c));
+                }
+            }
+            if io.poll_flush(cx).is_ready() && gated {
+                return Poll::Ready(SxEv::Kick);
+            }
+            Poll::Pending
+        })
+        .await;
+        match ev {
+            SxEv::Kick => {}
+            SxEv::Io(None) => {
+                let _ = sig.send(ns::SIGKILL);
+                return;
+            }
+            SxEv::Io(Some(bytes)) => {
+                if sess.feed(&bytes).is_err() {
+                    let _ = sig.send(ns::SIGKILL);
+                    return;
+                }
+                while let Some(e) = sess.poll_event() {
+                    match e {
+                        SpdyEvent::Data { id, bytes, fin } => {
+                            sess.consume(id, bytes.len());
+                            if Some(id) == in_s {
+                                if let Some(w) = &stdin_w {
+                                    let mut off = 0;
+                                    while off < bytes.len() {
+                                        match kr_sys::write(w.raw(), &bytes[off..]) {
+                                            Ok(n) => off += n,
+                                            Err(_) => break,
+                                        }
+                                    }
+                                }
+                                if fin {
+                                    stdin_w = None;
+                                }
+                            }
+                        }
+                        SpdyEvent::StreamOpened { id, .. } => sess.reply(id, &[]),
+                        SpdyEvent::Reset { id, .. } if Some(id) == in_s => stdin_w = None,
+                        SpdyEvent::Reset { .. } => {}
+                        SpdyEvent::GoAway { .. } => {
+                            let _ = sig.send(ns::SIGKILL);
+                            return;
+                        }
+                    }
+                }
+            }
+            SxEv::Out(id, d) => {
+                let r = reads.iter_mut().find(|r| r.0 == id).unwrap();
+                if d.is_empty() {
+                    sess.data(id, b"", true);
+                } else {
+                    sess.data(id, &d, false);
+                    r.2 = Some(Box::pin(read_chunk(r.1.clone())));
+                }
+            }
+            SxEv::Exit(c) => exit = Some(c),
         }
     }
 }

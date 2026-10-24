@@ -434,10 +434,23 @@ impl FieldSelector {
             } else {
                 return Err(ApiError::bad_request(alloc::format!("invalid field selector {p:?}")));
             };
-            let path: Vec<String> = match k.trim() {
-                f @ ("metadata.name" | "metadata.namespace" | "spec.nodeName" | "status.phase" | "spec.schedulerName" | "involvedObject.name") => f.split('.').map(String::from).collect(),
-                f => return Err(ApiError::bad_request(alloc::format!("field label not supported: {f}"))),
-            };
+            // The union of upstream's per-resource field labels (selectable fields).
+            const FIELDS: &[&str] = &[
+                "metadata.name", "metadata.namespace",
+                // pods
+                "spec.nodeName", "spec.restartPolicy", "spec.schedulerName", "spec.serviceAccountName", "spec.hostNetwork", "status.phase", "status.podIP", "status.nominatedNodeName",
+                // nodes
+                "spec.unschedulable",
+                // events
+                "involvedObject.kind", "involvedObject.namespace", "involvedObject.name", "involvedObject.uid", "involvedObject.apiVersion", "involvedObject.resourceVersion", "involvedObject.fieldPath", "reason", "reportingComponent", "source", "type",
+                // secrets / services / namespaces / replicasets / jobs
+                "spec.clusterIP", "spec.type", "status.replicas", "status.successful",
+            ];
+            let f = k.trim();
+            if !FIELDS.contains(&f) {
+                return Err(ApiError::bad_request(alloc::format!("field label not supported: {f}")));
+            }
+            let path: Vec<String> = f.split('.').map(String::from).collect();
             out.push((path, neg, v.trim().to_string()));
         }
         Ok(FieldSelector(out))
@@ -450,8 +463,17 @@ impl FieldSelector {
     pub fn matches(&self, o: &Value) -> bool {
         self.0.iter().all(|(path, neg, v)| {
             let refs: Vec<&str> = path.iter().map(String::as_str).collect();
-            let got = o.pointer(&refs).and_then(Value::as_str).unwrap_or("");
-            (got == v) != *neg
+            // Non-string fields compare in their string form; absent booleans are "false".
+            let got = match o.pointer(&refs) {
+                Some(Value::String(x)) => x.clone(),
+                Some(Value::Bool(b)) => b.to_string(),
+                Some(Value::Number(n)) => n.raw().to_string(),
+                Some(_) => String::new(),
+                None if path.last().is_some_and(|l| l == "unschedulable" || l == "hostNetwork") => "false".into(),
+                None if path.last().is_some_and(|l| l == "replicas" || l == "successful") => "0".into(),
+                None => String::new(),
+            };
+            (got == *v) != *neg
         })
     }
 }
