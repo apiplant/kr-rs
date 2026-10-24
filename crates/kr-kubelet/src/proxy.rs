@@ -136,6 +136,7 @@ impl NodeNet {
         self.op(OP_LOCAL_ROUTE, 0, SERVICE_CIDR.0, SERVICE_CIDR.1 as u16).map(|_| ())
     }
 
+    /// proto: 1 = TCP, 2 = UDP.
     pub fn listen(&self, proto: u8, ip: [u8; 4], port: u16) -> Result<Fd, Errno> {
         self.op(OP_LISTEN, proto, ip, port)?.ok_or(Errno(5))
     }
@@ -199,8 +200,8 @@ fn ip4(s: &str) -> Option<[u8; 4]> {
 }
 
 impl<C: Client + Clone + 'static> Proxy<C> {
-    pub fn new(c: C, net: NodeNet) -> Rc<Self> {
-        Rc::new(Proxy { c, net: Rc::new(net), listeners: RefCell::new(BTreeMap::new()) })
+    pub fn new(c: C, net: Rc<NodeNet>) -> Rc<Self> {
+        Rc::new(Proxy { c, net, listeners: RefCell::new(BTreeMap::new()) })
     }
 
     pub async fn run(self: Rc<Self>) {

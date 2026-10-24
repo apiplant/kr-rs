@@ -16,6 +16,7 @@
 extern crate alloc;
 
 pub mod node;
+pub mod dns;
 mod probe;
 pub mod proxy;
 mod spec;
@@ -227,7 +228,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         };
         match net {
             Some(net) => {
-                kr_rt::exec::spawn(proxy::Proxy::new(self.c.clone(), net).run());
+                let net = Rc::new(net);
+                kr_rt::exec::spawn(proxy::Proxy::new(self.c.clone(), net.clone()).run());
+                kr_rt::exec::spawn(dns::run(self.c.clone(), net));
             }
             None => kr_rt::eprint(b"kubelet: no node network; Services are not proxied\n"),
         }
