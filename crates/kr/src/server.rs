@@ -267,7 +267,7 @@ fn start_kubelet(api: &Rc<kr_apiserver::api::ApiServer>) -> Result<Rc<kr_kubelet
     let name = node_name();
     let cgroups = cgroups_available();
     let node_ip = kr_sys::ns::route_source([1, 1, 1, 1]).unwrap_or([127, 0, 0, 1]);
-    let cfg = kr_kubelet::Config { node_name: name, root: String::from(store.root()), network: ns::getuid() == 0, cgroups, node_ip };
+    let cfg = kr_kubelet::Config { node_name: name, root: String::from(store.root()), network: ns::getuid() == 0, cgroups, node_ip, vxlan: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() != Some("host-gw") };
     let client = kr_apiserver::client::InProcess::new(api.clone(), "kubelet");
     Ok(kr_kubelet::Kubelet::new(client, cfg, store))
 }
