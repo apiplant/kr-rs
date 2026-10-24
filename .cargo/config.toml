@@ -1,0 +1,4 @@
+[env]
+# Unoptimized async state machines (API server request path) are large; the default 2 MiB
+# test-thread stack overflows in debug test builds. No effect on the shipped binary.
+RUST_MIN_STACK = "67108864"

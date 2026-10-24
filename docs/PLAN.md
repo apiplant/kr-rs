@@ -86,3 +86,4 @@ Scaffold the Cargo workspace and build phase 0: kr-sys syscalls, the kr-rt alloc
 ## Test scripts
 - `tools/test/conformance.sh`: Sonobuoy conformance in a throwaway privileged container (`run quick|full`, `wait`, `results`).
 - `tools/test/two-node.sh`: server + agent in two containers.
+- `tools/test/unit.sh`: every library crate's tests, failing on any crash or abort (use this, not summed `cargo test` output).
