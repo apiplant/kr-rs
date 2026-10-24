@@ -26,8 +26,8 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     The single binary (server, agent, runtime, TLS/crypto, CRDs, webhooks) is ~1.8 MB on x86_64, just under the 2 MB agent budget from PLAN.md (aarch64: ~1.5 MB). Measure before adding large features; avoid `{:?}` on large types, and keep `opt-level = "z"` + LTO + strip.
 
 ## kr-crypto / TLS (ADR-020)
-60. **P-256 scalar multiplication is a plain ladder (~0.8 ms sign, ~1.5 ms verify)** — *watch*
-    That is fine per handshake. Fixed-base tables would speed up the apiserver when there are many clients.
+60. **P-256 scalar multiplication is slow** — *watch* (commit: 3440e98)
+    Now a constant-time fixed 4-bit window (masked table scan): ~0.5 ms sign, ~0.95 ms verify (was 0.75 / 1.4 ms), dudect |t| 0.4. A fixed-base comb table would make signing ~4x faster again but costs ~100 KB RAM per process; revisit if handshake rate on the API server matters.
 
 ## Control plane (ADR-021)
 63. **No typed schemas or defaulting** — *partly fixed*
