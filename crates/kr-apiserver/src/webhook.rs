@@ -615,7 +615,7 @@ pub async fn run(api: &ApiServer, req: &Req<'_>) -> Result<Option<Rewrite>, Repl
     let dry = req.query.split('&').any(|p| p == "dryRun=All");
     let q2 = if req.query.is_empty() { "dryRun=All".to_string() } else { format!("{}&dryRun=All", req.query) };
     let dreq = Req { method: req.method, path: req.path, query: &q2, content_type: req.content_type, accept: None, body: req.body, user: Some(user.clone()), bearer: req.bearer, headers: req.headers, authz_verb: None };
-    let result = match api.handle(&dreq) {
+    let result = match api.handle_w(&dreq).0 {
         Reply::Json(c, b) if c < 300 => json::parse(b.as_bytes()).map_err(|_| Reply::err(ApiError::new(500, "InternalError", "bad admission result")))?,
         other => return Err(other),
     };

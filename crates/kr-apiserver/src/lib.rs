@@ -15,6 +15,7 @@ pub mod crd;
 pub mod defaults;
 pub mod discovery;
 pub mod durable;
+pub mod fieldval;
 pub mod node_authz;
 pub mod object;
 pub mod openapi;

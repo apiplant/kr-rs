@@ -103,6 +103,10 @@ pub struct ApiServer {
     custom: RefCell<Vec<crate::crd::Custom>>,
     /// Group commit: writes reach the log synchronously, fsync happens off the event loop.
     committer: crate::durable::Committer,
+    /// `fieldValidation` of the request being handled (`Ignore` outside `handle`).
+    fv_mode: core::cell::Cell<crate::fieldval::Mode>,
+    /// Warnings for the response of the request being handled.
+    warnings: RefCell<Vec<String>>,
 }
 
 /// Default namespaces created on first start.
@@ -193,7 +197,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new() };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()) };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -241,6 +245,16 @@ impl ApiServer {
         let custom = self.custom.borrow();
         let Some(c) = custom.iter().find(|c| core::ptr::eq(c.res, rt.res)) else { return Ok(()) };
         if let Some(s) = &c.schema {
+            if self.fv_mode.get() != crate::fieldval::Mode::Ignore {
+                let mut p = o.clone();
+                crate::crd::prune(s, &mut p, true);
+                let mut gone = Vec::new();
+                crate::fieldval::pruned_paths(o, &p, "", &mut gone);
+                gone.retain(|g| !g.starts_with("metadata"));
+                gone.extend(crate::fieldval::unknown_meta(o));
+                let old_meta = old.map(crate::fieldval::unknown_meta).unwrap_or_default();
+                self.fv_report(crate::fieldval::messages(gone, &old_meta))?;
+            }
             crate::crd::prune(s, o, true);
             let mut errs = Vec::new();
             crate::crd::validate(s, o, "", &mut errs);
@@ -561,10 +575,59 @@ impl ApiServer {
     }
 
     pub fn handle(&self, req: &Req) -> Reply {
-        match self.route(req) {
+        let (reply, warnings) = self.handle_w(req);
+        match reply {
+            Reply::Json(code, body) if !warnings.is_empty() => {
+                let mut r = kr_net::http1::server::Response::new(code, body.into_bytes()).with_header("Content-Type", "application/json");
+                for w in warnings {
+                    let esc = w.replace('\\', "\\\\").replace('"', "\\\"");
+                    r = r.with_header("Warning", &alloc::format!("299 - \"{esc}\""));
+                }
+                Reply::Http(r)
+            }
+            r => r,
+        }
+    }
+
+    /// Like [`Self::handle`], with the `fieldValidation` warnings returned apart from the reply.
+    pub(crate) fn handle_w(&self, req: &Req) -> (Reply, Vec<String>) {
+        let write = matches!(req.method, "POST" | "PUT" | "PATCH");
+        let mode = if write { crate::fieldval::Mode::parse(Query::parse(req.query).ok().as_ref().and_then(|q| q.get("fieldValidation"))) } else { crate::fieldval::Mode::Ignore };
+        self.fv_mode.set(mode);
+        self.warnings.borrow_mut().clear();
+        let reply = match self.route(req) {
             Ok(r) => r,
             Err(e) => Reply::err(e),
+        };
+        self.fv_mode.set(crate::fieldval::Mode::Ignore);
+        (reply, core::mem::take(&mut *self.warnings.borrow_mut()))
+    }
+
+    /// Applies `fieldValidation` to unknown/duplicate field messages: reject (Strict), warn
+    /// (Warn) or ignore.
+    fn fv_report(&self, msgs: Vec<String>) -> R<()> {
+        if msgs.is_empty() {
+            return Ok(());
         }
+        match self.fv_mode.get() {
+            crate::fieldval::Mode::Ignore => Ok(()),
+            crate::fieldval::Mode::Warn => {
+                self.warnings.borrow_mut().extend(msgs);
+                Ok(())
+            }
+            crate::fieldval::Mode::Strict => Err(ApiError::bad_request(alloc::format!("strict decoding error: {}", msgs.join(", ")))),
+        }
+    }
+
+    /// Unknown fields of a built-in kind's object (those `old` already had are not reported).
+    fn fv_builtin(&self, rt: &Route, new: &Value, old: Option<&Value>) -> R<()> {
+        if self.fv_mode.get() == crate::fieldval::Mode::Ignore {
+            return Ok(());
+        }
+        let gv = rt.res.group_version();
+        let Some(u) = crate::fieldval::unknown_builtin(&gv, rt.res.kind, new) else { return Ok(()) };
+        let o = old.and_then(|o| crate::fieldval::unknown_builtin(&gv, rt.res.kind, o)).unwrap_or_default();
+        self.fv_report(crate::fieldval::messages(u, &o))
     }
 
     /// Parses a resource URL (for the webhook layer).
@@ -912,8 +975,10 @@ impl ApiServer {
         } else {
             json::parse(req.body).map_err(|_| ApiError::bad_request("invalid JSON body"))?
         };
-        if v.has_duplicate_keys() {
-            return Err(ApiError::bad_request("duplicate keys in request body"));
+        if v.has_duplicate_keys() && self.fv_mode.get() != crate::fieldval::Mode::Ignore {
+            let mut d = Vec::new();
+            crate::fieldval::duplicates(&v, "", &mut d);
+            self.fv_report(d.into_iter().map(|p| alloc::format!("duplicate field \"{p}\"")).collect())?;
         }
         Ok(v)
     }
@@ -978,6 +1043,7 @@ impl ApiServer {
     }
 
     fn create_value(&self, o: &mut Value, rt: &Route, q: &Query) -> R<Value> {
+        self.fv_builtin(rt, o, None)?;
         let (gv, mut t) = self.target(rt);
         t.api_version = &gv;
         let rev = self.store.borrow().revision() + 1;
@@ -1044,6 +1110,7 @@ impl ApiServer {
         let (gv, mut t) = self.target(rt);
         t.api_version = &gv;
         let rev = self.store.borrow().revision() + 1;
+        self.fv_builtin(rt, &new, Some(&old))?;
         let has_status = rt.res.subresources.contains(&"status");
         object::prepare_update(&old, &mut new, &t, rev, has_status, status)?;
         if !status {

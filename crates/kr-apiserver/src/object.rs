@@ -208,9 +208,6 @@ fn check_type(o: &Value, t: &Target) -> Result<(), ApiError> {
     if !matches!(o, Value::Object(_)) {
         return Err(ApiError::bad_request("request body must be a JSON object"));
     }
-    if o.has_duplicate_keys() {
-        return Err(ApiError::bad_request("duplicate keys in request body"));
-    }
     match (o.get("apiVersion").and_then(Value::as_str), o.get("kind").and_then(Value::as_str)) {
         (Some(v), Some(k)) if v == t.api_version && k == t.kind => Ok(()),
         (None, None) => Ok(()),
@@ -529,9 +526,6 @@ mod tests {
         // wrong namespace in body
         let mut bad = parse_str(r#"{"metadata":{"name":"a","namespace":"other"}}"#).unwrap();
         assert_eq!(prepare_create(&mut bad, &t, &clock, 9).unwrap_err().code, 400);
-        // duplicate keys are rejected
-        let mut dup = parse_str(r#"{"metadata":{"name":"a","name":"b"}}"#).unwrap();
-        assert_eq!(prepare_create(&mut dup, &t, &clock, 9).unwrap_err().code, 400);
     }
 
     #[test]
