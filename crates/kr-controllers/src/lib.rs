@@ -39,6 +39,7 @@ pub mod deployment;
 pub mod endpoints;
 pub mod gc;
 pub mod job;
+pub mod quota;
 pub mod replicaset;
 pub mod scheduler;
 pub mod statefulset;
@@ -92,6 +93,7 @@ pub async fn run_all_with<C: Client + Clone + 'static>(c: C, cfg: Config) {
         spawn(job::run(c.clone(), cfg)),
         spawn(cronjob::run(c.clone(), cfg)),
         spawn(endpoints::run(c.clone(), cfg)),
+        spawn(quota::run(c.clone(), cfg)),
         spawn(gc::run(c, cfg)),
     ]);
     // A never-woken future would let the executor free this task (and abort the guard).

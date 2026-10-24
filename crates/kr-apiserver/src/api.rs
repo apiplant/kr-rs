@@ -19,6 +19,7 @@ use core::cell::RefCell;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use kr_fmt::json::{self, Number, Value};
+use kr_fmt::quantity::Quantity;
 use kr_store::{Error as StoreError, Event, EventKind, Kv, Store, Watcher};
 
 /// The authenticated caller.
@@ -800,6 +801,10 @@ impl ApiServer {
             o.entry_object("spec").set("finalizers", Value::Array(alloc::vec![Value::from("kubernetes")]));
             o.entry_object("status").set("phase", Value::from("Active"));
         }
+        if rt.res.plural == "resourcequotas" {
+            crate::quota::validate(o).map_err(ApiError::invalid)?;
+        }
+        self.admit_quota(rt, o, None)?;
         if q.get("dryRun") == Some("All") {
             return Ok(o.clone());
         }
@@ -835,6 +840,14 @@ impl ApiServer {
         }
         if rt.res.plural == "services" && !status {
             self.admit_service(&mut new, Some(&old))?;
+        }
+        if rt.res.plural == "resourcequotas" && !status {
+            crate::quota::validate(&new).map_err(ApiError::invalid)?;
+        }
+        // Usage can change on update only for these kinds (a Service type/port change moves
+        // nodeports/loadbalancers, a PVC may grow); pods fix their resources at create.
+        if matches!(rt.res.plural, "services" | "persistentvolumeclaims") && !status {
+            self.admit_quota(rt, &new, Some(&old))?;
         }
         if q.get("dryRun") == Some("All") {
             return Ok(Reply::ok(&new));
@@ -1119,6 +1132,89 @@ impl ApiServer {
         spec.set("podCIDR", Value::String(cidr.clone()));
         spec.set("podCIDRs", Value::Array(alloc::vec![Value::String(cidr)]));
         Ok(())
+    }
+
+    // ---- ResourceQuota admission ----
+
+    /// ResourceQuota admission. On create (`old = None`) every quota whose scopes select the
+    /// object must allow its usage (`used + usage <= hard`, else 403 Forbidden with the
+    /// upstream message), and a tracked cpu/memory name the pod fails to specify is refused.
+    /// On update only the usage delta matters — which is why only Services and PVCs re-enter
+    /// admission here: they are the kinds whose usage an update can move.
+    fn admit_quota(&self, rt: &Route, obj: &Value, old: Option<&Value>) -> R<()> {
+        let Some(ns) = rt.namespace.as_deref() else { return Ok(()) };
+        let qr = resources::find("", "v1", "resourcequotas").unwrap();
+        let quotas: Vec<Value> = {
+            let store = self.store.borrow();
+            store.list(&alloc::format!("{}{ns}/", qr.prefix()), None, 0).0.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect()
+        };
+        if quotas.is_empty() || quotas.iter().all(|q| crate::quota::hard(q).is_empty()) {
+            return Ok(());
+        }
+        let deltas = match old {
+            None => crate::quota::usage(rt.res.plural, rt.res.group, obj),
+            Some(old) => crate::quota::delta(rt.res.plural, rt.res.group, obj, old),
+        };
+        for q in quotas {
+            // "must specify" is decided before usage: without the resources named, the delta
+            // cannot be charged (only meaningful on create, against scope-selecting quotas).
+            if old.is_none() {
+                let must = crate::quota::missing(&q, rt.res.plural, obj);
+                if !must.is_empty() && crate::quota::matches_scopes(&q, rt.res.plural, obj) {
+                    return Err(forbidden_obj(rt, obj, crate::quota::must_specify_msg(&q, &must)));
+                }
+            }
+            let tracked: Vec<(String, Quantity)> = deltas.iter().filter(|(k, _)| crate::quota::tracked(&q, k)).cloned().collect();
+            if tracked.is_empty() || !crate::quota::matches_scopes(&q, rt.res.plural, obj) {
+                continue;
+            }
+            let names: Vec<String> = tracked.iter().map(|(n, _)| n.clone()).collect();
+            let used = self.quota_usage(ns, &q, &names);
+            let hard = crate::quota::hard(&q);
+            for (k, d) in &tracked {
+                let limit = hard.iter().find(|(h, _)| h == k).map(|(_, x)| *x).unwrap_or_else(crate::quota::zero);
+                let have = used.iter().find(|(u, _)| u == k).map(|(_, x)| *x).unwrap_or_else(crate::quota::zero);
+                if crate::quota::add(&have, d) > limit {
+                    let used_now: Vec<(String, Quantity)> = tracked.iter().filter(|(t, _)| used.iter().any(|(u, _)| u == t)).map(|(t, _)| (t.clone(), used.iter().find(|(u, _)| u == t).map(|(_, x)| *x).unwrap_or_else(crate::quota::zero))).collect();
+                    let limited: Vec<(String, Quantity)> = hard.iter().filter(|(h, _)| tracked.iter().any(|(t, _)| t == h)).cloned().collect();
+                    return Err(forbidden_obj(rt, obj, crate::quota::exceeded_msg(&q, &tracked, &used_now, &limited)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Current namespace usage of `names` by the objects that `quota`'s scopes select: the
+    /// resources those names imply are listed and charged (upstream computes usage the same
+    /// way, over the namespace's objects).
+    fn quota_usage(&self, ns: &str, quota: &Value, names: &[String]) -> Vec<(String, Quantity)> {
+        let mut sources: Vec<&'static Resource> = Vec::new();
+        for n in names {
+            if let Some(r) = crate::quota::source_of(n) {
+                if !sources.iter().any(|s| s.plural == r.plural && s.group == r.group) {
+                    sources.push(r);
+                }
+            }
+        }
+        let mut used: Vec<(String, Quantity)> = Vec::new();
+        let store = self.store.borrow();
+        for src in sources {
+            for kv in store.list(&alloc::format!("{}{ns}/", src.prefix()), None, 0).0.iter() {
+                let Ok(o) = json::parse(&kv.value) else { continue };
+                if !crate::quota::matches_scopes(quota, src.plural, &o) {
+                    continue;
+                }
+                for (k, v) in crate::quota::usage(src.plural, src.group, &o) {
+                    if names.contains(&k) {
+                        match used.iter_mut().find(|(x, _)| x == &k) {
+                            Some((_, q)) => *q = crate::quota::add(q, &v),
+                            None => used.push((k, v)),
+                        }
+                    }
+                }
+            }
+        }
+        used
     }
 
     fn services(&self) -> Vec<Value> {
@@ -1451,6 +1547,12 @@ fn admit_job(o: &mut Value, name: &str) -> R<()> {
         }
     }
     Ok(())
+}
+
+/// An admission denial carrying the upstream object prefix (`pods "nginx" is forbidden: ...`).
+fn forbidden_obj(rt: &Route, obj: &Value, detail: String) -> ApiError {
+    let name = obj.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("");
+    ApiError::new(403, "Forbidden", alloc::format!("{} \"{name}\" is forbidden: {}", rt.res.singular, detail))
 }
 
 fn event_line(ty: &str, obj: &[u8]) -> Vec<u8> {

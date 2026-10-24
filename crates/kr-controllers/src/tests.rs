@@ -421,3 +421,68 @@ fn replicationcontroller_creates_pods() {
         .await;
     });
 }
+
+fn quota_used(q: &Value, name: &str) -> Option<String> {
+    q.pointer(&["status", "used", name]).and_then(Value::as_str).map(String::from)
+}
+
+#[test]
+fn quota_status_tracks_usage() {
+    scenario(|c| async move {
+        let qp = "/api/v1/namespaces/default/resourcequotas";
+        c.create(qp, &v(r#"{"metadata":{"name":"q"},"spec":{"hard":{"configmaps":"10","count/secrets":"10"}}}"#)).await.unwrap();
+        for n in ["a", "b"] {
+            c.create("/api/v1/namespaces/default/configmaps", &v(&alloc::format!(r#"{{"metadata":{{"name":"{n}"}}}}"#))).await.unwrap();
+        }
+        c.create("/api/v1/namespaces/default/secrets", &v(r#"{"metadata":{"name":"s"}}"#)).await.unwrap();
+        wait_until("used counts", || async {
+            let q = c.get(&alloc::format!("{qp}/q")).await.unwrap();
+            quota_used(&q, "configmaps").as_deref() == Some("2") && quota_used(&q, "count/secrets").as_deref() == Some("1") && q.pointer(&["status", "hard", "configmaps"]).is_some()
+        })
+        .await;
+        c.delete("/api/v1/namespaces/default/configmaps/a").await.unwrap();
+        wait_until("used drops after delete", || async { quota_used(&c.get(&alloc::format!("{qp}/q")).await.unwrap(), "configmaps").as_deref() == Some("1") }).await;
+    });
+}
+
+#[test]
+fn quota_admission_rejects_over_limit() {
+    scenario(|c| async move {
+        let qp = "/api/v1/namespaces/default/resourcequotas";
+        c.create(qp, &v(r#"{"metadata":{"name":"q"},"spec":{"hard":{"secrets":"1"}}}"#)).await.unwrap();
+        let sp = "/api/v1/namespaces/default/secrets";
+        c.create(sp, &v(r#"{"metadata":{"name":"s1"}}"#)).await.unwrap();
+        // Back to back: admission counts from the store, not from the controller's status.
+        let e = c.create(sp, &v(r#"{"metadata":{"name":"s2"}}"#)).await.unwrap_err();
+        assert_eq!(e.code, 403, "{}", e.message);
+        assert!(e.message.contains("exceeded quota: q, requested: secrets=1, used: secrets=1, limited: secrets=1"), "{}", e.message);
+        c.delete(&alloc::format!("{sp}/s1")).await.unwrap();
+        c.create(sp, &v(r#"{"metadata":{"name":"s2"}}"#)).await.unwrap();
+    });
+}
+
+#[test]
+fn quota_admission_requires_tracked_resources() {
+    scenario(|c| async move {
+        c.create("/api/v1/namespaces/default/resourcequotas", &v(r#"{"metadata":{"name":"q"},"spec":{"hard":{"requests.cpu":"1"}}}"#)).await.unwrap();
+        let pp = "/api/v1/namespaces/default/pods";
+        let e = c.create(pp, &v(r#"{"metadata":{"name":"p1"},"spec":{"containers":[{"name":"c","image":"i"}]}}"#)).await.unwrap_err();
+        assert_eq!(e.code, 403);
+        assert!(e.message.contains("must specify requests.cpu"), "{}", e.message);
+        c.create(pp, &v(r#"{"metadata":{"name":"p2"},"spec":{"containers":[{"name":"c","image":"i","resources":{"requests":{"cpu":"600m"}}}]}}"#)).await.unwrap();
+        let e = c.create(pp, &v(r#"{"metadata":{"name":"p3"},"spec":{"containers":[{"name":"c","image":"i","resources":{"requests":{"cpu":"500m"}}}]}}"#)).await.unwrap_err();
+        assert!(e.message.contains("exceeded quota: q, requested: requests.cpu=500m, used: requests.cpu=600m, limited: requests.cpu=1"), "{}", e.message);
+    });
+}
+
+#[test]
+fn quota_scopes_select_pods() {
+    scenario(|c| async move {
+        let qp = "/api/v1/namespaces/default/resourcequotas";
+        c.create(qp, &v(r#"{"metadata":{"name":"be"},"spec":{"hard":{"pods":"5"},"scopes":["BestEffort"]}}"#)).await.unwrap();
+        let pp = "/api/v1/namespaces/default/pods";
+        c.create(pp, &v(r#"{"metadata":{"name":"best"},"spec":{"containers":[{"name":"c","image":"i"}]}}"#)).await.unwrap();
+        c.create(pp, &v(r#"{"metadata":{"name":"burst"},"spec":{"containers":[{"name":"c","image":"i","resources":{"requests":{"cpu":"100m"}}}]}}"#)).await.unwrap();
+        wait_until("only the best-effort pod counts", || async { quota_used(&c.get(&alloc::format!("{qp}/be")).await.unwrap(), "pods").as_deref() == Some("1") }).await;
+    });
+}

@@ -21,6 +21,7 @@ pub mod printers;
 pub mod rbac;
 pub mod proto;
 pub mod proto_schema;
+pub mod quota;
 pub mod resources;
 pub mod server;
 pub mod tokens;
