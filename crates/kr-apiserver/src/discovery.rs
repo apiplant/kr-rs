@@ -50,8 +50,8 @@ fn resource_entries(r: &Resource) -> Vec<Value> {
 }
 
 /// APIResourceList for one group/version.
-pub fn resource_list(group: &str, version: &str) -> Option<String> {
-    let items: Vec<Value> = RESOURCES.iter().filter(|r| r.group == group && r.version == version).flat_map(resource_entries).collect();
+pub fn resource_list(extra: &[&'static Resource], group: &str, version: &str) -> Option<String> {
+    let items: Vec<Value> = RESOURCES.iter().chain(extra.iter().copied()).filter(|r| r.group == group && r.version == version).flat_map(resource_entries).collect();
     if items.is_empty() {
         return None;
     }
@@ -73,30 +73,24 @@ pub fn core_versions(server_address: &str) -> String {
     ]))
 }
 
+fn group_doc(extra: &[&'static Resource], g: &str) -> Value {
+    let vers: Vec<Value> = resources::versions(extra, g).into_iter().map(|v| obj(alloc::vec![("groupVersion", Value::String(alloc::format!("{g}/{v}"))), ("version", s(v))])).collect();
+    obj(alloc::vec![("name", s(g)), ("versions", Value::Array(vers.clone())), ("preferredVersion", vers[0].clone())])
+}
+
 /// `/apis`: APIGroupList.
-pub fn group_list() -> String {
-    let groups: Vec<Value> = resources::groups()
-        .into_iter()
-        .map(|g| {
-            let gv = alloc::format!("{g}/v1");
-            let ver = obj(alloc::vec![("groupVersion", Value::String(gv)), ("version", s("v1"))]);
-            obj(alloc::vec![("name", s(g)), ("versions", Value::Array(alloc::vec![ver.clone()])), ("preferredVersion", ver)])
-        })
-        .collect();
+pub fn group_list(extra: &[&'static Resource]) -> String {
+    let groups: Vec<Value> = resources::groups(extra).into_iter().map(|g| group_doc(extra, g)).collect();
     json::to_string(&obj(alloc::vec![("kind", s("APIGroupList")), ("apiVersion", s("v1")), ("groups", Value::Array(groups))]))
 }
 
 /// `/apis/<group>`: APIGroup.
-pub fn group(name: &str) -> Option<String> {
-    if !resources::groups().contains(&name) {
+pub fn group(extra: &[&'static Resource], name: &str) -> Option<String> {
+    if !resources::groups(extra).contains(&name) {
         return None;
     }
-    let ver = obj(alloc::vec![("groupVersion", Value::String(alloc::format!("{name}/v1"))), ("version", s("v1"))]);
-    Some(json::to_string(&obj(alloc::vec![
-        ("kind", s("APIGroup")),
-        ("apiVersion", s("v1")),
-        ("name", s(name)),
-        ("versions", Value::Array(alloc::vec![ver.clone()])),
-        ("preferredVersion", ver),
-    ])))
+    let Value::Object(mut f) = group_doc(extra, name) else { return None };
+    f.insert(0, ("apiVersion".into(), s("v1")));
+    f.insert(0, ("kind".into(), s("APIGroup")));
+    Some(json::to_string(&Value::Object(f)))
 }

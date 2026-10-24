@@ -17,10 +17,10 @@ fn gv_path(group: &str, version: &str) -> String {
 }
 
 /// `/openapi/v3`: index of group-version documents.
-pub fn index() -> String {
+pub fn index(extra: &[&'static Resource]) -> String {
     let mut paths = alloc::vec![(String::from("api/v1"), o(alloc::vec![("serverRelativeURL", Value::from("/openapi/v3/api/v1?hash=kr"))]))];
-    for g in resources::groups() {
-        let p = gv_path(g, "v1");
+    for (g, v) in resources::group_versions(extra) {
+        let p = gv_path(g, v);
         let url = alloc::format!("/openapi/v3/{p}?hash=kr");
         paths.push((p, o(alloc::vec![("serverRelativeURL", Value::String(url))])));
     }
@@ -39,9 +39,9 @@ fn op(r: &Resource, action: &str) -> Value {
 }
 
 /// `/openapi/v3/<gv path>`: operations per resource (no component schemas).
-pub fn group_version(path: &str) -> Option<String> {
+pub fn group_version(extra: &[&'static Resource], path: &str) -> Option<String> {
     let mut paths = Vec::new();
-    for r in RESOURCES.iter().filter(|r| gv_path(r.group, r.version) == path) {
+    for r in RESOURCES.iter().chain(extra.iter().copied()).filter(|r| gv_path(r.group, r.version) == path) {
         let base = if r.namespaced { alloc::format!("/{path}/namespaces/{{namespace}}/{}", r.plural) } else { alloc::format!("/{path}/{}", r.plural) };
         paths.push((base.clone(), o(alloc::vec![("post", op(r, "post")), ("get", op(r, "list"))])));
         paths.push((alloc::format!("{base}/{{name}}"), o(alloc::vec![("get", op(r, "get")), ("put", op(r, "put")), ("patch", op(r, "patch")), ("delete", op(r, "delete"))])));

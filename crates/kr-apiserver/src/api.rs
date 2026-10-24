@@ -83,6 +83,8 @@ pub struct ApiServer {
     ca: RefCell<Option<(kr_crypto::x509::Name, kr_crypto::x509::SigningKey, Vec<u8>)>>,
     /// Lifetime of issued node certificates, seconds (agents renew at 2/3).
     node_cert_secs: core::cell::Cell<i64>,
+    /// Served versions of established CustomResourceDefinitions.
+    custom: RefCell<Vec<crate::crd::Custom>>,
 }
 
 /// Default namespaces created on first start.
@@ -173,12 +175,115 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400) };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()) };
+        if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
+            let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
+            for kv in crds {
+                if let Ok(v) = json::parse(&kv.value) {
+                    api.register_crd(&v);
+                }
+            }
+        }
         for ns in SYSTEM_NAMESPACES {
             api.ensure_default_sa(ns);
         }
         api.sync()?;
         Ok(api)
+    }
+
+    fn extra(&self) -> Vec<&'static Resource> {
+        self.custom.borrow().iter().map(|c| c.res).collect()
+    }
+
+    /// (Re)registers the served versions of a stored CRD.
+    fn register_crd(&self, crd: &Value) {
+        let name = crd.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("");
+        let mut all = self.custom.borrow_mut();
+        let fresh = crate::crd::build(crd, &all);
+        all.retain(|c| c.crd != name);
+        all.extend(fresh);
+    }
+
+    /// Removes a CRD's resources and every stored object of its kind.
+    fn unregister_crd(&self, crd: &Value) {
+        let name = crd.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("");
+        let res = self.custom.borrow().iter().find(|c| c.crd == name).map(|c| c.res);
+        self.custom.borrow_mut().retain(|c| c.crd != name);
+        if let Some(r) = res {
+            let mut store = self.store.borrow_mut();
+            let (items, _) = store.list(&r.prefix(), None, 0);
+            for it in items {
+                let _ = store.delete(&it.key, None);
+            }
+        }
+    }
+
+    /// Defaulting, pruning, validation and generation rules for a custom object.
+    fn admit_custom(&self, rt: &Route, o: &mut Value, old: Option<&Value>, status: bool) -> R<()> {
+        let custom = self.custom.borrow();
+        let Some(c) = custom.iter().find(|c| core::ptr::eq(c.res, rt.res)) else { return Ok(()) };
+        if let Some(s) = &c.schema {
+            crate::crd::prune(s, o, true);
+            let mut errs = Vec::new();
+            crate::crd::validate(s, o, "", &mut errs);
+            if !errs.is_empty() {
+                let name = o.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("");
+                return Err(ApiError::invalid(alloc::format!("{}.{} \"{name}\" is invalid: {}", rt.res.kind, rt.res.group, errs.join(", "))));
+            }
+        }
+        let has_status = c.status();
+        let gen_of = |v: &Value| v.pointer(&["metadata", "generation"]).and_then(Value::as_u64).unwrap_or(1);
+        match old {
+            None => {
+                if has_status {
+                    o.remove("status");
+                }
+                o.entry_object("metadata").set("generation", Value::Number(Number::from_u64(1)));
+            }
+            Some(old) if !status => {
+                let strip = |v: &Value| {
+                    let mut v = v.clone();
+                    v.remove("metadata");
+                    if has_status {
+                        v.remove("status");
+                    }
+                    v
+                };
+                let g = gen_of(old) + u64::from(strip(old) != strip(o));
+                o.entry_object("metadata").set("generation", Value::Number(Number::from_u64(g)));
+            }
+            Some(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Rewrites apiVersion in a response to the requested version (conversion strategy None).
+    fn convert_reply(&self, rt: &Route, reply: Reply) -> Reply {
+        let multi = {
+            let custom = self.custom.borrow();
+            let Some(c) = custom.iter().find(|c| core::ptr::eq(c.res, rt.res)) else { return reply };
+            custom.iter().filter(|x| x.crd == c.crd).count() > 1
+        };
+        let Reply::Json(code, body) = reply else { return reply };
+        if !multi || code >= 300 {
+            return Reply::Json(code, body);
+        }
+        let Ok(mut v) = json::parse(body.as_bytes()) else { return Reply::Json(code, body) };
+        let gv = rt.res.group_version();
+        let kind = v.get("kind").and_then(Value::as_str).unwrap_or("").to_string();
+        if kind == rt.res.kind {
+            v.set("apiVersion", Value::from(gv.as_str()));
+        } else if kind == alloc::format!("{}List", rt.res.kind) {
+            v.set("apiVersion", Value::from(gv.as_str()));
+            if let Some(items) = v.get_mut("items").and_then(Value::as_array_mut) {
+                for it in items {
+                    it.set("apiVersion", Value::from(gv.as_str()));
+                }
+            }
+        } else {
+            return Reply::Json(code, body);
+        }
+        Reply::Json(code, json::to_string(&v))
     }
 
     /// Enables node joining (`POST /kr/join`) with the cluster CA.
@@ -456,9 +561,10 @@ impl ApiServer {
         let q = Query::parse(req.query)?;
         let segs: Vec<&str> = path.split('/').skip(1).collect();
         // Resource URL? Then authorize on resource attributes; otherwise on the path.
+        let extra = self.extra();
         let resource = match segs.as_slice() {
-            ["api", "v1", rest @ ..] if !rest.is_empty() => parse_route("", "v1", rest),
-            ["apis", g, v, rest @ ..] if !rest.is_empty() => parse_route(g, v, rest),
+            ["api", "v1", rest @ ..] if !rest.is_empty() => parse_route(&extra, "", "v1", rest),
+            ["apis", g, v, rest @ ..] if !rest.is_empty() => parse_route(&extra, g, v, rest),
             _ => None,
         };
         let attrs = match &resource {
@@ -518,15 +624,15 @@ impl ApiServer {
             }
             ["apis", "authorization.k8s.io", "v1", "selfsubjectaccessreviews"] if req.method == "POST" => return self.self_subject_access_review(req, &user),
             ["api"] => return Ok(Reply::Json(200, discovery::core_versions(&self.server_address))),
-            ["api", "v1"] => return Ok(Reply::Json(200, discovery::resource_list("", "v1").unwrap())),
-            ["apis"] => return Ok(Reply::Json(200, discovery::group_list())),
-            ["openapi", "v3"] => return Ok(Reply::Json(200, crate::openapi::index())),
+            ["api", "v1"] => return Ok(Reply::Json(200, discovery::resource_list(&extra, "", "v1").unwrap())),
+            ["apis"] => return Ok(Reply::Json(200, discovery::group_list(&extra))),
+            ["openapi", "v3"] => return Ok(Reply::Json(200, crate::openapi::index(&extra))),
             ["openapi", "v3", rest @ ..] => {
                 let p = rest.join("/");
-                return crate::openapi::group_version(&p).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("openapi", &p));
+                return crate::openapi::group_version(&extra, &p).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("openapi", &p));
             }
-            ["apis", g] => return discovery::group(g).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("group", g)),
-            ["apis", g, v] => return discovery::resource_list(g, v).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("groupVersion", v)),
+            ["apis", g] => return discovery::group(&extra, g).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("group", g)),
+            ["apis", g, v] => return discovery::resource_list(&extra, g, v).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("groupVersion", v)),
             _ => {}
         }
         let (group, version, rest) = match segs.as_slice() {
@@ -536,7 +642,8 @@ impl ApiServer {
         };
         let _ = (group, version, rest);
         let route = resource.ok_or_else(|| ApiError::not_found("path", path))?;
-        self.dispatch(req, &route, &q)
+        let reply = self.dispatch(req, &route, &q)?;
+        Ok(self.convert_reply(&route, reply))
     }
 
     fn dispatch(&self, req: &Req, rt: &Route, q: &Query) -> R<Reply> {
@@ -735,7 +842,13 @@ impl ApiServer {
             return Err(ApiError::new(415, "UnsupportedMediaType", alloc::format!("the body of the request was in an unknown format - accepted media types include: application/json, application/yaml, application/vnd.kubernetes.protobuf (got {ct})")));
         }
         let v = if ct.starts_with("application/vnd.kubernetes.protobuf") {
-            proto::decode_body_as(req.body, fallback).map_err(ApiError::bad_request)?
+            proto::decode_body_as(req.body, fallback).map_err(|e| {
+                if e == "protobuf: unsupported kind" {
+                    ApiError::new(415, "UnsupportedMediaType", "protobuf is not supported for this kind; use application/json")
+                } else {
+                    ApiError::bad_request(e)
+                }
+            })?
         } else if ct.starts_with("application/yaml") || ct.starts_with("application/apply-patch+yaml") {
             let s = core::str::from_utf8(req.body).map_err(|_| ApiError::bad_request("body is not UTF-8"))?;
             kr_fmt::yaml::parse(s).map_err(|_| ApiError::bad_request("invalid YAML body"))?
@@ -784,6 +897,11 @@ impl ApiServer {
         let name = object::prepare_create(o, &t, &self.clock(), rev)?;
         self.check_namespace(rt, &name)?;
         crate::defaults::apply(rt.res.group, rt.res.plural, o);
+        let is_crd = crate::crd::is_crd(rt.res);
+        if is_crd {
+            crate::crd::admit(o, None, (self.now)())?;
+        }
+        self.admit_custom(rt, o, None, false)?;
         if rt.res.plural == "pods" {
             let ns = rt.namespace.clone().unwrap_or_default();
             self.admit_pod(o, &ns)?;
@@ -811,6 +929,9 @@ impl ApiServer {
         let key = rt.res.key(rt.namespace.as_deref(), &name);
         let kv = self.store.borrow_mut().create(&key, json::to_string(o).into_bytes()).map_err(|e| store_err(e, rt.res.singular, &name))?;
         debug_assert_eq!(kv.mod_rev, rev);
+        if is_crd {
+            self.register_crd(o);
+        }
         if rt.res.plural == "namespaces" {
             self.ensure_default_sa(&name);
             self.ensure_root_ca(&name);
@@ -838,6 +959,10 @@ impl ApiServer {
         if !status {
             crate::defaults::apply(rt.res.group, rt.res.plural, &mut new);
         }
+        if crate::crd::is_crd(rt.res) {
+            crate::crd::admit(&mut new, Some(&old), (self.now)())?;
+        }
+        self.admit_custom(rt, &mut new, Some(&old), status)?;
         if rt.res.plural == "services" && !status {
             self.admit_service(&mut new, Some(&old))?;
         }
@@ -861,6 +986,9 @@ impl ApiServer {
             return Ok(Reply::ok(&new));
         }
         self.store.borrow_mut().update(&kv.key, json::to_string(&new).into_bytes(), Some(kv.mod_rev)).map_err(|e| store_err(e, rt.res.singular, name))?;
+        if crate::crd::is_crd(rt.res) {
+            self.register_crd(&new);
+        }
         self.sync()?;
         Ok(Reply::ok(&new))
     }
@@ -880,10 +1008,17 @@ impl ApiServer {
             }
         }
         let (kv, old) = existing?;
+        let custom = self.custom.borrow().iter().any(|c| core::ptr::eq(c.res, rt.res));
+        if custom && ct.starts_with("application/strategic-merge-patch+json") {
+            return Err(ApiError::new(415, "UnsupportedMediaType", "the body of the request was in an unknown format - accepted media types include: application/json-patch+json, application/merge-patch+json, application/apply-patch+yaml"));
+        }
         let mut new = old.clone();
         let r = if ct.starts_with("application/json-patch+json") {
             patch::json_patch(&mut new, &p)
         } else if ct.starts_with("application/merge-patch+json") {
+            patch::merge_patch(&mut new, &p);
+            Ok(())
+        } else if custom && ct.starts_with("application/apply-patch") {
             patch::merge_patch(&mut new, &p);
             Ok(())
         } else if ct.starts_with("application/strategic-merge-patch+json") || ct.starts_with("application/apply-patch") {
@@ -956,6 +1091,9 @@ impl ApiServer {
             return Ok(Reply::Json(202, json::to_string(&v)));
         }
         self.store.borrow_mut().delete(&kv.key, Some(kv.mod_rev)).map_err(|e| store_err(e, rt.res.singular, name))?;
+        if crate::crd::is_crd(rt.res) {
+            self.unregister_crd(&v);
+        }
         self.sync()?;
         Ok(Reply::ok(&v))
     }
@@ -967,7 +1105,8 @@ impl ApiServer {
             return Err(ApiError::new(403, "Forbidden", alloc::format!("namespace {name} is a system namespace and cannot be deleted")));
         }
         let mut store = self.store.borrow_mut();
-        for r in RESOURCES.iter().filter(|r| r.namespaced) {
+        let extra = self.extra();
+        for r in RESOURCES.iter().chain(extra.iter().copied()).filter(|r| r.namespaced) {
             let prefix = alloc::format!("{}{name}/", r.prefix());
             let (items, _) = store.list(&prefix, None, 0);
             for it in items {
@@ -1404,9 +1543,11 @@ impl ApiServer {
 
     fn scale_of(&self, rt: &Route, v: &Value) -> Value {
         let meta = v.get("metadata").cloned().unwrap_or(Value::Object(Vec::new()));
-        let spec_replicas = v.pointer(&["spec", "replicas"]).cloned().unwrap_or(Value::Number(Number::from_u64(1)));
-        let status_replicas = v.pointer(&["status", "replicas"]).cloned().unwrap_or(Value::Number(Number::from_u64(0)));
-        let selector = v.pointer(&["spec", "selector", "matchLabels"]).and_then(Value::as_object).map(|m| m.iter().map(|(k, v)| alloc::format!("{k}={}", v.as_str().unwrap_or(""))).collect::<Vec<_>>().join(",")).unwrap_or_default();
+        let paths = self.scale_paths(rt);
+        let spec_replicas = v.pointer(&crate::crd::path_segs(&paths[0])).cloned().unwrap_or(Value::Number(Number::from_u64(1)));
+        let status_replicas = v.pointer(&crate::crd::path_segs(&paths[1])).cloned().unwrap_or(Value::Number(Number::from_u64(0)));
+        let custom_selector = Some(paths[2].as_str()).filter(|p| !p.is_empty()).map(|p| v.pointer(&crate::crd::path_segs(p)).and_then(Value::as_str).unwrap_or("").to_string());
+        let selector = custom_selector.or_else(|| v.pointer(&["spec", "selector", "matchLabels"]).and_then(Value::as_object).map(|m| m.iter().map(|(k, v)| alloc::format!("{k}={}", v.as_str().unwrap_or(""))).collect::<Vec<_>>().join(","))).unwrap_or_default();
         let mut m = obj(alloc::vec![]);
         for f in ["name", "namespace", "uid", "resourceVersion", "creationTimestamp"] {
             if let Some(x) = meta.get(f) {
@@ -1421,6 +1562,15 @@ impl ApiServer {
             ("spec", obj(alloc::vec![("replicas", spec_replicas)])),
             ("status", obj(alloc::vec![("replicas", status_replicas), ("selector", Value::String(selector))])),
         ])
+    }
+
+    /// (spec replicas, status replicas, selector) paths of the scale subresource.
+    fn scale_paths(&self, rt: &Route) -> [String; 3] {
+        let custom = self.custom.borrow();
+        match custom.iter().find(|c| core::ptr::eq(c.res, rt.res)).and_then(|c| c.scale.clone()) {
+            Some(p) => p,
+            None => [".spec.replicas".into(), ".status.replicas".into(), String::new()],
+        }
     }
 
     fn get_scale(&self, rt: &Route, name: &str) -> R<Reply> {
@@ -1444,7 +1594,15 @@ impl ApiServer {
         }
         let replicas = scale.pointer(&["spec", "replicas"]).and_then(Value::as_i64).filter(|r| *r >= 0).ok_or_else(|| ApiError::invalid("spec.replicas must be a non-negative integer"))?;
         let mut new = old.clone();
-        new.entry_object("spec").set("replicas", Value::Number(Number::from_i64(replicas)));
+        let segs = crate::crd::path_segs(&self.scale_paths(rt)[0]).into_iter().map(String::from).collect::<Vec<_>>();
+        let mut cur = &mut new;
+        for (i, seg) in segs.iter().enumerate() {
+            if i + 1 == segs.len() {
+                cur.set(seg, Value::Number(Number::from_i64(replicas)));
+            } else {
+                cur = cur.entry_object(seg);
+            }
+        }
         if let Some(m) = new.get_mut("metadata") {
             m.remove("resourceVersion");
         }
@@ -1569,7 +1727,7 @@ fn wants_table(accept: Option<&str>) -> bool {
     accept.is_some_and(|a| a.split(',').next().is_some_and(|first| first.contains("as=Table")))
 }
 
-fn parse_route(group: &str, version: &str, rest: &[&str]) -> Option<Route> {
+fn parse_route(extra: &[&'static Resource], group: &str, version: &str, rest: &[&str]) -> Option<Route> {
     let ok_seg = |s: &str| !s.is_empty() && s != "." && s != "..";
     if !rest.iter().all(|s| ok_seg(s)) {
         return None;
@@ -1588,7 +1746,7 @@ fn parse_route(group: &str, version: &str, rest: &[&str]) -> Option<Route> {
         [p, n, s] => (*p, Some(n.to_string()), Some(s.to_string())),
         _ => return None,
     };
-    let res = resources::find(group, version, plural)?;
+    let res = resources::find_in(extra, group, version, plural)?;
     if namespace.is_some() && !res.namespaced {
         return None;
     }

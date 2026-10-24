@@ -87,6 +87,7 @@ pub static RESOURCES: &[Resource] = &[
     r!("networking.k8s.io", "v1", "IngressClass", "ingressclasses", "ingressclass", false, [], [], []),
     r!("networking.k8s.io", "v1", "IPAddress", "ipaddresses", "ipaddress", false, ["ip"], [], []),
     r!("networking.k8s.io", "v1", "ServiceCIDR", "servicecidrs", "servicecidr", false, [], ["status"], []),
+    r!("apiextensions.k8s.io", "v1", "CustomResourceDefinition", "customresourcedefinitions", "customresourcedefinition", false, ["crd", "crds"], ["status"], ["api-extensions"]),
     // Stored only (no controllers or enforcement yet): CRUD-level API support.
     r!("admissionregistration.k8s.io", "v1", "ValidatingWebhookConfiguration", "validatingwebhookconfigurations", "validatingwebhookconfiguration", false, [], [], ["api-extensions"]),
     r!("admissionregistration.k8s.io", "v1", "MutatingWebhookConfiguration", "mutatingwebhookconfigurations", "mutatingwebhookconfiguration", false, [], [], ["api-extensions"]),
@@ -118,18 +119,41 @@ pub static RESOURCES: &[Resource] = &[
     r!("rbac.authorization.k8s.io", "v1", "ClusterRoleBinding", "clusterrolebindings", "clusterrolebinding", false, [], [], []),
 ];
 
-/// Looks up a resource by group, version and plural.
+/// Looks up a built-in resource by group, version and plural.
 pub fn find(group: &str, version: &str, plural: &str) -> Option<&'static Resource> {
     RESOURCES.iter().find(|r| r.group == group && r.version == version && r.plural == plural)
 }
 
-/// Groups in discovery order (core first), each with its versions.
-pub fn groups() -> alloc::vec::Vec<&'static str> {
-    let mut out: alloc::vec::Vec<&'static str> = alloc::vec::Vec::new();
-    for r in RESOURCES {
-        if !r.group.is_empty() && !out.contains(&r.group) {
-            out.push(r.group);
+/// Like [`find`], also searching dynamically registered (custom) resources.
+pub fn find_in(extra: &[&'static Resource], group: &str, version: &str, plural: &str) -> Option<&'static Resource> {
+    find(group, version, plural).or_else(|| extra.iter().copied().find(|r| r.group == group && r.version == version && r.plural == plural))
+}
+
+/// Non-core (group, version) pairs in discovery order.
+pub fn group_versions(extra: &[&'static Resource]) -> alloc::vec::Vec<(&'static str, &'static str)> {
+    let mut out: alloc::vec::Vec<(&'static str, &'static str)> = alloc::vec::Vec::new();
+    for r in RESOURCES.iter().chain(extra.iter().copied()) {
+        if !r.group.is_empty() && !out.contains(&(r.group, r.version)) {
+            out.push((r.group, r.version));
         }
     }
+    out
+}
+
+/// Groups in discovery order (core first), each with its versions.
+pub fn groups(extra: &[&'static Resource]) -> alloc::vec::Vec<&'static str> {
+    let mut out: alloc::vec::Vec<&'static str> = alloc::vec::Vec::new();
+    for (g, _) in group_versions(extra) {
+        if !out.contains(&g) {
+            out.push(g);
+        }
+    }
+    out
+}
+
+/// Versions of a group, highest priority first.
+pub fn versions(extra: &[&'static Resource], group: &str) -> alloc::vec::Vec<&'static str> {
+    let mut out: alloc::vec::Vec<&'static str> = group_versions(extra).into_iter().filter(|(g, _)| *g == group).map(|(_, v)| v).collect();
+    out.sort_by(|a, b| crate::crd::version_rank(b).cmp(&crate::crd::version_rank(a)));
     out
 }
