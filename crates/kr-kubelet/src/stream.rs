@@ -103,6 +103,26 @@ impl<C: Client + Clone + 'static> NodeProxy for Proxy<C> {
         let q = Query::parse(query);
         let v = self.view(ns, pod, q.get("container"))?;
         match sub {
+            "log" if headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("upgrade") && v.eq_ignore_ascii_case("websocket")) => {
+                // Logs over WebSocket (non-follow): the content as one binary message, or base64
+                // text for base64.binary.k8s.io.
+                let hs = websocket::handshake(&ws_request("/log", headers), &["binary.k8s.io", "base64.binary.k8s.io"]).map_err(|_| ApiError::bad_request("invalid websocket upgrade"))?;
+                let b64 = hs.protocol.as_deref() == Some("base64.binary.k8s.io");
+                let data = match self.logs(ns, pod, &v, &Query::parse(&query.replace("follow=true", "follow=false")))?.body {
+                    Body::Full(d) => d,
+                    _ => Vec::new(),
+                };
+                let handler = move |conn: Box<dyn Conn>| -> Pin<Box<dyn Future<Output = ()>>> {
+                    Box::pin(async move {
+                        let mut ws = WebSocket::new(conn, WsConfig::default());
+                        if !data.is_empty() {
+                            let _ = if b64 { ws.send_text(&kr_fmt::base64::encode(&data)).await } else { ws.send_binary(&data).await };
+                        }
+                        let _ = ws.close(1000, "").await;
+                    })
+                };
+                Ok(hs.into_response(Box::new(handler)))
+            }
             "log" => self.logs(ns, pod, &v, &q),
             "exec" => {
                 let target = v.ctr_target.clone().ok_or_else(|| ApiError::bad_request(alloc::format!("container {} is not running", v.container)))?;
