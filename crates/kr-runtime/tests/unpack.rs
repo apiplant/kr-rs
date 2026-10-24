@@ -415,3 +415,20 @@ fn symlink_cannot_be_used_to_chmod_outside() {
     assert_eq!(std::fs::metadata(&sb.outside).unwrap().permissions().mode(), mode_before);
     assert_eq!(sb.outside_snapshot(), before);
 }
+
+#[test]
+fn stats_carry_the_sha256_of_the_uncompressed_tar() {
+    use kr_net::sha256::{hex, sha256};
+    let sb = Sandbox::new();
+    let mut t = Tar::new();
+    t.file("a", 0o644, b"hello");
+    let raw = t.finish();
+    let st = sb.unpack_gz(&gzip_stored(&raw), &Limits::default()).unwrap();
+    assert_eq!(st.diff_id, hex(&sha256(&raw)));
+}
+
+#[test]
+fn image_wide_byte_cap_is_a_separate_field() {
+    let l = Limits::default();
+    assert_eq!(l.max_image_bytes, 8 << 30);
+}

@@ -13,6 +13,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use kr_archive::gzip::GzDecoder;
 use kr_archive::tar::{self, Entry, Event, Kind, TarReader, Whiteout};
+use kr_net::sha256::{hex, Sha256};
 use kr_sys::fs::{self, ENOENT, ENOTDIR};
 use kr_sys::{Errno, Fd, Timespec};
 
@@ -21,6 +22,8 @@ use kr_sys::{Errno, Fd, Timespec};
 pub struct Limits {
     /// Maximum uncompressed (tar stream) bytes per layer.
     pub max_bytes: u64,
+    /// Maximum uncompressed bytes over all layers of one image (enforced by the pull).
+    pub max_image_bytes: u64,
     /// Maximum tar entries per layer.
     pub max_entries: u64,
     /// Paths and link targets must be shorter than this (PATH_MAX).
@@ -29,7 +32,7 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_bytes: 16 << 30, max_entries: 1_000_000, max_path: 4096 }
+        Limits { max_bytes: 8 << 30, max_image_bytes: 8 << 30, max_entries: 1_000_000, max_path: 4096 }
     }
 }
 
@@ -49,6 +52,8 @@ pub struct Stats {
     pub skipped_reserved: u64,
     /// Uncompressed bytes read from the layer.
     pub bytes: u64,
+    /// Lower-case hex sha256 of the uncompressed tar stream (the OCI `diff_id`).
+    pub diff_id: String,
 }
 
 const ATFLAG_NOFOLLOW: i32 = fs::AT_SYMLINK_NOFOLLOW;
@@ -442,6 +447,7 @@ fn run(root: i32, src: &mut dyn FnMut(&mut [u8]) -> Result<usize>, lim: &Limits,
     let mut gz = GzDecoder::new();
     let mut buf = alloc::vec![0u8; 64 * 1024];
     let mut total: u64 = 0;
+    let mut hash = Sha256::new();
     loop {
         let n = src(&mut buf)?;
         if n == 0 {
@@ -453,6 +459,7 @@ fn run(root: i32, src: &mut dyn FnMut(&mut [u8]) -> Result<usize>, lim: &Limits,
                 if total > lim.max_bytes {
                     return Err(Error::Limit("layer exceeds the uncompressed size limit"));
                 }
+                hash.update(out);
                 tr.feed(out, &mut |ev| u.event(ev)).map_err(Error::from)
             })?;
         } else {
@@ -460,6 +467,7 @@ fn run(root: i32, src: &mut dyn FnMut(&mut [u8]) -> Result<usize>, lim: &Limits,
             if total > lim.max_bytes {
                 return Err(Error::Limit("layer exceeds the uncompressed size limit"));
             }
+            hash.update(&buf[..n]);
             tr.feed(&buf[..n], &mut |ev| u.event(ev)).map_err(Error::from)?;
         }
     }
@@ -468,6 +476,7 @@ fn run(root: i32, src: &mut dyn FnMut(&mut [u8]) -> Result<usize>, lim: &Limits,
     }
     tr.finish().map_err(Error::Archive)?;
     u.st.bytes = total;
+    u.st.diff_id = hex(&hash.finalize());
     u.finish()
 }
 

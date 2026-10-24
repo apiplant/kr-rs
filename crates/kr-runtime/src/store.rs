@@ -111,6 +111,8 @@ pub struct ImageConfig {
     pub working_dir: String,
     /// `user[:group]`, names or numeric ids; empty means root.
     pub user: String,
+    /// `rootfs.diff_ids`: sha256 (hex, no prefix) of each uncompressed layer tar, in order.
+    pub diff_ids: Vec<String>,
 }
 
 fn str_list(v: Option<&kr_fmt::json::Value>) -> Result<Vec<String>> {
@@ -133,8 +135,15 @@ impl ImageConfig {
         if v.as_object().is_none() {
             return Err(Error::Json("config is not an object"));
         }
+        let mut diff_ids = Vec::new();
+        if let Some(a) = v.get("rootfs").and_then(|r| r.get("diff_ids")).and_then(|d| d.as_array()) {
+            for d in a {
+                let d = d.as_str().and_then(|d| d.strip_prefix("sha256:")).ok_or(Error::Json("bad rootfs.diff_ids entry"))?;
+                diff_ids.push(d.to_string());
+            }
+        }
         let Some(c) = v.get("config").filter(|c| !c.is_null()) else {
-            return Ok(ImageConfig::default());
+            return Ok(ImageConfig { diff_ids, ..ImageConfig::default() });
         };
         if c.as_object().is_none() {
             return Err(Error::Json("config.config is not an object"));
@@ -152,6 +161,7 @@ impl ImageConfig {
             cmd: str_list(c.get("Cmd"))?,
             working_dir: s("WorkingDir")?,
             user: s("User")?,
+            diff_ids,
         })
     }
 }

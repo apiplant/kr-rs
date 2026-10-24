@@ -27,13 +27,24 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with(false)
+}
+
+fn fixture_with(bad_diff: bool) -> Fixture {
     let mut l1 = Tar::new();
     l1.dir("bin", 0o755).file("bin/busybox", 0o755, b"ELF").hardlink("bin/sh", "bin/busybox");
     l1.dir("etc", 0o755).file("etc/old", 0o644, b"old").file("etc/keep", 0o644, b"keep");
     let mut l2 = Tar::new();
     l2.file("etc/.wh.old", 0o644, b"").file("etc/new", 0o644, b"new");
-    let layers = vec![gzip_stored(&l1.finish()), gzip_stored(&l2.finish())];
-    let config = br#"{"architecture":"amd64","os":"linux","config":{"Env":["A=1"],"Cmd":["/bin/sh"],"WorkingDir":"/"}}"#.to_vec();
+    let (t1, t2) = (l1.finish(), l2.finish());
+    let layers = vec![gzip_stored(&t1), gzip_stored(&t2)];
+    let d2 = if bad_diff { hex(&sha256(b"wrong")) } else { hex(&sha256(&t2)) };
+    let config = format!(
+        r#"{{"architecture":"amd64","os":"linux","config":{{"Env":["A=1"],"Cmd":["/bin/sh"],"WorkingDir":"/"}},"rootfs":{{"type":"layers","diff_ids":["sha256:{}","sha256:{}"]}}}}"#,
+        hex(&sha256(&t1)),
+        d2
+    )
+    .into_bytes();
     let manifest = format!(
         r#"{{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{{"mediaType":"application/vnd.docker.container.image.v1+json","digest":"{}","size":{}}},"layers":[{}]}}"#,
         dg(&config),
@@ -195,6 +206,20 @@ fn pull_rejects_corrupt_blob_and_leaves_no_image() {
     assert!(leftovers.iter().all(|n| !n.to_string_lossy().starts_with('.')), "{leftovers:?}");
     let imgs: Vec<_> = std::fs::read_dir(p.join("images")).unwrap().flatten().collect();
     assert!(imgs.iter().all(|e| !e.path().join("rootfs").exists()), "{imgs:?}");
+    let _ = std::fs::remove_dir_all(&p);
+}
+
+#[test]
+fn pull_rejects_diff_id_mismatch_and_leaves_no_rootfs() {
+    let f = Arc::new(fixture_with(true));
+    let srv = serve(f.clone(), None);
+    let (p, store) = tmp_store("diffid");
+    let r = format!("127.0.0.1:{}/test/app:latest", srv.port);
+    let e = run_pull(&store, &r).unwrap_err();
+    assert!(matches!(e, Error::Image(m) if m.contains("diff_id")), "{e:?}");
+    assert!(store.image(&r).is_none());
+    let imgs: Vec<_> = std::fs::read_dir(p.join("images")).unwrap().flatten().collect();
+    assert!(imgs.iter().all(|e| !e.path().join("rootfs").exists() && !e.path().join("rootfs.tmp").exists()), "{imgs:?}");
     let _ = std::fs::remove_dir_all(&p);
 }
 

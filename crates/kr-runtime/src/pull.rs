@@ -2,7 +2,7 @@
 use crate::store::{cpath, Ctx, Error, ImageConfig, ImageId, Result, Store};
 use crate::unpack::{unpack_layer_fd, Limits, Stats};
 use alloc::format;
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use kr_net::http1::{Client, Config};
 use kr_net::registry::{Descriptor, Reference, Registry};
@@ -72,7 +72,7 @@ pub async fn pull_with(store: &Store, image_ref: &str, limits: &Limits) -> Resul
         let fd = store.open_blob(&cfg_desc.digest)?;
         fs::read_to_end(fd.raw(), &mut cfg_json, MAX_CONFIG as usize).ctx("read config blob")?;
     }
-    ImageConfig::parse(&cfg_json)?; // reject unusable configs before downloading layers
+    let icfg = ImageConfig::parse(&cfg_json)?; // reject unusable configs before downloading layers
     // keep the manifest content-addressed too (best effort; the id does not depend on it)
     let _ = store.put_blob(&image.digest, &image.raw);
 
@@ -96,7 +96,7 @@ pub async fn pull_with(store: &Store, image_ref: &str, limits: &Limits) -> Resul
     let dirfd = fs::openat(AT_FDCWD, &cpath(&dir)?, fs::O_PATH | fs::O_DIRECTORY | fs::O_CLOEXEC, 0).ctx("open image dir")?;
     fs::remove_all(dirfd.raw(), b"rootfs.tmp\0").ctx("clear rootfs.tmp")?;
     fs::mkdirat(dirfd.raw(), b"rootfs.tmp\0", 0o755).ctx("mkdir rootfs.tmp")?;
-    let built = build_rootfs(store, &image.manifest.layers, &gz, &format!("{dir}/rootfs.tmp"), limits);
+    let built = build_rootfs(store, &image.manifest.layers, &gz, &icfg.diff_ids, &format!("{dir}/rootfs.tmp"), limits);
     if let Err(e) = built {
         let _ = fs::remove_all(dirfd.raw(), b"rootfs.tmp\0");
         return Err(e);
@@ -116,12 +116,28 @@ pub async fn pull_with(store: &Store, image_ref: &str, limits: &Limits) -> Resul
     Ok(id)
 }
 
-fn build_rootfs(store: &Store, layers: &[Descriptor], gz: &[bool], tmp: &str, limits: &Limits) -> Result<Vec<Stats>> {
+fn build_rootfs(store: &Store, layers: &[Descriptor], gz: &[bool], diff_ids: &[String], tmp: &str, limits: &Limits) -> Result<Vec<Stats>> {
+    if diff_ids.len() != layers.len() {
+        return Err(Error::Image("config rootfs.diff_ids does not match the layer count"));
+    }
     let root = fs::openat(AT_FDCWD, &cpath(tmp)?, fs::O_RDONLY | fs::O_DIRECTORY | fs::O_CLOEXEC, 0).ctx("open rootfs.tmp")?;
     let mut out = Vec::new();
-    for (l, &g) in layers.iter().zip(gz) {
+    let (mut bytes, mut entries) = (0u64, 0u64);
+    for ((l, &g), want) in layers.iter().zip(gz).zip(diff_ids) {
         let blob = store.open_blob(&l.digest)?;
-        out.push(unpack_layer_fd(root.raw(), blob.raw(), g, limits)?);
+        // the image-wide caps are spent down across layers
+        let lim = Limits {
+            max_bytes: limits.max_bytes.min(limits.max_image_bytes.saturating_sub(bytes)),
+            max_entries: limits.max_entries.saturating_sub(entries),
+            ..limits.clone()
+        };
+        let st = unpack_layer_fd(root.raw(), blob.raw(), g, &lim)?;
+        if st.diff_id != *want {
+            return Err(Error::Image("layer diff_id does not match the config"));
+        }
+        bytes += st.bytes;
+        entries += st.entries;
+        out.push(st);
     }
     Ok(out)
 }
