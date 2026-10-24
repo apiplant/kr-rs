@@ -13,22 +13,63 @@ pub struct Cred {
     pub cred: Credential,
 }
 
-/// Canonical registry host for matching: scheme, path (`/v1/`) and case dropped, docker.io
-/// aliases folded (`index.docker.io`, `registry-1.docker.io`, ...).
+/// Canonical key for matching: scheme and case dropped, docker.io aliases folded
+/// (`index.docker.io`, `registry-1.docker.io`, ...), the legacy `/v1/` suffix dropped. A
+/// repository path is kept (`registry.io/org/team`), as is a `*.` wildcard host.
 pub fn registry_key(s: &str) -> String {
     let s = s.trim().to_ascii_lowercase();
     let s = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")).unwrap_or(&s);
-    let host = s.split('/').next().unwrap_or("").to_string();
-    match host.as_str() {
-        "index.docker.io" | "registry-1.docker.io" | "registry.hub.docker.com" | "docker.io" => "docker.io".to_string(),
-        _ => host,
-    }
+    let s = s.trim_end_matches('/');
+    let s = s.strip_suffix("/v1").or_else(|| s.strip_suffix("/v2")).unwrap_or(s);
+    let (host, path) = s.split_once('/').unwrap_or((s, ""));
+    let host = match host {
+        "index.docker.io" | "registry-1.docker.io" | "registry.hub.docker.com" | "docker.io" => "docker.io",
+        h => h,
+    };
+    if path.is_empty() { host.to_string() } else { alloc::format!("{host}/{path}") }
 }
 
-/// The credential for `registry` (a [`kr_net::registry::Reference`] registry), if any.
-pub fn lookup<'a>(creds: &'a [Cred], registry: &str) -> Option<&'a Credential> {
-    let want = registry_key(registry);
-    creds.iter().find(|c| c.registry == want).map(|c| &c.cred)
+/// Whether credential key `key` applies to `host` + `repo`, and how specifically (higher wins):
+/// exact host beats `*.` wildcard, and a longer repository prefix (on `/` boundaries) beats a
+/// shorter one, as the kubelet's credential-provider matching does.
+fn match_rank(key: &str, host: &str, repo: &str) -> Option<usize> {
+    let (khost, kpath) = key.split_once('/').unwrap_or((key, ""));
+    let host_rank = if khost == host {
+        2
+    } else if let Some(suffix) = khost.strip_prefix("*.") {
+        // One label only, like the kubelet: *.example.com matches a.example.com.
+        let (label, rest) = host.split_once('.')?;
+        if rest != suffix || label.is_empty() {
+            return None;
+        }
+        1
+    } else {
+        return None;
+    };
+    if !kpath.is_empty() && !(repo == kpath || repo.starts_with(kpath) && repo.as_bytes().get(kpath.len()) == Some(&b'/')) {
+        return None;
+    }
+    Some(kpath.len() * 4 + host_rank)
+}
+
+/// The most specific credential for `registry` + `repository` (from a
+/// [`kr_net::registry::Reference`]), if any.
+pub fn lookup<'a>(creds: &'a [Cred], registry: &str, repository: &str) -> Option<&'a Credential> {
+    let host = registry_key(registry);
+    let repo = repository.to_ascii_lowercase();
+    creds.iter().filter_map(|c| match_rank(&c.registry, &host, &repo).map(|r| (r, &c.cred))).max_by_key(|(r, _)| *r).map(|(_, c)| c)
+}
+
+/// Docker client config for `kr ctr pull`: `$DOCKER_CONFIG/config.json`, else
+/// `~/.docker/config.json`. Credential helpers (`credsStore`/`credHelpers`) are not run.
+pub fn docker_config(env: &dyn Fn(&str) -> Option<String>) -> Vec<Cred> {
+    let path = match (env("DOCKER_CONFIG"), env("HOME")) {
+        (Some(d), _) if !d.is_empty() => alloc::format!("{d}/config.json"),
+        (_, Some(h)) => alloc::format!("{h}/.docker/config.json"),
+        _ => return Vec::new(),
+    };
+    let Ok(data) = kr_sys::fs::read_file(alloc::format!("{path}\0").as_bytes(), 1 << 20) else { return Vec::new() };
+    parse_dockerconfig(&data).unwrap_or_default()
 }
 
 fn entry(host: &str, v: &Value) -> Option<Cred> {
@@ -100,13 +141,13 @@ mod tests {
         );
         let creds = parse_dockerconfig(cfg.as_bytes()).unwrap();
         assert_eq!(creds.len(), 3);
-        let c = lookup(&creds, "docker.io").unwrap();
+        let c = lookup(&creds, "docker.io", "lib/app").unwrap();
         assert_eq!((c.username.as_str(), c.password.as_str()), ("alice", "p:w"));
-        let c = lookup(&creds, "reg.io").unwrap();
+        let c = lookup(&creds, "reg.io", "lib/app").unwrap();
         assert_eq!((c.username.as_str(), c.password.as_str()), ("bob", "pw"));
-        assert_eq!(lookup(&creds, "id.io").unwrap().identity_token.as_deref(), Some("rt"));
-        assert!(lookup(&creds, "other.io").is_none());
-        assert!(lookup(&creds, "junk.io").is_none());
+        assert_eq!(lookup(&creds, "id.io", "lib/app").unwrap().identity_token.as_deref(), Some("rt"));
+        assert!(lookup(&creds, "other.io", "lib/app").is_none());
+        assert!(lookup(&creds, "junk.io", "lib/app").is_none());
         // Debug never shows secrets
         assert!(!format!("{creds:?}").contains("alice") && !format!("{creds:?}").contains("pw"));
     }
@@ -116,11 +157,35 @@ mod tests {
         let auth = kr_fmt::base64::encode(b"u:p");
         let cfg = format!(r#"{{"reg.io":{{"auth":"{auth}","email":"a@b"}}}}"#);
         let creds = parse_dockerconfig(cfg.as_bytes()).unwrap();
-        assert_eq!(lookup(&creds, "reg.io").unwrap().username, "u");
+        assert_eq!(lookup(&creds, "reg.io", "lib/app").unwrap().username, "u");
         let secret = kr_fmt::json::parse(format!(r#"{{"type":"kubernetes.io/dockercfg","data":{{".dockercfg":"{}"}}}}"#, kr_fmt::base64::encode(cfg.as_bytes())).as_bytes()).unwrap();
         assert_eq!(from_secret(&secret).len(), 1);
         let other = kr_fmt::json::parse(br#"{"type":"Opaque","data":{}}"#).unwrap();
         assert!(from_secret(&other).is_empty());
         assert!(parse_dockerconfig(b"[]").is_err());
+    }
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+
+    fn creds(keys: &[&str]) -> Vec<Cred> {
+        keys.iter().map(|k| Cred { registry: registry_key(k), cred: Credential { username: (*k).to_string(), ..Default::default() } }).collect()
+    }
+
+    #[test]
+    fn most_specific_key_wins() {
+        let c = creds(&["reg.io", "reg.io/team", "reg.io/team/app", "*.cdn.io", "https://index.docker.io/v1/"]);
+        let user = |h: &str, r: &str| lookup(&c, h, r).map(|x| x.username.clone());
+        assert_eq!(user("reg.io", "team/app").as_deref(), Some("reg.io/team/app"));
+        assert_eq!(user("reg.io", "team/other").as_deref(), Some("reg.io/team"));
+        assert_eq!(user("reg.io", "teamx/app").as_deref(), Some("reg.io")); // prefix on '/' only
+        assert_eq!(user("reg.io", "lib").as_deref(), Some("reg.io"));
+        assert_eq!(user("eu.cdn.io", "x").as_deref(), Some("*.cdn.io"));
+        assert_eq!(user("a.b.cdn.io", "x"), None); // one label only
+        assert_eq!(user("cdn.io", "x"), None);
+        assert_eq!(user("docker.io", "library/alpine").as_deref(), Some("https://index.docker.io/v1/"));
+        assert_eq!(user("other.io", "x"), None);
     }
 }

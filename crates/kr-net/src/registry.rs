@@ -464,8 +464,8 @@ pub struct Registry<C: Connector = TcpConnector> {
     cred: Option<Credential>,
     /// `Authorization` value once the registry itself asked for Basic auth.
     basic: Option<String>,
-    /// Bearer tokens keyed by `registry/repository`.
-    tokens: Vec<(String, String)>,
+    /// Bearer tokens keyed by `registry/repository`, with their expiry (ms, `kr_rt` clock).
+    tokens: Vec<(String, String, u64)>,
     plain_http: Vec<String>,
     tls_loopback: bool,
     os: String,
@@ -532,7 +532,7 @@ impl<C: Connector> Registry<C> {
         format!("{}://{}", if plain { "http" } else { "https" }, r.endpoint())
     }
 
-    async fn fetch_token(&mut self, r: &Reference, challenge: Option<String>) -> Result<String> {
+    async fn fetch_token(&mut self, r: &Reference, challenge: Option<String>) -> Result<(String, u64)> {
         let ch = parse_challenge(&challenge.ok_or(Error::Auth("401 without WWW-Authenticate"))?)?;
         let realm = ch.param("realm").ok_or(Error::Auth("challenge without realm"))?;
         // Credentials only travel over TLS: a plain-http realm is accepted only for a registry
@@ -592,14 +592,19 @@ impl<C: Connector> Registry<C> {
         if tok.is_empty() || !crate::http1::head::valid_field_value(tok.as_bytes()) {
             return Err(Error::Auth("unusable token"));
         }
-        Ok(tok.to_string())
+        // Docker token spec: expires_in seconds, default (and minimum) 60.
+        let ttl = v.get("expires_in").and_then(Value::as_u64).unwrap_or(60).max(60);
+        Ok((tok.to_string(), kr_rt::exec::now_ms() + ttl * 1000))
     }
 
     async fn get(&mut self, r: &Reference, path: &str, accept: Option<&str>) -> Result<Response<C::Conn>> {
         let url = format!("{}{}", self.base(r), path);
         let key = format!("{}/{}", r.registry, r.repository);
         for attempt in 0..2 {
-            let bearer = self.tokens.iter().find(|(k, _)| *k == key).map(|(_, t)| format!("Bearer {t}"));
+            // Expired tokens (5 s margin) are dropped up front instead of waiting for a 401.
+            let now = kr_rt::exec::now_ms();
+            self.tokens.retain(|(_, _, exp)| *exp > now + 5000);
+            let bearer = self.tokens.iter().find(|(k, _, _)| *k == key).map(|(_, t, _)| format!("Bearer {t}"));
             let mut hdrs: Vec<(&str, &str)> = Vec::new();
             if let Some(a) = accept {
                 hdrs.push(("Accept", a));
@@ -625,8 +630,8 @@ impl<C: Connector> Registry<C> {
                         return Err(Error::Auth("unsupported authentication scheme"));
                     }
                     let tok = self.fetch_token(r, challenge).await?;
-                    self.tokens.retain(|(k, _)| *k != key);
-                    self.tokens.push((key.clone(), tok));
+                    self.tokens.retain(|(k, _, _)| *k != key);
+                    self.tokens.push((key.clone(), tok.0, tok.1));
                 }
                 401 => return Err(Error::Auth(if self.basic.is_some() { "credentials rejected" } else { "token rejected" })),
                 s => return Err(Error::Status(s)),

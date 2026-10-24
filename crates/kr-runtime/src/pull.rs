@@ -63,7 +63,7 @@ async fn pull_full(store: &Store, image_ref: &str, creds: &[Cred], limits: &Limi
     }
     let r = Reference::parse(image_ref)?;
     let mut reg = registry()?;
-    reg.set_credential(lookup(creds, &r.registry).cloned());
+    reg.set_credential(lookup(creds, &r.registry, &r.repository).cloned());
     let image = reg.resolve(&r).await?;
     if image.manifest.layers.len() > MAX_LAYERS {
         return Err(Error::Image("too many layers"));

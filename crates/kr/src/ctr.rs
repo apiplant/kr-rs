@@ -95,7 +95,9 @@ fn pull(mut args: Args) -> i32 {
         Ok(s) => s,
         Err(c) => return c,
     };
-    let r = kr_rt::exec::block_on(async move { kr_runtime::pull::pull(&store, &image).await });
+    // Credentials from the user's docker config, as `docker pull` would use them.
+    let creds = kr_runtime::auth::docker_config(&kr_runtime::store::env_var);
+    let r = kr_rt::exec::block_on(async move { kr_runtime::pull::pull_auth(&store, &image, &creds).await });
     match r {
         Ok(id) => {
             print(format!("{id}\n").as_bytes());
