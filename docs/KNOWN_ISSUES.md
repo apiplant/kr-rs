@@ -57,8 +57,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 80. **host-gw networking only** — *open*
     - Nodes must share an L2 segment; VXLAN is planned.
     - Rootless agents have no cross-node pod networking.
-    - Cross-node pod traffic is masqueraded (the source pod IP is hidden); the nft rule should exclude the cluster CIDR.
-    - Routes of removed nodes are not deleted.
 86. **Defaulting is a subset** — *open*
     Defaults cover core/apps/batch fields seen by clients; other groups (networking, policy, storage) store what was sent.
 87. **CustomResourceDefinitions are a subset** — *open*
@@ -293,6 +291,12 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 ## kr-fmt
 18. **14 clippy style lints in kr-fmt** — *fixed* (commit: )
 
+## Echo server (cont.)
+14. **The lingering close holds each connection for up to 1 s after the response** — *fixed* (commit: )
+    Under heavy load this raises the number of concurrent connections. Plan: skip the drain when the request was fully read, and cap total lingering connections.
+91. **Datastore fsync blocked the event loop; log never compacted** — *fixed* (ADR-024)
+    Found in conformance run 3: kr sat in `D` state under write load and the log grew without bound. Writes now go through group commit, with fsync in a helper process, and the log is compacted periodically. Verified: no `D` states during a 300-write burst, and all acknowledged writes survive `kill -9`.
+
 ## kr-sys (cont.)
 35. **`syscall0..6` lack `# Safety` docs (clippy `missing_safety_doc`)** — *fixed (e64a857)*
 
@@ -300,9 +304,3 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 12. **The 431 path closes with unread data, so the client may see a TCP RST** — *fixed* (commit: 68940ad)
     Plan: lingering close. Send the response, `shutdown(SHUT_WR)`, then drain the input for up to 1 s and close.
     Fix: `linger_close` runs after every response (not only the 431) using the new `kr_sys::shutdown`. Note that a request whose headers are complete is answered 200 even if a large body follows, and the lingering close drains that body without a reset.
-
-## Echo server (cont.)
-14. **The lingering close holds each connection for up to 1 s after the response** — *fixed* (commit: )
-    Under heavy load this raises the number of concurrent connections. Plan: skip the drain when the request was fully read, and cap total lingering connections.
-91. **Datastore fsync blocked the event loop; log never compacted** — *fixed* (ADR-024)
-    Found in conformance run 3: kr sat in `D` state under write load and the log grew without bound. Writes now go through group commit, with fsync in a helper process, and the log is compacted periodically. Verified: no `D` states during a 300-write burst, and all acknowledged writes survive `kill -9`.
