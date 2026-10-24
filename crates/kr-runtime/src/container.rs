@@ -15,6 +15,7 @@
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use kr_sys::ns::{self, CloneArgs};
+use core::sync::atomic::{AtomicI32, Ordering};
 use kr_sys::{Errno, Fd};
 
 use crate::cgroup::{Cgroup, Limits};
@@ -249,9 +250,21 @@ pub fn run_in_net(sb: &Sandbox, f: impl FnOnce() -> i32) -> Result<i32, RunError
     Ok(ns::exit_code(status))
 }
 
+/// O_PATH fd of our own executable, opened once before the first sandbox (-1 if unavailable).
+static EXE_FD: AtomicI32 = AtomicI32::new(-1);
+
+fn init_exe_fd() {
+    if EXE_FD.load(Ordering::Relaxed) < 0 {
+        if let Ok(fd) = ns::open(b"/proc/self/exe\0", kr_sys::fs::O_PATH, 0) {
+            EXE_FD.store(fd.into_raw(), Ordering::Relaxed);
+        }
+    }
+}
+
 /// Shared sandbox start. With `clone_parent` the sandbox becomes the caller's parent's child
 /// (used from a helper inside the pod-network namespaces) and no pidfd is returned.
 fn sandbox_inner(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>, clone_parent: bool) -> Result<(i32, Option<Fd>), RunError> {
+    init_exe_fd();
     let (go_r, go_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     let (rep_r, rep_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     let (uid, gid) = (ns::getuid(), ns::getgid());
@@ -293,6 +306,16 @@ fn sandbox_inner(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfi
         drop(rep_w);
         drop(go_r);
         // Never execs: drop every inherited descriptor (sockets, store files) explicitly.
+        // Re-exec kr as a tiny "pause" process for a fresh address space (no COW heap copy);
+        // the exe fd survives until execveat. Empty environment: the agent's may hold secrets.
+        let exe = EXE_FD.load(Ordering::Relaxed);
+        if exe >= 3 {
+            ns::close_from_except(3, exe as u32);
+            let _ = ns::sigmask_reset();
+            let argv: [*const u8; 3] = [b"kr\0".as_ptr(), b"pause\0".as_ptr(), core::ptr::null()];
+            let envp: [*const u8; 1] = [core::ptr::null()];
+            let _ = ns::execveat_fd(exe, &argv, &envp);
+        }
         ns::close_from(3);
         ns::pause_forever();
     }
