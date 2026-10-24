@@ -24,6 +24,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod codec;
+pub mod storage;
 
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;

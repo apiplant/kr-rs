@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+kr-sys = { path = "../kr-sys" }
+kr-archive = { path = "../kr-archive" }
 
 [dev-dependencies]
 # `host` drops _start/panic handler/allocator/mem* so the std test harness can link (ADR-015).

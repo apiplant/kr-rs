@@ -83,7 +83,9 @@ dependencies = [
 name = "kr-raft"
 version = "0.0.1"
 dependencies = [
+ "kr-archive",
  "kr-rt",
+ "kr-sys",
 ]
 
 [[package]]
