@@ -2,6 +2,7 @@
 # Two-node kr cluster (server kr1 + agent kr2) in throwaway privileged containers (dev only).
 #   tools/test/two-node.sh [up|down]
 # Extra env for the server: KR_SERVER_ENV, e.g. KR_SERVER_ENV=KR_NODE_CERT_SECONDS=90.
+# Same for the agent: KR_AGENT_ENV, e.g. KR_AGENT_ENV=KR_NET_BACKEND=host-gw.
 # Then: docker exec -e KUBECONFIG=/var/tmp/srv/admin.kubeconfig kr1 kubectl get nodes
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
@@ -19,7 +20,7 @@ for _ in $(seq 60); do docker exec -e KUBECONFIG=/var/tmp/srv/admin.kubeconfig k
 TOKEN=$(docker exec kr1 cat /var/tmp/srv/node-token)
 IP1=$(docker inspect -f '{{.NetworkSettings.Networks.krnet.IPAddress}}' kr1)
 docker exec kr2 sh -c "umask 077; echo '$TOKEN' > /root/kr-token"
-docker exec -d kr2 sh -c "KR_ROOT=/store /krbin/kr agent --server https://$IP1:6443 --token-file /root/kr-token > /tmp/agent.log 2>&1"
+docker exec -d kr2 sh -c "${KR_AGENT_ENV:-} KR_ROOT=/store /krbin/kr agent --server https://$IP1:6443 --token-file /root/kr-token > /tmp/agent.log 2>&1"
 for _ in $(seq 60); do
   [ "$(docker exec -e KUBECONFIG=/var/tmp/srv/admin.kubeconfig kr1 kubectl get nodes --no-headers 2>/dev/null | grep -c ' Ready')" = 2 ] && break; sleep 1
 done

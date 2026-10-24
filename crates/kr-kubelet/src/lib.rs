@@ -50,6 +50,8 @@ pub struct Config {
     pub cgroups: bool,
     /// The node's InternalIP (reported in Node status; peers route pod subnets to it).
     pub node_ip: [u8; 4],
+    /// Pod network backend: VXLAN overlay (true) or host-gw routes (false, needs one L2 segment).
+    pub vxlan: bool,
 }
 
 fn now() -> i64 {
@@ -281,9 +283,93 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
     }
 
+    /// VXLAN overlay (root mode): device `kr.vxlan`, and per peer node a route to its pod
+    /// subnet via the peer's VTEP address, a permanent ARP entry for that address and an FDB
+    /// entry mapping the peer's VTEP MAC to its InternalIP. Works across L3.
+    async fn vxlan_loop(&self) {
+        use kr_net::netlink::{self, mac_string, parse_mac, vtep_mac, RTPROT_KR};
+        let my_mac = mac_string(vtep_mac(self.cfg.node_ip));
+        let my_ip = fmt_ip(self.cfg.node_ip);
+        loop {
+            if let (Ok(list), Ok(nl)) = (self.c.list("/api/v1/nodes", "").await, netlink::Netlink::route()) {
+                let mut mine = None;
+                let mut peers = Vec::new();
+                let mut annotated = false;
+                for n in list.get("items").and_then(Value::as_array).unwrap_or(&[]) {
+                    let Some(pn) = n.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).and_then(network::PodNet::parse) else { continue };
+                    if meta(n, "name") == self.cfg.node_name {
+                        let ann = |k| n.pointer(&["metadata", "annotations", k]).and_then(Value::as_str);
+                        annotated = ann(VTEP_MAC_KEY) == Some(my_mac.as_str()) && ann(VTEP_IP_KEY) == Some(my_ip.as_str());
+                        mine = Some(pn);
+                        continue;
+                    }
+                    let ip = n.pointer(&["status", "addresses"]).and_then(Value::as_array).and_then(|a| a.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("InternalIP"))).and_then(|x| x.get("address")).and_then(Value::as_str).and_then(kr_apiserver::object::parse_ipv4);
+                    let mac = n.pointer(&["metadata", "annotations", VTEP_MAC_KEY]).and_then(Value::as_str).and_then(parse_mac);
+                    if let (Some(ip), Some(mac)) = (ip, mac) {
+                        peers.push((pn, ip, mac));
+                    }
+                }
+                if !annotated && mine.is_some() {
+                    let p = alloc::format!(r#"{{"metadata":{{"annotations":{{"{VTEP_MAC_KEY}":"{my_mac}","{VTEP_IP_KEY}":"{my_ip}"}}}}}}"#);
+                    if let Ok(p) = json::parse(p.as_bytes()) {
+                        let _ = self.c.patch(&alloc::format!("/api/v1/nodes/{}", self.cfg.node_name), "application/merge-patch+json", &p).await;
+                    }
+                }
+                if let Some(idx) = mine.and_then(|pn| self.ensure_vxlan(&nl, pn.subnet)) {
+                    let routes: Vec<_> = peers.iter().map(|(pn, _, _)| (pn.subnet, pn.prefix, pn.subnet)).collect();
+                    let neighs: Vec<_> = peers.iter().map(|(pn, _, mac)| (pn.subnet, *mac)).collect();
+                    let fdbs: Vec<_> = peers.iter().map(|(_, ip, mac)| (*mac, *ip)).collect();
+                    let have_routes: Vec<_> = nl.routes_by_proto(RTPROT_KR).unwrap_or_default();
+                    let (radd, rdel) = route_diff(&routes, &have_routes);
+                    let (nadd, ndel) = set_diff(&neighs, &nl.neighs(idx).unwrap_or_default());
+                    let (fadd, fdel) = set_diff(&fdbs, &nl.fdbs(idx).unwrap_or_default());
+                    for (d, p) in rdel {
+                        let _ = nl.route_del(d, p, RTPROT_KR);
+                    }
+                    for (ip, mac) in ndel {
+                        let _ = nl.neigh_del(idx, ip, mac);
+                    }
+                    for (mac, ip) in fdel {
+                        let _ = nl.fdb_del(idx, mac, ip);
+                    }
+                    for (ip, mac) in nadd {
+                        let _ = nl.neigh_add(idx, ip, mac);
+                    }
+                    for (mac, ip) in fadd {
+                        let _ = nl.fdb_add(idx, mac, ip);
+                    }
+                    for (d, p, gw) in radd {
+                        let _ = nl.route_add_onlink(d, p, gw, idx, RTPROT_KR);
+                    }
+                }
+            }
+            kr_rt::exec::sleep(5000).await;
+        }
+    }
+
+    /// Creates `kr.vxlan` (VNI 1, UDP 8472, MTU = uplink - 50) with the node's pod-subnet
+    /// network address as a /32 and brings it up; returns its ifindex.
+    fn ensure_vxlan(&self, nl: &kr_net::netlink::Netlink, subnet: [u8; 4]) -> Option<i32> {
+        let name = VXLAN_DEV.as_bytes();
+        let idx = match kr_net::netlink::ifindex(name) {
+            Ok(i) => i,
+            Err(_) => {
+                let mtu = uplink_mtu().saturating_sub(50);
+                nl.vxlan_add(name, 1, 8472, self.cfg.node_ip, mtu, kr_net::netlink::vtep_mac(self.cfg.node_ip)).ok()?;
+                kr_net::netlink::ifindex(name).ok()?
+            }
+        };
+        let _ = nl.addr_add(idx, subnet, 32);
+        nl.link_up(idx).ok()?;
+        Some(idx)
+    }
+
     /// host-gw routing (root mode): a route to every other node's pod subnet via its
     /// InternalIP. Nodes must share an L2 segment (no overlay yet).
     async fn route_loop(&self) {
+        if self.cfg.vxlan {
+            return self.vxlan_loop().await;
+        }
         use kr_net::netlink::RTPROT_KR;
         loop {
             if let (Ok(list), Ok(nl)) = (self.c.list("/api/v1/nodes", "").await, kr_net::netlink::Netlink::route()) {
@@ -1096,6 +1182,33 @@ mod status_tests {
     }
 }
 
+const VXLAN_DEV: &str = "kr.vxlan";
+const VTEP_MAC_KEY: &str = "kr.io/vtep-mac";
+const VTEP_IP_KEY: &str = "kr.io/vtep-ip";
+
+fn fmt_ip(ip: [u8; 4]) -> String {
+    alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+}
+
+/// MTU of the interface carrying the default route (1500 when unknown).
+fn uplink_mtu() -> u32 {
+    let route = kr_sys::fs::read_file(b"/proc/net/route\0", 1 << 16).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
+    let dev = route.lines().skip(1).find_map(|l| {
+        let mut f = l.split_whitespace();
+        let (dev, dst) = (f.next()?, f.next()?);
+        (dst == "00000000").then(|| dev.to_string())
+    });
+    dev.and_then(|d| kr_sys::fs::read_file(alloc::format!("/sys/class/net/{d}/mtu\0").as_bytes(), 64).ok())
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(1500)
+}
+
+/// Generic reconcile diff: (wanted but missing, present but unwanted).
+fn set_diff<T: PartialEq + Copy>(want: &[T], have: &[T]) -> (Vec<T>, Vec<T>) {
+    (want.iter().filter(|w| !have.contains(w)).copied().collect(), have.iter().filter(|h| !want.contains(h)).copied().collect())
+}
+
 /// Diff between wanted host-gw routes and the kr-installed ones: (to add or fix, to delete).
 /// A route whose gateway changed is deleted and re-added.
 fn route_diff(want: &[([u8; 4], u8, [u8; 4])], have: &[([u8; 4], u8, Option<[u8; 4]>)]) -> (Vec<([u8; 4], u8, [u8; 4])>, Vec<([u8; 4], u8)>) {
@@ -1106,7 +1219,21 @@ fn route_diff(want: &[([u8; 4], u8, [u8; 4])], have: &[([u8; 4], u8, Option<[u8;
 
 #[cfg(test)]
 mod route_tests {
-    use super::route_diff;
+    use super::{route_diff, set_diff};
+
+    #[test]
+    fn set_diff_neigh_and_fdb() {
+        let (a, b) = ([10, 88, 1, 0], [10, 88, 2, 0]);
+        let (m1, m2) = ([2, 0x4b, 1, 1, 1, 1], [2, 0x4b, 2, 2, 2, 2]);
+        let (add, del) = set_diff(&[(a, m1), (b, m2)], &[(a, m1), ([10, 88, 9, 0], m2)]);
+        assert_eq!((add, del), (alloc::vec![(b, m2)], alloc::vec![([10, 88, 9, 0], m2)]));
+        // changed MAC: old entry removed, new added
+        let (add, del) = set_diff(&[(a, m2)], &[(a, m1)]);
+        assert_eq!((add.len(), del.len()), (1, 1));
+        // FDB: peer IP changed
+        let (add, del) = set_diff(&[(m1, [192, 168, 0, 9])], &[(m1, [192, 168, 0, 2])]);
+        assert_eq!((add.len(), del.len()), (1, 1));
+    }
 
     #[test]
     fn diff() {

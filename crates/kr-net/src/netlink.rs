@@ -398,6 +398,195 @@ impl Netlink {
     }
 }
 
+// ---- VXLAN overlay: link, neighbour (ARP) and FDB entries ----
+
+const RTM_NEWNEIGH: u16 = 28;
+const RTM_DELNEIGH: u16 = 29;
+const RTM_GETNEIGH: u16 = 30;
+const AF_BRIDGE: u8 = 7;
+const NUD_PERMANENT: u16 = 0x80;
+const NTF_SELF: u8 = 2;
+const NDA_DST: u16 = 1;
+const NDA_LLADDR: u16 = 2;
+const IFLA_ADDRESS: u16 = 1;
+const IFLA_MTU: u16 = 4;
+const IFLA_VXLAN_ID: u16 = 1;
+const IFLA_VXLAN_LOCAL: u16 = 4;
+const IFLA_VXLAN_LEARNING: u16 = 7;
+const IFLA_VXLAN_PORT: u16 = 15;
+const RTNH_F_ONLINK: u8 = 4;
+
+/// Stable, locally administered VTEP MAC derived from the node's IPv4 address.
+pub fn vtep_mac(ip: [u8; 4]) -> [u8; 6] {
+    [0x02, 0x4b, ip[0], ip[1], ip[2], ip[3]]
+}
+
+/// `aa:bb:..` formatting of a MAC (the Node annotation form).
+pub fn mac_string(m: [u8; 6]) -> alloc::string::String {
+    alloc::format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5])
+}
+
+pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut it = s.split(':');
+    for o in out.iter_mut() {
+        *o = u8::from_str_radix(it.next()?, 16).ok()?;
+    }
+    it.next().is_none().then_some(out)
+}
+
+/// RTM_NEWLINK creating a non-learning VXLAN device bound to `local`.
+fn vxlan_msg(name: &[u8], vni: u32, port: u16, local: [u8; 4], mtu: u32, mac: [u8; 6]) -> NlBuf {
+    let mut b = NlBuf::new();
+    b.begin(RTM_NEWLINK, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+    b.raw(&ifinfo(0, 0, 0));
+    b.attr_str(IFLA_IFNAME, name);
+    b.attr(IFLA_ADDRESS, &mac);
+    b.attr_u32(IFLA_MTU, mtu);
+    b.nest_begin(IFLA_LINKINFO);
+    b.attr_str(IFLA_INFO_KIND, b"vxlan");
+    b.nest_begin(IFLA_INFO_DATA);
+    b.attr_u32(IFLA_VXLAN_ID, vni);
+    b.attr(IFLA_VXLAN_LOCAL, &local);
+    b.attr(IFLA_VXLAN_LEARNING, &[0]);
+    b.attr(IFLA_VXLAN_PORT, &port.to_be_bytes());
+    b.nest_end();
+    b.nest_end();
+    b.end();
+    b
+}
+
+/// ARP entry (family AF_INET, `dst` -> `mac`) or FDB entry (AF_BRIDGE, `mac` -> remote `dst`),
+/// both permanent.
+fn neigh_msg(ty: u16, fdb: bool, ifindex: i32, dst: [u8; 4], mac: [u8; 6]) -> NlBuf {
+    let mut b = NlBuf::new();
+    let flags = if ty == RTM_NEWNEIGH { NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE } else { NLM_F_ACK };
+    b.begin(ty, flags);
+    // struct ndmsg: family, pad1, pad2, ifindex, state, flags, type
+    let mut h = [0u8; 12];
+    h[0] = if fdb { AF_BRIDGE } else { AF_INET };
+    h[4..8].copy_from_slice(&ifindex.to_ne_bytes());
+    h[8..10].copy_from_slice(&NUD_PERMANENT.to_ne_bytes());
+    h[10] = if fdb { NTF_SELF } else { 0 };
+    b.raw(&h);
+    b.attr(NDA_DST, &dst);
+    b.attr(NDA_LLADDR, &mac);
+    b.end();
+    b
+}
+
+/// Parses an ndmsg payload: (ifindex, state, dst, mac) of IPv4-destination entries of `family`.
+fn parse_neigh(m: &[u8], family: u8) -> Option<(i32, u16, [u8; 4], [u8; 6])> {
+    if m.len() < 12 || m[0] != family {
+        return None;
+    }
+    let ifindex = i32::from_ne_bytes(m[4..8].try_into().unwrap());
+    let state = u16::from_ne_bytes([m[8], m[9]]);
+    let (mut dst, mut mac) = (None, None);
+    let mut o = 12;
+    while o + 4 <= m.len() {
+        let l = u16::from_ne_bytes([m[o], m[o + 1]]) as usize;
+        let t = u16::from_ne_bytes([m[o + 2], m[o + 3]]) & 0x3fff;
+        if l < 4 || o + l > m.len() {
+            break;
+        }
+        if l == 8 && t == NDA_DST {
+            dst = Some([m[o + 4], m[o + 5], m[o + 6], m[o + 7]]);
+        } else if l == 10 && t == NDA_LLADDR {
+            mac = Some([m[o + 4], m[o + 5], m[o + 6], m[o + 7], m[o + 8], m[o + 9]]);
+        }
+        o += align4(l);
+    }
+    Some((ifindex, state, dst?, mac?))
+}
+
+impl Netlink {
+    /// Creates the VXLAN device; EEXIST when present.
+    pub fn vxlan_add(&self, name: &[u8], vni: u32, port: u16, local: [u8; 4], mtu: u32, mac: [u8; 6]) -> Result<(), Errno> {
+        self.transact(&vxlan_msg(name, vni, port, local, mtu, mac))
+    }
+
+    /// Adds (or replaces) a permanent ARP entry `ip` -> `mac` on `ifindex`.
+    pub fn neigh_add(&self, ifindex: i32, ip: [u8; 4], mac: [u8; 6]) -> Result<(), Errno> {
+        self.transact(&neigh_msg(RTM_NEWNEIGH, false, ifindex, ip, mac))
+    }
+
+    pub fn neigh_del(&self, ifindex: i32, ip: [u8; 4], mac: [u8; 6]) -> Result<(), Errno> {
+        self.transact(&neigh_msg(RTM_DELNEIGH, false, ifindex, ip, mac))
+    }
+
+    /// Adds (or replaces) a forwarding entry: frames for `mac` go to the VTEP at `dst`.
+    pub fn fdb_add(&self, ifindex: i32, mac: [u8; 6], dst: [u8; 4]) -> Result<(), Errno> {
+        self.transact(&neigh_msg(RTM_NEWNEIGH, true, ifindex, dst, mac))
+    }
+
+    pub fn fdb_del(&self, ifindex: i32, mac: [u8; 6], dst: [u8; 4]) -> Result<(), Errno> {
+        self.transact(&neigh_msg(RTM_DELNEIGH, true, ifindex, dst, mac))
+    }
+
+    /// Permanent ARP entries on `ifindex` as (ip, mac).
+    pub fn neighs(&self, ifindex: i32) -> Result<Vec<([u8; 4], [u8; 6])>, Errno> {
+        Ok(self.dump_neigh(AF_INET)?.into_iter().filter(|e| e.0 == ifindex && e.1 & NUD_PERMANENT != 0).map(|e| (e.2, e.3)).collect())
+    }
+
+    /// FDB entries with a remote destination on `ifindex` as (mac, dst).
+    pub fn fdbs(&self, ifindex: i32) -> Result<Vec<([u8; 6], [u8; 4])>, Errno> {
+        Ok(self.dump_neigh(AF_BRIDGE)?.into_iter().filter(|e| e.0 == ifindex).map(|e| (e.3, e.2)).collect())
+    }
+
+    fn dump_neigh(&self, family: u8) -> Result<Vec<(i32, u16, [u8; 4], [u8; 6])>, Errno> {
+        let mut b = NlBuf::new();
+        b.begin(RTM_GETNEIGH, NLM_F_DUMP);
+        let mut h = [0u8; 12];
+        h[0] = family;
+        b.raw(&h);
+        b.end();
+        let n = kr_sys::write(self.fd.raw(), b.bytes())?;
+        if n != b.bytes().len() {
+            return Err(Errno(5));
+        }
+        let mut out = Vec::new();
+        let mut buf = alloc::vec![0u8; 32 * 1024];
+        loop {
+            let n = match kr_sys::read(self.fd.raw(), &mut buf) {
+                Err(Errno(4)) => continue,
+                r => r?,
+            };
+            let mut off = 0;
+            while off + 16 <= n {
+                let len = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+                let ty = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
+                if len < 16 || off + len > n {
+                    return Err(Errno(74));
+                }
+                match ty {
+                    NLMSG_DONE => return Ok(out),
+                    NLMSG_ERROR => return Err(Errno(5)),
+                    RTM_NEWNEIGH => {
+                        if let Some(r) = parse_neigh(&buf[off + 16..off + len], family) {
+                            out.push(r);
+                        }
+                    }
+                    _ => {}
+                }
+                off += align4(len);
+            }
+        }
+    }
+
+    /// A route via `gateway` on `oif` with RTNH_F_ONLINK: the gateway is reachable on the
+    /// link without a covering connected route (VXLAN peers' VTEP addresses).
+    pub fn route_add_onlink(&self, dst: [u8; 4], prefix: u8, gateway: [u8; 4], oif: i32, proto: u8) -> Result<(), Errno> {
+        self.one(|b| {
+            b.begin(RTM_NEWROUTE, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+            b.raw(&[AF_INET, prefix, 0, 0, 254, proto, 0, 1, RTNH_F_ONLINK, 0, 0, 0]);
+            b.attr(RTA_DST, &dst);
+            b.attr(RTA_GATEWAY, &gateway);
+            b.attr_u32(RTA_OIF, oif as u32);
+        })
+    }
+}
+
 /// Interface index by name (SIOCGIFINDEX).
 pub fn ifindex(name: &[u8]) -> Result<i32, Errno> {
     kr_sys::ns::ifindex(name)
@@ -416,6 +605,47 @@ mod tests {
         assert_eq!(parse_route(&m, 3), None);
         m[4] = 255; // other table
         assert_eq!(parse_route(&m, RTPROT_KR), None);
+    }
+
+    #[test]
+    fn vxlan_link_encoding() {
+        let b = vxlan_msg(b"kr.vxlan", 1, 8472, [192, 168, 0, 2], 1450, vtep_mac([192, 168, 0, 2]));
+        let m = b.bytes();
+        assert_eq!(u16::from_ne_bytes([m[4], m[5]]), RTM_NEWLINK);
+        assert_eq!(u32::from_ne_bytes(m[0..4].try_into().unwrap()) as usize, m.len());
+        let has = |needle: &[u8]| m.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"vxlan\0"));
+        assert!(has(&[8, 0, IFLA_VXLAN_ID as u8, 0, 1, 0, 0, 0]));
+        assert!(has(&[8, 0, IFLA_VXLAN_LOCAL as u8, 0, 192, 168, 0, 2]));
+        assert!(has(&[5, 0, IFLA_VXLAN_LEARNING as u8, 0, 0])); // nolearning
+        assert!(has(&[6, 0, IFLA_VXLAN_PORT as u8, 0, 0x21, 0x18])); // 8472 big-endian
+        assert!(has(&[8, 0, IFLA_MTU as u8, 0, 0xaa, 0x05, 0, 0]));
+        assert!(has(&[10, 0, 1, 0, 0x02, 0x4b, 192, 168, 0, 2]));
+    }
+
+    #[test]
+    fn neigh_and_fdb_encoding() {
+        let mac = [2, 0x4b, 10, 0, 0, 3];
+        let n = neigh_msg(RTM_NEWNEIGH, false, 7, [10, 88, 2, 0], mac);
+        let m = n.bytes();
+        assert_eq!((m[16], i32::from_ne_bytes(m[20..24].try_into().unwrap())), (AF_INET, 7));
+        assert_eq!(u16::from_ne_bytes([m[24], m[25]]), NUD_PERMANENT);
+        assert_eq!(m[26], 0);
+        let f = neigh_msg(RTM_NEWNEIGH, true, 7, [10, 0, 0, 3], mac);
+        let m = f.bytes();
+        assert_eq!((m[16], m[26]), (AF_BRIDGE, NTF_SELF));
+        assert_eq!(&m[28..36], &[8, 0, 1, 0, 10, 0, 0, 3]); // NDA_DST
+        assert_eq!(&m[36..42], &[10, 0, 2, 0, 2, 0x4b]); // NDA_LLADDR header
+        assert_eq!(parse_neigh(&m[16..], AF_BRIDGE), Some((7, NUD_PERMANENT, [10, 0, 0, 3], mac)));
+        assert_eq!(parse_neigh(&m[16..], AF_INET), None);
+    }
+
+    #[test]
+    fn mac_text() {
+        let m = vtep_mac([10, 0, 0, 3]);
+        assert_eq!(mac_string(m), "02:4b:0a:00:00:03");
+        assert_eq!(parse_mac("02:4b:0a:00:00:03"), Some(m));
+        assert_eq!(parse_mac("02:4b:0a:00:00"), None);
     }
 
     #[test]

@@ -330,3 +330,17 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **Compaction:** every minute, the log is rewritten into a snapshot once it exceeds 8 MiB and is more than 4× the live data.
 
 **Status:** accepted.
+
+## ADR-025: VXLAN overlay as the default pod network backend
+
+**Context:** host-gw (ADR-022) only works when all nodes share an L2 segment.
+
+**Decision:**
+- **Selection:** `KR_NET_BACKEND=vxlan|host-gw` is read by `kr server` and `kr agent`; the default is `vxlan`.
+- **Device:** each root node creates `kr.vxlan` over raw netlink (VNI 1, UDP 8472, `nolearning`, local = InternalIP, MTU = uplink - 50) with the node's pod-subnet network address as a /32.
+- **VTEP identity:** the MAC is `02:4b:<InternalIP>`; the kubelet publishes it as the Node annotations `kr.io/vtep-mac` and `kr.io/vtep-ip`.
+- **Per peer:** route `podCIDR via <peer subnet address> dev kr.vxlan onlink` (`RTPROT_KR`), a permanent ARP entry to the peer's VTEP MAC and an FDB entry MAC -> peer InternalIP. There is no flood, learning or multicast.
+- **Reconcile:** the existing 5 s loop diffs wanted against installed routes, ARP entries and FDB entries and removes stale ones.
+- **NAT:** the masquerade rule already skips cluster-CIDR destinations, so pod source IPs survive.
+
+**Status:** accepted.
