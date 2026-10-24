@@ -1,8 +1,8 @@
 //! The API client used by kr's own components (controllers, scheduler, kubelet).
 //!
 //! [`Client`] is the interface; [`InProcess`] calls [`ApiServer::handle`] directly as an
-//! internal `system:masters` identity (no HTTP, no TLS). A remote HTTP implementation for
-//! joining agents comes with multi-node support. All objects are `kr_fmt::json::Value`.
+//! internal `system:masters` identity (no HTTP, no TLS). [`Remote`] speaks HTTPS to an API
+//! server on another machine (node agents). All objects are `kr_fmt::json::Value`.
 
 use crate::api::{ApiServer, Reply, Req, User, WatchStream};
 use crate::object::ApiError;
@@ -11,6 +11,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::future::poll_fn;
 use kr_fmt::json::{self, Value};
+
+mod remote;
+pub use remote::{Remote, RemoteAuth};
 
 pub type Result<T> = core::result::Result<T, ApiError>;
 
@@ -38,8 +41,19 @@ pub trait Client {
 /// A stream of watch events. Ends (`None`) at the server-side timeout or on error; callers
 /// re-list/re-watch (see [`Informer`]-style loops in the controllers).
 pub struct Watch {
-    inner: WatchStream,
+    inner: Source,
     buf: Vec<u8>,
+}
+
+enum Source {
+    InProcess(WatchStream),
+    Remote(remote::RemoteStream),
+}
+
+impl Watch {
+    pub(crate) fn from_remote(r: remote::RemoteStream) -> Watch {
+        Watch { inner: Source::Remote(r), buf: Vec::new() }
+    }
 }
 
 impl Watch {
@@ -52,8 +66,17 @@ impl Watch {
                 let object = v.get("object").cloned().unwrap_or(Value::Null);
                 return Some(WatchEvent { kind, object });
             }
-            let chunk = poll_fn(|cx| self.inner.poll_chunk(cx)).await?;
-            self.buf.extend_from_slice(&chunk);
+            match &mut self.inner {
+                Source::InProcess(w) => {
+                    let chunk = poll_fn(|cx| w.poll_chunk(cx)).await?;
+                    self.buf.extend_from_slice(&chunk);
+                }
+                Source::Remote(r) => {
+                    if !r.read_more(&mut self.buf).await {
+                        return None;
+                    }
+                }
+            }
         }
     }
 }
@@ -122,7 +145,7 @@ impl Client for InProcess {
         let q = if query.is_empty() { String::from("watch=1") } else { alloc::format!("{query}&watch=1") };
         let req = Req { method: "GET", path, query: &q, content_type: None, accept: Some("application/json"), body: b"", user: Some(self.user.clone()), bearer: None, headers: &[] };
         match self.api.handle(&req) {
-            Reply::Watch(w) => Ok(Watch { inner: w, buf: Vec::new() }),
+            Reply::Watch(w) => Ok(Watch { inner: Source::InProcess(w), buf: Vec::new() }),
             Reply::Json(code, s) => Err(ApiError::new(code, "Error", s)),
             Reply::Http(_) => Err(ApiError::new(500, "InternalError", "unexpected raw reply")),
         }

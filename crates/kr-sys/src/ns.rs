@@ -510,3 +510,84 @@ pub fn poll2(a: i32, b: i32, timeout_ms: i32) -> Result<(bool, bool, bool)> {
     // POLLIN 0x1, POLLERR 0x8, POLLHUP 0x10
     Ok((ra & 0x1 != 0, rb & 0x1 != 0, (ra | rb) & 0x18 != 0 && (ra | rb) & 0x1 == 0))
 }
+
+/// The local IPv4 address the kernel would use to reach `dst` (UDP connect + getsockname; no
+/// packet is sent). Used to find the node's primary address.
+pub fn route_source(dst: [u8; 4]) -> Result<[u8; 4]> {
+    #[cfg(target_arch = "x86_64")]
+    const GETSOCKNAME: usize = 51;
+    #[cfg(target_arch = "aarch64")]
+    const GETSOCKNAME: usize = 204;
+    let sock = super::socket(super::AF_INET, 2 | super::O_CLOEXEC, 0)?; // SOCK_DGRAM
+    super::connect(sock.raw(), &super::SockaddrIn::new(dst, 53))?;
+    let mut addr = [0u8; 16];
+    let mut len: u32 = 16;
+    // SAFETY: addr/len describe a writable sockaddr_in buffer.
+    check(unsafe { syscall3(GETSOCKNAME, sock.raw() as usize, addr.as_mut_ptr() as usize, &mut len as *mut u32 as usize) })?;
+    Ok([addr[4], addr[5], addr[6], addr[7]])
+}
+
+#[cfg(target_arch = "x86_64")]
+mod sock_nr {
+    pub const SENDTO: usize = 44;
+    pub const RECVFROM: usize = 45;
+    pub const SENDMSG: usize = 46;
+    pub const RECVMSG: usize = 47;
+}
+#[cfg(target_arch = "aarch64")]
+mod sock_nr {
+    pub const SENDTO: usize = 206;
+    pub const RECVFROM: usize = 207;
+    pub const SENDMSG: usize = 211;
+    pub const RECVMSG: usize = 212;
+}
+
+const MSG_NOSIGNAL: usize = 0x4000;
+
+/// Sends `data` plus one file descriptor (SCM_RIGHTS) over a unix socket.
+pub fn send_fd(sock: i32, data: &[u8], fd: i32) -> Result<usize> {
+    // struct cmsghdr { size_t len; int level; int type; } followed by the int, padded to 8.
+    let mut cmsg = [0u8; 24];
+    cmsg[..8].copy_from_slice(&20u64.to_ne_bytes()); // CMSG_LEN(sizeof(int))
+    cmsg[8..12].copy_from_slice(&1i32.to_ne_bytes()); // SOL_SOCKET
+    cmsg[12..16].copy_from_slice(&1i32.to_ne_bytes()); // SCM_RIGHTS
+    cmsg[16..20].copy_from_slice(&fd.to_ne_bytes());
+    let iov: [usize; 2] = [data.as_ptr() as usize, data.len()];
+    // struct msghdr { name, namelen, iov, iovlen, control, controllen, flags }
+    let msg: [usize; 7] = [0, 0, iov.as_ptr() as usize, 1, cmsg.as_ptr() as usize, cmsg.len(), 0];
+    // SAFETY: msg points at a valid msghdr whose iov and control buffers outlive the call.
+    check(unsafe { syscall3(sock_nr::SENDMSG, sock as usize, msg.as_ptr() as usize, MSG_NOSIGNAL) }).map(|n| n as usize)
+}
+
+/// Receives data and at most one passed descriptor (made close-on-exec).
+pub fn recv_fd(sock: i32, buf: &mut [u8]) -> Result<(usize, Option<Fd>)> {
+    let mut cmsg = [0u8; 24];
+    let iov: [usize; 2] = [buf.as_mut_ptr() as usize, buf.len()];
+    let mut msg: [usize; 7] = [0, 0, iov.as_ptr() as usize, 1, cmsg.as_mut_ptr() as usize, cmsg.len(), 0];
+    const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;
+    // SAFETY: msg points at a valid msghdr with writable iov/control buffers.
+    let n = check(unsafe { syscall3(sock_nr::RECVMSG, sock as usize, msg.as_mut_ptr() as usize, MSG_CMSG_CLOEXEC) })? as usize;
+    let clen = msg[5];
+    let fd = if clen >= 20 && i32::from_ne_bytes(cmsg[8..12].try_into().unwrap()) == 1 && i32::from_ne_bytes(cmsg[12..16].try_into().unwrap()) == 1 {
+        Some(Fd(i32::from_ne_bytes(cmsg[16..20].try_into().unwrap())))
+    } else {
+        None
+    };
+    Ok((n, fd))
+}
+
+/// recvfrom on an IPv4 datagram socket: (bytes, source address, source port).
+pub fn recv_from(sock: i32, buf: &mut [u8]) -> Result<(usize, [u8; 4], u16)> {
+    let mut addr = [0u8; 16];
+    let mut len: u32 = 16;
+    // SAFETY: buf, addr and len are valid writable buffers for the call.
+    let n = check(unsafe { super::syscall6(sock_nr::RECVFROM, sock as usize, buf.as_mut_ptr() as usize, buf.len(), 0, addr.as_mut_ptr() as usize, &mut len as *mut u32 as usize) })?;
+    Ok((n as usize, [addr[4], addr[5], addr[6], addr[7]], u16::from_be_bytes([addr[2], addr[3]])))
+}
+
+/// sendto an IPv4 address.
+pub fn send_to(sock: i32, data: &[u8], ip: [u8; 4], port: u16) -> Result<usize> {
+    let addr = super::SockaddrIn::new(ip, port);
+    // SAFETY: data and addr are valid for the call.
+    check(unsafe { super::syscall6(sock_nr::SENDTO, sock as usize, data.as_ptr() as usize, data.len(), MSG_NOSIGNAL, &addr as *const _ as usize, core::mem::size_of::<super::SockaddrIn>()) }).map(|n| n as usize)
+}

@@ -631,6 +631,9 @@ impl ApiServer {
         if rt.res.plural == "jobs" {
             admit_job(o, &name)?;
         }
+        if rt.res.plural == "services" {
+            self.admit_service(o, None)?;
+        }
         if rt.res.plural == "namespaces" {
             o.entry_object("spec").set("finalizers", Value::Array(alloc::vec![Value::from("kubernetes")]));
             o.entry_object("status").set("phase", Value::from("Active"));
@@ -665,6 +668,9 @@ impl ApiServer {
         let rev = self.store.borrow().revision() + 1;
         let has_status = rt.res.subresources.contains(&"status");
         object::prepare_update(&old, &mut new, &t, rev, has_status, status)?;
+        if rt.res.plural == "services" && !status {
+            self.admit_service(&mut new, Some(&old))?;
+        }
         if q.get("dryRun") == Some("All") {
             return Ok(Reply::ok(&new));
         }
@@ -834,6 +840,139 @@ impl ApiServer {
         self.store.borrow_mut().update(&kv.key, json::to_string(&new).into_bytes(), Some(kv.mod_rev)).map_err(|e| store_err(e, "pod", name))?;
         self.sync()?;
         Ok(Reply::Json(201, json::to_string(&object::status_value(201, "", "Success"))))
+    }
+
+    /// Service defaulting and allocation: type, ports (protocol, targetPort), ClusterIP from
+    /// the service CIDR, NodePorts. On update (`old`), allocated values are kept.
+    fn admit_service(&self, o: &mut Value, old: Option<&Value>) -> R<()> {
+        let spec = o.entry_object("spec");
+        let ty = spec.get("type").and_then(Value::as_str).unwrap_or("ClusterIP").to_string();
+        if !matches!(ty.as_str(), "ClusterIP" | "NodePort" | "LoadBalancer" | "ExternalName") {
+            return Err(ApiError::invalid(alloc::format!("spec.type: Unsupported value: {ty:?}")));
+        }
+        spec.set("type", Value::from(ty.as_str()));
+        if ty == "ExternalName" {
+            if spec.get("externalName").and_then(Value::as_str).is_none_or(str::is_empty) {
+                return Err(ApiError::invalid("spec.externalName: Required value"));
+            }
+            return Ok(());
+        }
+        if spec.get("sessionAffinity").is_none() {
+            spec.set("sessionAffinity", Value::from("None"));
+        }
+        for (k, v) in [("internalTrafficPolicy", "Cluster"), ("ipFamilyPolicy", "SingleStack")] {
+            if spec.get(k).is_none() {
+                spec.set(k, Value::from(v));
+            }
+        }
+        spec.set("ipFamilies", Value::Array(alloc::vec![Value::from("IPv4")]));
+        let ports = match spec.get_mut("ports") {
+            Some(Value::Array(p)) if !p.is_empty() => p,
+            _ => return Err(ApiError::invalid("spec.ports: Required value")),
+        };
+        let multi = ports.len() > 1;
+        for p in ports.iter_mut() {
+            let port = p.get("port").and_then(Value::as_u64).filter(|v| (1..=65535).contains(v)).ok_or_else(|| ApiError::invalid("spec.ports[].port: must be between 1 and 65535"))?;
+            if multi && p.get("name").and_then(Value::as_str).is_none_or(str::is_empty) {
+                return Err(ApiError::invalid("spec.ports[].name: Required value (multiple ports)"));
+            }
+            if p.get("protocol").is_none() {
+                p.set("protocol", Value::from("TCP"));
+            }
+            if p.get("targetPort").is_none() {
+                p.set("targetPort", Value::Number(Number::from_u64(port)));
+            }
+        }
+        let old_spec = old.and_then(|o| o.get("spec"));
+        // ClusterIP: immutable once set.
+        let want = o.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).unwrap_or("").to_string();
+        let old_ip = old_spec.and_then(|s| s.get("clusterIP")).and_then(Value::as_str).map(String::from);
+        let ip = match (old_ip, want.as_str()) {
+            (Some(o), "") => o,
+            (Some(o), w) if w != o => return Err(ApiError::invalid("spec.clusterIP: field is immutable")),
+            (Some(o), _) => o,
+            (None, "None") => "None".into(),
+            (None, "") => self.allocate_cluster_ip()?,
+            (None, w) => {
+                let a = crate::object::parse_ipv4(w).ok_or_else(|| ApiError::invalid("spec.clusterIP: must be a valid IPv4 address"))?;
+                if a[0] != 10 || a[1] != 96 {
+                    return Err(ApiError::invalid("spec.clusterIP: not in the service CIDR 10.96.0.0/16"));
+                }
+                if self.cluster_ips_in_use().contains(&a) {
+                    return Err(ApiError::invalid(alloc::format!("spec.clusterIP: Invalid value: {w:?}: provided IP is already allocated")));
+                }
+                w.into()
+            }
+        };
+        let spec = o.get_mut("spec").unwrap();
+        spec.set("clusterIP", Value::String(ip.clone()));
+        spec.set("clusterIPs", Value::Array(alloc::vec![Value::String(ip)]));
+        if ty == "NodePort" || ty == "LoadBalancer" {
+            let mut used = self.node_ports_in_use();
+            let old_ports: Vec<Value> = old_spec.and_then(|s| s.get("ports")).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+            if let Some(Value::Array(ports)) = spec.get_mut("ports") {
+                for p in ports.iter_mut() {
+                    if p.get("nodePort").and_then(Value::as_u64).is_some() {
+                        continue;
+                    }
+                    // Keep the previous allocation for the same port on updates.
+                    let prev = old_ports.iter().find(|op| op.get("port") == p.get("port") && op.get("protocol") == p.get("protocol")).and_then(|op| op.get("nodePort")).and_then(Value::as_u64);
+                    let np = match prev {
+                        Some(n) => n as u16,
+                        None => {
+                            let n = (30000u16..=32767).find(|n| !used.contains(n)).ok_or_else(|| ApiError::new(422, "Invalid", "no free NodePorts"))?;
+                            used.push(n);
+                            n
+                        }
+                    };
+                    p.set("nodePort", Value::Number(Number::from_u64(np as u64)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn services(&self) -> Vec<Value> {
+        let r = resources::find("", "v1", "services").unwrap();
+        let (items, _) = self.store.borrow().list(&r.prefix(), None, 0);
+        items.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect()
+    }
+
+    fn cluster_ips_in_use(&self) -> Vec<[u8; 4]> {
+        self.services().iter().filter_map(|s| s.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).and_then(crate::object::parse_ipv4)).collect()
+    }
+
+    fn node_ports_in_use(&self) -> Vec<u16> {
+        self.services()
+            .iter()
+            .flat_map(|s| s.pointer(&["spec", "ports"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default())
+            .filter_map(|p| p.get("nodePort").and_then(Value::as_u64).map(|n| n as u16))
+            .collect()
+    }
+
+    /// Lowest free address in 10.96.0.0/16 from .11 up (.1 = kubernetes, .10 = DNS).
+    fn allocate_cluster_ip(&self) -> R<String> {
+        let used = self.cluster_ips_in_use();
+        (11u32..65535)
+            .map(|n| [10, 96, (n >> 8) as u8, n as u8])
+            .find(|a| a[3] != 0 && a[3] != 255 && !used.contains(a))
+            .map(|a| alloc::format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]))
+            .ok_or_else(|| ApiError::new(422, "Invalid", "service CIDR exhausted"))
+    }
+
+    /// Creates `default/kubernetes` (pointing at `advertise:port`) and `kube-system/kube-dns`.
+    pub fn ensure_builtin_services(&self, advertise: [u8; 4], port: u16) -> Result<(), ApiError> {
+        let svc = resources::find("", "v1", "services").unwrap();
+        let ep = resources::find("", "v1", "endpoints").unwrap();
+        let ip = alloc::format!("{}.{}.{}.{}", advertise[0], advertise[1], advertise[2], advertise[3]);
+        self.bootstrap_object(svc, Some("default"), "kubernetes", "Service", r#"{"metadata":{"name":"kubernetes","labels":{"component":"apiserver","provider":"kubernetes"}},"spec":{"type":"ClusterIP","clusterIP":"10.96.0.1","clusterIPs":["10.96.0.1"],"ipFamilies":["IPv4"],"ipFamilyPolicy":"SingleStack","sessionAffinity":"None","internalTrafficPolicy":"Cluster","ports":[{"name":"https","port":443,"protocol":"TCP","targetPort":6443}]}}"#);
+        // The endpoints follow the API server's current address (re-written on every start).
+        let body = alloc::format!(r#"{{"metadata":{{"name":"kubernetes","labels":{{"endpointslice.kubernetes.io/skip-mirror":"true"}}}},"subsets":[{{"addresses":[{{"ip":"{ip}"}}],"ports":[{{"name":"https","port":{port},"protocol":"TCP"}}]}}]}}"#);
+        let key = ep.key(Some("default"), "kubernetes");
+        let _ = self.store.borrow_mut().delete(&key, None);
+        self.bootstrap_object(ep, Some("default"), "kubernetes", "Endpoints", &body);
+        self.bootstrap_object(svc, Some("kube-system"), "kube-dns", "Service", r#"{"metadata":{"name":"kube-dns","labels":{"k8s-app":"kube-dns","kubernetes.io/name":"CoreDNS"},"annotations":{"kr.io/builtin":"dns"}},"spec":{"type":"ClusterIP","clusterIP":"10.96.0.10","clusterIPs":["10.96.0.10"],"ipFamilies":["IPv4"],"ipFamilyPolicy":"SingleStack","sessionAffinity":"None","internalTrafficPolicy":"Cluster","ports":[{"name":"dns","port":53,"protocol":"UDP","targetPort":53},{"name":"dns-tcp","port":53,"protocol":"TCP","targetPort":53}]}}"#);
+        self.sync()
     }
 
     /// `serviceaccounts/<name>/token` (TokenRequest).

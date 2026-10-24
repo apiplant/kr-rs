@@ -159,6 +159,11 @@ pub fn main(mut args: Args) -> i32 {
     if let Err(e) = sa_setup() {
         return fail(&e);
     }
+    // The address pods and agents use to reach this API server.
+    let advertise = kr_sys::ns::route_source([1, 1, 1, 1]).unwrap_or([127, 0, 0, 1]);
+    if let Err(e) = api.ensure_builtin_services(advertise, port) {
+        return fail(&e.message);
+    }
     print(format!("kr server: listening on https://0.0.0.0:{port}\nkr server: export KUBECONFIG={data}/admin.kubeconfig\n").as_bytes());
     let kubelet = match start_kubelet(&api) {
         Ok(k) => Some(k),

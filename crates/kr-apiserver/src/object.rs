@@ -128,6 +128,20 @@ pub fn validate_meta_maps(meta: &Value) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Strict dotted-quad IPv4 parser.
+pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut parts = s.split('.');
+    for o in out.iter_mut() {
+        let p = parts.next()?;
+        if p.is_empty() || p.len() > 3 || !p.bytes().all(|b| b.is_ascii_digit()) || (p.len() > 1 && p.starts_with('0')) {
+            return None;
+        }
+        *o = p.parse::<u16>().ok().filter(|v| *v <= 255)? as u8;
+    }
+    parts.next().is_none().then_some(out)
+}
+
 // ---- time ----
 
 /// RFC 3339 UTC timestamp with second precision ("2026-10-23T16:00:00Z").

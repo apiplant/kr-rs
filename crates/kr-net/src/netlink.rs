@@ -298,6 +298,20 @@ impl Netlink {
     }
 }
 
+impl Netlink {
+    /// `ip route add local <dst>/<prefix> dev <oif> table local`: makes a whole range locally
+    /// deliverable and bindable (used for the Service CIDR). EEXIST when present.
+    pub fn route_add_local(&self, dst: [u8; 4], prefix: u8, oif: i32) -> Result<(), Errno> {
+        self.one(|b| {
+            b.begin(RTM_NEWROUTE, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+            // rtmsg: family, dst_len, src_len, tos, table=local(255), proto=boot, scope=host, type=local
+            b.raw(&[AF_INET, prefix, 0, 0, 255, 3, 254, 2, 0, 0, 0, 0]);
+            b.attr(RTA_DST, &dst);
+            b.attr_u32(RTA_OIF, oif as u32);
+        })
+    }
+}
+
 /// Interface index by name (SIOCGIFINDEX).
 pub fn ifindex(name: &[u8]) -> Result<i32, Errno> {
     kr_sys::ns::ifindex(name)
