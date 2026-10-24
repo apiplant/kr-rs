@@ -23,6 +23,8 @@ pub struct Config {
     pub user_agent: String,
     /// Idle connections kept for reuse.
     pub max_idle: usize,
+    /// Idle connections older than this are dropped instead of reused (0 disables pooling).
+    pub idle_timeout_ms: u64,
 }
 
 impl Default for Config {
@@ -35,6 +37,7 @@ impl Default for Config {
             limits: Limits::default(),
             user_agent: "kr-net/0.0.1".to_string(),
             max_idle: 4,
+            idle_timeout_ms: 90_000,
         }
     }
 }
@@ -42,23 +45,32 @@ impl Default for Config {
 type Key = (Scheme, String, u16);
 
 struct Pool<T> {
-    idle: Vec<(Key, T)>,
+    /// (key, connection, time it went idle in ms).
+    idle: Vec<(Key, T, u64)>,
     max: usize,
+    idle_ms: u64,
 }
 
 impl<T> Pool<T> {
-    fn take(&mut self, key: &Key) -> Option<T> {
-        let i = self.idle.iter().rposition(|(k, _)| k == key)?;
+    /// Drops every connection idle for longer than the timeout.
+    fn expire(&mut self, now: u64) {
+        let idle_ms = self.idle_ms;
+        self.idle.retain(|(_, _, since)| now.saturating_sub(*since) <= idle_ms);
+    }
+    fn take(&mut self, key: &Key, now: u64) -> Option<T> {
+        self.expire(now);
+        let i = self.idle.iter().rposition(|(k, _, _)| k == key)?;
         Some(self.idle.remove(i).1)
     }
-    fn put(&mut self, key: Key, c: T) {
-        if self.max == 0 {
+    fn put(&mut self, key: Key, c: T, now: u64) {
+        self.expire(now);
+        if self.max == 0 || self.idle_ms == 0 {
             return;
         }
         if self.idle.len() >= self.max {
             self.idle.remove(0);
         }
-        self.idle.push((key, c));
+        self.idle.push((key, c, now));
     }
 }
 
@@ -207,8 +219,8 @@ fn is_redirect(status: u16) -> bool {
 
 impl<C: Connector> Client<C> {
     pub fn with_connector(connector: C, cfg: Config) -> Self {
-        let max = cfg.max_idle;
-        Client { connector, cfg, pool: Rc::new(RefCell::new(Pool { idle: Vec::new(), max })) }
+        let (max, idle_ms) = (cfg.max_idle, cfg.idle_timeout_ms);
+        Client { connector, cfg, pool: Rc::new(RefCell::new(Pool { idle: Vec::new(), max, idle_ms })) }
     }
 
     pub fn connector(&self) -> &C {
@@ -222,7 +234,7 @@ impl<C: Connector> Client<C> {
     async fn send_once(&self, method: &str, url: &Url, headers: &[(String, String)], body: &[u8]) -> Result<(C::Conn, Head)> {
         let req = build_request(method, url, headers, body, &self.cfg.user_agent)?;
         let key: Key = (url.scheme, url.host.clone(), url.port);
-        let mut reused = self.pool.borrow_mut().take(&key);
+        let mut reused = self.pool.borrow_mut().take(&key, kr_rt::exec::now_ms());
         loop {
             let was_reused = reused.is_some();
             let mut conn = match reused.take() {
@@ -363,7 +375,7 @@ impl<T: Transport> Response<T> {
         // Unconsumed bytes would be a pipelined/garbage response: do not reuse.
         if self.keep_alive && self.pos == self.buf.len() {
             if let Some(c) = self.conn.take() {
-                self.pool.borrow_mut().put(self.key.clone(), c);
+                self.pool.borrow_mut().put(self.key.clone(), c, kr_rt::exec::now_ms());
             }
         }
         self.conn = None;
@@ -493,5 +505,37 @@ impl<T: Transport> Response<T> {
                 return Ok(false);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    fn key() -> Key {
+        (Scheme::Http, "h".to_string(), 80)
+    }
+
+    #[test]
+    fn idle_connections_expire() {
+        let mut p: Pool<u8> = Pool { idle: Vec::new(), max: 4, idle_ms: 100 };
+        p.put(key(), 1, 1000);
+        p.put(key(), 2, 1050);
+        // newest first, both still fresh
+        assert_eq!(p.take(&key(), 1100), Some(2));
+        p.put(key(), 3, 1100);
+        // 1 is now 200ms old: dropped, never handed out
+        assert_eq!(p.take(&key(), 1200), Some(3));
+        assert_eq!(p.take(&key(), 1200), None);
+        assert!(p.idle.is_empty());
+        p.put(key(), 4, 2000);
+        assert_eq!(p.take(&key(), 2101), None);
+    }
+
+    #[test]
+    fn zero_timeout_disables_pooling() {
+        let mut p: Pool<u8> = Pool { idle: Vec::new(), max: 4, idle_ms: 0 };
+        p.put(key(), 1, 0);
+        assert!(p.idle.is_empty());
     }
 }

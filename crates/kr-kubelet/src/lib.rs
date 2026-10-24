@@ -35,6 +35,7 @@ use core::task::{Poll, Waker};
 use kr_apiserver::client::{meta, Client};
 use kr_apiserver::object::rfc3339;
 use kr_fmt::json::{self, Number, Value};
+use kr_runtime::auth::Cred;
 use kr_runtime::container::{self, IdMaps, Running, Sandbox, Signaller};
 use kr_runtime::network::{self, Lease, NetConfig};
 use kr_runtime::store::Store;
@@ -180,6 +181,12 @@ pub struct Kubelet<C: Client> {
     infra: RefCell<Option<Sandbox>>,
     /// This node's pod subnet (from `spec.podCIDR`).
     podnet: Cell<network::PodNet>,
+}
+
+enum PullGate {
+    Ready,
+    Wait,
+    Start,
 }
 
 enum Pull {
@@ -509,8 +516,16 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let policy = cspec.and_then(|c| c.get("imagePullPolicy")).and_then(Value::as_str).unwrap_or("");
         let latest = !image.contains(':') || image.ends_with(":latest");
         let need_pull = self.store.image(&image).is_none() || (policy == "Always" && self.pods.borrow()[uid].ctrs[i].seq == 0) || (policy.is_empty() && latest && self.pods.borrow()[uid].ctrs[i].seq == 0);
-        if need_pull && policy != "Never" && !self.ensure_pulled(&image) {
-            let msg = match self.pulls.borrow().get(&image) {
+        // Pulls are keyed by image plus the pod's pull-credential identity, so a pull that failed
+        // for lack of credentials never blocks a pod that has them.
+        let key = spec::pull_key(pod, &image);
+        let gate = if need_pull && policy != "Never" { self.pull_gate(&key, &image) } else { PullGate::Ready };
+        if matches!(gate, PullGate::Start) {
+            let creds = self.pull_creds(pod).await;
+            self.start_pull(key.clone(), image.clone(), creds);
+        }
+        if !matches!(gate, PullGate::Ready) {
+            let msg = match self.pulls.borrow().get(&key) {
                 Some(Pull::Failed { msg, .. }) => Some(msg.clone()),
                 _ => None,
             };
@@ -627,41 +642,67 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     /// Pulls happen in background tasks so a slow registry never stalls the sync loop.
     /// Returns true once the image may be used (pull finished in this kubelet's lifetime, or a
     /// pull is unnecessary); false while pulling or backing off after a failure.
-    fn ensure_pulled(self: &Rc<Self>, image: &str) -> bool {
+    /// `Start` marks the pull in progress; the caller then gathers credentials and calls
+    /// [`Kubelet::start_pull`].
+    fn pull_gate(&self, key: &str, image: &str) -> PullGate {
         let mut pulls = self.pulls.borrow_mut();
-        match pulls.get(image) {
-            Some(Pull::InProgress) => return false,
-            Some(Pull::Failed { retry_at, .. }) if now_ms() < *retry_at => return false,
+        match pulls.get(key) {
+            Some(Pull::InProgress) => return PullGate::Wait,
+            Some(Pull::Failed { retry_at, .. }) if now_ms() < *retry_at => return PullGate::Wait,
             _ => {}
         }
         // A completed pull is recorded by removing the entry and the image being present.
-        if self.store.image(image).is_some() && !pulls.contains_key(image) && self.pulled_once(image) {
-            return true;
+        if self.store.image(image).is_some() && !pulls.contains_key(key) && self.pulled_once(key) {
+            return PullGate::Ready;
         }
-        pulls.insert(image.to_string(), Pull::InProgress);
-        drop(pulls);
+        pulls.insert(key.to_string(), Pull::InProgress);
+        PullGate::Start
+    }
+
+    fn start_pull(self: &Rc<Self>, key: String, image: String, creds: Vec<Cred>) {
         let me = self.clone();
-        let img = image.to_string();
         kr_rt::exec::spawn(async move {
-            let r = kr_runtime::pull::pull(&me.store, &img).await;
+            let r = kr_runtime::pull::pull_auth(&me.store, &image, &creds).await;
             let mut pulls = me.pulls.borrow_mut();
             match r {
                 Ok(_) => {
-                    pulls.remove(&img);
-                    me.done_pulls.borrow_mut().push(img);
+                    pulls.remove(&key);
+                    me.done_pulls.borrow_mut().push(key);
                 }
                 Err(e) => {
-                    pulls.insert(img.clone(), Pull::Failed { msg: alloc::format!("failed to pull {img}: {e:?}"), retry_at: now_ms() + 10_000 });
+                    // errors carry static strings only, never credentials or tokens
+                    pulls.insert(key, Pull::Failed { msg: alloc::format!("failed to pull {image}: {e:?}"), retry_at: now_ms() + 10_000 });
                 }
             }
             drop(pulls);
             me.notify.notify();
         });
-        false
     }
 
-    fn pulled_once(&self, image: &str) -> bool {
-        self.done_pulls.borrow().iter().any(|i| i == image)
+    /// Registry credentials from the pod's `imagePullSecrets` and its ServiceAccount's.
+    /// Missing or unreadable secrets are skipped (the pull then fails or goes anonymous).
+    async fn pull_creds(&self, pod: &Value) -> Vec<Cred> {
+        let ns = meta(pod, "namespace");
+        let mut names = spec::pull_secret_names(pod);
+        let sa = pod.pointer(&["spec", "serviceAccountName"]).and_then(Value::as_str).unwrap_or("default");
+        if let Ok(sa) = self.c.get(&alloc::format!("/api/v1/namespaces/{ns}/serviceaccounts/{sa}")).await {
+            for n in spec::pull_secret_names_of(sa.get("imagePullSecrets")) {
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for n in names {
+            if let Ok(s) = self.c.get(&alloc::format!("/api/v1/namespaces/{ns}/secrets/{n}")).await {
+                out.extend(kr_runtime::auth::from_secret(&s));
+            }
+        }
+        out
+    }
+
+    fn pulled_once(&self, key: &str) -> bool {
+        self.done_pulls.borrow().iter().any(|i| i == key)
     }
 
     fn spawn_waiter(self: &Rc<Self>, pod_uid: String, ctr: String, cid: String, running: Running, started_at: i64) {

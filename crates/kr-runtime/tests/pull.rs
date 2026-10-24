@@ -70,6 +70,19 @@ struct Server {
 }
 
 fn serve(f: Arc<Fixture>, corrupt: Option<String>) -> Server {
+    serve_with(f, corrupt, None)
+}
+
+/// Registry auth for the fake: either `Basic` straight on /v2, or a Bearer token handed out by
+/// /token only against Basic credentials (`bearer`).
+#[derive(Clone)]
+struct Auth {
+    /// The expected `Authorization: Basic ...` value.
+    basic: String,
+    bearer: bool,
+}
+
+fn serve_with(f: Arc<Fixture>, corrupt: Option<String>, auth: Option<Auth>) -> Server {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -77,7 +90,7 @@ fn serve(f: Arc<Fixture>, corrupt: Option<String>) -> Server {
     std::thread::spawn(move || {
         for s in l.incoming() {
             let Ok(mut s) = s else { continue };
-            let (f, log, corrupt) = (f.clone(), log2.clone(), corrupt.clone());
+            let (f, log, corrupt, auth) = (f.clone(), log2.clone(), corrupt.clone(), auth.clone());
             std::thread::spawn(move || {
                 s.set_read_timeout(Some(Duration::from_secs(10))).ok();
                 loop {
@@ -92,7 +105,31 @@ fn serve(f: Arc<Fixture>, corrupt: Option<String>) -> Server {
                     let text = String::from_utf8_lossy(&head).into_owned();
                     let path = text.split(' ').nth(1).unwrap_or("").to_string();
                     log.lock().unwrap().push(path.clone());
-                    let (status, ct, body): (&str, &str, Vec<u8>) = if path == "/v2/" {
+                    let authz = text
+                        .lines()
+                        .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("authorization")))
+                        .map(|(_, v)| v.trim().to_string())
+                        .unwrap_or_default();
+                    let mut extra = String::new();
+                    let denied = match &auth {
+                        Some(a) if path.starts_with("/token") => authz != a.basic,
+                        Some(a) if a.bearer => authz != "Bearer tok-123",
+                        Some(a) => authz != a.basic,
+                        None => false,
+                    };
+                    let (status, ct, body): (&str, &str, Vec<u8>) = if denied {
+                        let chal = if path.starts_with("/token") {
+                            r#"Basic realm="token""#.to_string()
+                        } else if auth.as_ref().unwrap().bearer {
+                            format!(r#"Bearer realm="http://127.0.0.1:{port}/token",service="fake",scope="repository:test/app:pull""#)
+                        } else {
+                            r#"Basic realm="fake""#.to_string()
+                        };
+                        extra = format!("WWW-Authenticate: {chal}\r\n");
+                        ("401 Unauthorized", "text/plain", vec![])
+                    } else if path.starts_with("/token") {
+                        ("200 OK", "application/json", br#"{"access_token":"tok-123"}"#.to_vec())
+                    } else if path == "/v2/" {
                         ("200 OK", "application/json", b"{}".to_vec())
                     } else if path.starts_with("/v2/test/app/manifests/") {
                         ("200 OK", "application/vnd.docker.distribution.manifest.v2+json", f.manifest.clone())
@@ -111,7 +148,7 @@ fn serve(f: Arc<Fixture>, corrupt: Option<String>) -> Server {
                     } else {
                         ("404 Not Found", "text/plain", vec![])
                     };
-                    let mut out = format!("HTTP/1.1 {status}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+                    let mut out = format!("HTTP/1.1 {status}\r\n{extra}Content-Type: {ct}\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
                     out.extend_from_slice(&body);
                     if s.write_all(&out).is_err() {
                         return;
@@ -221,6 +258,49 @@ fn pull_rejects_diff_id_mismatch_and_leaves_no_rootfs() {
     let imgs: Vec<_> = std::fs::read_dir(p.join("images")).unwrap().flatten().collect();
     assert!(imgs.iter().all(|e| !e.path().join("rootfs").exists() && !e.path().join("rootfs.tmp").exists()), "{imgs:?}");
     let _ = std::fs::remove_dir_all(&p);
+}
+
+fn run_pull_auth(s: &Store, r: &str, creds: Vec<kr_runtime::auth::Cred>) -> Result<kr_runtime::store::ImageId, Error> {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (s, r) = (s.clone(), r.to_string());
+    block_on(async move { kr_runtime::pull::pull_auth(&s, &r, &creds).await })
+}
+
+fn creds_for(host: &str, user: &str, pass: &str) -> Vec<kr_runtime::auth::Cred> {
+    let auth = kr_fmt::base64::encode(format!("{user}:{pass}").as_bytes());
+    let cfg = format!(r#"{{"auths":{{"{host}":{{"auth":"{auth}"}}}}}}"#);
+    kr_runtime::auth::parse_dockerconfig(cfg.as_bytes()).unwrap()
+}
+
+fn authed_pull(name: &str, bearer: bool) {
+    let f = Arc::new(fixture());
+    let basic = format!("Basic {}", kr_fmt::base64::encode(b"alice:s3cret"));
+    let srv = serve_with(f.clone(), None, Some(Auth { basic, bearer }));
+    let host = format!("127.0.0.1:{}", srv.port);
+    let r = format!("{host}/test/app:latest");
+    let (p, store) = tmp_store(name);
+
+    // no credentials, then wrong ones: refused, nothing stored
+    assert!(matches!(run_pull(&store, &r), Err(Error::Net(kr_net::Error::Auth(_)))));
+    assert!(matches!(run_pull_auth(&store, &r, creds_for(&host, "alice", "wrong")), Err(Error::Net(kr_net::Error::Auth(_)))));
+    // credentials for another registry are not sent here
+    assert!(run_pull_auth(&store, &r, creds_for("other.example.com", "alice", "s3cret")).is_err());
+    assert!(store.image(&r).is_none());
+    // the right ones work
+    let id = run_pull_auth(&store, &r, creds_for(&host, "alice", "s3cret")).unwrap();
+    assert_eq!(id.digest(), dg(&f.config));
+    assert!(store.image(&r).is_some());
+    let _ = std::fs::remove_dir_all(&p);
+}
+
+#[test]
+fn pull_with_basic_auth_credentials() {
+    authed_pull("basic", false);
+}
+
+#[test]
+fn pull_with_bearer_token_fetched_using_basic_credentials() {
+    authed_pull("bearer", true);
 }
 
 // ---------- real registry:2 through docker (ignored) ----------

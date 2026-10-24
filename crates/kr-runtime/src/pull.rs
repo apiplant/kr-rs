@@ -1,4 +1,5 @@
 //! Image pull: registry -> verified blobs -> flattened rootfs (ADR-013, ADR-017).
+use crate::auth::{lookup, Cred};
 use crate::store::{cpath, Ctx, Error, ImageConfig, ImageId, Result, Store};
 use crate::unpack::{unpack_layer_fd, Limits, Stats};
 use alloc::format;
@@ -40,11 +41,21 @@ fn registry() -> Result<Registry<TlsConnector>> {
 }
 
 pub async fn pull(store: &Store, image_ref: &str) -> Result<ImageId> {
-    pull_with(store, image_ref, &Limits::default()).await
+    pull_full(store, image_ref, &[], &Limits::default()).await
 }
 
 /// [`pull`] with explicit unpack limits.
 pub async fn pull_with(store: &Store, image_ref: &str, limits: &Limits) -> Result<ImageId> {
+    pull_full(store, image_ref, &[], limits).await
+}
+
+/// [`pull`] with registry credentials (from image pull secrets); the one matching the
+/// image's registry is used, none means anonymous.
+pub async fn pull_auth(store: &Store, image_ref: &str, creds: &[Cred]) -> Result<ImageId> {
+    pull_full(store, image_ref, creds, &Limits::default()).await
+}
+
+async fn pull_full(store: &Store, image_ref: &str, creds: &[Cred], limits: &Limits) -> Result<ImageId> {
     if let Some(id) = store.resolve_ref(image_ref) {
         if store.has_image(&id) {
             return Ok(id);
@@ -52,6 +63,7 @@ pub async fn pull_with(store: &Store, image_ref: &str, limits: &Limits) -> Resul
     }
     let r = Reference::parse(image_ref)?;
     let mut reg = registry()?;
+    reg.set_credential(lookup(creds, &r.registry).cloned());
     let image = reg.resolve(&r).await?;
     if image.manifest.layers.len() > MAX_LAYERS {
         return Err(Error::Image("too many layers"));

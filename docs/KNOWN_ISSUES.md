@@ -17,10 +17,8 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     It compiles under cfg but has never run. Plan: a qemu-user CI job.
 
 ## kr-net
-30. **Keep-alive pool has no idle timeout** — *open*
-    Stale connections are detected only when reused (one retry for GET/HEAD). Add a timer-based eviction if long-lived clients appear.
-31. **Registry auth supports anonymous Bearer tokens only** — *open*
-    No Basic auth, no credentials (`~/.docker/config.json`), no token refresh by expiry (a token is retried once after a 401), and `scope` is taken from the challenge or defaults to `repository:<repo>:pull`.
+31. **Registry auth supports anonymous Bearer tokens only** — *mostly fixed* (13ba669)
+    Basic and Bearer-with-credentials (`token`/`access_token`), docker `identitytoken` (refresh_token POST), `imagePullSecrets` (dockerconfigjson/dockercfg, pod and ServiceAccount) with docker.io alias matching, `kr_runtime::pull::pull_auth`; kubelet pulls are keyed by image+credential identity. Remaining: matching is by registry host only (no per-repo path prefixes), no `~/.docker/config.json` / credential helpers for `kr ctr pull`, no token refresh by expiry (retried once after a 401), identitytoken path is untested against a real registry.
 
 ## kr-sys (cont.)
 35. **`syscall0..6` lack `# Safety` docs (clippy `missing_safety_doc`)** — *open (cleanup)*
@@ -216,6 +214,8 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     `kr-net::tls::TlsConnector` serves `https`, and image pulls use it. Trust anchors come from `KR_CA_BUNDLE` or the system bundle.
 27. **Interim SHA-256 in `kr-net/src/sha256.rs`** — *fixed*
     It now re-exports `kr_crypto::sha2`.
+30. **Keep-alive pool has no idle timeout** — *fixed* (13ba669)
+    `Config::idle_timeout_ms` (default 90 s): idle connections older than that are dropped, never reused. Remaining: no proactive EOF/readability probe before reuse (a server-closed connection is still found on use, with the existing one retry for GET/HEAD) and no background eviction timer (expiry runs on pool take/put).
 
 ## kr-runtime store / unpack / pull
 39. **Layer diff_ids are verified** — *fixed* (commit: 38ed253)
