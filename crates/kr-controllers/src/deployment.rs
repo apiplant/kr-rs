@@ -200,6 +200,13 @@ pub async fn reconcile<C: Client>(c: &C, cfg: &Config, ns: &str, dname: &str) ->
         },
     };
 
+    // The Deployment mirrors its new ReplicaSet's revision (kubectl rollout and clients read it).
+    let rev = revision_of(&new_rs).to_string();
+    if str_at(&d, &["metadata", "annotations", REVISION]) != rev {
+        let patch = obj(alloc::vec![("metadata", obj(alloc::vec![("annotations", obj(alloc::vec![(REVISION, Value::String(rev))]))]))]);
+        c.patch(&alloc::format!("{}/{dname}", deployments(Some(ns))), MERGE, &patch).await?;
+    }
+
     let recreate = str_at(&d, &["spec", "strategy", "type"]) == "Recreate";
     let mut wait = None;
     if recreate {
