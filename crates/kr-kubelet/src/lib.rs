@@ -14,6 +14,8 @@
 #![forbid(unsafe_code)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub mod node;
 pub mod dns;
@@ -827,7 +829,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let pods = self.pods.borrow();
             let Some(p) = pods.get(uid) else { return };
             let policy = pod.pointer(&["spec", "restartPolicy"]).and_then(Value::as_str).unwrap_or("Always");
-            (self.status_json(p, policy), alloc::format!("/api/v1/namespaces/{}/pods/{}/status", p.ns, p.name))
+            (status_json(p, policy), alloc::format!("/api/v1/namespaces/{}/pods/{}/status", p.ns, p.name))
         };
         let text = json::to_string(&status);
         if self.pods.borrow().get(uid).is_some_and(|p| p.last_status == text) {
@@ -840,99 +842,186 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             }
         }
     }
+}
 
-    fn status_json(&self, p: &PodRt, policy: &str) -> Value {
-        let t = |s: i64| Value::String(rfc3339(s));
-        let o = |f: Vec<(&str, Value)>| Value::Object(f.into_iter().map(|(k, v)| (k.into(), v)).collect());
-        let state_json = |s: &CState| -> Value {
-            match s {
-                CState::Waiting(r, m) => o(alloc::vec![("waiting", o(alloc::vec![("reason", Value::from(*r)), ("message", Value::from(m.as_str()))]))]),
-                CState::Running { started_at, .. } => o(alloc::vec![("running", o(alloc::vec![("startedAt", t(*started_at))]))]),
-                CState::Terminated(tm) => o(alloc::vec![(
-                    "terminated",
-                    o(alloc::vec![("exitCode", Value::Number(Number::from_i64(tm.exit_code as i64))), ("reason", Value::from(tm.reason)), ("startedAt", t(tm.started_at)), ("finishedAt", t(tm.finished_at))])
-                )]),
-            }
+
+fn status_json(p: &PodRt, policy: &str) -> Value {
+    let t = |s: i64| Value::String(rfc3339(s));
+    let o = |f: Vec<(&str, Value)>| Value::Object(f.into_iter().map(|(k, v)| (k.into(), v)).collect());
+    let state_json = |s: &CState| -> Value {
+        match s {
+            CState::Waiting(r, m) => o(alloc::vec![("waiting", o(alloc::vec![("reason", Value::from(*r)), ("message", Value::from(m.as_str()))]))]),
+            CState::Running { started_at, .. } => o(alloc::vec![("running", o(alloc::vec![("startedAt", t(*started_at))]))]),
+            CState::Terminated(tm) => o(alloc::vec![(
+                "terminated",
+                o(alloc::vec![("exitCode", Value::Number(Number::from_i64(tm.exit_code as i64))), ("reason", Value::from(tm.reason)), ("startedAt", t(tm.started_at)), ("finishedAt", t(tm.finished_at))])
+            )]),
+        }
+    };
+    let inits_done = p.ctrs.iter().filter(|c| c.init).all(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code == 0));
+    let cstat = |c: &Ctr| -> Value {
+        let id = match &c.state {
+            CState::Running { id, .. } => alloc::format!("kr://{id}"),
+            _ => String::new(),
         };
-        let inits_done = p.ctrs.iter().filter(|c| c.init).all(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code == 0));
-        let cstat = |c: &Ctr| -> Value {
-            let id = match &c.state {
-                CState::Running { id, .. } => alloc::format!("kr://{id}"),
-                _ => String::new(),
-            };
-            let running = matches!(c.state, CState::Running { .. });
-            let ready = running && c.started && c.ready;
-            let mut f = alloc::vec![
-                ("name", Value::from(c.name.as_str())),
-                ("image", Value::from(c.image.as_str())),
-                ("imageID", Value::from("")),
-                ("containerID", Value::String(id)),
-                ("ready", Value::Bool(if c.init { matches!(&c.state, CState::Terminated(t) if t.exit_code == 0) } else { ready && !c.eph })),
-                ("started", Value::Bool(running && c.started)),
-                ("restartCount", Value::Number(Number::from_u64(c.restart_count as u64))),
-                ("state", match &c.state {
-                    CState::Waiting("ContainerCreating", m) if !c.init && !c.eph && !inits_done => state_json(&CState::Waiting("PodInitializing", m.clone())),
-                    s => state_json(s),
-                }),
-            ];
-            f.push(("lastState", c.last_term.as_ref().filter(|_| !matches!(c.state, CState::Terminated(_))).map(|tm| state_json(&CState::Terminated(tm.clone()))).unwrap_or(o(Vec::new()))));
-            o(f)
-        };
-        let apps: Vec<&Ctr> = p.ctrs.iter().filter(|c| !c.init && !c.eph).collect();
-        let all_running = !apps.is_empty() && apps.iter().all(|c| matches!(c.state, CState::Running { .. }) && c.started && c.ready);
-        let all_done = !apps.is_empty() && apps.iter().all(|c| matches!(c.state, CState::Terminated(_)));
-        let failed = apps.iter().any(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code != 0)) || p.ctrs.iter().any(|c| c.init && matches!(&c.state, CState::Terminated(t) if t.exit_code != 0) && policy == "Never");
-        let phase = if p.failed_setup.is_some() {
-            "Failed"
-        } else if all_done && policy != "Always" && (policy == "Never" || !failed) {
-            if failed { "Failed" } else { "Succeeded" }
-        } else if failed && policy == "Never" && apps.iter().all(|c| !matches!(c.state, CState::Running { .. })) && p.ctrs.iter().any(|c| c.init && matches!(&c.state, CState::Terminated(t) if t.exit_code != 0)) {
-            "Failed"
-        } else if apps.iter().any(|c| matches!(c.state, CState::Running { .. })) || (inits_done && apps.iter().any(|c| c.last_term.is_some())) {
-            "Running"
-        } else {
-            "Pending"
-        };
-        let cond = |ty: &str, ok: bool, why: Option<(&str, String)>| {
-            let mut f = alloc::vec![("type", Value::from(ty)), ("status", Value::from(if ok { "True" } else { "False" })), ("lastTransitionTime", t(p.start_time))];
-            if let (false, Some((r, m))) = (ok, why) {
-                f.push(("reason", Value::from(r)));
-                if !m.is_empty() {
-                    f.push(("message", Value::String(m)));
-                }
-            }
-            o(f)
-        };
-        let incomplete: Vec<&str> = p.ctrs.iter().filter(|c| c.init && !matches!(&c.state, CState::Terminated(t) if t.exit_code == 0)).map(|c| c.name.as_str()).collect();
-        let init_why = Some(("ContainersNotInitialized", alloc::format!("containers with incomplete status: [{}]", incomplete.join(" "))));
-        let notready = || Some(("ContainersNotReady", {
-            let n: Vec<&str> = apps.iter().filter(|c| !(matches!(c.state, CState::Running { .. }) && c.started && c.ready)).map(|c| c.name.as_str()).collect();
-            if n.is_empty() { String::new() } else { alloc::format!("containers with unready status: [{}]", n.join(" ")) }
-        }));
-        let ip = p.ip.map(|a| alloc::format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]));
+        let running = matches!(c.state, CState::Running { .. });
+        let ready = running && c.started && c.ready;
         let mut f = alloc::vec![
-            ("phase", Value::from(phase)),
-            ("conditions", Value::Array(alloc::vec![cond("PodScheduled", true, None), cond("Initialized", inits_done, init_why), cond("Ready", all_running, notready()), cond("ContainersReady", all_running, notready())])),
-            ("hostIP", Value::from("127.0.0.1")),
-            ("startTime", t(p.start_time)),
-            ("containerStatuses", Value::Array(apps.iter().map(|c| cstat(c)).collect())),
+            ("name", Value::from(c.name.as_str())),
+            ("image", Value::from(c.image.as_str())),
+            ("imageID", Value::from("")),
+            ("containerID", Value::String(id)),
+            ("ready", Value::Bool(if c.init { matches!(&c.state, CState::Terminated(t) if t.exit_code == 0) } else { ready && !c.eph })),
+            ("started", Value::Bool(running && c.started)),
+            ("restartCount", Value::Number(Number::from_u64(c.restart_count as u64))),
+            ("state", match &c.state {
+                CState::Waiting("ContainerCreating", m) if !c.init && !c.eph && !inits_done => state_json(&CState::Waiting("PodInitializing", m.clone())),
+                s => state_json(s),
+            }),
         ];
-        let inits: Vec<Value> = p.ctrs.iter().filter(|c| c.init).map(cstat).collect();
-        if !inits.is_empty() {
-            f.push(("initContainerStatuses", Value::Array(inits)));
-        }
-        let ephs: Vec<Value> = p.ctrs.iter().filter(|c| c.eph).map(cstat).collect();
-        if !ephs.is_empty() {
-            f.push(("ephemeralContainerStatuses", Value::Array(ephs)));
-        }
-        if let Some(ip) = ip {
-            f.push(("podIP", Value::from(ip.as_str())));
-            f.push(("podIPs", Value::Array(alloc::vec![o(alloc::vec![("ip", Value::from(ip.as_str()))])])));
-        }
-        if let Some(msg) = &p.failed_setup {
-            f.push(("message", Value::from(msg.as_str())));
-            f.push(("reason", Value::from("SandboxFailed")));
+        f.push(("lastState", c.last_term.as_ref().filter(|_| !matches!(c.state, CState::Terminated(_))).map(|tm| state_json(&CState::Terminated(tm.clone()))).unwrap_or(o(Vec::new()))));
+        o(f)
+    };
+    let apps: Vec<&Ctr> = p.ctrs.iter().filter(|c| !c.init && !c.eph).collect();
+    let all_running = !apps.is_empty() && apps.iter().all(|c| matches!(c.state, CState::Running { .. }) && c.started && c.ready);
+    let all_done = !apps.is_empty() && apps.iter().all(|c| matches!(c.state, CState::Terminated(_)));
+    let failed = apps.iter().any(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code != 0)) || p.ctrs.iter().any(|c| c.init && matches!(&c.state, CState::Terminated(t) if t.exit_code != 0) && policy == "Never");
+    let phase = if p.failed_setup.is_some() {
+        "Failed"
+    } else if all_done && policy != "Always" && (policy == "Never" || !failed) {
+        if failed { "Failed" } else { "Succeeded" }
+    } else if failed && policy == "Never" && apps.iter().all(|c| !matches!(c.state, CState::Running { .. })) && p.ctrs.iter().any(|c| c.init && matches!(&c.state, CState::Terminated(t) if t.exit_code != 0)) {
+        "Failed"
+    } else if apps.iter().any(|c| matches!(c.state, CState::Running { .. })) || (inits_done && apps.iter().any(|c| c.last_term.is_some())) {
+        "Running"
+    } else {
+        "Pending"
+    };
+    let cond = |ty: &str, ok: bool, why: Option<(&str, String)>| {
+        let mut f = alloc::vec![("type", Value::from(ty)), ("status", Value::from(if ok { "True" } else { "False" })), ("lastTransitionTime", t(p.start_time))];
+        if let (false, Some((r, m))) = (ok, why) {
+            f.push(("reason", Value::from(r)));
+            if !m.is_empty() {
+                f.push(("message", Value::String(m)));
+            }
         }
         o(f)
+    };
+    let incomplete: Vec<&str> = p.ctrs.iter().filter(|c| c.init && !matches!(&c.state, CState::Terminated(t) if t.exit_code == 0)).map(|c| c.name.as_str()).collect();
+    let init_why = Some(("ContainersNotInitialized", alloc::format!("containers with incomplete status: [{}]", incomplete.join(" "))));
+    let notready = || Some(("ContainersNotReady", {
+        let n: Vec<&str> = apps.iter().filter(|c| !(matches!(c.state, CState::Running { .. }) && c.started && c.ready)).map(|c| c.name.as_str()).collect();
+        if n.is_empty() { String::new() } else { alloc::format!("containers with unready status: [{}]", n.join(" ")) }
+    }));
+    let ip = p.ip.map(|a| alloc::format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]));
+    let mut f = alloc::vec![
+        ("phase", Value::from(phase)),
+        ("conditions", Value::Array(alloc::vec![cond("PodScheduled", true, None), cond("Initialized", inits_done, init_why), cond("Ready", all_running, notready()), cond("ContainersReady", all_running, notready())])),
+        ("hostIP", Value::from("127.0.0.1")),
+        ("startTime", t(p.start_time)),
+        ("containerStatuses", Value::Array(apps.iter().map(|c| cstat(c)).collect())),
+    ];
+    let inits: Vec<Value> = p.ctrs.iter().filter(|c| c.init).map(cstat).collect();
+    if !inits.is_empty() {
+        f.push(("initContainerStatuses", Value::Array(inits)));
+    }
+    let ephs: Vec<Value> = p.ctrs.iter().filter(|c| c.eph).map(cstat).collect();
+    if !ephs.is_empty() {
+        f.push(("ephemeralContainerStatuses", Value::Array(ephs)));
+    }
+    if let Some(ip) = ip {
+        f.push(("podIP", Value::from(ip.as_str())));
+        f.push(("podIPs", Value::Array(alloc::vec![o(alloc::vec![("ip", Value::from(ip.as_str()))])])));
+    }
+    if let Some(msg) = &p.failed_setup {
+        f.push(("message", Value::from(msg.as_str())));
+        f.push(("reason", Value::from("SandboxFailed")));
+    }
+    o(f)
+}
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    use alloc::vec;
+
+    fn ctr(name: &str, init: bool, eph: bool, state: CState) -> Ctr {
+        Ctr { name: name.into(), image: "img".into(), init, eph, restart_count: 0, state, last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: true, ready: true }
+    }
+    fn done(code: i32) -> CState {
+        CState::Terminated(Term { exit_code: code, reason: if code == 0 { "Completed" } else { "Error" }, started_at: 1, finished_at: 2 })
+    }
+    fn run() -> CState {
+        CState::Running { started_at: 1, id: "x".into() }
+    }
+    fn creating() -> CState {
+        CState::Waiting("ContainerCreating", String::new())
+    }
+    fn pod(ctrs: Vec<Ctr>) -> PodRt {
+        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ctrs, start_time: 0, kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0 }
+    }
+    fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
+        path.iter().try_fold(v, |v, k| match k.parse::<usize>() {
+            Ok(i) => v.as_array()?.get(i),
+            Err(_) => v.get(k),
+        })
+    }
+    fn s<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
+        at(v, path).and_then(Value::as_str)
+    }
+    fn cond<'a>(st: &'a Value, ty: &str) -> &'a Value {
+        st.get("conditions").and_then(Value::as_array).unwrap().iter().find(|c| s(c, &["type"]) == Some(ty)).unwrap()
+    }
+
+    #[test]
+    fn during_init() {
+        let st = status_json(&pod(vec![ctr("init1", true, false, run()), ctr("init2", true, false, creating()), ctr("run1", false, false, creating())]), "Always");
+        assert_eq!(s(&st, &["phase"]), Some("Pending"));
+        assert_eq!(s(&st, &["containerStatuses", "0", "state", "waiting", "reason"]), Some("PodInitializing"));
+        let i = cond(&st, "Initialized");
+        assert_eq!(s(i, &["status"]), Some("False"));
+        assert_eq!(s(i, &["reason"]), Some("ContainersNotInitialized"));
+        assert_eq!(s(i, &["message"]), Some("containers with incomplete status: [init1 init2]"));
+        assert_eq!(s(cond(&st, "Ready"), &["reason"]), Some("ContainersNotReady"));
+        assert_eq!(s(&st, &["initContainerStatuses", "1", "name"]), Some("init2"));
+    }
+
+    #[test]
+    fn inits_done() {
+        let st = status_json(&pod(vec![ctr("init1", true, false, done(0)), ctr("run1", false, false, creating())]), "Always");
+        assert_eq!(at(&st, &["initContainerStatuses", "0", "ready"]), Some(&Value::Bool(true)));
+        assert_eq!(s(&st, &["initContainerStatuses", "0", "state", "terminated", "reason"]), Some("Completed"));
+        assert_eq!(s(cond(&st, "Initialized"), &["status"]), Some("True"));
+        assert_eq!(s(&st, &["containerStatuses", "0", "state", "waiting", "reason"]), Some("ContainerCreating"));
+    }
+
+    #[test]
+    fn failing_init_never() {
+        let st = status_json(&pod(vec![ctr("init1", true, false, done(3)), ctr("run1", false, false, creating())]), "Never");
+        assert_eq!(s(&st, &["phase"]), Some("Failed"));
+        assert_eq!(s(&st, &["initContainerStatuses", "0", "state", "terminated", "reason"]), Some("Error"));
+        assert_eq!(s(&st, &["containerStatuses", "0", "state", "waiting", "reason"]), Some("PodInitializing"));
+    }
+
+    #[test]
+    fn failing_init_always() {
+        let mut i = ctr("init1", true, false, CState::Waiting("CrashLoopBackOff", String::new()));
+        i.restart_count = 2;
+        i.last_term = Some(Term { exit_code: 1, reason: "Error", started_at: 1, finished_at: 2 });
+        let st = status_json(&pod(vec![i, ctr("run1", false, false, creating())]), "Always");
+        assert_eq!(s(&st, &["phase"]), Some("Pending"));
+        assert_eq!(at(&st, &["initContainerStatuses", "0", "restartCount"]).and_then(Value::as_u64), Some(2));
+        assert!(at(&st, &["initContainerStatuses", "0", "lastState", "terminated"]).is_some());
+        assert_eq!(s(&st, &["containerStatuses", "0", "state", "waiting", "reason"]), Some("PodInitializing"));
+    }
+
+    #[test]
+    fn ephemeral_separate() {
+        let st = status_json(&pod(vec![ctr("run1", false, false, run()), ctr("dbg", false, true, run())]), "Always");
+        assert_eq!(st.get("containerStatuses").and_then(Value::as_array).map(|a| a.len()), Some(1));
+        assert_eq!(s(&st, &["ephemeralContainerStatuses", "0", "name"]), Some("dbg"));
+        assert_eq!(at(&st, &["ephemeralContainerStatuses", "0", "ready"]), Some(&Value::Bool(false)));
+        assert_eq!(s(cond(&st, "Ready"), &["status"]), Some("True"));
+        let st = status_json(&pod(vec![ctr("run1", false, false, run()), ctr("dbg", false, true, creating())]), "Always");
+        assert_eq!(s(cond(&st, "Ready"), &["status"]), Some("True"));
     }
 }
