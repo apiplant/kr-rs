@@ -243,7 +243,7 @@ impl ApiServer {
         if let Some(s) = &c.schema {
             crate::crd::prune(s, o, true);
             let mut errs = Vec::new();
-            crate::crd::validate(s, o, "", &mut errs);
+            crate::crd::validate(s, o, old, "", &mut errs);
             if !errs.is_empty() {
                 let name = o.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("");
                 return Err(ApiError::invalid(alloc::format!("{}.{} \"{name}\" is invalid: {}", rt.res.kind, rt.res.group, errs.join(", "))));
@@ -281,6 +281,13 @@ impl ApiServer {
             let custom = self.custom.borrow();
             let Some(c) = custom.iter().find(|c| core::ptr::eq(c.res, rt.res)) else { return reply };
             custom.iter().filter(|x| x.crd == c.crd).count() > 1
+        };
+        let reply = match reply {
+            Reply::Watch(mut w) if multi => {
+                w.gv = Some(rt.res.group_version());
+                return Reply::Watch(w);
+            }
+            r => r,
         };
         let Reply::Json(code, body) = reply else { return reply };
         if !multi || code >= 300 {
@@ -1786,7 +1793,7 @@ impl ApiServer {
             Err(_) => return Err(ApiError::new(500, "InternalError", "watch failed")),
         };
         let timeout_s: u64 = q.get("timeoutSeconds").and_then(|t| t.parse().ok()).unwrap_or(1800).min(3600);
-        Ok(Reply::Watch(WatchStream { watcher, initial, ls, fs, deadline: Some(Box::pin(kr_rt::exec::sleep(timeout_s * 1000))) }))
+        Ok(Reply::Watch(WatchStream { watcher, initial, ls, fs, deadline: Some(Box::pin(kr_rt::exec::sleep(timeout_s * 1000))), gv: None }))
     }
 }
 
@@ -1880,6 +1887,8 @@ pub struct WatchStream {
     ls: Selector,
     fs: FieldSelector,
     deadline: Option<Pin<Box<kr_rt::exec::Sleep>>>,
+    /// Custom resources served at several versions: apiVersion to stamp on every event object.
+    gv: Option<String>,
 }
 
 impl WatchStream {
@@ -1901,10 +1910,23 @@ impl WatchStream {
         }
     }
 
+    /// Rewrites the apiVersion of the event's object (conversion strategy None).
+    fn retag(gv: &Option<String>, line: Vec<u8>) -> Vec<u8> {
+        let Some(gv) = gv else { return line };
+        let Ok(mut ev) = json::parse(&line) else { return line };
+        match ev.get_mut("object") {
+            Some(o) if o.get("kind").and_then(Value::as_str) != Some("Status") => o.set("apiVersion", Value::from(gv.as_str())),
+            _ => return line,
+        }
+        let mut out = json::to_string(&ev).into_bytes();
+        out.push(b'\n');
+        out
+    }
+
     /// Next chunk of the response body; `None` ends the stream.
     pub fn poll_chunk(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
         if let Some(l) = self.initial.pop_front() {
-            return Poll::Ready(Some(l));
+            return Poll::Ready(Some(Self::retag(&self.gv, l)));
         }
         if let Some(d) = self.deadline.as_mut() {
             if d.as_mut().poll(cx).is_ready() {
@@ -1918,7 +1940,7 @@ impl WatchStream {
             match w.poll_next(cx) {
                 Poll::Ready(Some(e)) => {
                     if let Some(l) = Self::convert(&self.ls, &self.fs, &e) {
-                        out.extend_from_slice(&l);
+                        out.extend_from_slice(&Self::retag(&self.gv, l));
                     }
                     if out.len() > 256 * 1024 {
                         return Poll::Ready(Some(out));

@@ -206,3 +206,168 @@ fn crds_are_loaded_from_the_store_at_startup() {
     assert!(j(&api, "GET", "/apis/example.com/v1", "").1.get("resources").is_some());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+const CRDS: &str = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions";
+const G: &str = "/apis/example.com/v1/namespaces/default/gizmos";
+
+/// A single-version `gizmos` CRD whose root schema is `schema` (a JSON object literal).
+fn gizmo_crd(schema: &str) -> String {
+    format!(
+        r#"{{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{{"name":"gizmos.example.com"}},
+"spec":{{"group":"example.com","scope":"Namespaced","names":{{"plural":"gizmos","kind":"Gizmo"}},
+"versions":[{{"name":"v1","served":true,"storage":true,"schema":{{"openAPIV3Schema":{schema}}}}}]}}}}"#
+    )
+}
+
+fn gizmo_api(spec_props: &str, spec_extra: &str) -> ApiServer {
+    let api = server();
+    let schema = format!(r#"{{"type":"object","properties":{{"spec":{{"type":"object"{spec_extra},"properties":{spec_props}}}}}}}"#);
+    let (c, v) = j(&api, "POST", CRDS, &gizmo_crd(&schema));
+    assert_eq!(c, 201, "{v:?}");
+    api
+}
+
+fn gizmo(name: &str, spec: &str) -> String {
+    format!(r#"{{"apiVersion":"example.com/v1","kind":"Gizmo","metadata":{{"name":"{name}"}},"spec":{spec}}}"#)
+}
+
+fn msg(v: &Value) -> String {
+    v.get("message").and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+#[test]
+fn non_structural_crds_are_rejected() {
+    let cases = [
+        (r#"{"type":"object","properties":{"a":{"description":"no type"}}}"#, "properties[a].type: Required value: must not be empty for specified object fields"),
+        (r#"{"properties":{}}"#, "must not be empty at the root"),
+        (r#"{"type":"object","properties":{"a":{"type":"string"}},"additionalProperties":{"type":"string"}}"#, "additionalProperties and properties are mutual exclusive"),
+        (r#"{"type":"object","properties":{"a":{"type":"array"}}}"#, "items: Required value"),
+        (r#"{"type":"object","properties":{"a":{"type":"array","items":{"description":"x"}}}}"#, "items.type: Required value: must not be empty for specified array items"),
+        (r#"{"type":"object","properties":{"a":{"type":"string","anyOf":[{"type":"string"}]}}}"#, "anyOf[0].type: Forbidden"),
+        (r#"{"type":"object","properties":{"a":{"type":"string","pattern":"("}}}"#, "pattern: Invalid value"),
+        (r#"{"type":"object","properties":{"a":{"type":"string","x-kubernetes-validations":[{"rule":"self.nope("}]}}}"#, "compilation failed"),
+        (r#"{"type":"object","properties":{"a":{"type":"string","x-kubernetes-validations":[{"rule":"unknownFn(self)"}]}}}"#, "compilation failed"),
+        (r#"{"type":"object","properties":{"a":{"type":"string","x-kubernetes-validations":[{"message":"m"}]}}}"#, "rule: Required value"),
+    ];
+    for (schema, want) in cases {
+        let (c, v) = j(&server(), "POST", CRDS, &gizmo_crd(schema));
+        assert_eq!(c, 422, "{schema}");
+        assert!(msg(&v).contains(want), "{schema}: {}", msg(&v));
+    }
+    // Structural forms are accepted: int-or-string, preserve-unknown-fields without type.
+    let ok = r#"{"type":"object","properties":{"a":{"x-kubernetes-int-or-string":true,"anyOf":[{"type":"integer"},{"type":"string"}]},"b":{"x-kubernetes-preserve-unknown-fields":true}}}"#;
+    assert_eq!(j(&server(), "POST", CRDS, &gizmo_crd(ok)).0, 201);
+    // Updates are checked too.
+    let api = server();
+    assert_eq!(j(&api, "POST", CRDS, &gizmo_crd(ok)).0, 201);
+    let bad = gizmo_crd(r#"{"type":"object","properties":{"a":{}}}"#);
+    assert_eq!(j(&api, "PUT", &format!("{CRDS}/gizmos.example.com"), &bad).0, 422);
+}
+
+#[test]
+fn schema_keywords_are_enforced() {
+    // allOf/oneOf/not inside a typed node are structural as long as they carry no type.
+    let props = r#"{
+"name":{"type":"string","pattern":"^[a-z][a-z0-9-]*$","maxLength":10},
+"when":{"type":"string","format":"date"},
+"at":{"type":"string","format":"date-time"},
+"id":{"type":"string","format":"uuid"},
+"ip":{"type":"string","format":"ipv4"},
+"ip6":{"type":"string","format":"ipv6"},
+"host":{"type":"string","format":"hostname"},
+"blob":{"type":"string","format":"byte"},
+"link":{"type":"string","format":"uri"},
+"i32":{"type":"integer","format":"int32"},
+"n":{"type":"number","minimum":0,"exclusiveMinimum":true,"maximum":10,"multipleOf":2},
+"list":{"type":"array","items":{"type":"string"},"uniqueItems":true,"minItems":1,"maxItems":3},
+"set":{"type":"array","items":{"type":"string"},"x-kubernetes-list-type":"set"},
+"map":{"type":"array","items":{"type":"object","properties":{"k":{"type":"string"},"v":{"type":"string"}}},"x-kubernetes-list-type":"map","x-kubernetes-list-map-keys":["k"]},
+"obj":{"type":"object","additionalProperties":{"type":"string"},"minProperties":1,"maxProperties":2},
+"choice":{"type":"integer","allOf":[{"minimum":1}],"oneOf":[{"maximum":5},{"minimum":10}],"not":{"enum":[3]}}
+}"#;
+    let api = gizmo_api(props, "");
+    let good = r#"{"name":"abc-1","when":"2024-02-29","at":"2024-05-01T10:20:30Z","id":"123e4567-e89b-12d3-a456-426614174000","ip":"10.0.0.1","ip6":"::1","host":"a.example.com","blob":"aGk=","link":"https://x.io/p","i32":5,"n":4,"list":["a","b"],"set":["a","b"],"map":[{"k":"a"},{"k":"b"}],"obj":{"x":"y"},"choice":2}"#;
+    let (c, v) = j(&api, "POST", G, &gizmo("g", good));
+    assert_eq!(c, 201, "{v:?}");
+    let bads = [
+        (r#"{"name":"Abc"}"#, "should match"),
+        (r#"{"name":"abcdefghijklmnop"}"#, "Too long"),
+        (r#"{"when":"2023-02-29"}"#, "must be of type date"),
+        (r#"{"at":"2024-05-01 10:20"}"#, "date-time"),
+        (r#"{"id":"nope"}"#, "uuid"),
+        (r#"{"ip":"300.1.1.1"}"#, "ipv4"),
+        (r#"{"ip6":"1.2.3.4"}"#, "ipv6"),
+        (r#"{"host":"-a.com"}"#, "hostname"),
+        (r#"{"blob":"abc"}"#, "byte"),
+        (r#"{"link":"not a uri"}"#, "uri"),
+        (r#"{"i32":3000000000}"#, "int32"),
+        (r#"{"n":0}"#, "greater than 0"),
+        (r#"{"n":12}"#, "less than or equal to 10"),
+        (r#"{"n":3}"#, "multiple of 2"),
+        (r#"{"list":["a","a"]}"#, "Duplicate value"),
+        (r#"{"list":[]}"#, "at least 1"),
+        (r#"{"list":["a","b","c","d"]}"#, "Too many"),
+        (r#"{"set":["a","a"]}"#, "Duplicate value"),
+        (r#"{"map":[{"k":"a","v":"1"},{"k":"a","v":"2"}]}"#, "Duplicate value"),
+        (r#"{"obj":{}}"#, "at least 1 properties"),
+        (r#"{"obj":{"a":"1","b":"2","c":"3"}}"#, "at most 2 properties"),
+        (r#"{"choice":0}"#, "greater than or equal to 1"),
+        (r#"{"choice":7}"#, "oneOf"),
+        (r#"{"choice":3}"#, "(not)"),
+    ];
+    for (spec, want) in bads {
+        let (c, v) = j(&api, "POST", G, &gizmo("h", spec));
+        assert_eq!(c, 422, "{spec}: {v:?}");
+        assert!(msg(&v).contains(want), "{spec}: {}", msg(&v));
+    }
+}
+
+#[test]
+fn cel_rules_run_with_self_and_old_self() {
+    let props = r#"{"lo":{"type":"integer"},"hi":{"type":"integer"},
+"replicas":{"type":"integer","x-kubernetes-validations":[{"rule":"self >= oldSelf","message":"replicas may not decrease"}]},
+"name":{"type":"string","x-kubernetes-validations":[{"rule":"self.matches('^[a-z]+$') && size(self) < 6","messageExpression":"'bad name ' + self"}]},
+"tags":{"type":"array","items":{"type":"string"},"x-kubernetes-validations":[{"rule":"self.all(t, t.startsWith('t-'))"}]}}"#;
+    let api = gizmo_api(props, r#","x-kubernetes-validations":[{"rule":"self.lo <= self.hi","message":"lo must not exceed hi"},{"rule":"!has(self.name) || self.name != 'root'"}]"#);
+    let (c, v) = j(&api, "POST", G, &gizmo("g", r#"{"lo":1,"hi":2,"replicas":3,"name":"abc","tags":["t-1"]}"#));
+    assert_eq!(c, 201, "{v:?}");
+    for (spec, want) in [
+        (r#"{"lo":3,"hi":2}"#, "lo must not exceed hi"),
+        (r#"{"lo":1,"hi":2,"name":"root"}"#, "failed rule"),
+        (r#"{"lo":1,"hi":2,"name":"ABC"}"#, "bad name ABC"),
+        (r#"{"lo":1,"hi":2,"tags":["x"]}"#, "failed rule: self.all"),
+    ] {
+        let (c, v) = j(&api, "POST", G, &gizmo("h", spec));
+        assert_eq!(c, 422, "{spec}: {v:?}");
+        assert!(msg(&v).contains(want), "{spec}: {}", msg(&v));
+    }
+    // Transition rule: only on update, against the stored value.
+    let up = |r: u32| gizmo("g", &format!(r#"{{"lo":1,"hi":2,"replicas":{r},"name":"abc","tags":["t-1"]}}"#));
+    assert_eq!(j(&api, "PUT", &format!("{G}/g"), &up(5)).0, 200);
+    let (c, v) = j(&api, "PUT", &format!("{G}/g"), &up(2));
+    assert_eq!(c, 422);
+    assert!(msg(&v).contains("replicas may not decrease"), "{}", msg(&v));
+    assert_eq!(j(&api, "PUT", &format!("{G}/g"), &up(5)).0, 200);
+}
+
+#[test]
+fn watch_events_carry_the_requested_version() {
+    use std::task::{Context, Poll, Waker};
+    let api = crd_installed();
+    assert_eq!(j(&api, "POST", W, &widget("w", r#"{"size":1}"#)).0, 201);
+    let lines = |p: &str, q: &str| -> String {
+        let req = Req { method: "GET", path: p, query: q, content_type: None, accept: None, body: b"", user: Some(User { name: "admin".into(), groups: vec!["system:masters".into()] }), bearer: None, headers: &[], authz_verb: None };
+        let Reply::Watch(mut w) = api.handle(&req) else { panic!("expected a watch") };
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut out = String::new();
+        while let Poll::Ready(Some(c)) = w.poll_chunk(&mut cx) {
+            out.push_str(&String::from_utf8(c).unwrap());
+        }
+        out
+    };
+    let q = "watch=true&resourceVersion=0";
+    let v2 = lines("/apis/example.com/v2/namespaces/default/widgets", q);
+    assert!(v2.contains(r#""apiVersion":"example.com/v2""#) && !v2.contains("example.com/v1"), "{v2}");
+    let v1 = lines("/apis/example.com/v1/namespaces/default/widgets", q);
+    assert!(v1.contains(r#""apiVersion":"example.com/v1""#), "{v1}");
+}

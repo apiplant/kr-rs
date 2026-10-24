@@ -7,6 +7,8 @@ use crate::resources::Resource;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use crate::cel::Program;
+use crate::regex::Regex;
 use kr_fmt::json::{self, Number, Value};
 
 pub const GROUP: &str = "apiextensions.k8s.io";
@@ -106,6 +108,9 @@ pub fn admit(o: &mut Value, old: Option<&Value>, now: i64) -> Result<(), ApiErro
         }
         if versions[..i].iter().any(|p| str_at(p, &["name"]) == vn) {
             errs.push(alloc::format!("spec.versions[{i}].name: Duplicate value: {vn:?}"));
+        }
+        if let Some(sc) = v.pointer(&["schema", "openAPIV3Schema"]) {
+            check_schema(sc, &alloc::format!("spec.versions[{i}].schema.openAPIV3Schema"), Pos::Root, &mut errs);
         }
         if is_true(v.get("storage")) {
             storage_count += 1;
@@ -289,9 +294,145 @@ fn join(path: &str, k: &str) -> String {
     if path.is_empty() { k.to_string() } else { alloc::format!("{path}.{k}") }
 }
 
-/// Validates `v` against the subset of OpenAPI v3 kr enforces: type, nullable, int-or-string,
-/// required, properties, additionalProperties, items, enum, min/max, min/maxLength, min/maxItems.
-pub fn validate(s: &Value, v: &Value, path: &str, errs: &mut Vec<String>) {
+fn tname(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn is_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' || ![0, 1, 2, 3, 5, 6, 8, 9].iter().all(|i| b[*i].is_ascii_digit()) {
+        return false;
+    }
+    let (y, m, d): (u32, u32, u32) = (s[0..4].parse().unwrap_or(0), s[5..7].parse().unwrap_or(0), s[8..10].parse().unwrap_or(0));
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&d)
+}
+
+fn is_date_time(s: &str) -> bool {
+    let Some((d, t)) = s.split_once(['T', 't']) else { return false };
+    if !is_date(d) {
+        return false;
+    }
+    let (clock, zone) = match t.find(['Z', 'z', '+', '-']) {
+        Some(i) => t.split_at(i),
+        None => return false,
+    };
+    let clock = clock.split_once('.').map_or(clock, |(c, frac)| if !frac.is_empty() && frac.bytes().all(|b| b.is_ascii_digit()) { c } else { "x" });
+    let parts: Vec<&str> = clock.split(':').collect();
+    let num = |p: &str, max: u32| p.len() == 2 && p.parse::<u32>().is_ok_and(|n| n <= max);
+    if parts.len() != 3 || !num(parts[0], 23) || !num(parts[1], 59) || !num(parts[2], 60) {
+        return false;
+    }
+    if zone.eq_ignore_ascii_case("z") {
+        return true;
+    }
+    match zone[1..].split_once(':') {
+        Some((h, m)) => num(h, 23) && num(m, 59),
+        None => false,
+    }
+}
+
+fn is_base64(s: &str) -> bool {
+    let t = s.trim_end_matches('=');
+    s.len() % 4 == 0 && s.len() - t.len() <= 2 && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+}
+
+fn is_uuid(s: &str) -> bool {
+    let p: Vec<&str> = s.split('-').collect();
+    p.len() == 5 && p.iter().zip([8, 4, 4, 4, 12]).all(|(x, n)| x.len() == n && x.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn is_hostname(s: &str) -> bool {
+    let s = s.strip_suffix('.').unwrap_or(s);
+    !s.is_empty() && s.len() <= 253 && s.split('.').all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
+fn is_uri(s: &str) -> bool {
+    let Some((scheme, rest)) = s.split_once(':') else { return false };
+    scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+        && !rest.is_empty()
+        && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// Loose `format` check for strings; unknown formats are accepted.
+fn string_format_ok(f: &str, s: &str) -> bool {
+    match f {
+        "date" => is_date(s),
+        "date-time" => is_date_time(s),
+        "byte" => is_base64(s),
+        "uuid" => is_uuid(s),
+        "ipv4" => s.parse::<core::net::Ipv4Addr>().is_ok(),
+        "ipv6" => s.parse::<core::net::Ipv6Addr>().is_ok(),
+        "hostname" => is_hostname(s),
+        "uri" => is_uri(s),
+        _ => true,
+    }
+}
+
+fn validation_rules(s: &Value, v: &Value, old: Option<&Value>, at: &str, errs: &mut Vec<String>) {
+    let Some(rules) = s.get("x-kubernetes-validations").and_then(Value::as_array) else { return };
+    let null = Value::Null;
+    for r in rules {
+        let rule = str_at(r, &["rule"]);
+        let Ok(p) = Program::compile(rule, &["self", "oldSelf"]) else { continue };
+        // Transition rules only run when there is an old value at this node.
+        if p.uses("oldSelf") && old.is_none() {
+            continue;
+        }
+        let vars = [("self", v), ("oldSelf", old.unwrap_or(&null))];
+        match p.eval_bool(&vars) {
+            Ok(true) => {}
+            Ok(false) => {
+                let mut msg = str_at(r, &["message"]).to_string();
+                let me = str_at(r, &["messageExpression"]);
+                if !me.is_empty() {
+                    if let Some(Value::String(m)) = Program::compile(me, &["self", "oldSelf"]).ok().and_then(|p| p.eval(&vars).ok()) {
+                        msg = m;
+                    }
+                }
+                if msg.is_empty() {
+                    msg = alloc::format!("failed rule: {rule}");
+                }
+                errs.push(alloc::format!("{at}: Invalid value: {:?}: {msg}", tname(v)));
+            }
+            Err(e) => errs.push(alloc::format!("{at}: Invalid value: {:?}: rule evaluation error: {e}", tname(v))),
+        }
+    }
+}
+
+fn is_multiple(n: &Number, m: f64) -> bool {
+    if m == 0.0 {
+        return true;
+    }
+    let q = n.as_f64() / m;
+    if n.is_integer() && m == (m as i64) as f64 {
+        return n.as_i64().is_none_or(|i| i % (m as i64) == 0);
+    }
+    let r = (q + if q < 0.0 { -0.5 } else { 0.5 }) as i64 as f64;
+    let d = q - r;
+    d < 1e-9 && d > -1e-9
+}
+
+/// Validates `v` against the OpenAPI v3 subset kr enforces: type, nullable, int-or-string,
+/// enum, required, properties, additionalProperties, items, numeric/string/array/object bounds,
+/// pattern, format, uniqueItems, list-type set/map, allOf/anyOf/oneOf/not and CEL
+/// `x-kubernetes-validations`. `old` is the stored value at the same node (for `oldSelf`).
+pub fn validate(s: &Value, v: &Value, old: Option<&Value>, path: &str, errs: &mut Vec<String>) {
     let at = if path.is_empty() { "<root>" } else { path };
     if v.is_null() {
         if !is_true(s.get("nullable")) && s.get("type").is_some() {
@@ -331,13 +472,20 @@ pub fn validate(s: &Value, v: &Value, path: &str, errs: &mut Vec<String>) {
                     errs.push(alloc::format!("{}: Required value", join(path, &r)));
                 }
             }
+            if let Some(n) = s.get("minProperties").and_then(Value::as_u64).filter(|n| (fields.len() as u64) < *n) {
+                errs.push(alloc::format!("{at}: Invalid value: should have at least {n} properties"));
+            }
+            if let Some(n) = s.get("maxProperties").and_then(Value::as_u64).filter(|n| (fields.len() as u64) > *n) {
+                errs.push(alloc::format!("{at}: Invalid value: should have at most {n} properties"));
+            }
             let props = s.get("properties").and_then(Value::as_object);
             for (k, fv) in fields {
+                let o = old.and_then(|o| o.get(k));
                 match props.and_then(|p| p.iter().find(|(n, _)| n == k)) {
-                    Some((_, ps)) => validate(ps, fv, &join(path, k), errs),
+                    Some((_, ps)) => validate(ps, fv, o, &join(path, k), errs),
                     None => {
                         if let Some(a @ Value::Object(_)) = s.get("additionalProperties") {
-                            validate(a, fv, &join(path, k), errs)
+                            validate(a, fv, o, &join(path, k), errs)
                         }
                     }
                 }
@@ -354,9 +502,35 @@ pub fn validate(s: &Value, v: &Value, path: &str, errs: &mut Vec<String>) {
                     errs.push(alloc::format!("{at}: Too many: {}: must have at most {n} items", items.len()));
                 }
             }
+            let list_type = str_at(s, &["x-kubernetes-list-type"]);
+            let keys = strs(s.get("x-kubernetes-list-map-keys"));
+            if is_true(s.get("uniqueItems")) || list_type == "set" {
+                for (i, it) in items.iter().enumerate() {
+                    if items[..i].iter().any(|p| p == it) {
+                        errs.push(alloc::format!("{path}[{i}]: Duplicate value: {}", json::to_string(it)));
+                    }
+                }
+            }
+            if list_type == "map" {
+                let key = |it: &Value| -> Vec<Value> { keys.iter().map(|k| it.get(k).cloned().unwrap_or(Value::Null)).collect() };
+                for (i, it) in items.iter().enumerate() {
+                    if items[..i].iter().any(|p| key(p) == key(it)) {
+                        let k: Vec<String> = keys.iter().zip(key(it)).map(|(n, x)| alloc::format!("\"{n}\":{}", json::to_string(&x))).collect();
+                        errs.push(alloc::format!("{path}[{i}]: Duplicate value: map[{}]", k.join(",")));
+                    }
+                }
+            }
             if let Some(is) = s.get("items") {
                 for (i, it) in items.iter().enumerate() {
-                    validate(is, it, &alloc::format!("{path}[{i}]"), errs);
+                    let o = match (list_type, old.and_then(Value::as_array)) {
+                        ("map", Some(prev)) => {
+                            let key = |x: &Value| -> Vec<Value> { keys.iter().map(|k| x.get(k).cloned().unwrap_or(Value::Null)).collect() };
+                            prev.iter().find(|p| key(p) == key(it))
+                        }
+                        ("set", Some(prev)) => prev.iter().find(|p| *p == it),
+                        _ => None,
+                    };
+                    validate(is, it, o, &alloc::format!("{path}[{i}]"), errs);
                 }
             }
         }
@@ -368,15 +542,178 @@ pub fn validate(s: &Value, v: &Value, path: &str, errs: &mut Vec<String>) {
             if let Some(m) = s.get("maxLength").and_then(Value::as_u64).filter(|m| n > *m) {
                 errs.push(alloc::format!("{at}: Too long: may not be more than {m} bytes"));
             }
+            if let Some(p) = s.get("pattern").and_then(Value::as_str) {
+                match Regex::new(p).and_then(|r| r.is_match(x)) {
+                    Ok(true) => {}
+                    Ok(false) => errs.push(alloc::format!("{at}: Invalid value: {x:?}: {at} in body should match '{p}'")),
+                    Err(e) => errs.push(alloc::format!("{at}: Invalid value: {x:?}: pattern '{p}' could not be evaluated: {e}")),
+                }
+            }
+            if let Some(f) = s.get("format").and_then(Value::as_str).filter(|f| !string_format_ok(f, x)) {
+                errs.push(alloc::format!("{at}: Invalid value: {x:?}: {at} in body must be of type {f}: {x:?}"));
+            }
         }
         Value::Number(n) => {
-            if let Some(m) = s.get("minimum").and_then(Value::as_f64).filter(|m| n.as_f64() < *m) {
-                errs.push(alloc::format!("{at}: Invalid value: should be greater than or equal to {m}"));
+            let excl = |f: &str| is_true(s.get(f));
+            if let Some(m) = s.get("minimum").and_then(Value::as_f64) {
+                let x = n.as_f64();
+                if excl("exclusiveMinimum") && x <= m {
+                    errs.push(alloc::format!("{at}: Invalid value: should be greater than {m}"));
+                } else if x < m {
+                    errs.push(alloc::format!("{at}: Invalid value: should be greater than or equal to {m}"));
+                }
             }
-            if let Some(m) = s.get("maximum").and_then(Value::as_f64).filter(|m| n.as_f64() > *m) {
-                errs.push(alloc::format!("{at}: Invalid value: should be less than or equal to {m}"));
+            if let Some(m) = s.get("maximum").and_then(Value::as_f64) {
+                let x = n.as_f64();
+                if excl("exclusiveMaximum") && x >= m {
+                    errs.push(alloc::format!("{at}: Invalid value: should be less than {m}"));
+                } else if x > m {
+                    errs.push(alloc::format!("{at}: Invalid value: should be less than or equal to {m}"));
+                }
+            }
+            if let Some(m) = s.get("multipleOf").and_then(Value::as_f64).filter(|m| !is_multiple(n, *m)) {
+                errs.push(alloc::format!("{at}: Invalid value: should be a multiple of {m}"));
+            }
+            let range = match str_at(s, &["format"]) {
+                "int32" => Some((i32::MIN as f64, i32::MAX as f64)),
+                "int64" => Some((i64::MIN as f64, i64::MAX as f64)),
+                _ => None,
+            };
+            if range.filter(|(lo, hi)| !n.is_integer() || n.as_f64() < *lo || n.as_f64() > *hi).is_some() {
+                errs.push(alloc::format!("{at}: Invalid value: {}: {at} in body must be of type {}", json::to_string(v), str_at(s, &["format"])));
             }
         }
         _ => {}
+    }
+    for sub in s.get("allOf").and_then(Value::as_array).unwrap_or(&[]) {
+        validate(sub, v, old, path, errs);
+    }
+    let passes = |sub: &Value| {
+        let mut e = Vec::new();
+        validate(sub, v, old, path, &mut e);
+        e.is_empty()
+    };
+    if let Some(subs) = s.get("anyOf").and_then(Value::as_array) {
+        if !subs.iter().any(passes) {
+            errs.push(alloc::format!("{at}: Invalid value: {:?}: must validate at least one schema (anyOf)", tname(v)));
+        }
+    }
+    if let Some(subs) = s.get("oneOf").and_then(Value::as_array) {
+        match subs.iter().filter(|x| passes(x)).count() {
+            1 => {}
+            0 => errs.push(alloc::format!("{at}: Invalid value: {:?}: must validate one and only one schema (oneOf). None validated", tname(v))),
+            n => errs.push(alloc::format!("{at}: Invalid value: {:?}: must validate one and only one schema (oneOf). {n} validated", tname(v))),
+        }
+    }
+    if let Some(sub) = s.get("not").filter(|n| matches!(n, Value::Object(_))) {
+        if passes(sub) {
+            errs.push(alloc::format!("{at}: Invalid value: {:?}: must not validate the schema (not)", tname(v)));
+        }
+    }
+    validation_rules(s, v, old, at, errs);
+}
+
+// ---- structural schema check of the CRD itself ----
+
+const UNSUPPORTED: [&str; 5] = ["$ref", "definitions", "dependencies", "additionalItems", "patternProperties"];
+
+/// Where a schema node sits, for the "type" requirement message.
+#[derive(Clone, Copy, PartialEq)]
+enum Pos {
+    Root,
+    Props,
+    Items,
+    Addl,
+    /// Inside allOf/anyOf/oneOf/not: value validation only.
+    Logic,
+}
+
+/// Upstream-like structural schema rules plus compile checks of `pattern` and CEL rules.
+fn check_schema(s: &Value, path: &str, pos: Pos, errs: &mut Vec<String>) {
+    let Value::Object(_) = s else { return };
+    let ios = is_true(s.get("x-kubernetes-int-or-string"));
+    let preserve = is_true(s.get("x-kubernetes-preserve-unknown-fields"));
+    let ty = s.get("type").and_then(Value::as_str).unwrap_or("");
+    if pos == Pos::Logic {
+        for k in ["type", "default", "additionalProperties", "nullable"] {
+            if s.get(k).is_some() {
+                errs.push(alloc::format!("{path}.{k}: Forbidden: must be empty to be structural"));
+            }
+        }
+    } else if ty.is_empty() && !ios && !preserve {
+        errs.push(match pos {
+            Pos::Root => alloc::format!("{path}.type: Required value: must not be empty at the root"),
+            Pos::Props => alloc::format!("{path}.type: Required value: must not be empty for specified object fields"),
+            Pos::Items => alloc::format!("{path}.type: Required value: must not be empty for specified array items"),
+            _ => alloc::format!("{path}.type: Required value: must not be empty for specified additionalProperties"),
+        });
+    } else if pos == Pos::Root && !ty.is_empty() && ty != "object" {
+        errs.push(alloc::format!("{path}.type: Invalid value: {ty:?}: must be object at the root"));
+    }
+    if ios && !ty.is_empty() {
+        errs.push(alloc::format!("{path}.type: Forbidden: must be empty to be structural when x-kubernetes-int-or-string is true"));
+    }
+    if !ty.is_empty() && !matches!(ty, "object" | "array" | "string" | "integer" | "number" | "boolean") {
+        errs.push(alloc::format!("{path}.type: Unsupported value: {ty:?}: supported values: \"array\", \"boolean\", \"integer\", \"number\", \"object\", \"string\""));
+    }
+    if s.get("properties").is_some() && s.get("additionalProperties").is_some() {
+        errs.push(alloc::format!("{path}.additionalProperties: Forbidden: additionalProperties and properties are mutual exclusive"));
+    }
+    for k in UNSUPPORTED {
+        if s.get(k).is_some() {
+            errs.push(alloc::format!("{path}.{k}: Forbidden: {k} is not supported"));
+        }
+    }
+    if ty == "array" && s.get("items").is_none() {
+        errs.push(alloc::format!("{path}.items: Required value: must be specified"));
+    }
+    if let Some(p) = s.get("pattern").and_then(Value::as_str) {
+        if let Err(e) = Regex::new(p) {
+            errs.push(alloc::format!("{path}.pattern: Invalid value: {p:?}: {e}"));
+        }
+    }
+    if let Some(rules) = s.get("x-kubernetes-validations").and_then(Value::as_array) {
+        for (i, r) in rules.iter().enumerate() {
+            let rule = str_at(r, &["rule"]);
+            let rp = alloc::format!("{path}.x-kubernetes-validations[{i}]");
+            if rule.is_empty() {
+                errs.push(alloc::format!("{rp}.rule: Required value: rule is not specified"));
+            } else if let Err(e) = Program::compile(rule, &["self", "oldSelf"]) {
+                errs.push(alloc::format!("{rp}.rule: Invalid value: {rule:?}: compilation failed: {e}"));
+            }
+            let me = str_at(r, &["messageExpression"]);
+            if !me.is_empty() {
+                if let Err(e) = Program::compile(me, &["self", "oldSelf"]) {
+                    errs.push(alloc::format!("{rp}.messageExpression: Invalid value: {me:?}: compilation failed: {e}"));
+                }
+            }
+        }
+    }
+    let inner = if pos == Pos::Logic { Pos::Logic } else { Pos::Props };
+    if let Some(p) = s.get("properties").and_then(Value::as_object) {
+        for (k, ps) in p {
+            check_schema(ps, &alloc::format!("{path}.properties[{k}]"), inner, errs);
+        }
+    }
+    match s.get("additionalProperties") {
+        Some(a @ Value::Object(_)) => check_schema(a, &alloc::format!("{path}.additionalProperties"), if pos == Pos::Logic { Pos::Logic } else { Pos::Addl }, errs),
+        _ => {}
+    }
+    match s.get("items") {
+        Some(i @ Value::Object(_)) => check_schema(i, &alloc::format!("{path}.items"), if pos == Pos::Logic { Pos::Logic } else { Pos::Items }, errs),
+        Some(Value::Array(_)) => errs.push(alloc::format!("{path}.items: Invalid value: must be a schema, not an array")),
+        _ => {}
+    }
+    for k in ["allOf", "anyOf", "oneOf"] {
+        // The canonical int-or-string form lists the two types in anyOf/oneOf.
+        if ios && k != "allOf" {
+            continue;
+        }
+        for (i, sub) in s.get(k).and_then(Value::as_array).unwrap_or(&[]).iter().enumerate() {
+            check_schema(sub, &alloc::format!("{path}.{k}[{i}]"), Pos::Logic, errs);
+        }
+    }
+    if let Some(n) = s.get("not") {
+        check_schema(n, &alloc::format!("{path}.not"), Pos::Logic, errs);
     }
 }
