@@ -6,7 +6,7 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 
 ## kr-sys
 11. **aarch64 path is only partly exercised** — *mostly fixed*
-    `tools/test/aarch64.sh` cross-builds `kr` (aarch64-unknown-linux-gnu, rust-lld shim, no cross gcc) and runs under `qemu-aarch64`: `version`, `sleep-test` and the HTTP `echo` server pass; unit tests of kr-sys, kr-rt, kr-fmt, kr-crypto, kr-archive, kr-store and kr-net pass (aarch64 musl, self-contained). Fixed: missing `getauxval` (compiler_builtins outline atomics) broke linking.
+    `tools/test/aarch64.sh` exits 0 (verified 2026-10-24): cross-builds `kr` (aarch64-unknown-linux-gnu, rust-lld shim, no cross gcc) and runs under `qemu-aarch64`: `version`, `sleep-test` and the HTTP `echo` server pass; unit tests of kr-sys, kr-rt, kr-fmt, kr-crypto, kr-archive, kr-store and kr-net pass (aarch64 musl, self-contained): 281 passed, 4 ignored (Wycheproof P-256-sign, RSA-8k, gzip bench, tar sparse), 0 failed. Fixed: missing `getauxval` (compiler_builtins outline atomics) broke linking.
     Remaining: `kr ctr`/kubelet/apiserver paths (namespaces, cgroups, clone3, mounts) are not run under qemu-user and need a real aarch64 host; no CI job yet.
 
 ## kr-net
@@ -23,7 +23,7 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 
 ## Build (cont.)
 53. **Binary size** — *watch*
-    The single binary (server, agent, runtime, TLS/crypto, CRDs, webhooks) is ~1.8 MB, just under the 2 MB agent budget from PLAN.md. Measure before adding large features; avoid `{:?}` on large types, and keep `opt-level = "z"` + LTO + strip.
+    The single binary (server, agent, runtime, TLS/crypto, CRDs, webhooks) is ~1.8 MB on x86_64, just under the 2 MB agent budget from PLAN.md (aarch64: ~1.5 MB). Measure before adding large features; avoid `{:?}` on large types, and keep `opt-level = "z"` + LTO + strip.
 
 ## kr-crypto / TLS (ADR-020)
 58. **Constant-time behaviour is by construction, not yet measured** — *open*
@@ -33,13 +33,13 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 
 ## Control plane (ADR-021)
 63. **No typed schemas or defaulting** — *partly fixed*
-    - Defaulting for core/apps/batch is in (`defaults.rs`, see #86).
+    - Defaulting for core/apps/batch is in (`defaults.rs`, see #86). Defaulted fields are loose: a mismatched `status.phase` on a fresh PV can make the PV controller rewrite it right back (`Available` ⇄ `Pending`), see `sync_pv`.
     - kr still accepts unknown fields even with `fieldValidation=Strict`, and per-kind validation is minimal.
     - Plan: generate schemas from the upstream OpenAPI, as the protobuf table does.
 65. **Server-side apply is approximate** — *open*
     `application/apply-patch+yaml` is treated as create-or-strategic-merge: there are no managedFields, no field ownership and no conflict detection. Client-side `kubectl apply` is fully supported.
 70. **Conformance gaps** — *open; tracked as C1–C9 in PLAN.md*
-    Done since: CRDs (#87), admission webhooks (#88), aggregated discovery, ResourceQuota, hostPort, lifecycle hooks, ephemeral containers.
+    Done since: CRDs (#87), admission webhooks (#88), aggregated discovery, ResourceQuota, hostPort, lifecycle hooks, ephemeral containers, storage (PVC/SC/PV #73).
     Remaining: protobuf responses, typed schemas (#63), SSA managedFields (#65), and whatever the current Sonobuoy run reports (`tools/test/conformance.sh results`).
 
 ## Node agent and controllers (phase 4)
