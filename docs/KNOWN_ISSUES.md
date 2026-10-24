@@ -9,10 +9,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     `tools/test/aarch64.sh` exits 0 (verified 2026-10-24): cross-builds `kr` (aarch64-unknown-linux-gnu, rust-lld shim, no cross gcc) and runs under `qemu-aarch64`: `version`, `sleep-test` and the HTTP `echo` server pass; unit tests of kr-sys, kr-rt, kr-fmt, kr-crypto, kr-archive, kr-store and kr-net pass (aarch64 musl, self-contained): 281 passed, 4 ignored (Wycheproof P-256-sign, RSA-8k, gzip bench, tar sparse), 0 failed. Fixed: missing `getauxval` (compiler_builtins outline atomics) broke linking.
     Remaining: `kr ctr`/kubelet/apiserver paths (namespaces, cgroups, clone3, mounts) are not run under qemu-user and need a real aarch64 host; no CI job yet.
 
-## kr-net
-31. **Registry auth supports anonymous Bearer tokens only** — *mostly fixed* (13ba669)
-    Basic and Bearer-with-credentials (`token`/`access_token`), docker `identitytoken` (refresh_token POST), `imagePullSecrets` (dockerconfigjson/dockercfg, pod and ServiceAccount) with docker.io alias matching, `kr_runtime::pull::pull_auth`; kubelet pulls are keyed by image+credential identity. Remaining: matching is by registry host only (no per-repo path prefixes), no `~/.docker/config.json` / credential helpers for `kr ctr pull`, no token refresh by expiry (retried once after a 401), identitytoken path is untested against a real registry.
-
 ## kr-runtime: isolation (container.rs, security.rs, cgroup.rs)
 50. **Container networking gaps** — *partly fixed* (ADR-019, ADR-022)
     Pods get a bridge network as root and rootless (an infra user+net namespace holds the bridge), and ports are published through hostPort/NodePort (userspace proxy).
@@ -184,6 +180,8 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     It now re-exports `kr_crypto::sha2`.
 30. **Keep-alive pool has no idle timeout** — *fixed* (13ba669)
     `Config::idle_timeout_ms` (default 90 s): idle connections older than that are dropped, never reused. Remaining: no proactive EOF/readability probe before reuse (a server-closed connection is still found on use, with the existing one retry for GET/HEAD) and no background eviction timer (expiry runs on pool take/put).
+31. **Registry auth** — *fixed* (commits: 13ba669, 169b2e7)
+    Basic and Bearer-with-credentials (`token`/`access_token`, `expires_in` honoured), docker `identitytoken` (refresh_token POST), `imagePullSecrets` (dockerconfigjson/dockercfg, pod and ServiceAccount), keys matched like the kubelet (repository path prefixes on `/` boundaries, `*.` one-label wildcards, docker.io aliases; most specific wins); `kr ctr pull` reads `$DOCKER_CONFIG/config.json` or `~/.docker/config.json`. Not supported: docker credential helpers (`credsStore`/`credHelpers`); the identitytoken path is untested against a real registry.
 
 ## kr-runtime: isolation (container.rs, security.rs, cgroup.rs)
 43. **Rootless maps a single uid/gid** — *fixed*
