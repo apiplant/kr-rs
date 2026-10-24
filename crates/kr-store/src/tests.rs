@@ -498,13 +498,17 @@ fn crash_between_snapshot_rename_and_log_truncate() {
 fn compact_rewrites_large_log() {
     let d = tmpdir("compact");
     let mut s = Store::open(&d).unwrap();
+    s.set_compact_min(64 * 1024);
+    assert!(!s.log_oversized());
     for _ in 0..40 {
         s.update_or_create("/big", vec![7u8; 4096]);
     }
     s.sync().unwrap();
     let before = std::fs::metadata(log_path(&d)).unwrap().len();
     assert!(before > 64 * 1024);
+    assert!(s.log_oversized());
     s.compact(s.revision()).unwrap();
+    assert!(!s.log_oversized());
     assert_eq!(std::fs::metadata(log_path(&d)).unwrap().len(), 0);
     drop(s);
     let s = Store::open(&d).unwrap();
@@ -551,4 +555,19 @@ impl Store {
             self.create(k, val).unwrap();
         }
     }
+}
+
+#[test]
+fn write_out_persists_without_fsync_and_reopens() {
+    let d = tmpdir("writeout");
+    let mut s = Store::open(&d).unwrap();
+    s.create("/a", b"1".to_vec()).unwrap();
+    let rev = s.write_out().unwrap();
+    assert_eq!(rev, s.revision());
+    assert!(s.log_fd().is_some());
+    assert!(std::fs::metadata(log_path(&d)).unwrap().len() > 0);
+    drop(s);
+    let s = Store::open(&d).unwrap();
+    assert_eq!(&*s.get("/a").unwrap().value, b"1");
+    assert!(Store::in_memory().log_fd().is_none());
 }

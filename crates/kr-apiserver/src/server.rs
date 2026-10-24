@@ -50,7 +50,14 @@ pub async fn handle(api: &ApiServer, req: Request) -> Response {
             Req { method: rewritten.method, content_type: Some("application/json"), body: &rewritten.body, authz_verb: (r.method == "PATCH").then_some("patch"), ..r }
         }
     };
-    respond(api.handle(&r))
+    let before = api.revision();
+    let reply = api.handle(&r);
+    // A write is acknowledged only once it is on disk (group commit, fsync off the event loop).
+    let after = api.revision();
+    if after > before && api.commit(after).await.is_err() {
+        return respond(Reply::err(crate::object::ApiError::new(500, "InternalError", "storage sync failed")));
+    }
+    respond(reply)
 }
 
 fn respond(reply: Reply) -> Response {
@@ -66,6 +73,23 @@ fn respond(reply: Reply) -> Response {
 
 /// Serves the API on `addr:port` until the listener fails.
 pub async fn run(api: Rc<ApiServer>, addr: [u8; 4], port: u16, tls: Rc<kr_crypto::tls::ServerConfig>) -> kr_net::Result<()> {
+    // Writes by in-process components (controllers, the server's kubelet) are not awaited by
+    // any HTTP request: flush them every second. Compaction is checked every minute.
+    let a = api.clone();
+    kr_rt::exec::spawn(async move {
+        let mut n = 0u32;
+        loop {
+            kr_rt::exec::sleep(1000).await;
+            let rev = a.revision();
+            if rev > a.durable_rev() {
+                let _ = a.commit(rev).await;
+            }
+            n += 1;
+            if n % 60 == 0 {
+                a.maybe_compact();
+            }
+        }
+    });
     let listener = server::listen(addr, port, 512)?;
     let cfg = Rc::new(ServerConfig { tls: Some(tls), idle_timeout_ms: 300_000, ..ServerConfig::default() });
     let handler = move |req: Request| -> HandlerFuture {

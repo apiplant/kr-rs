@@ -82,6 +82,7 @@ mod nr {
     pub const FCHMODAT: usize = 268;
     pub const GETUID: usize = 102;
     pub const GETPID: usize = 39;
+    pub const GETPPID: usize = 110;
     pub const FSETXATTR: usize = 190;
     pub const GETDENTS64: usize = 217;
     pub const OPENAT: usize = 257;
@@ -107,6 +108,7 @@ mod nr {
     pub const FCHMODAT: usize = 53;
     pub const GETUID: usize = 174;
     pub const GETPID: usize = 172;
+    pub const GETPPID: usize = 173;
     pub const FSETXATTR: usize = 7;
     pub const GETDENTS64: usize = 61;
     pub const OPENAT: usize = 56;
@@ -270,6 +272,11 @@ pub fn getuid() -> u32 {
 pub fn getpid() -> u32 {
     // SAFETY: getpid takes no arguments and cannot fail.
     unsafe { syscall0(nr::GETPID) as u32 }
+}
+
+pub fn getppid() -> u32 {
+    // SAFETY: getppid takes no arguments and cannot fail.
+    unsafe { syscall0(nr::GETPPID) as u32 }
 }
 
 // ---- stat ----

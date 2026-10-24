@@ -60,6 +60,9 @@ use watch::{WatchState, QUEUE_LIMIT};
 
 const O_APPEND: i32 = 0o2000;
 const READ_LIMIT: usize = usize::MAX >> 1;
+/// Logs smaller than this are never rewritten (a rewrite costs a snapshot write and fsyncs).
+const COMPACT_MIN_LOG: u64 = 8 << 20;
+
 /// Default number of events retained for watch replay.
 pub const DEFAULT_HISTORY: usize = 10_000;
 
@@ -124,6 +127,7 @@ pub struct Store {
     watchers: Vec<Weak<RefCell<WatchState>>>,
     persist: Option<Persist>,
     auto_sync: bool,
+    compact_min: u64,
     /// Approximate size of a snapshot of the live data.
     live_bytes: u64,
 }
@@ -167,6 +171,7 @@ impl Store {
             watchers: Vec::new(),
             persist: None,
             auto_sync: false,
+            compact_min: COMPACT_MIN_LOG,
             live_bytes: 0,
         }
     }
@@ -292,6 +297,11 @@ impl Store {
     }
 
     /// When true every mutation is followed by `sync()`.
+    /// Logs smaller than `bytes` are never rewritten by [`Store::compact`] (default 8 MiB).
+    pub fn set_compact_min(&mut self, bytes: u64) {
+        self.compact_min = bytes;
+    }
+
     pub fn set_auto_sync(&mut self, on: bool) {
         self.auto_sync = on;
     }
@@ -479,19 +489,42 @@ impl Store {
 
     /// Writes buffered records and fsyncs the log. Call before acknowledging writes.
     pub fn sync(&mut self) -> Result<(), Error> {
-        let Some(p) = &mut self.persist else { return Ok(()) };
-        if p.buf.is_empty() {
-            return Ok(());
+        let had = self.persist.as_ref().is_some_and(|p| !p.buf.is_empty());
+        self.write_out()?;
+        if let (true, Some(p)) = (had, &self.persist) {
+            fs::fsync(p.log.raw())?;
         }
-        if let Err(e) = fs::write_all(p.log.raw(), &p.buf) {
-            // Remove any partial write so a retry does not duplicate bytes.
-            let _ = fs::ftruncate(p.log.raw(), p.log_len);
-            return Err(e.into());
-        }
-        p.log_len += p.buf.len() as u64;
-        p.buf.clear();
-        fs::fsync(p.log.raw())?;
         Ok(())
+    }
+
+    /// Writes buffered records to the log without fsync (page cache only); a caller that
+    /// acknowledges writes must make [`Store::log_fd`] durable first (e.g. fsync elsewhere,
+    /// off the event loop). Returns the revision now in the log.
+    pub fn write_out(&mut self) -> Result<u64, Error> {
+        let Some(p) = &mut self.persist else { return Ok(self.rev) };
+        if !p.buf.is_empty() {
+            if let Err(e) = fs::write_all(p.log.raw(), &p.buf) {
+                // Remove any partial write so a retry does not duplicate bytes.
+                let _ = fs::ftruncate(p.log.raw(), p.log_len);
+                return Err(e.into());
+            }
+            p.log_len += p.buf.len() as u64;
+            p.buf.clear();
+        }
+        Ok(self.rev)
+    }
+
+    /// The log file descriptor (None for an in-memory store). Stable across compactions.
+    pub fn log_fd(&self) -> Option<i32> {
+        self.persist.as_ref().map(|p| p.log.raw())
+    }
+
+    /// Whether the log has grown enough that [`Store::compact`] would rewrite it.
+    pub fn log_oversized(&self) -> bool {
+        self.persist.as_ref().is_some_and(|p| {
+            let size = p.log_len + p.buf.len() as u64;
+            size > self.compact_min && size > 4 * self.live_bytes
+        })
     }
 
     /// Drops history with `rev <= rev` (watch replay limit), then rewrites the log into a snapshot
@@ -504,7 +537,7 @@ impl Store {
         self.hist_floor = self.hist_floor.max(rev);
         if let Some(p) = &self.persist {
             let size = p.log_len + p.buf.len() as u64;
-            if size > 64 * 1024 && size > 4 * self.live_bytes {
+            if size > self.compact_min && size > 4 * self.live_bytes {
                 self.rewrite_log()?;
             }
         }

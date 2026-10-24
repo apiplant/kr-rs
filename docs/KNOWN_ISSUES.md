@@ -177,6 +177,10 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 17. **Quantity mantissa is i128** — *accepted*
     `1e40` is OutOfRange. k8s has the same practical bounds.
 
+## Echo server (cont.)
+92. **Writes by in-process components are durable within ~1 s, not at acknowledgement** — *accepted* (ADR-024)
+    Controllers and the server's kubelet call the API in-process. A crash can lose their last ~1 s of writes, which they then re-derive. Watch events are also delivered before the fsync.
+
 # Resolved
 
 ## kr-net
@@ -300,3 +304,5 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 ## Echo server (cont.)
 14. **The lingering close holds each connection for up to 1 s after the response** — *fixed* (commit: )
     Under heavy load this raises the number of concurrent connections. Plan: skip the drain when the request was fully read, and cap total lingering connections.
+91. **Datastore fsync blocked the event loop; log never compacted** — *fixed* (ADR-024)
+    Found in conformance run 3: kr sat in `D` state under write load and the log grew without bound. Writes now go through group commit, with fsync in a helper process, and the log is compacted periodically. Verified: no `D` states during a 300-write burst, and all acknowledged writes survive `kill -9`.

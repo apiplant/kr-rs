@@ -311,3 +311,22 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
   - `KR_NODE_CERT_SECONDS` shortens node certificates for testing.
 
 **Status:** accepted.
+
+## ADR-024: Group commit with fsync off the event loop; log compaction
+
+**Context:** In the first full conformance runs the server stalled: kr-store fsynced the log on every write, inside the single-threaded event loop. Under the e2e suite's write load, kr spent most of its time in `D` state (`jbd2_log_wait_commit`), and the API, kubelet and controllers all froze together. Nothing called `Store::compact`, so the log reached 255 MB after 43 minutes, which also made restarts slow.
+
+**Decision:**
+- **Writes:** `Store::write_out` writes records to the log, landing in the page cache without blocking on the disk.
+- **Acknowledgement:** an API write is acknowledged only after `ApiServer::commit` reports it durable, which keeps etcd's semantics.
+- **Where the fsync runs:**
+  - It runs in a helper process (`kr_sys::ns::spawn_fsync_helper`). The helper is a fork-style child with `CLONE_FILES`, so it shares kr's fd table.
+  - kr sends it the log fd number over a pipe, and it answers with one byte. A death signal makes it exit when kr exits.
+  - A process is used instead of a thread because the runtime is single-threaded by design (KNOWN_ISSUES #3).
+- **Group commit:** while one fsync is in flight, later writers wait and share the next fsync, so there is one fsync per batch.
+- **Fallback:** if the helper can't start or dies, commits fall back to a blocking fsync.
+- **In-process writers:** the controllers and the server's own kubelet call the API in-process and don't await durability. A background task flushes their writes every second, so a crash can lose up to about one second of them. These components re-derive their state from the API, so that's acceptable.
+- **Watch delivery:** watch events are delivered when written, not when durable. This is a deliberate small deviation from etcd.
+- **Compaction:** every minute, the log is rewritten into a snapshot once it exceeds 8 MiB and is more than 4× the live data.
+
+**Status:** accepted.

@@ -69,6 +69,7 @@ pub const CLONE_NEWPID: u64 = 0x2000_0000;
 pub const CLONE_NEWNET: u64 = 0x4000_0000;
 pub const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 
+pub const CLONE_FILES: u64 = 0x400;
 pub const SIGKILL: i32 = 9;
 pub const SIGCHLD: i32 = 17;
 pub const SIGINT: i32 = 2;
@@ -649,4 +650,42 @@ pub fn peer_ipv4(fd: i32) -> Option<[u8; 4]> {
     // SAFETY: addr/len describe a writable sockaddr buffer.
     check(unsafe { syscall3(GETPEERNAME, fd as usize, addr.as_mut_ptr() as usize, &mut len as *mut u32 as usize) }).ok()?;
     (u16::from_ne_bytes([addr[0], addr[1]]) == super::AF_INET as u16).then(|| [addr[4], addr[5], addr[6], addr[7]])
+}
+
+/// Starts an fsync helper process: a fork-style child sharing our fd table (`CLONE_FILES`) that
+/// reads a little-endian i32 fd from `req`, fsyncs it and answers one byte (0 ok, 1 error) on
+/// `resp`; it exits when `req` closes and dies with us (PDEATHSIG). Returns (req write end,
+/// resp read end). The child's pipe ends stay open in the shared table and must not be closed.
+pub fn spawn_fsync_helper() -> Result<(Fd, Fd)> {
+    let (req_r, req_w) = crate::pipe2(crate::O_CLOEXEC)?;
+    let (resp_r, resp_w) = crate::pipe2(crate::O_CLOEXEC)?;
+    let parent = crate::fs::getpid();
+    let mut args = CloneArgs { flags: CLONE_FILES, exit_signal: SIGCHLD as u64, ..Default::default() };
+    // SAFETY: fork-style clone (no CLONE_VM, no new stack): the child continues on a private
+    // copy of our memory and only makes raw syscalls before exiting.
+    match unsafe { clone3(&mut args) }? {
+        0 => {
+            let _ = prctl(PR_SET_PDEATHSIG, SIGKILL as usize);
+            if crate::fs::getppid() != parent {
+                crate::exit_group(0);
+            }
+            let mut b = [0u8; 4];
+            loop {
+                match crate::read(req_r.raw(), &mut b) {
+                    Ok(4) => {}
+                    _ => crate::exit_group(0),
+                }
+                let ok = crate::fs::fsync(i32::from_le_bytes(b)).is_ok();
+                if crate::write(resp_w.raw(), &[if ok { 0 } else { 1 }]).is_err() {
+                    crate::exit_group(0);
+                }
+            }
+        }
+        _ => {
+            // Shared table: the child's ends are the same entries; keep them open.
+            core::mem::forget(req_r);
+            core::mem::forget(resp_w);
+            Ok((req_w, resp_r))
+        }
+    }
 }

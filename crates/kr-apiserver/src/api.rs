@@ -100,6 +100,8 @@ pub struct ApiServer {
     node_cert_secs: core::cell::Cell<i64>,
     /// Served versions of established CustomResourceDefinitions.
     custom: RefCell<Vec<crate::crd::Custom>>,
+    /// Group commit: writes reach the log synchronously, fsync happens off the event loop.
+    committer: crate::durable::Committer,
 }
 
 /// Default namespaces created on first start.
@@ -190,7 +192,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()) };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new() };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -933,8 +935,38 @@ impl ApiServer {
         Ok(())
     }
 
+    /// Writes buffered records to the log (page cache). Durability comes from [`Self::commit`],
+    /// which the HTTP layer awaits before answering a write.
     fn sync(&self) -> R<()> {
-        self.store.borrow_mut().sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))
+        self.store.borrow_mut().write_out().map(|_| ()).map_err(|_| ApiError::new(500, "InternalError", "storage write failed"))
+    }
+
+    pub fn durable_rev(&self) -> u64 {
+        self.committer.durable_rev()
+    }
+
+    /// The store's current revision (a request that advanced it wrote something).
+    pub fn revision(&self) -> u64 {
+        self.store.borrow().revision()
+    }
+
+    /// Resolves once every write up to `rev` is fsynced (group commit, fsync off the event loop).
+    pub async fn commit(&self, rev: u64) -> Result<(), ()> {
+        let fd = self.store.borrow().log_fd();
+        let written = || self.store.borrow_mut().write_out().unwrap_or(0);
+        if self.store.borrow_mut().write_out().is_err() {
+            return Err(());
+        }
+        self.committer.wait(rev, fd, written).await
+    }
+
+    /// Rewrites the log into a snapshot when it has grown far beyond the live data. Blocking
+    /// (snapshot write + fsyncs); call it rarely, from a background task.
+    pub fn maybe_compact(&self) {
+        let mut s = self.store.borrow_mut();
+        if s.log_oversized() {
+            let _ = s.compact(0);
+        }
     }
 
     fn create(&self, req: &Req, rt: &Route, q: &Query) -> R<Reply> {
