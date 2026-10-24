@@ -107,6 +107,8 @@ pub struct ApiServer {
     fv_mode: core::cell::Cell<crate::fieldval::Mode>,
     /// Warnings for the response of the request being handled.
     warnings: RefCell<Vec<String>>,
+    /// Parsed webhook configurations, valid for the stamp they were built at.
+    pub(crate) wh_cache: RefCell<Option<([u64; 4], alloc::rc::Rc<crate::webhook::Configs>)>>,
 }
 
 /// Default namespaces created on first start.
@@ -150,10 +152,10 @@ fn url_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-struct Query(Vec<(String, String)>);
+pub(crate) struct Query(Vec<(String, String)>);
 
 impl Query {
-    fn parse(q: &str) -> R<Query> {
+    pub(crate) fn parse(q: &str) -> R<Query> {
         let mut v = Vec::new();
         for kv in q.split('&').filter(|p| !p.is_empty()) {
             let (k, val) = kv.split_once('=').unwrap_or((kv, ""));
@@ -162,8 +164,11 @@ impl Query {
         }
         Ok(Query(v))
     }
-    fn get(&self, k: &str) -> Option<&str> {
+    pub(crate) fn get(&self, k: &str) -> Option<&str> {
         self.0.iter().rev().find(|(x, _)| x == k).map(|(_, v)| v.as_str())
+    }
+    pub(crate) fn all(&self, k: &str) -> Vec<&str> {
+        self.0.iter().filter(|(x, _)| x == k).map(|(_, v)| v.as_str()).collect()
     }
     fn flag(&self, k: &str) -> bool {
         matches!(self.get(k), Some("true" | "1"))
@@ -197,7 +202,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()) };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), wh_cache: RefCell::new(None) };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -655,8 +660,75 @@ impl ApiServer {
         items.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect()
     }
 
+    /// (count, newest mod revision) of the mutating and validating webhook configurations.
+    pub(crate) fn wh_stamp(&self) -> [u64; 4] {
+        let mut s = [0; 4];
+        for (i, p) in ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"].iter().enumerate() {
+            if let Some(r) = resources::find("admissionregistration.k8s.io", "v1", p) {
+                let (items, _) = self.store.borrow().list(&r.prefix(), None, 0);
+                s[i * 2] = items.len() as u64;
+                s[i * 2 + 1] = items.iter().map(|kv| kv.mod_rev).max().unwrap_or(0);
+            }
+        }
+        s
+    }
+
     pub(crate) fn wh_uid(&self) -> String {
         object::uuid4(self.rng)
+    }
+
+    /// RBAC (and Node authorizer) decision for `req` by `user`, as the request path makes it.
+    /// Also used by admission webhooks for paths they handle before routing (CONNECT, body-only
+    /// subresources), so an unauthorized caller never triggers a webhook call.
+    pub(crate) fn authorize_request(&self, req: &Req, user: &User) -> R<()> {
+        let path = req.path.trim_end_matches('/');
+        let q = Query::parse(req.query)?;
+        let segs: Vec<&str> = path.split('/').skip(1).collect();
+        let extra = self.extra();
+        let resource = match segs.as_slice() {
+            ["api", "v1", rest @ ..] if !rest.is_empty() => parse_route(&extra, "", "v1", rest),
+            ["apis", g, v, rest @ ..] if !rest.is_empty() => parse_route(&extra, g, v, rest),
+            _ => None,
+        };
+        self.check_authorized(req, user, resource.as_ref(), &q, &segs)
+    }
+
+    fn check_authorized(&self, req: &Req, user: &User, resource: Option<&Route>, q: &Query, segs: &[&str]) -> R<()> {
+        let path = req.path.trim_end_matches('/');
+        let attrs = match resource {
+            Some(rt) => crate::rbac::Attrs {
+                verb: req.authz_verb.map(String::from).unwrap_or_else(|| crate::rbac::verb(req.method, rt.name.is_some(), q.flag("watch"))),
+                api_group: rt.res.group.into(),
+                resource: rt.res.plural.into(),
+                subresource: rt.sub.clone().unwrap_or_default(),
+                namespace: rt.namespace.clone().unwrap_or_default(),
+                name: rt.name.clone().unwrap_or_default(),
+                resource_request: true,
+                path: String::new(),
+            },
+            // Review APIs are virtual resources (create-only, not in the storage table).
+            None if path.starts_with("/apis/authorization.k8s.io/v1/") || path.starts_with("/apis/authentication.k8s.io/v1/") => crate::rbac::Attrs {
+                verb: "create".into(),
+                api_group: segs.get(1).copied().unwrap_or("").into(),
+                resource: segs.last().copied().unwrap_or("").into(),
+                resource_request: true,
+                ..Default::default()
+            },
+            None => crate::rbac::Attrs { verb: req.method.to_ascii_lowercase(), path: if path.is_empty() { "/".into() } else { path.into() }, ..Default::default() },
+        };
+        let body_name = match resource {
+            Some(rt) if req.method == "POST" && crate::node_authz::node_name(&user.name, &user.groups).is_some() => {
+                self.parse_body(req).ok().and_then(|v| v.pointer(&["metadata", "name"]).and_then(Value::as_str).map(String::from)).or_else(|| rt.name.clone())
+            }
+            _ => None,
+        };
+        if !self.authorize(user, &attrs, body_name.as_deref()) {
+            if user.name == "system:anonymous" {
+                return Err(ApiError::new(401, "Unauthorized", "Unauthorized"));
+            }
+            return Err(Self::forbidden(user, &attrs));
+        }
+        Ok(())
     }
 
     fn route(&self, req: &Req) -> R<Reply> {
@@ -679,39 +751,7 @@ impl ApiServer {
             ["apis", g, v, rest @ ..] if !rest.is_empty() => parse_route(&extra, g, v, rest),
             _ => None,
         };
-        let attrs = match &resource {
-            Some(rt) => crate::rbac::Attrs {
-                verb: req.authz_verb.map(String::from).unwrap_or_else(|| crate::rbac::verb(req.method, rt.name.is_some(), q.flag("watch"))),
-                api_group: rt.res.group.into(),
-                resource: rt.res.plural.into(),
-                subresource: rt.sub.clone().unwrap_or_default(),
-                namespace: rt.namespace.clone().unwrap_or_default(),
-                name: rt.name.clone().unwrap_or_default(),
-                resource_request: true,
-                path: String::new(),
-            },
-            // Review APIs are virtual resources (create-only, not in the storage table).
-            None if path.starts_with("/apis/authorization.k8s.io/v1/") || path.starts_with("/apis/authentication.k8s.io/v1/") => crate::rbac::Attrs {
-                verb: "create".into(),
-                api_group: segs.get(1).copied().unwrap_or("").into(),
-                resource: segs.last().copied().unwrap_or("").into(),
-                resource_request: true,
-                ..Default::default()
-            },
-            None => crate::rbac::Attrs { verb: req.method.to_ascii_lowercase(), path: if path.is_empty() { "/".into() } else { path.into() }, ..Default::default() },
-        };
-        let body_name = match &resource {
-            Some(rt) if req.method == "POST" && crate::node_authz::node_name(&user.name, &user.groups).is_some() => {
-                self.parse_body(req).ok().and_then(|v| v.pointer(&["metadata", "name"]).and_then(Value::as_str).map(String::from)).or_else(|| rt.name.clone())
-            }
-            _ => None,
-        };
-        if !self.authorize(&user, &attrs, body_name.as_deref()) {
-            if user.name == "system:anonymous" {
-                return Err(ApiError::new(401, "Unauthorized", "Unauthorized"));
-            }
-            return Err(Self::forbidden(&user, &attrs));
-        }
+        self.check_authorized(req, &user, resource.as_ref(), &q, &segs)?;
         match path {
             "/healthz" | "/livez" | "/readyz" => return Ok(Reply::Json(200, String::from("\"ok\""))),
             "/version" => {
@@ -1787,7 +1827,7 @@ impl ApiServer {
         if let Some(m) = new.get_mut("metadata") {
             m.remove("resourceVersion");
         }
-        let q = Query(Vec::new());
+        let q = Query::parse(req.query)?;
         match self.update(req, rt, name, false, &q, Some((kv, old, new)))? {
             Reply::Json(200, s) => {
                 let v = json::parse(s.as_bytes()).unwrap_or(Value::Null);
