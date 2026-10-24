@@ -106,7 +106,7 @@ fn kr_client_vs_s_server(tag: &str, extra: &[&str], ed_server: bool, expect_suit
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().unwrap();
     let mut sock = (0..100).find_map(|_| { std::thread::sleep(Duration::from_millis(30)); TcpStream::connect(("127.0.0.1", port)).ok() }).expect("connect");
-    let cfg = Rc::new(ClientConfig { roots: vec![f.ca.clone()], client_cert: Some((vec![f.cli_cert.clone()], f.cli_key)), alpn: vec![b"http/1.1".to_vec()] });
+    let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: vec![f.ca.clone()], client_cert: Some((vec![f.cli_cert.clone()], f.cli_key)), alpn: vec![b"http/1.1".to_vec()] });
     let mut c = Connection::client(cfg, b"localhost", rng, now());
     drive(&mut c, &mut sock, |c| !c.is_handshaking());
     assert_eq!(c.cipher_suite(), expect_suite);
@@ -287,7 +287,7 @@ fn client_vs_openssl_rsa_chain() {
         .spawn().unwrap();
     let mut sock = (0..100).find_map(|_| { std::thread::sleep(Duration::from_millis(30)); TcpStream::connect(("127.0.0.1", port)).ok() }).expect("connect");
     let ca = x509::pem_decode_all(&std::fs::read_to_string(dir.join("ca.pem")).unwrap(), "CERTIFICATE").unwrap();
-    let cfg = Rc::new(ClientConfig { roots: ca, client_cert: None, alpn: vec![] });
+    let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: ca, client_cert: None, alpn: vec![] });
     let mut c = Connection::client(cfg, b"localhost", rng, now());
     drive(&mut c, &mut sock, |c| !c.is_handshaking());
     let leaf = x509::Certificate::parse(&c.peer_certificates()[0]).unwrap();

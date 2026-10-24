@@ -861,19 +861,35 @@ fn report_exit(rep: &Fd, step: u8, e: Errno) -> ! {
     kr_sys::exit_group(127)
 }
 
-/// Opens (creating as needed) `path` inside the current root as an O_PATH fd, refusing
-/// symlinks in every component so an image cannot redirect a volume mount.
+/// Opens (creating as needed) `path` inside the current (container) root as an O_PATH fd.
+/// Existing components may be symlinks (e.g. Alpine's /var/run -> /run), but resolution is
+/// confined to the container root (RESOLVE_IN_ROOT), so an image cannot point a mount at the
+/// host. Missing components are created one at a time without following symlinks.
 fn open_mount_target(path: &[u8], dir: bool) -> Result<Fd, Errno> {
     use kr_sys::fs;
     let comps: Vec<&[u8]> = path.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
     if comps.iter().any(|c| *c == b"." || *c == b"..") {
         return Err(Errno(22));
     }
-    let how = |flags: i32| fs::OpenHow { flags: (flags | fs::O_PATH | kr_sys::O_CLOEXEC) as u64, mode: 0, resolve: fs::RESOLVE_NO_SYMLINKS | fs::RESOLVE_NO_MAGICLINKS | fs::RESOLVE_BENEATH };
-    // The root itself is opened plainly (RESOLVE_BENEATH rejects absolute paths); every
-    // component below it is resolved strictly.
-    let mut cur = ns::open(b"/\0", fs::O_PATH | ns::O_DIRECTORY, 0)?;
-    for (i, c) in comps.iter().enumerate() {
+    let root = ns::open(b"/\0", fs::O_PATH | ns::O_DIRECTORY, 0)?;
+    let in_root = |flags: i32| fs::OpenHow { flags: (flags | fs::O_PATH | kr_sys::O_CLOEXEC) as u64, mode: 0, resolve: fs::RESOLVE_IN_ROOT | fs::RESOLVE_NO_MAGICLINKS };
+    let strict = |flags: i32| fs::OpenHow { flags: (flags | fs::O_PATH | kr_sys::O_CLOEXEC) as u64, mode: 0, resolve: fs::RESOLVE_NO_SYMLINKS | fs::RESOLVE_NO_MAGICLINKS | fs::RESOLVE_BENEATH };
+    // The whole target may already exist.
+    if let Ok(fd) = fs::openat2(root.raw(), &cstr(&[&comps.join(&b'/')]), &in_root(0)) {
+        return Ok(fd);
+    }
+    // Longest existing directory prefix (symlinks allowed, confined to the root).
+    let mut k = comps.len().saturating_sub(1);
+    let mut cur = loop {
+        if k == 0 {
+            break ns::open(b"/\0", fs::O_PATH | ns::O_DIRECTORY, 0)?;
+        }
+        if let Ok(fd) = fs::openat2(root.raw(), &cstr(&[&comps[..k].join(&b'/')]), &in_root(ns::O_DIRECTORY)) {
+            break fd;
+        }
+        k -= 1;
+    };
+    for (i, c) in comps.iter().enumerate().skip(k) {
         let last = i + 1 == comps.len();
         let name = cstr(&[c]);
         if last && !dir {
@@ -881,13 +897,13 @@ fn open_mount_target(path: &[u8], dir: bool) -> Result<Fd, Errno> {
                 Ok(_) | Err(Errno(21)) | Err(Errno(26)) => {}
                 Err(e) => return Err(e),
             }
-            return fs::openat2(cur.raw(), &name, &how(0));
+            return fs::openat2(cur.raw(), &name, &strict(0));
         }
         match fs::mkdirat(cur.raw(), &name, 0o755) {
             Ok(()) | Err(Errno(17)) => {}
             Err(e) => return Err(e),
         }
-        cur = fs::openat2(cur.raw(), &name, &how(fs::O_DIRECTORY))?;
+        cur = fs::openat2(cur.raw(), &name, &strict(ns::O_DIRECTORY))?;
     }
     Ok(cur)
 }

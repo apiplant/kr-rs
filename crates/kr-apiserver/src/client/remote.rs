@@ -81,7 +81,7 @@ impl Remote {
                 (Some((chain, key)), None)
             }
         };
-        let cfg = Rc::new(ClientConfig { roots, client_cert, alpn: alloc::vec![b"http/1.1".to_vec()] });
+        let cfg = Rc::new(ClientConfig { pinned_ca: None, roots, client_cert, alpn: alloc::vec![b"http/1.1".to_vec()] });
         let unary = Http::with_connector(
             TlsConnector::new(SystemResolver::system(), cfg.clone()),
             HttpConfig { max_redirects: 0, user_agent: "kr-node/0.0.1".to_string(), ..HttpConfig::default() },

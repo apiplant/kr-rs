@@ -622,6 +622,7 @@ fn tls_serves_requests_and_exposes_client_certs() {
         Rc::new(TlsServerConfig { cert_chain: vec![srv_cert.clone()], key: key(2), client_auth: auth, alpn: vec![b"http/1.1".to_vec()] })
     };
     let client_cfg = |with_cert: bool| ClientConfig {
+        pinned_ca: None,
         roots: vec![ca.clone()],
         client_cert: with_cert.then(|| (vec![cli_cert.clone()], key(3))),
         alpn: vec![b"http/1.1".to_vec()],

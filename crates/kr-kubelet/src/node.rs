@@ -34,10 +34,11 @@ fn status(cfg: &Config) -> String {
 {{"type":"MemoryPressure","status":"False","reason":"KubeletHasSufficientMemory","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}},
 {{"type":"DiskPressure","status":"False","reason":"KubeletHasNoDiskPressure","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}},
 {{"type":"PIDPressure","status":"False","reason":"KubeletHasSufficientPID","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}}],
-"addresses":[{{"type":"InternalIP","address":"127.0.0.1"}},{{"type":"Hostname","address":"{name}"}}],
+"addresses":[{{"type":"InternalIP","address":"{ip}"}},{{"type":"Hostname","address":"{name}"}}],
 "nodeInfo":{{"kubeletVersion":"v1.31.0-kr","kubeProxyVersion":"v1.31.0-kr","containerRuntimeVersion":"kr://0.0.1","kernelVersion":"{kernel}","osImage":"kr","operatingSystem":"linux","architecture":"{arch}","machineID":"","systemUUID":"","bootID":""}}}}"#,
         name = cfg.node_name,
-        kernel = kernel.trim()
+        kernel = kernel.trim(),
+        ip = alloc::format!("{}.{}.{}.{}", cfg.node_ip[0], cfg.node_ip[1], cfg.node_ip[2], cfg.node_ip[3])
     )
 }
 

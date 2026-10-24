@@ -19,6 +19,7 @@ pub mod node;
 pub mod dns;
 mod probe;
 pub mod proxy;
+pub mod remote;
 mod spec;
 pub mod stream;
 
@@ -44,6 +45,8 @@ pub struct Config {
     pub network: bool,
     /// cgroup limits are applied only when kr runs in a delegated cgroup.
     pub cgroups: bool,
+    /// The node's InternalIP (reported in Node status; peers route pod subnets to it).
+    pub node_ip: [u8; 4],
 }
 
 fn now() -> i64 {
@@ -167,6 +170,8 @@ pub struct Kubelet<C: Client> {
     /// Rootless pod network: a namespace pair owned by kr holding the bridge; pod sandboxes
     /// are nested inside it so pods get IPs and reach each other without real root.
     infra: RefCell<Option<Sandbox>>,
+    /// This node's pod subnet (from `spec.podCIDR`).
+    podnet: Cell<network::PodNet>,
 }
 
 enum Pull {
@@ -179,15 +184,27 @@ const BACKOFF_MAX_MS: u64 = 300_000;
 
 impl<C: Client + Clone + 'static> Kubelet<C> {
     pub fn new(c: C, cfg: Config, store: Store) -> Rc<Self> {
-        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None) })
+        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()) })
     }
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
     pub async fn run(self: Rc<Self>) {
         // All sandboxes died with the previous kr process: their IP leases are stale.
         let _ = remove_tree(&alloc::format!("{}/ipam", self.cfg.root));
+        node::register(&self.c, &self.cfg).await;
+        // The API server assigns the pod subnet at registration.
+        for _ in 0..30 {
+            if let Ok(n) = self.c.get(&alloc::format!("/api/v1/nodes/{}", self.cfg.node_name)).await {
+                if let Some(pn) = n.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).and_then(network::PodNet::parse) {
+                    self.podnet.set(pn);
+                    break;
+                }
+            }
+            kr_rt::exec::sleep(1000).await;
+        }
+        let pn = self.podnet.get();
         if self.cfg.network {
-            if let Err(e) = network::setup_host() {
+            if let Err(e) = network::setup_host_with(&pn) {
                 kr_rt::eprint(alloc::format!("kubelet: network setup failed (errno {}); pods get no IP\n", e.0).as_bytes());
             }
         } else {
@@ -202,7 +219,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                         };
                         let _ = nl.bridge_add(network::BRIDGE);
                         let Ok(br) = kr_net::netlink::ifindex(network::BRIDGE) else { return 2 };
-                        let _ = nl.addr_add(br, network::GATEWAY, network::PREFIX);
+                        let _ = nl.addr_add(br, pn.gateway, pn.prefix);
                         if nl.link_up(br).is_err() {
                             return 3;
                         }
@@ -234,7 +251,10 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             }
             None => kr_rt::eprint(b"kubelet: no node network; Services are not proxied\n"),
         }
-        node::register(&self.c, &self.cfg).await;
+        if self.cfg.network {
+            let me = self.clone();
+            kr_rt::exec::spawn(async move { me.route_loop().await });
+        }
         let hb = self.clone();
         kr_rt::exec::spawn(async move { node::heartbeat_loop(&hb.c, &hb.cfg).await });
         let w = self.clone();
@@ -242,6 +262,26 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         loop {
             self.sync_all().await;
             self.notify.wait(1000).await;
+        }
+    }
+
+    /// host-gw routing (root mode): a route to every other node's pod subnet via its
+    /// InternalIP. Nodes must share an L2 segment (no overlay yet).
+    async fn route_loop(&self) {
+        loop {
+            if let (Ok(list), Ok(nl)) = (self.c.list("/api/v1/nodes", "").await, kr_net::netlink::Netlink::route()) {
+                for n in list.get("items").and_then(Value::as_array).unwrap_or(&[]) {
+                    if meta(n, "name") == self.cfg.node_name {
+                        continue;
+                    }
+                    let Some(pn) = n.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).and_then(network::PodNet::parse) else { continue };
+                    let ip = n.pointer(&["status", "addresses"]).and_then(Value::as_array).and_then(|a| a.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("InternalIP"))).and_then(|x| x.get("address")).and_then(Value::as_str).and_then(kr_apiserver::object::parse_ipv4);
+                    if let Some(gw) = ip {
+                        let _ = nl.route_add(pn.subnet, pn.prefix, Some(gw), 0);
+                    }
+                }
+            }
+            kr_rt::exec::sleep(5000).await;
         }
     }
 
@@ -388,10 +428,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         if self.cfg.network || rootless_net {
             let ipam = alloc::format!("{}/ipam", self.cfg.root);
             let _ = kr_runtime::store::mkdir_p(&ipam, 0o700);
-            lease = network::allocate(ipam.as_bytes(), uid.as_bytes()).ok();
+            lease = network::allocate_in(ipam.as_bytes(), uid.as_bytes(), &self.podnet.get()).ok();
         }
         let ip = lease.as_ref().map(|l: &Lease| l.ip);
-        let net = ip.map(|ip| NetConfig { ip, prefix: network::PREFIX, gateway: network::GATEWAY });
+        let pn = self.podnet.get();
+        let net = ip.map(|ip| NetConfig { ip, prefix: pn.prefix, gateway: pn.gateway });
         let hostname = spec::pod_hostname(pod);
         let started = match self.infra.borrow().as_ref() {
             Some(infra) => container::start_sandbox_in(infra, uid.as_bytes(), hostname.as_bytes(), &self.maps, net),

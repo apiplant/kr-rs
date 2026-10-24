@@ -35,7 +35,7 @@ fn data_dir() -> String {
     format!("{}/.local/share/kr/server", env("HOME").unwrap_or_else(|| "/tmp".into()))
 }
 
-fn mkdir_p(dir: &str) -> Result<(), String> {
+pub fn mkdir_p(dir: &str) -> Result<(), String> {
     let mut cur = String::new();
     for part in dir.split('/').filter(|p| !p.is_empty()) {
         cur.push('/');
@@ -50,7 +50,7 @@ fn mkdir_p(dir: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn hostname() -> String {
+pub fn hostname() -> String {
     fs::read_file(b"/proc/sys/kernel/hostname\0", 256).ok().and_then(|b| String::from_utf8(b).ok()).map(|s| s.trim().into()).unwrap_or_default()
 }
 
@@ -82,7 +82,26 @@ fn bootstrap(data: &str, port: u16) -> Result<(), String> {
             dns.push(host);
         }
         let name = Name { common_name: "kube-apiserver".into(), organizations: Vec::new() };
-        issue(&pki_dir, "apiserver", &ca, name, true, false, dns, alloc::vec![alloc::vec![127, 0, 0, 1]])?;
+        let mut ips = alloc::vec![alloc::vec![127, 0, 0, 1], alloc::vec![10, 96, 0, 1]];
+        if let Ok(adv) = kr_sys::ns::route_source([1, 1, 1, 1]) {
+            ips.push(adv.to_vec());
+        }
+        issue(&pki_dir, "apiserver", &ca, name, true, false, dns, ips)?;
+    }
+    if !exists(&pki::path(&pki_dir, "kubelet-client.pem")) {
+        // Used by the API server to reach node agents' kubelets (logs/exec/port-forward).
+        let name = Name { common_name: "kube-apiserver-kubelet-client".into(), organizations: alloc::vec!["system:masters".into()] };
+        issue(&pki_dir, "kubelet-client", &ca, name, false, true, Vec::new(), Vec::new())?;
+    }
+    if !exists(&pki::path(data, "node-token")) {
+        // K10<sha256 of the CA certificate>::<id>.<secret> (k3s-style join token).
+        let mut rnd = [0u8; 22];
+        kr_sys::getrandom(&mut rnd);
+        const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        let t: String = rnd.iter().map(|b| ALPHA[*b as usize % ALPHA.len()] as char).collect();
+        let hash: String = kr_crypto::sha2::sha256(&ca.2).iter().map(|b| alloc::format!("{b:02x}")).collect();
+        let token = format!("K10{hash}::{}.{}\n", &t[..6], &t[6..]);
+        pki::write_new(&pki::path(data, "node-token"), token.as_bytes(), 0o600)?;
     }
     if !exists(&pki::path(&pki_dir, "sa.key")) {
         let key = pki::new_key();
@@ -104,7 +123,7 @@ fn bootstrap(data: &str, port: u16) -> Result<(), String> {
     Ok(())
 }
 
-fn load_pem(dir: &str, file: &str, label: &str) -> Result<Vec<Vec<u8>>, String> {
+pub fn load_pem(dir: &str, file: &str, label: &str) -> Result<Vec<Vec<u8>>, String> {
     let b = fs::read_file(&pki::path(dir, file), 1 << 20).map_err(|e| format!("read {file}: errno {}", e.0))?;
     x509::pem_decode_all(core::str::from_utf8(&b).map_err(|_| "not UTF-8")?, label).map_err(|_| format!("{file}: bad PEM"))
 }
@@ -132,7 +151,9 @@ pub fn main(mut args: Args) -> i32 {
     }
     let pki_dir = format!("{data}/pki");
     let setup = || -> Result<(Rc<ServerConfig>, kr_store::Store), String> {
-        let chain = load_pem(&pki_dir, "apiserver.pem", "CERTIFICATE")?;
+        // The CA travels in the chain so joining agents can pin it by hash.
+        let mut chain = load_pem(&pki_dir, "apiserver.pem", "CERTIFICATE")?;
+        chain.extend(load_pem(&pki_dir, "ca.pem", "CERTIFICATE")?);
         let key_der = load_pem(&pki_dir, "apiserver.key", "PRIVATE KEY")?.pop().ok_or("apiserver.key empty")?;
         let key = x509::private_key_from_pkcs8(&key_der).map_err(|_| "apiserver.key unsupported")?;
         let ca = load_pem(&pki_dir, "ca.pem", "CERTIFICATE")?;
@@ -159,6 +180,18 @@ pub fn main(mut args: Args) -> i32 {
     if let Err(e) = sa_setup() {
         return fail(&e);
     }
+    // Node joining: CA for issuing node certificates, and the bootstrap token Secret.
+    let join_setup = || -> Result<(), String> {
+        let (name, key, der) = pki::load_ca(&pki_dir)?;
+        api.set_ca(name, key, der);
+        let tok = fs::read_file(&pki::path(&data, "node-token"), 4096).ok().and_then(|b| String::from_utf8(b).ok()).ok_or("cannot read node-token")?;
+        let (_, idsec) = tok.trim().split_once("::").ok_or("bad node-token")?;
+        let (id, secret) = idsec.split_once('.').ok_or("bad node-token")?;
+        api.ensure_bootstrap_token(id, secret).map_err(|e| e.message)
+    };
+    if let Err(e) = join_setup() {
+        return fail(&e);
+    }
     // The address pods and agents use to reach this API server.
     let advertise = kr_sys::ns::route_source([1, 1, 1, 1]).unwrap_or([127, 0, 0, 1]);
     if let Err(e) = api.ensure_builtin_services(advertise, port) {
@@ -173,12 +206,24 @@ pub fn main(mut args: Args) -> i32 {
         }
     };
     let controllers = kr_apiserver::client::InProcess::new(api.clone(), "controller-manager");
+    let local_node = node_name();
+    // TLS identity for reaching agents' kubelets.
+    let kubelet_client = match (|| -> Result<Rc<kr_crypto::tls::ClientConfig>, String> {
+        let chain = load_pem(&pki_dir, "kubelet-client.pem", "CERTIFICATE")?;
+        let key = x509::private_key_from_pkcs8(&load_pem(&pki_dir, "kubelet-client.key", "PRIVATE KEY")?.pop().ok_or("empty key")?).map_err(|_| "bad kubelet-client key")?;
+        let roots = load_pem(&pki_dir, "ca.pem", "CERTIFICATE")?;
+        Ok(Rc::new(kr_crypto::tls::ClientConfig { roots, pinned_ca: None, client_cert: Some((chain, key)), alpn: alloc::vec![b"http/1.1".to_vec()] }))
+    })() {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
     let api_for_proxy = api.clone();
     match kr_rt::exec::block_on(async move {
         let cfg = kr_controllers::Config { now: pki::now, ..kr_controllers::Config::default() };
         kr_rt::exec::spawn(kr_controllers::run_all_with(controllers, cfg));
+        let local: Option<Rc<dyn kr_apiserver::api::NodeProxy>> = kubelet.as_ref().map(|k| Rc::new(kr_kubelet::stream::Proxy(k.clone())) as Rc<dyn kr_apiserver::api::NodeProxy>);
+        api_for_proxy.set_node_proxy(Rc::new(kr_kubelet::remote::Router { local_node: local_node.clone(), local, tls: kubelet_client.clone() }));
         if let Some(k) = kubelet {
-            api_for_proxy.set_node_proxy(Rc::new(kr_kubelet::stream::Proxy(k.clone())));
             kr_rt::exec::spawn(k.run());
         }
         kr_apiserver::server::run(api, [0, 0, 0, 0], port, tls).await
@@ -188,26 +233,37 @@ pub fn main(mut args: Args) -> i32 {
     }
 }
 
-/// The node agent embedded in the server (single-node mode).
-fn start_kubelet(api: &Rc<kr_apiserver::api::ApiServer>) -> Result<Rc<kr_kubelet::Kubelet<kr_apiserver::client::InProcess>>, String> {
-    let store = kr_runtime::store::Store::open(None).map_err(|_| String::from("cannot open the image store"))?;
-    let mut name = hostname().to_ascii_lowercase();
-    if !kr_apiserver::object::is_dns_subdomain(&name) || name.is_empty() {
-        name = "kr-node".into();
+/// This machine's node name: the lowercased hostname, or "kr-node".
+pub fn node_name() -> String {
+    let name = hostname().to_ascii_lowercase();
+    if name.is_empty() || !kr_apiserver::object::is_dns_subdomain(&name) {
+        "kr-node".into()
+    } else {
+        name
     }
-    // cgroup limits need a delegated cgroup (systemd Delegate=yes); probe once.
+}
+
+pub fn cgroups_available() -> bool {
     let probe = kr_runtime::cgroup::Limits { pids: Some(1024), ..Default::default() };
-    let cgroups = match kr_runtime::cgroup::Cgroup::create(b"kr-probe", &probe) {
+    match kr_runtime::cgroup::Cgroup::create(b"kr-probe", &probe) {
         Ok(cg) => {
             cg.remove();
             true
         }
         Err(_) => {
-            eprint(b"kr server: no delegated cgroup; container resource limits are not enforced\n");
+            eprint(b"kr: no delegated cgroup; container resource limits are not enforced\n");
             false
         }
-    };
-    let cfg = kr_kubelet::Config { node_name: name, root: String::from(store.root()), network: ns::getuid() == 0, cgroups };
+    }
+}
+
+/// The node agent embedded in the server (single-node mode).
+fn start_kubelet(api: &Rc<kr_apiserver::api::ApiServer>) -> Result<Rc<kr_kubelet::Kubelet<kr_apiserver::client::InProcess>>, String> {
+    let store = kr_runtime::store::Store::open(None).map_err(|_| String::from("cannot open the image store"))?;
+    let name = node_name();
+    let cgroups = cgroups_available();
+    let node_ip = kr_sys::ns::route_source([1, 1, 1, 1]).unwrap_or([127, 0, 0, 1]);
+    let cfg = kr_kubelet::Config { node_name: name, root: String::from(store.root()), network: ns::getuid() == 0, cgroups, node_ip };
     let client = kr_apiserver::client::InProcess::new(api.clone(), "kubelet");
     Ok(kr_kubelet::Kubelet::new(client, cfg, store))
 }

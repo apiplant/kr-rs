@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod agent;
 mod ctr;
 mod pki;
 mod server;
@@ -57,12 +58,13 @@ fn kr_main(mut args: Args) -> i32 {
         Some(b"ctr") => ctr::main(args),
         Some(b"pki") => pki::main(args),
         Some(b"server") => server::main(args),
+        Some(b"agent") => agent::main(args),
         Some(b"sleep-test") => {
             exec::block_on(sleep_test());
             0
         }
         _ => {
-            eprint(b"usage: kr <version | echo [port] | ctr ... | pki ... | server ... | sleep-test>\n");
+            eprint(b"usage: kr <version | echo [port] | ctr ... | pki ... | server ... | agent ... | sleep-test>\n");
             2
         }
     }

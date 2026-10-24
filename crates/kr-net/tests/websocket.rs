@@ -517,7 +517,7 @@ fn websocket_over_tls() {
     let ca = cert("test-ca", 1, &ca_key, true, false, (&ca_name, &ca_key));
     let srv_cert = cert("localhost", 2, &key(2), false, true, (&ca_name, &ca_key));
     let tls = Rc::new(TlsServerConfig { cert_chain: vec![srv_cert], key: key(2), client_auth: ClientAuth::None, alpn: vec![b"http/1.1".to_vec()] });
-    let cc = ClientConfig { roots: vec![ca], client_cert: None, alpn: vec![b"http/1.1".to_vec()] };
+    let cc = ClientConfig { pinned_ca: None, roots: vec![ca], client_cert: None, alpn: vec![b"http/1.1".to_vec()] };
     let out = block_on(async move {
         let l = listen([127, 0, 0, 1], 0, 16).unwrap();
         let port = local_addr(&l).unwrap().1;

@@ -46,7 +46,9 @@ pub struct Req<'a> {
 /// Serves pod subresources that live on the node (log, exec, attach, portforward). In single
 /// node mode the in-process kubelet implements it; agents will be reached over HTTPS.
 pub trait NodeProxy {
-    fn pod_subresource(&self, sub: &str, namespace: &str, pod: &str, query: &str, headers: &[(String, String)]) -> Result<kr_net::http1::server::Response, ApiError>;
+    /// `node`/`node_ip`: where the pod runs (from `spec.nodeName` and the Node's InternalIP).
+    #[allow(clippy::too_many_arguments)]
+    fn pod_subresource(&self, sub: &str, namespace: &str, pod: &str, node: &str, node_ip: Option<[u8; 4]>, query: &str, headers: &[(String, String)]) -> Result<kr_net::http1::server::Response, ApiError>;
 }
 
 pub enum Reply {
@@ -76,6 +78,8 @@ pub struct ApiServer {
     /// ServiceAccount token signer and the cluster CA PEM (for kube-root-ca.crt).
     sa: RefCell<Option<(crate::tokens::Signer, String)>>,
     node_proxy: RefCell<Option<alloc::rc::Rc<dyn NodeProxy>>>,
+    /// Cluster CA (name, key, DER) for issuing node certificates at join.
+    ca: RefCell<Option<(kr_crypto::x509::Name, kr_crypto::x509::SigningKey, Vec<u8>)>>,
 }
 
 /// Default namespaces created on first start.
@@ -166,12 +170,103 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.31.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None) };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.31.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None) };
         for ns in SYSTEM_NAMESPACES {
             api.ensure_default_sa(ns);
         }
         api.sync()?;
         Ok(api)
+    }
+
+    /// Enables node joining (`POST /kr/join`) with the cluster CA.
+    pub fn set_ca(&self, name: kr_crypto::x509::Name, key: kr_crypto::x509::SigningKey, ca_der: Vec<u8>) {
+        *self.ca.borrow_mut() = Some((name, key, ca_der));
+    }
+
+    /// Creates a bootstrap token Secret (`<id>.<secret>`) if it does not exist.
+    pub fn ensure_bootstrap_token(&self, id: &str, secret: &str) -> Result<(), ApiError> {
+        let r = resources::find("", "v1", "secrets").unwrap();
+        let b64 = |v: &str| kr_fmt::base64::encode(v.as_bytes());
+        let body = alloc::format!(
+            r#"{{"metadata":{{"name":"bootstrap-token-{id}"}},"type":"bootstrap.kubernetes.io/token","data":{{"token-id":"{}","token-secret":"{}","usage-bootstrap-authentication":"{}","auth-extra-groups":"{}"}}}}"#,
+            b64(id),
+            b64(secret),
+            b64("true"),
+            b64("system:bootstrappers:kr:default-node-token")
+        );
+        self.bootstrap_object(r, Some("kube-system"), &alloc::format!("bootstrap-token-{id}"), "Secret", &body);
+        self.sync()
+    }
+
+    /// Bootstrap token authentication (`<6 [a-z0-9]>.<16 [a-z0-9]>`).
+    fn bootstrap_user(&self, token: &str) -> Option<User> {
+        let (id, secret) = token.split_once('.')?;
+        let ok = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        if !ok(id, 6) || !ok(secret, 16) {
+            return None;
+        }
+        let r = resources::find("", "v1", "secrets").unwrap();
+        let kv = self.store.borrow().get(&r.key(Some("kube-system"), &alloc::format!("bootstrap-token-{id}")))?;
+        let sec = json::parse(&kv.value).ok()?;
+        if sec.get("type").and_then(Value::as_str) != Some("bootstrap.kubernetes.io/token") {
+            return None;
+        }
+        let field = |f: &str| sec.pointer(&["data", f]).and_then(Value::as_str).and_then(|v| kr_fmt::base64::decode(v).ok()).and_then(|b| String::from_utf8(b).ok());
+        if !kr_crypto::ct_eq(field("token-secret")?.as_bytes(), secret.as_bytes()) || field("usage-bootstrap-authentication").as_deref() != Some("true") {
+            return None;
+        }
+        if let Some(exp) = field("expiration").and_then(|e| crate::printers::parse_rfc3339(&e)) {
+            if (self.now)() > exp {
+                return None;
+            }
+        }
+        let mut groups = alloc::vec![String::from("system:bootstrappers")];
+        groups.extend(field("auth-extra-groups").unwrap_or_default().split(',').filter(|g| g.starts_with("system:bootstrappers:")).map(String::from));
+        groups.push("system:authenticated".into());
+        Some(User { name: alloc::format!("system:bootstrap:{id}"), groups })
+    }
+
+    /// `POST /kr/join`: a bootstrapping node exchanges its public keys for a client
+    /// certificate (`system:node:<name>` in `system:nodes`) and a kubelet serving certificate.
+    fn join(&self, req: &Req, user: &User) -> R<Reply> {
+        if !user.groups.iter().any(|g| g == "system:bootstrappers") {
+            return Err(ApiError::new(403, "Forbidden", "join requires a bootstrap token"));
+        }
+        let b = self.parse_body(req)?;
+        let name = b.get("nodeName").and_then(Value::as_str).filter(|n| object::is_dns_subdomain(n)).ok_or_else(|| ApiError::invalid("nodeName must be a DNS subdomain"))?;
+        let key = |f: &str| -> R<kr_crypto::x509::PublicKey> {
+            let der = b.get(f).and_then(Value::as_str).and_then(|v| kr_fmt::base64::decode(v).ok()).ok_or_else(|| ApiError::invalid(alloc::format!("{f}: base64 SPKI required")))?;
+            match kr_crypto::x509::PublicKey::from_spki(&der) {
+                Ok(Some(k @ (kr_crypto::x509::PublicKey::P256(_) | kr_crypto::x509::PublicKey::Ed25519(_)))) => Ok(k),
+                _ => Err(ApiError::invalid(alloc::format!("{f}: unsupported key"))),
+            }
+        };
+        let (client_key, serving_key) = (key("clientKey")?, key("servingKey")?);
+        let ips: Vec<Vec<u8>> = b.get("addresses").and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_str).filter_map(object::parse_ipv4).map(|a| a.to_vec()).collect();
+        let guard = self.ca.borrow();
+        let (ca_name, ca_key, ca_der) = guard.as_ref().ok_or_else(|| ApiError::new(503, "ServiceUnavailable", "node joining is not enabled"))?;
+        let now = (self.now)();
+        let mut serial = [0u8; 16];
+        (self.rng)(&mut serial);
+        let subject = kr_crypto::x509::Name { common_name: alloc::format!("system:node:{name}"), organizations: alloc::vec!["system:nodes".into()] };
+        let mut p = kr_crypto::x509::CertParams { serial, subject, not_before: now - 300, not_after: now + 365 * 86400, is_ca: false, server: false, client: true, dns_names: Vec::new(), ip_addrs: Vec::new(), public_key: client_key };
+        let client = kr_crypto::x509::issue(&p, ca_name, ca_key);
+        (self.rng)(&mut p.serial);
+        p.client = false;
+        p.server = true;
+        p.dns_names = alloc::vec![name.to_string()];
+        p.ip_addrs = ips;
+        p.public_key = serving_key;
+        let serving = kr_crypto::x509::issue(&p, ca_name, ca_key);
+        let pem = |d: &[u8]| kr_crypto::x509::pem_encode("CERTIFICATE", d);
+        let mut out = String::from("{\"clientCert\":");
+        json::write_str(&pem(&client), &mut out);
+        out.push_str(",\"servingCert\":");
+        json::write_str(&pem(&serving), &mut out);
+        out.push_str(",\"ca\":");
+        json::write_str(&pem(ca_der), &mut out);
+        out.push('}');
+        Ok(Reply::Json(200, out))
     }
 
     pub fn set_node_proxy(&self, p: alloc::rc::Rc<dyn NodeProxy>) {
@@ -236,6 +331,9 @@ impl ApiServer {
             return Ok(User { name: "system:anonymous".into(), groups: alloc::vec!["system:unauthenticated".into()] });
         };
         let unauthorized = || ApiError::new(401, "Unauthorized", "Unauthorized");
+        if let Some(u) = self.bootstrap_user(token) {
+            return Ok(u);
+        }
         let sa = self.sa.borrow();
         let (signer, _) = sa.as_ref().ok_or_else(unauthorized)?;
         let c = signer.verify(token, (self.now)()).ok_or_else(unauthorized)?;
@@ -314,6 +412,14 @@ impl ApiServer {
     fn route(&self, req: &Req) -> R<Reply> {
         let path = req.path.trim_end_matches('/');
         let user = self.authenticate(req)?;
+        // Node bootstrap endpoints (outside RBAC: the CA is public; join checks its caller).
+        if path == "/cacerts" && req.method == "GET" {
+            let pem = self.ca.borrow().as_ref().map(|(_, _, der)| kr_crypto::x509::pem_encode("CERTIFICATE", der)).ok_or_else(|| ApiError::not_found("cacerts", "ca"))?;
+            return Ok(Reply::Json(200, pem));
+        }
+        if path == "/kr/join" && req.method == "POST" {
+            return self.join(req, &user);
+        }
         let q = Query::parse(req.query)?;
         let segs: Vec<&str> = path.split('/').skip(1).collect();
         // Resource URL? Then authorize on resource attributes; otherwise on the path.
@@ -403,10 +509,20 @@ impl ApiServer {
         }
         match (req.method, &rt.name, sub) {
             ("GET" | "POST", Some(n), Some(sub @ ("log" | "exec" | "attach" | "portforward"))) => {
-                self.get_kv(rt, n)?;
+                let (_, pod) = self.get_value(rt, n)?;
+                let node = pod.pointer(&["spec", "nodeName"]).and_then(Value::as_str).unwrap_or("").to_string();
+                if node.is_empty() {
+                    return Err(ApiError::bad_request(alloc::format!("pod {n} is not scheduled to a node yet")));
+                }
+                let node_ip = resources::find("", "v1", "nodes")
+                    .and_then(|r| self.store.borrow().get(&r.key(None, &node)))
+                    .and_then(|kv| json::parse(&kv.value).ok())
+                    .and_then(|v| {
+                        v.pointer(&["status", "addresses"])?.as_array()?.iter().find(|a| a.get("type").and_then(Value::as_str) == Some("InternalIP"))?.get("address")?.as_str().and_then(object::parse_ipv4)
+                    });
                 let proxy = self.node_proxy.borrow().clone().ok_or_else(|| ApiError::new(503, "ServiceUnavailable", "no node agent to serve this request"))?;
                 let ns = rt.namespace.clone().unwrap_or_default();
-                proxy.pod_subresource(sub, &ns, n, req.query, req.headers).map(Reply::Http)
+                proxy.pod_subresource(sub, &ns, n, &node, node_ip, req.query, req.headers).map(Reply::Http)
             }
             ("GET", None, None) if q.flag("watch") => self.watch(rt, q),
             ("GET", None, None) => self.list(req, rt, q),
@@ -633,6 +749,9 @@ impl ApiServer {
         }
         if rt.res.plural == "services" {
             self.admit_service(o, None)?;
+        }
+        if rt.res.plural == "nodes" {
+            self.admit_node(o)?;
         }
         if rt.res.plural == "namespaces" {
             o.entry_object("spec").set("finalizers", Value::Array(alloc::vec![Value::from("kubernetes")]));
@@ -929,6 +1048,21 @@ impl ApiServer {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Assigns each new Node a /24 of the cluster pod CIDR 10.88.0.0/16 (`spec.podCIDR`).
+    fn admit_node(&self, o: &mut Value) -> R<()> {
+        if o.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).is_some_and(|c| !c.is_empty()) {
+            return Ok(());
+        }
+        let r = resources::find("", "v1", "nodes").unwrap();
+        let (items, _) = self.store.borrow().list(&r.prefix(), None, 0);
+        let used: Vec<String> = items.iter().filter_map(|kv| json::parse(&kv.value).ok()).filter_map(|n| n.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).map(String::from)).collect();
+        let cidr = (0u16..256).map(|i| alloc::format!("10.88.{i}.0/24")).find(|c| !used.contains(c)).ok_or_else(|| ApiError::new(422, "Invalid", "pod CIDR exhausted"))?;
+        let spec = o.entry_object("spec");
+        spec.set("podCIDR", Value::String(cidr.clone()));
+        spec.set("podCIDRs", Value::Array(alloc::vec![Value::String(cidr)]));
         Ok(())
     }
 

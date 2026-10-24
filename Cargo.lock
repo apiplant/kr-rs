@@ -11,6 +11,7 @@ dependencies = [
  "kr-crypto",
  "kr-fmt",
  "kr-kubelet",
+ "kr-net",
  "kr-rt",
  "kr-runtime",
  "kr-store",
@@ -59,6 +60,7 @@ name = "kr-kubelet"
 version = "0.0.1"
 dependencies = [
  "kr-apiserver",
+ "kr-crypto",
  "kr-fmt",
  "kr-net",
  "kr-rt",

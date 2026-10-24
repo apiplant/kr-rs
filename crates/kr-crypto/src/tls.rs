@@ -368,6 +368,10 @@ pub struct ServerConfig {
 pub struct ClientConfig {
     /// Trust anchors (DER).
     pub roots: Vec<Vec<u8>>,
+    /// Bootstrap trust: accept a CA certificate sent in the server's chain if SHA-256 of its
+    /// DER equals this pin (used by joining nodes that only know the CA hash from their
+    /// token). The pinned CA must still sign the leaf, and the hostname is still checked.
+    pub pinned_ca: Option<[u8; 32]>,
     /// Certificate chain and key presented if the server asks.
     pub client_cert: Option<(Vec<Vec<u8>>, SigningKey)>,
     pub alpn: Vec<Vec<u8>>,
@@ -1035,7 +1039,12 @@ impl Connection {
                 x509::verify_chain(&refs, &roots, self.now, Usage::Client)
             }
             Role::Client { cfg, server_name, .. } => {
-                let roots: Vec<&[u8]> = cfg.roots.iter().map(|c| &c[..]).collect();
+                let mut roots: Vec<&[u8]> = cfg.roots.iter().map(|c| &c[..]).collect();
+                if let Some(pin) = cfg.pinned_ca {
+                    if let Some(ca) = refs[1..].iter().find(|c| crate::sha2::sha256(c) == pin) {
+                        roots.push(ca);
+                    }
+                }
                 x509::verify_chain(&refs, &roots, self.now, Usage::Server(server_name))
             }
         };

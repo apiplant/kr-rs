@@ -293,7 +293,10 @@ impl Netlink {
             if let Some(gw) = gateway {
                 b.attr(RTA_GATEWAY, &gw);
             }
-            b.attr_u32(RTA_OIF, oif as u32);
+            // oif 0: let the kernel pick the interface from the gateway.
+            if oif > 0 {
+                b.attr_u32(RTA_OIF, oif as u32);
+            }
         })
     }
 }

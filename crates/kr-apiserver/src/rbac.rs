@@ -134,6 +134,23 @@ pub fn bootstrap_roles() -> Vec<(&'static str, String)> {
         ("system:discovery", alloc::format!("[{}]", nonres(&["/api", "/api/*", "/apis", "/apis/*", "/healthz", "/livez", "/readyz", "/openapi", "/openapi/*", "/version", "/version/"], &["get"]))),
         ("system:public-info-viewer", alloc::format!("[{}]", nonres(&["/healthz", "/livez", "/readyz", "/version", "/version/"], &["get"]))),
         ("system:basic-user", alloc::format!("[{}]", rule(&["authorization.k8s.io"], &["selfsubjectaccessreviews", "selfsubjectrulesreviews"], &["create"]))),
+        // Node agents (kubelet + proxy). Broad on reads: there is no Node authorizer yet that
+        // would limit a node to the objects of its own pods (KNOWN_ISSUES).
+        (
+            "system:node",
+            alloc::format!(
+                "[{},{},{},{},{},{},{},{},{}]",
+                rule(&[""], &["pods", "services", "endpoints", "namespaces", "configmaps", "secrets", "persistentvolumeclaims", "persistentvolumes"], READ),
+                rule(&[""], &["pods"], &["delete"]),
+                rule(&[""], &["pods/status", "nodes/status"], &["get", "patch", "update"]),
+                rule(&[""], &["nodes"], &["get", "list", "watch", "create", "patch", "update"]),
+                rule(&[""], &["events"], &["create", "patch", "update"]),
+                rule(&[""], &["serviceaccounts/token"], &["create"]),
+                rule(&["coordination.k8s.io"], &["leases"], &["get", "create", "update", "patch"]),
+                rule(&["discovery.k8s.io"], &["endpointslices"], READ),
+                nonres(&["/api", "/api/*", "/apis", "/apis/*", "/version", "/healthz"], &["get"])
+            ),
+        ),
         ("system:service-account-issuer-discovery", alloc::format!("[{}]", nonres(&["/.well-known/openid-configuration", "/.well-known/openid-configuration/", "/openid/v1/jwks", "/openid/v1/jwks/"], &["get"]))),
     ]
 }
@@ -146,6 +163,7 @@ pub fn bootstrap_bindings() -> Vec<(&'static str, &'static str, &'static str)> {
         ("system:basic-user", "system:basic-user", r#"[{"kind":"Group","apiGroup":"rbac.authorization.k8s.io","name":"system:authenticated"}]"#),
         ("system:public-info-viewer", "system:public-info-viewer", r#"[{"kind":"Group","apiGroup":"rbac.authorization.k8s.io","name":"system:authenticated"},{"kind":"Group","apiGroup":"rbac.authorization.k8s.io","name":"system:unauthenticated"}]"#),
         ("system:service-account-issuer-discovery", "system:service-account-issuer-discovery", r#"[{"kind":"Group","apiGroup":"rbac.authorization.k8s.io","name":"system:serviceaccounts"}]"#),
+        ("system:node", "system:node", r#"[{"kind":"Group","apiGroup":"rbac.authorization.k8s.io","name":"system:nodes"}]"#),
     ]
 }
 
