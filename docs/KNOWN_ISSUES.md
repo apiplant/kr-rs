@@ -16,12 +16,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 11. **aarch64 path is untested** — *open*
     It compiles under cfg but has never run. Plan: a qemu-user CI job.
 
-## kr-archive
-21. **Hardlink/symlink targets and the symlink-traversal check are the runtime's job** — *open (kr-runtime)*
-    `sanitize` is lexical. `kr-runtime` must implement the no-follow extraction (ADR-014) and validate `linkname`.
-24. **No decompression-bomb limit in the crate** — *open (kr-runtime)*
-    Output is streamed, so memory is safe, but callers should cap total uncompressed bytes and entry counts.
-
 ## kr-net
 30. **Keep-alive pool has no idle timeout** — *open*
     Stale connections are detected only when reused (one retry for GET/HEAD). Add a timer-based eviction if long-lived clients appear.
@@ -30,10 +24,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 
 ## kr-sys (cont.)
 35. **`syscall0..6` lack `# Safety` docs (clippy `missing_safety_doc`)** — *open (cleanup)*
-
-## kr-runtime store / unpack / pull
-39. **Layer diff_ids are not verified; only blob digests are** — *open*
-    The sha256 of the uncompressed tar (`rootfs.diff_ids` in the config) is not compared. zstd layers (`+zstd`) are rejected with `Error::Image`. Pulled-image refs are never refreshed (a moved `:latest` is not re-fetched once present).
 
 ## kr-runtime: isolation (container.rs, security.rs, cgroup.rs)
 50. **Container networking gaps** — *partly fixed* (ADR-019, ADR-022)
@@ -109,15 +99,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 9. **`block_on` panics with "deadlock" when there is no work** — *accepted*
    This is intended, but it is a panic rather than an error.
 
-## kr-archive
-19. **Tar: no sparse files, unknown type flags are errors, strings must be UTF-8** — *accepted*
-    GNU sparse (`S`, pax `GNU.sparse.*`) and any non-standard typeflag fail with `UnsupportedType`. Non-UTF-8 names, link targets or pax values fail with `InvalidUtf8`. Container image layers do not use these. Revisit if a real layer hits them.
-20. **pax `mtime` fractions are truncated; global (`g`) pax `path`/`linkpath`/`size` are ignored; `LIBARCHIVE.xattr.*` is not parsed (only `SCHILY.xattr.*`)** — *accepted*
-22. **gzip: any non-gzip trailing bytes after the last member are an error** — *accepted*
-    Unlike `gzip -d`, which tolerates zero padding. Also, a stream that ends cleanly without ever feeding a byte is `Truncated`. Only DEFLATE with CM=8 is supported (no zlib/raw-deflate wrapper API beyond `Inflater`).
-23. **Inflate throughput depends on the profile** — *accepted*
-    The workspace release profile uses `opt-level = "z"`. The 50 MB benchmark (`cargo test --release -p kr-archive --test gzip -- --ignored --nocapture`) measures about 800 MB/s on this machine, well above the 150 MB/s target, but re-check if the profile or target changes.
-
 ## kr-net
 28. **HTTP/1.1 client limits** — *accepted*
     No request body streaming (the body is a `&[u8]`; `body::encode_chunk` exists but the client does not send chunked requests), no proxies, no `Expect: 100-continue`, no response decompression (`Accept-Encoding: identity` is sent), no HTTP/1.0 keep-alive negotiation beyond `Connection: keep-alive`. Responses with `Transfer-Encoding` AND `Content-Length` are rejected rather than handled per the RFC's "TE wins" rule.
@@ -191,6 +172,15 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 85. **SPDY exec: no TTY resize, v4 only** — *accepted*
     The `resize` stream is accepted and ignored; clients offering only v1–v3 are refused.
 
+## kr-archive
+19. **Tar: no sparse files, unknown type flags are errors, strings must be UTF-8** — *accepted*
+    GNU sparse (`S`, pax `GNU.sparse.*`) and any non-standard typeflag fail with `UnsupportedType`. Non-UTF-8 names, link targets or pax values fail with `InvalidUtf8`. Container image layers do not use these. Revisit if a real layer hits them.
+20. **pax `mtime` fractions are truncated; global (`g`) pax `path`/`linkpath`/`size` are ignored; `LIBARCHIVE.xattr.*` is not parsed (only `SCHILY.xattr.*`)** — *accepted*
+22. **gzip: any non-gzip trailing bytes after the last member are an error** — *accepted*
+    Unlike `gzip -d`, which tolerates zero padding. Also, a stream that ends cleanly without ever feeding a byte is `Truncated`. Only DEFLATE with CM=8 is supported (no zlib/raw-deflate wrapper API beyond `Inflater`).
+23. **Inflate throughput depends on the profile** — *accepted*
+    The workspace release profile uses `opt-level = "z"`. The 50 MB benchmark (`cargo test --release -p kr-archive --test gzip -- --ignored --nocapture`) measures about 800 MB/s on this machine, well above the 150 MB/s target, but re-check if the profile or target changes.
+
 ## Build
 13. **Linker passes `-pie` alongside `-static`** — *accepted*
     The output is `ET_EXEC` with no relocations, which was verified. Re-check after toolchain bumps, since a static-pie would need self-relocation in `_start`.
@@ -226,6 +216,10 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     `kr-net::tls::TlsConnector` serves `https`, and image pulls use it. Trust anchors come from `KR_CA_BUNDLE` or the system bundle.
 27. **Interim SHA-256 in `kr-net/src/sha256.rs`** — *fixed*
     It now re-exports `kr_crypto::sha2`.
+
+## kr-runtime store / unpack / pull
+39. **Layer diff_ids are verified** — *fixed* (commit: 38ed253)
+    The pull hashes each uncompressed layer tar while inflating and compares it with `rootfs.diff_ids[i]`, failing on mismatch. Still open: zstd layers (`+zstd`) are rejected with `Error::Image`. Pulled-image refs are never refreshed (a moved `:latest` is not re-fetched once present).
 
 ## kr-runtime: isolation (container.rs, security.rs, cgroup.rs)
 43. **Rootless maps a single uid/gid** — *fixed*
@@ -293,6 +287,12 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     `kr agent --token VALUE` exposed the token in /proc/<pid>/cmdline. Use `--token-file` (must be mode 600) or `KR_TOKEN`; `--token` still works but warns.
 90. **Pod sandbox holder costs ~0.6–0.9 MB PSS per pod** — *fixed* (commits: 8f76327, bfd9d3e)
     After setup the holder execveats kr (O_PATH|O_CLOEXEC fd of /proc/self/exe) as `kr pause` with an empty environment and all other fds closed: ~77 kB PSS per pod instead of ~700 kB. If the exec fails it silently falls back to the old in-process pause.
+
+## kr-archive
+21. **Hardlink/symlink targets and the symlink-traversal check** — *fixed* (commit: 38ed253)
+    Every path (and hardlink target) resolves via `openat2(RESOLVE_IN_ROOT)` against the rootfs fd and entries are created with `*at` calls that never follow the final component; regression tests cover absolute/`..` symlinks, earlier-layer symlink parents, outside hardlinks and `..` paths.
+24. **Decompression-bomb limits** — *fixed* (commit: 38ed253)
+    `Limits` caps uncompressed bytes per layer and per image (8 GiB each, spent down across layers by the pull), entry count and path length; failure removes `rootfs.tmp`.
 
 ## kr-fmt
 18. **14 clippy style lints in kr-fmt** — *fixed* (commit: )
