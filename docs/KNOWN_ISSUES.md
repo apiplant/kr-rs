@@ -250,3 +250,21 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
 78. **exec/probe processes join the container cgroup slightly late** — *accepted*
     The kernel refuses CLONE_INTO_CGROUP after joining the container's cgroup namespace. kr moves the process via cgroup.procs right after the clone, so there is a brief window outside the container's limits.
 
+## Services, DNS, multi-node (phase 5, ADR-022)
+
+79. **Userspace service proxy** — *accepted for now*
+    Throughput is limited by kr's copy loop, and source IPs are not preserved to backends. Not supported: SCTP, externalTrafficPolicy, topology hints, and LoadBalancer status (a LoadBalancer gets a NodePort only).
+80. **host-gw networking only** — *open*
+    - Nodes must share an L2 segment; VXLAN is planned.
+    - Rootless agents have no cross-node pod networking.
+    - Cross-node pod traffic is masqueraded (the source pod IP is hidden); the nft rule should exclude the cluster CIDR.
+    - Routes of removed nodes are not deleted.
+81. **No Node authorizer** — *open*
+    `system:nodes` may read every pod, secret and configmap. Upstream limits a node to objects referenced by its own pods.
+82. **Bootstrap token never expires** — *open*
+    Planned: expiration and rotation. Node client certificates (1 year) are not rotated either.
+83. **Node-proxied logs report 200 before contacting the node** — *accepted*
+    Errors arrive in the body. A direct `Upgrade: SPDY/3.1` (non-WebSocket port-forward) to remote nodes is not proxied; kubectl's default WebSocket path is.
+84. **DNS: no negative caching or prefetch** — *accepted*
+    The zone snapshot is rebuilt every second from full lists, which is fine for small clusters.
+

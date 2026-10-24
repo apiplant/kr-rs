@@ -274,3 +274,22 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **Protobuf request bodies** (sent by kubectl's typed clients) are decoded with a generated schema table; responses are always JSON.
 
 **Status:** accepted.
+
+## ADR-022: Services, cluster DNS and multi-node
+**Context:** phase 5 needs Service VIPs, cluster DNS and nodes joining a server, without iptables/ipvs/CoreDNS binaries and in both root and rootless modes.
+
+**Decision:**
+- **Service proxy:** a userspace proxy inside kr. One `local 10.96.0.0/16` route makes every ClusterIP bindable in the node network namespace.
+  - kr listens on ClusterIP:port (and 0.0.0.0:nodePort) and splices to ready endpoints (round-robin or ClientIP affinity). UDP gets per-client sessions.
+  - Rootless, a socket factory inside the pod-network namespace creates the sockets and passes them over SCM_RIGHTS.
+  - Trade-off: lower throughput than a kernel datapath, but identical behaviour as root and rootless, no packet-rewrite rules, and simple testing. An nftables DNAT datapath can replace it later behind the same reconcile loop.
+- **Cluster DNS:** kr serves `cluster.local` itself from a 1 s snapshot of Services, Endpoints and Pods, bound on the kube-dns ClusterIP 10.96.0.10:53. Other names are forwarded to the host resolvers.
+  - Pods get resolv.conf per `dnsPolicy`, plus Docker-link service environment variables.
+- **Multi-node:**
+  - **Join token:** `kr server` writes `node-token` = `K10<sha256 of CA cert>::<id>.<secret>` (a bootstrap-token Secret).
+  - **CA bootstrap:** `kr agent` fetches `/cacerts` over TLS pinned to that hash (the CA is in the server's chain).
+  - **Node certificates:** it exchanges the token at `POST /kr/join` for a client certificate (`system:node:<name>`, `system:nodes`) and a kubelet serving certificate.
+  - **Pod subnets:** each Node gets a /24 of 10.88.0.0/16 (`spec.podCIDR`). Root nodes route each other's subnets via their InternalIPs (host-gw).
+  - **Pod subresources:** the API server reaches agents' kubelets at `:10250` with mTLS (`kube-apiserver-kubelet-client`). WebSocket upgrades are completed at the API server and replayed to the node with the client's key, then frames are pumped both ways.
+
+**Status:** accepted.
