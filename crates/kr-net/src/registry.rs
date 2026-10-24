@@ -484,6 +484,12 @@ impl Default for Registry<TcpConnector> {
     }
 }
 
+/// Whether credentials may be sent to a token `realm`: always over https; over plain http only
+/// when the registry itself is plain http (loopback dev registry or an explicit insecure one).
+fn realm_may_receive(realm: &str, has_cred: bool, registry_plain: bool) -> bool {
+    !has_cred || registry_plain || !realm.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+}
+
 fn is_loopback_host(hostport: &str) -> bool {
     let host = if let Some(r) = hostport.strip_prefix('[') {
         r.split(']').next().unwrap_or("")
@@ -529,6 +535,11 @@ impl<C: Connector> Registry<C> {
     async fn fetch_token(&mut self, r: &Reference, challenge: Option<String>) -> Result<String> {
         let ch = parse_challenge(&challenge.ok_or(Error::Auth("401 without WWW-Authenticate"))?)?;
         let realm = ch.param("realm").ok_or(Error::Auth("challenge without realm"))?;
+        // Credentials only travel over TLS: a plain-http realm is accepted only for a registry
+        // that is itself plain http (loopback dev registry or explicitly insecure).
+        if !realm_may_receive(realm, self.cred.is_some(), self.base(r).starts_with("http://")) {
+            return Err(Error::Auth("token realm must use https to receive credentials"));
+        }
         let mut url = realm.to_string();
         url.push(if realm.contains('?') { '&' } else { '?' });
         let mut first = true;
@@ -725,6 +736,15 @@ fn _assert_transport<T: Transport>() {}
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn credentials_never_go_to_a_plain_http_realm_of_a_tls_registry() {
+        assert!(!realm_may_receive("http://evil.example/token", true, false));
+        assert!(!realm_may_receive("HTTP://evil.example/token", true, false));
+        assert!(realm_may_receive("https://auth.example/token", true, false));
+        assert!(realm_may_receive("http://127.0.0.1:5000/token", true, true));
+        assert!(realm_may_receive("http://evil.example/token", false, false)); // anonymous
+    }
     use super::*;
 
     fn p(s: &str) -> Reference {
