@@ -165,7 +165,7 @@ pub fn json_patch(doc: &mut Value, ops: &Value) -> Result<(), PatchError> {
 const CONTAINER_LISTS: &[&str] = &["containers", "initContainers", "ephemeralContainers"];
 
 /// Merge key for a list field, given the field names on the path to it.
-fn merge_key(path: &[&str], field: &str) -> Option<&'static str> {
+pub(crate) fn merge_key(path: &[&str], field: &str) -> Option<&'static str> {
     Some(match field {
         "containers" | "initContainers" | "ephemeralContainers" | "env" | "volumes" | "imagePullSecrets" | "resourceClaims" | "schedulingGates" | "secrets" => "name",
         "ports" if path.iter().any(|p| CONTAINER_LISTS.contains(p)) => "containerPort",
@@ -183,7 +183,7 @@ fn merge_key(path: &[&str], field: &str) -> Option<&'static str> {
 }
 
 /// Primitive lists with merge (set union) semantics.
-fn primitive_merge(field: &str) -> bool {
+pub(crate) fn primitive_merge(field: &str) -> bool {
     field == "finalizers"
 }
 

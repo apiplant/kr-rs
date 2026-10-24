@@ -1086,11 +1086,49 @@ impl ApiServer {
 
     fn create(&self, req: &Req, rt: &Route, q: &Query) -> R<Reply> {
         let mut o = self.parse_body(req)?;
-        self.create_value(&mut o, rt, q).map(|v| Reply::Json(201, json::to_string(&v)))
+        self.create_value(&mut o, rt, q, req, None).map(|v| Reply::Json(201, json::to_string(&v)))
     }
 
-    fn create_value(&self, o: &mut Value, rt: &Route, q: &Query) -> R<Value> {
+    /// The field manager of a write: `fieldManager`, else the User-Agent's program name.
+    fn manager(&self, req: &Req, q: &Query) -> String {
+        if let Some(m) = q.get("fieldManager").filter(|m| !m.is_empty()) {
+            return m.to_string();
+        }
+        let ua = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")).map(|(_, v)| v.as_str()).unwrap_or("");
+        let n = ua.split('/').next().unwrap_or("").trim();
+        if n.is_empty() { "unknown".to_string() } else { n.to_string() }
+    }
+
+    /// Runs `f` with the list-kind lookup for `rt` (CRD schema, or the built-in tables).
+    fn with_lists<T>(&self, rt: &Route, f: impl FnOnce(crate::ssa::Lists) -> T) -> T {
+        let custom = self.custom.borrow();
+        match custom.iter().find(|c| core::ptr::eq(c.res, rt.res)) {
+            Some(c) => match &c.schema {
+                Some(s) => f(&|p| crate::ssa::schema_lists(s, p)),
+                None => f(&|_| crate::ssa::ListKind::Atomic),
+            },
+            None => f(&crate::ssa::builtin_lists),
+        }
+    }
+
+    fn ssa_scope(&self, rt: &Route, status: bool) -> crate::ssa::Scope {
+        if status {
+            crate::ssa::Scope::StatusOnly
+        } else if rt.res.subresources.contains(&"status") {
+            crate::ssa::Scope::NoStatus
+        } else {
+            crate::ssa::Scope::All
+        }
+    }
+
+    /// `apply`: the manager of a server-side apply that creates the object.
+    fn create_value(&self, o: &mut Value, rt: &Route, q: &Query, req: &Req, apply: Option<&str>) -> R<Value> {
         self.fv_builtin(rt, o, None)?;
+        if let Some(mf) = o.pointer(&["metadata", "managedFields"]) {
+            crate::ssa::validate_client(mf).map_err(ApiError::invalid)?;
+        }
+        let scope = self.ssa_scope(rt, false);
+        let applied = apply.map(|_| self.with_lists(rt, |l| crate::ssa::applied_fields(o, l, scope)));
         let (gv, mut t) = self.target(rt);
         t.api_version = &gv;
         let rev = self.store.borrow().revision() + 1;
@@ -1126,6 +1164,18 @@ impl ApiServer {
             crate::quota::validate(o).map_err(ApiError::invalid)?;
         }
         self.admit_quota(rt, o, None)?;
+        {
+            use crate::ssa;
+            let (now_s, mut entries) = (object::rfc3339((self.now)()), Vec::new());
+            match (apply, applied) {
+                (Some(m), Some(fields)) => entries.push(ssa::Entry { manager: m.to_string(), apply: true, api_version: gv.clone(), time: now_s, subresource: String::new(), fields }),
+                _ => {
+                    let changed = self.with_lists(rt, |l| ssa::fields(o, None, l, scope));
+                    ssa::record_update(&mut entries, &changed, &self.manager(req, q), "", &gv, &now_s);
+                }
+            }
+            ssa::store(o, entries);
+        }
         if q.get("dryRun") == Some("All") {
             return Ok(o.clone());
         }
@@ -1146,6 +1196,13 @@ impl ApiServer {
 
     /// PUT, or the final step of PATCH (`patched` carries the already-patched object).
     fn update(&self, req: &Req, rt: &Route, name: &str, status: bool, q: &Query, patched: Option<(Kv, Value, Value)>) -> R<Reply> {
+        self.update_ex(req, rt, name, status, q, patched, "", None)
+    }
+
+    /// `sub`: subresource recorded in managedFields besides `status`; `apply`: the managedFields
+    /// computed by a server-side apply.
+    #[allow(clippy::too_many_arguments)]
+    fn update_ex(&self, req: &Req, rt: &Route, name: &str, status: bool, q: &Query, patched: Option<(Kv, Value, Value)>, sub: &str, apply: Option<Vec<crate::ssa::Entry>>) -> R<Reply> {
         let (kv, old, mut new) = match patched {
             Some(p) => p,
             None => {
@@ -1158,6 +1215,17 @@ impl ApiServer {
         t.api_version = &gv;
         let rev = self.store.borrow().revision() + 1;
         self.fv_builtin(rt, &new, Some(&old))?;
+        // Client-sent managedFields are ignored, except the `[]` / `[{}]` reset.
+        let old_mf = old.pointer(&["metadata", "managedFields"]).cloned();
+        let mut reset = false;
+        if apply.is_none() {
+            if let Some(mf) = new.pointer(&["metadata", "managedFields"]) {
+                if old_mf.as_ref() != Some(mf) {
+                    crate::ssa::validate_client(mf).map_err(ApiError::invalid)?;
+                    reset = crate::ssa::is_reset(mf);
+                }
+            }
+        }
         let has_status = rt.res.subresources.contains(&"status");
         object::prepare_update(&old, &mut new, &t, rev, has_status, status)?;
         if !status {
@@ -1177,6 +1245,20 @@ impl ApiServer {
         // nodeports/loadbalancers, a PVC may grow); pods fix their resources at create.
         if matches!(rt.res.plural, "services" | "persistentvolumeclaims") && !status {
             self.admit_quota(rt, &new, Some(&old))?;
+        }
+        {
+            use crate::ssa;
+            let entries = match apply {
+                Some(e) => e,
+                None => {
+                    let scope = self.ssa_scope(rt, status);
+                    let mut e = if reset { Vec::new() } else { ssa::parse_entries(old_mf.as_ref()) };
+                    let changed = self.with_lists(rt, |l| ssa::fields(&new, if reset { None } else { Some(&old) }, l, scope));
+                    ssa::record_update(&mut e, &changed, &self.manager(req, q), if status { "status" } else { sub }, &gv, &object::rfc3339((self.now)()));
+                    e
+                }
+            };
+            ssa::store(&mut new, entries);
         }
         if q.get("dryRun") == Some("All") {
             return Ok(Reply::ok(&new));
@@ -1202,17 +1284,39 @@ impl ApiServer {
         let ct = req.content_type.unwrap_or("");
         let p = self.parse_body(req)?;
         let existing = self.get_value(rt, name);
-        if ct.starts_with("application/apply-patch") {
-            // Server-side apply, simplified: create if absent, otherwise strategic-merge the
-            // applied configuration (no managedFields/field ownership; KNOWN_ISSUES).
-            if let Err(e) = &existing {
-                if e.code == 404 {
-                    let mut o = p;
-                    return self.create_value(&mut o, rt, q).map(|v| Reply::Json(201, json::to_string(&v)));
-                }
+        let is_apply = ct.starts_with("application/apply-patch");
+        let manager = q.get("fieldManager").filter(|m| !m.is_empty());
+        if is_apply {
+            if manager.is_none() {
+                return Err(ApiError::bad_request("PatchOptions.meta.k8s.io \"\" is invalid: fieldManager: Required value: is required for apply patch"));
+            }
+            if p.pointer(&["metadata", "managedFields"]).is_some_and(|m| !m.is_null()) {
+                return Err(ApiError::bad_request("metadata.managedFields must be nil"));
             }
         }
-        let (kv, old) = existing?;
+        let (kv, old) = match existing {
+            Err(e) if is_apply && e.code == 404 => {
+                let mut o = p;
+                return self.create_value(&mut o, rt, q, req, manager).map(|v| Reply::Json(201, json::to_string(&v)));
+            }
+            other => other?,
+        };
+        if let (true, Some(mgr)) = (is_apply, manager) {
+            // Server-side apply: the body is the manager's full intent.
+            let scope = self.ssa_scope(rt, status);
+            let entries = crate::ssa::parse_entries(old.pointer(&["metadata", "managedFields"]));
+            let gv = rt.res.group_version();
+            let now_s = object::rfc3339((self.now)());
+            let force = q.get("force") == Some("true");
+            let res = self.with_lists(rt, |l| crate::ssa::apply(&old, &p, entries, mgr, force, &gv, &now_s, l, scope)).map_err(|m| ApiError::new(409, "Conflict", m))?;
+            let mut new = res.object;
+            if p.pointer(&["metadata", "resourceVersion"]).is_none() {
+                if let Some(m) = new.get_mut("metadata") {
+                    m.remove("resourceVersion");
+                }
+            }
+            return self.update_ex(req, rt, name, status, q, Some((kv, old, new)), "", Some(res.entries));
+        }
         let custom = self.custom.borrow().iter().any(|c| core::ptr::eq(c.res, rt.res));
         if custom && ct.starts_with("application/strategic-merge-patch+json") {
             return Err(ApiError::new(415, "UnsupportedMediaType", "the body of the request was in an unknown format - accepted media types include: application/json-patch+json, application/merge-patch+json, application/apply-patch+yaml"));
@@ -1223,10 +1327,7 @@ impl ApiServer {
         } else if ct.starts_with("application/merge-patch+json") {
             patch::merge_patch(&mut new, &p);
             Ok(())
-        } else if custom && ct.starts_with("application/apply-patch") {
-            patch::merge_patch(&mut new, &p);
-            Ok(())
-        } else if ct.starts_with("application/strategic-merge-patch+json") || ct.starts_with("application/apply-patch") {
+        } else if ct.starts_with("application/strategic-merge-patch+json") {
             patch::strategic_merge(&mut new, &p)
         } else {
             return Err(ApiError::new(415, "UnsupportedMediaType", alloc::format!("unsupported patch type {ct:?}")));
@@ -1835,7 +1936,7 @@ impl ApiServer {
             m.remove("resourceVersion");
         }
         let q = Query::parse(req.query)?;
-        match self.update(req, rt, name, false, &q, Some((kv, old, new)))? {
+        match self.update_ex(req, rt, name, false, &q, Some((kv, old, new)), "scale", None)? {
             Reply::Json(200, s) => {
                 let v = json::parse(s.as_bytes()).unwrap_or(Value::Null);
                 Ok(Reply::ok(&self.scale_of(rt, &v)))

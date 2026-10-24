@@ -371,7 +371,7 @@ fn watch_events_carry_the_requested_version() {
     };
     let q = "watch=true&resourceVersion=0";
     let v2 = lines("/apis/example.com/v2/namespaces/default/widgets", q);
-    assert!(v2.contains(r#""apiVersion":"example.com/v2""#) && !v2.contains("example.com/v1"), "{v2}");
+    assert!(v2.contains(r#""object":{"apiVersion":"example.com/v2""#), "{v2}");
     let v1 = lines("/apis/example.com/v1/namespaces/default/widgets", q);
     assert!(v1.contains(r#""apiVersion":"example.com/v1""#), "{v1}");
 }
