@@ -1,4 +1,7 @@
-//! `kr agent --server https://<host>:6443 --token K10<ca-sha256>::<id>.<secret>`
+//! `kr agent --server https://<host>:6443 --token-file FILE` (or `KR_TOKEN=K10<ca-sha256>::<id>.<secret>`)
+//!
+//! The token is needed only for the first join. `--token VALUE` also works but leaves the
+//! secret readable by every local user in /proc/<pid>/cmdline, so it prints a warning.
 //!
 //! Joins a cluster: fetches the CA over TLS pinned to the hash in the token, exchanges the
 //! bootstrap token for node certificates (`POST /kr/join`), then runs the kubelet, service
@@ -153,15 +156,30 @@ async fn renew(remote: &Remote, pki_dir: &str, name: &str, ip: [u8; 4]) -> Resul
     remote.set_client_cert(chain, key).map_err(|e| e.message)
 }
 
+/// Reads the join token from a file that only its owner can read.
+fn read_token_file(path: &str) -> Result<String, String> {
+    let c = format!("{path}\0");
+    let st = fs::newfstatat(fs::AT_FDCWD, c.as_bytes(), 0).map_err(|e| format!("token file {path}: errno {}", e.0))?;
+    if st.mode & 0o077 != 0 {
+        return Err(format!("token file {path} is accessible by other users (mode {:o}); chmod 600 it", st.mode & 0o777));
+    }
+    let b = fs::read_file(c.as_bytes(), 4096).map_err(|e| format!("token file {path}: errno {}", e.0))?;
+    String::from_utf8(b).map(|t| String::from(t.trim())).map_err(|_| format!("token file {path} is not UTF-8"))
+}
+
 pub fn main(mut args: Args) -> i32 {
-    let (mut server, mut token, mut data) = (None, None, None);
+    let (mut server, mut token, mut token_file, mut data) = (None, None, None, None);
     while let Some(a) = args.next() {
         let v = args.next().and_then(|v| core::str::from_utf8(v).ok()).map(String::from);
         match (a, v) {
             (b"--server", Some(v)) => server = Some(v),
-            (b"--token", Some(v)) => token = Some(v),
+            (b"--token", Some(v)) => {
+                eprint(b"kr agent: warning: --token exposes the join token to local users via the process list; use --token-file or KR_TOKEN\n");
+                token = Some(v)
+            }
+            (b"--token-file", Some(v)) => token_file = Some(v),
             (b"--data", Some(v)) => data = Some(v),
-            _ => return fail("usage: kr agent --server https://HOST:6443 --token TOKEN [--data DIR]"),
+            _ => return fail("usage: kr agent --server https://HOST:6443 [--token-file FILE | --token TOKEN] [--data DIR]   (or KR_TOKEN in the environment)"),
         }
     }
     let Some(server) = server.map(|s| String::from(s.trim_end_matches('/'))) else { return fail("--server is required") };
@@ -173,7 +191,17 @@ pub fn main(mut args: Args) -> i32 {
     let ip = kr_apiserver::object::parse_ipv4(host).and_then(|a| ns::route_source(a).ok()).or_else(|| ns::route_source([1, 1, 1, 1]).ok()).unwrap_or([127, 0, 0, 1]);
     let joined = ns::open(&pki::path(&pki_dir, "node.pem"), ns::O_RDONLY, 0).is_ok();
     if !joined {
-        let Some(token) = token else { return fail("--token is required for the first join") };
+        let token = match (token, token_file) {
+            (Some(t), _) => t,
+            (None, Some(f)) => match read_token_file(&f) {
+                Ok(t) => t,
+                Err(e) => return fail(&e),
+            },
+            (None, None) => match kr_runtime::store::env_var("KR_TOKEN").filter(|t| !t.trim().is_empty()) {
+                Some(t) => t,
+                None => return fail("a join token is required for the first join (--token-file FILE or KR_TOKEN)"),
+            },
+        };
         let (sv, pd, nm) = (server.clone(), pki_dir.clone(), name.clone());
         if let Err(e) = kr_rt::exec::block_on(async move { join(&sv, &token, &pd, &nm, ip).await }) {
             return fail(&e);
