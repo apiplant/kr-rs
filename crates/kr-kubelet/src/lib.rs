@@ -246,7 +246,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         match net {
             Some(net) => {
                 let net = Rc::new(net);
-                kr_rt::exec::spawn(proxy::Proxy::new(self.c.clone(), net.clone()).run());
+                kr_rt::exec::spawn(proxy::Proxy::new(self.c.clone(), net.clone(), self.cfg.node_name.clone()).run());
                 kr_rt::exec::spawn(dns::run(self.c.clone(), net));
             }
             None => kr_rt::eprint(b"kubelet: no node network; Services are not proxied\n"),

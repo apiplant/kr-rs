@@ -199,10 +199,38 @@ pub fn selector_matches(pod: &Value, node: &Value) -> bool {
     sel.iter().all(|(k, v)| node.pointer(&["metadata", "labels", k]).and_then(Value::as_str) == v.as_str())
 }
 
+/// (hostIP, protocol, hostPort) of every container port that asks for a host port.
+fn host_ports(pod: &Value) -> Vec<(String, String, u64)> {
+    let mut out = Vec::new();
+    for c in pod.pointer(&["spec", "containers"]).and_then(Value::as_array).unwrap_or(&[]) {
+        for p in c.get("ports").and_then(Value::as_array).unwrap_or(&[]) {
+            let hp = p.get("hostPort").and_then(Value::as_u64).unwrap_or(0);
+            if hp > 0 {
+                let ip = match str_at(p, &["hostIP"]) {
+                    "" => "0.0.0.0",
+                    s => s,
+                };
+                let proto = match str_at(p, &["protocol"]) {
+                    "" => "TCP",
+                    s => s,
+                };
+                out.push((ip.to_string(), proto.to_string(), hp));
+            }
+        }
+    }
+    out
+}
+
+/// NodePorts filter: same port and protocol, and equal or wildcard hostIPs.
+fn port_conflict(pod: &Value, other: &Value) -> bool {
+    let theirs = host_ports(other);
+    host_ports(pod).iter().any(|(ip, pr, port)| theirs.iter().any(|(i2, p2, o)| o == port && p2 == pr && (ip == i2 || ip == "0.0.0.0" || i2 == "0.0.0.0")))
+}
+
 /// Chooses a node name, or explains (`0/N nodes are available: ...`) why none fits.
 fn pick(pod: &Value, nodes: &[Value], all_pods: &[Value]) -> core::result::Result<String, String> {
     let want = requests(pod);
-    let (mut not_ready, mut taint, mut selector, mut cpu, mut mem, mut count) = (0, 0, 0, 0, 0, 0);
+    let (mut not_ready, mut taint, mut selector, mut cpu, mut mem, mut count, mut ports) = (0, 0, 0, 0, 0, 0, 0);
     let mut best: Option<(i128, usize, &str)> = None; // (score, pods on node, name)
     for n in nodes {
         let nname = name(n);
@@ -216,6 +244,10 @@ fn pick(pod: &Value, nodes: &[Value], all_pods: &[Value]) -> core::result::Resul
         }
         if untolerated_taint(pod, n) {
             taint += 1;
+            continue;
+        }
+        if all_pods.iter().any(|p| str_at(p, &["spec", "nodeName"]) == nname && !pod_terminal(p) && port_conflict(pod, p)) {
+            ports += 1;
             continue;
         }
         let mut used = Res::default();
@@ -264,6 +296,7 @@ fn pick(pod: &Value, nodes: &[Value], all_pods: &[Value]) -> core::result::Resul
         (cpu, "Insufficient cpu"),
         (mem, "Insufficient memory"),
         (count, "Too many pods"),
+        (ports, "node(s) didn't have free ports for the requested pod ports"),
     ] {
         if n > 0 {
             reasons.push(alloc::format!("{n} {what}"));
@@ -302,5 +335,15 @@ mod tests {
         assert_eq!(pick(&pod, &nodes, &[busy]).unwrap(), "b"); // a is busier; b and c tie, name wins
         let big = v(r#"{"spec":{"containers":[{"resources":{"requests":{"cpu":"5"}}}]}}"#);
         assert!(pick(&big, &nodes, &[]).unwrap_err().contains("Insufficient cpu"));
+    }
+
+    #[test]
+    fn node_ports_filter() {
+        let pp = |ip: &str, proto: &str| v(&alloc::format!(r#"{{"spec":{{"nodeName":"a","containers":[{{"ports":[{{"hostPort":80,"hostIP":"{ip}","protocol":"{proto}"}}]}}]}}}}"#));
+        assert!(!port_conflict(&pp("10.0.0.1", "TCP"), &pp("10.0.0.2", "TCP")));
+        assert!(!port_conflict(&pp("10.0.0.1", "TCP"), &pp("10.0.0.1", "UDP")));
+        assert!(port_conflict(&pp("10.0.0.1", "TCP"), &pp("10.0.0.1", "TCP")));
+        assert!(port_conflict(&pp("", "TCP"), &pp("10.0.0.2", "TCP")));
+        assert!(!port_conflict(&v(r#"{"spec":{"containers":[{"ports":[{"containerPort":80}]}]}}"#), &pp("", "TCP")));
     }
 }

@@ -14,6 +14,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use kr_apiserver::client::Client;
@@ -192,6 +193,7 @@ struct Listener {
 pub struct Proxy<C: Client> {
     c: C,
     net: Rc<NodeNet>,
+    node: String,
     listeners: RefCell<BTreeMap<Key, Listener>>,
 }
 
@@ -200,8 +202,8 @@ fn ip4(s: &str) -> Option<[u8; 4]> {
 }
 
 impl<C: Client + Clone + 'static> Proxy<C> {
-    pub fn new(c: C, net: Rc<NodeNet>) -> Rc<Self> {
-        Rc::new(Proxy { c, net, listeners: RefCell::new(BTreeMap::new()) })
+    pub fn new(c: C, net: Rc<NodeNet>, node: String) -> Rc<Self> {
+        Rc::new(Proxy { c, net, node, listeners: RefCell::new(BTreeMap::new()) })
     }
 
     pub async fn run(self: Rc<Self>) {
@@ -255,6 +257,9 @@ impl<C: Client + Clone + 'static> Proxy<C> {
                 }
             }
         }
+        let q = alloc::format!("fieldSelector=spec.nodeName%3D{}", self.node);
+        let Ok(pods) = self.c.list("/api/v1/pods", &q).await else { return };
+        host_port_listeners(pods.get("items").and_then(Value::as_array).unwrap_or(&empty), &mut desired);
         let mut cur = self.listeners.borrow_mut();
         cur.retain(|k, _| desired.contains_key(k)); // dropping a Listener aborts its task
         for (k, b) in desired {
@@ -274,6 +279,31 @@ impl<C: Client + Clone + 'static> Proxy<C> {
                 kr_rt::exec::spawn(udp_loop(sock, backends.clone(), self.net.clone()))
             };
             cur.insert(k, Listener { backends, _task: task });
+        }
+    }
+}
+
+/// One listener per running pod container hostPort, backed by podIP:containerPort.
+fn host_port_listeners(pods: &[Value], desired: &mut BTreeMap<Key, Backends>) {
+    for p in pods {
+        if p.pointer(&["status", "phase"]).and_then(Value::as_str) != Some("Running") || p.pointer(&["metadata", "deletionTimestamp"]).is_some() {
+            continue;
+        }
+        let Some(pip) = p.pointer(&["status", "podIP"]).and_then(Value::as_str).and_then(ip4) else { continue };
+        for c in p.pointer(&["spec", "containers"]).and_then(Value::as_array).unwrap_or(&[]) {
+            for pt in c.get("ports").and_then(Value::as_array).unwrap_or(&[]) {
+                let (Some(hp), Some(cp)) = (pt.get("hostPort").and_then(Value::as_u64), pt.get("containerPort").and_then(Value::as_u64)) else { continue };
+                if hp == 0 {
+                    continue;
+                }
+                let proto = match pt.get("protocol").and_then(Value::as_str) {
+                    Some("UDP") => UDP,
+                    Some("TCP") | None => TCP,
+                    _ => continue,
+                };
+                let ip = pt.get("hostIP").and_then(Value::as_str).and_then(ip4).unwrap_or([0; 4]);
+                desired.insert(Key { proto, ip, port: hp as u16, host: true }, Backends { eps: alloc::vec![(pip, cp as u16)], rr: Cell::new(0), affinity: false });
+            }
         }
     }
 }
@@ -391,5 +421,21 @@ async fn udp_loop(listener: Async<Fd>, backends: Rc<RefCell<Backends>>, net: Rc<
 impl Drop for UdpSession {
     fn drop(&mut self) {
         self._task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn host_ports_desired() {
+        let pod = |ip: &str, proto: &str, phase: &str| kr_fmt::json::parse_str(&alloc::format!(r#"{{"status":{{"phase":"{phase}","podIP":"10.1.0.5"}},"spec":{{"containers":[{{"ports":[{{"containerPort":8080,"hostPort":9090,"hostIP":"{ip}","protocol":"{proto}"}},{{"containerPort":1}}]}}]}}}}"#)).unwrap();
+        let pods = [pod("", "TCP", "Running"), pod("127.0.0.1", "TCP", "Running"), pod("", "UDP", "Running"), pod("", "TCP", "Pending")];
+        let mut d = BTreeMap::new();
+        host_port_listeners(&pods, &mut d);
+        assert_eq!(d.len(), 3);
+        let b = &d[&Key { proto: UDP, ip: [0; 4], port: 9090, host: true }];
+        assert_eq!(b.eps, alloc::vec![([10, 1, 0, 5], 8080)]);
+        assert!(d.contains_key(&Key { proto: TCP, ip: [127, 0, 0, 1], port: 9090, host: true }));
     }
 }
