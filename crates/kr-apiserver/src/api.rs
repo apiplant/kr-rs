@@ -62,6 +62,18 @@ pub enum Reply {
 }
 
 impl Reply {
+    fn aggregated_discovery(req: &Req, extra: &[&'static Resource], core: bool) -> Reply {
+        use kr_net::http1::server::Response;
+        if discovery::negotiate(req.accept) == discovery::Negotiated::NotAcceptable {
+            return Reply::Http(Response::new(406, Vec::new()));
+        }
+        let body = discovery::aggregated(extra, core);
+        let tag = discovery::etag(&body);
+        let matched = req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("if-none-match") && v.split(',').any(|t| t.trim() == tag || t.trim() == "*"));
+        let resp = if matched { Response::new(304, Vec::new()) } else { Response::new(200, body.into_bytes()) };
+        Reply::Http(resp.with_header("Content-Type", discovery::agg_content_type()).with_header("ETag", &tag))
+    }
+
     fn err(e: ApiError) -> Reply {
         Reply::Json(e.code, e.to_status_json())
     }
@@ -623,6 +635,7 @@ impl ApiServer {
                 return self.sa.borrow().as_ref().map(|(s, _)| Reply::Json(200, s.jwks())).ok_or_else(|| ApiError::not_found("jwks", "jwks"));
             }
             ["apis", "authorization.k8s.io", "v1", "selfsubjectaccessreviews"] if req.method == "POST" => return self.self_subject_access_review(req, &user),
+            ["api"] | ["apis"] if req.method == "GET" && discovery::negotiate(req.accept) != discovery::Negotiated::Legacy => return Ok(Reply::aggregated_discovery(req, &extra, segs.len() == 1 && segs[0] == "api")),
             ["api"] => return Ok(Reply::Json(200, discovery::core_versions(&self.server_address))),
             ["api", "v1"] => return Ok(Reply::Json(200, discovery::resource_list(&extra, "", "v1").unwrap())),
             ["apis"] => return Ok(Reply::Json(200, discovery::group_list(&extra))),
