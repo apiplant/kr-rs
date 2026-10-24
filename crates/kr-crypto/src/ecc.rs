@@ -106,12 +106,30 @@ impl<const N: usize> Curve<N> {
     }
 
     /// k * pt, constant-time in k (k is a plain integer, any N-limb value).
+    ///
+    /// Fixed 4-bit window: a table of 0..15 * pt, then per nibble four doublings and one
+    /// addition of the entry chosen by a full masked scan of the table (no secret-dependent
+    /// index or branch). 256 doublings + 64 additions for P-256 instead of 256 + 256.
     pub fn mul(&self, pt: &Point<N>, k: &Uint<N>) -> Point<N> {
+        let mut tbl = [self.identity(); 16];
+        tbl[1] = *pt;
+        for i in 2..16 {
+            tbl[i] = self.add(&tbl[i - 1], pt);
+        }
         let mut r = self.identity();
-        for i in (0..64 * N).rev() {
-            r = self.add(&r, &r);
-            let t = self.add(&r, pt);
-            r = Self::select(&r, &t, k.bit(i));
+        for w in (0..16 * N).rev() {
+            for _ in 0..4 {
+                r = self.add(&r, &r);
+            }
+            let nib = (k.bit(4 * w) | k.bit(4 * w + 1) << 1 | k.bit(4 * w + 2) << 2 | k.bit(4 * w + 3) << 3) as u64;
+            let mut sel = tbl[0];
+            for (i, e) in tbl.iter().enumerate() {
+                let d = nib ^ i as u64;
+                // 1 iff d == 0, without branching.
+                let eq = ((d | d.wrapping_neg()) >> 63) ^ 1;
+                sel = Self::select(&sel, e, eq);
+            }
+            r = self.add(&r, &sel);
         }
         r
     }
