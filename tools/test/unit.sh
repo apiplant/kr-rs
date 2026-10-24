@@ -5,7 +5,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 crates=("$@")
-[ ${#crates[@]} -eq 0 ] && crates=(kr-sys kr-rt kr-fmt kr-archive kr-crypto kr-store kr-net kr-runtime kr-apiserver kr-controllers kr-kubelet)
+[ ${#crates[@]} -eq 0 ] && crates=(kr-sys kr-rt kr-fmt kr-archive kr-crypto kr-store kr-raft kr-net kr-runtime kr-apiserver kr-controllers kr-kubelet)
 fail=0
 for c in "${crates[@]}"; do
   out=$(/usr/bin/timeout 900 cargo test -q -p "$c" 2>&1); rc=$?

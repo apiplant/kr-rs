@@ -80,6 +80,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-raft"
+version = "0.0.1"
+dependencies = [
+ "kr-rt",
+]
+
+[[package]]
 name = "kr-rt"
 version = "0.0.1"
 dependencies = [
