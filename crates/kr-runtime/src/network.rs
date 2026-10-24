@@ -185,9 +185,64 @@ pub fn allocate_in(dir: &[u8], owner: &[u8], pn: &PodNet) -> Result<Lease, Errno
     Err(Errno(28)) // ENOSPC: subnet exhausted
 }
 
+/// Garbage-collects leases whose owner (the id recorded in the file) fails `keep`, e.g. leases
+/// of sandboxes that died with a SIGKILLed kr. Returns how many were removed. Non-lease names
+/// (anything not a dotted quad) are left alone.
+pub fn gc(dir: &[u8], keep: impl Fn(&[u8]) -> bool) -> usize {
+    let mut d = dir.to_vec();
+    d.push(0);
+    let Ok(fd) = ns::open(&d, ns::O_RDONLY | ns::O_DIRECTORY, 0) else { return 0 };
+    let names: Vec<Vec<u8>> = kr_sys::fs::read_dir(&fd).filter_map(Result::ok).map(|e| e.name).filter(|n| !n.is_empty() && n.iter().all(|b| b.is_ascii_digit() || *b == b'.')).collect();
+    let mut removed = 0;
+    for name in names {
+        let mut path = dir.to_vec();
+        path.push(b'/');
+        path.extend_from_slice(&name);
+        path.push(0);
+        let Ok(f) = ns::open(&path, ns::O_RDONLY, 0) else { continue };
+        let mut buf = [0u8; 256];
+        let n = kr_sys::read(f.raw(), &mut buf).unwrap_or(0);
+        if !keep(&buf[..n]) && kr_sys::fs::unlinkat(ns::AT_FDCWD, &path, 0).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gc_removes_only_stale_leases() {
+        let mut dir = b"/tmp/kr-ipam-gc-test-".to_vec();
+        dir.extend_from_slice(&dec_pid());
+        let mut c = dir.clone();
+        c.push(0);
+        let _ = ns::mkdir(&c, 0o700);
+        let pn = PodNet::default();
+        let a = allocate_in(&dir, b"live-pod", &pn).unwrap();
+        let b = allocate_in(&dir, b"dead-pod", &pn).unwrap();
+        let c2 = allocate_in(&dir, b"dead-pod-2", &pn).unwrap();
+        assert_eq!(gc(&dir, |o| o == b"live-pod"), 2);
+        // The freed addresses are reusable; the live one is not handed out again.
+        let again = allocate_in(&dir, b"new", &pn).unwrap();
+        assert_eq!(again.ip, b.ip);
+        assert_ne!(again.ip, a.ip);
+        assert_eq!(gc(&dir, |_| false), 2);
+        let _ = (c2, a);
+        let _ = ns::rmdir(&c);
+    }
+
+    fn dec_pid() -> Vec<u8> {
+        let mut v = Vec::new();
+        let mut n = kr_sys::fs::getpid();
+        while n > 0 {
+            v.insert(0, b'0' + (n % 10) as u8);
+            n /= 10;
+        }
+        v
+    }
 
     #[test]
     fn ifname_fits_and_is_stable() {
