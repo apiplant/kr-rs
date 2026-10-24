@@ -286,7 +286,10 @@ impl<C: Client + Clone + 'static> Proxy<C> {
 /// One listener per running pod container hostPort, backed by podIP:containerPort.
 fn host_port_listeners(pods: &[Value], desired: &mut BTreeMap<Key, Backends>) {
     for p in pods {
-        if p.pointer(&["status", "phase"]).and_then(Value::as_str) != Some("Running") || p.pointer(&["metadata", "deletionTimestamp"]).is_some() {
+        if p.pointer(&["status", "phase"]).and_then(Value::as_str) != Some("Running") || p.pointer(&["metadata", "deletionTimestamp"]).is_some()
+            // hostNetwork pods already listen on the host themselves.
+            || p.pointer(&["spec", "hostNetwork"]).and_then(Value::as_bool) == Some(true)
+        {
             continue;
         }
         let Some(pip) = p.pointer(&["status", "podIP"]).and_then(Value::as_str).and_then(ip4) else { continue };
