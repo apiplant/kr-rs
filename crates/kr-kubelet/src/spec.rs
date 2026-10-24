@@ -368,6 +368,39 @@ fn publish(dir: &str, stage_name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Secret names from an `imagePullSecrets` list (`[{"name": ...}]`).
+pub fn pull_secret_names_of(list: Option<&Value>) -> Vec<String> {
+    list.and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(|s| s.get("name").and_then(Value::as_str)).map(String::from).collect()
+}
+
+/// `spec.imagePullSecrets` of a pod.
+pub fn pull_secret_names(pod: &Value) -> Vec<String> {
+    pull_secret_names_of(pod.pointer(&["spec", "imagePullSecrets"]))
+}
+
+/// Identity of an image pull: the image plus who pulls it (namespace, ServiceAccount, pull
+/// secrets), so pulls for pods with different credentials neither share nor poison each other.
+pub fn pull_key(pod: &Value, image: &str) -> String {
+    let sa = pod.pointer(&["spec", "serviceAccountName"]).and_then(Value::as_str).unwrap_or("default");
+    alloc::format!("{image}\0{}/{sa}/{}", meta(pod, "namespace"), pull_secret_names(pod).join(","))
+}
+
+#[cfg(test)]
+mod pull_key_tests {
+    use super::*;
+
+    #[test]
+    fn pull_key_separates_credential_identities() {
+        let p = |s: &str| kr_fmt::json::parse(s.as_bytes()).unwrap();
+        let a = p(r#"{"metadata":{"namespace":"n"},"spec":{"imagePullSecrets":[{"name":"s1"},{"name":"s2"}]}}"#);
+        let b = p(r#"{"metadata":{"namespace":"n"},"spec":{}}"#);
+        assert_eq!(pull_secret_names(&a), ["s1", "s2"]);
+        assert_ne!(pull_key(&a, "img"), pull_key(&b, "img"));
+        assert_eq!(pull_key(&b, "img"), pull_key(&b, "img"));
+        assert_ne!(pull_key(&b, "img"), pull_key(&b, "img2"));
+    }
+}
+
 /// Requests a pod-bound ServiceAccount token (TokenRequest API).
 async fn request_token<C: Client>(c: &C, pod: &Value, src: &Value) -> Result<String, String> {
     let ns = meta(pod, "namespace");

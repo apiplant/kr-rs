@@ -587,3 +587,22 @@ fn real_registry_busybox_roundtrip() {
     }
     eprintln!("pulled {} layer(s), {} bytes", layers.len(), layers.iter().map(|l| l.1).sum::<usize>());
 }
+
+#[test]
+fn idle_connections_are_dropped_after_the_idle_timeout() {
+    let srv = start(|_, _| Act::Send(resp("200 OK", &[], b"hi")));
+    let port = srv.port;
+    run(async move {
+        let cfg = Config { idle_timeout_ms: 80, ..Config::default() };
+        let c = Client::with_connector(kr_net::http1::TcpConnector::default(), cfg);
+        for sleep in [0, 0, 200, 0] {
+            let mut r = c.get(&format!("http://127.0.0.1:{port}/"), &[]).await.unwrap();
+            assert_eq!(r.read_to_end(10).await.unwrap(), b"hi");
+            drop(r);
+            kr_rt::exec::sleep(sleep).await;
+        }
+    });
+    // requests 1 and 2 share a connection; the 200ms idle gap forces a new one for request 3;
+    // request 4 reuses that.
+    assert_eq!(srv.conns.load(Ordering::SeqCst), 2);
+}

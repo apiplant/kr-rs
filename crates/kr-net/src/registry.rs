@@ -438,8 +438,32 @@ pub struct RawManifest {
     pub body: Vec<u8>,
 }
 
+/// Registry credentials. Never printed: `Debug` redacts every field.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct Credential {
+    pub username: String,
+    pub password: String,
+    /// Docker `identitytoken`: an OAuth2 refresh token exchanged at the token endpoint.
+    pub identity_token: Option<String>,
+}
+
+impl core::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Credential(<redacted>)")
+    }
+}
+
+impl Credential {
+    fn basic_header(&self) -> String {
+        format!("Basic {}", kr_fmt::base64::encode(format!("{}:{}", self.username, self.password).as_bytes()))
+    }
+}
+
 pub struct Registry<C: Connector = TcpConnector> {
     http: Client<C>,
+    cred: Option<Credential>,
+    /// `Authorization` value once the registry itself asked for Basic auth.
+    basic: Option<String>,
     /// Bearer tokens keyed by `registry/repository`.
     tokens: Vec<(String, String)>,
     plain_http: Vec<String>,
@@ -471,7 +495,14 @@ fn is_loopback_host(hostport: &str) -> bool {
 
 impl<C: Connector> Registry<C> {
     pub fn with_client(http: Client<C>) -> Self {
-        Registry { http, tokens: Vec::new(), plain_http: Vec::new(), tls_loopback: false, os: "linux".to_string(), arch: target_arch().to_string() }
+        Registry { http, cred: None, basic: None, tokens: Vec::new(), plain_http: Vec::new(), tls_loopback: false, os: "linux".to_string(), arch: target_arch().to_string() }
+    }
+
+    /// Credentials for this registry: sent only as Basic auth to the registry or its token
+    /// endpoint, never on anonymous requests.
+    pub fn set_credential(&mut self, cred: Option<Credential>) {
+        self.cred = cred;
+        self.basic = None;
     }
 
     /// Uses https for loopback registries too (e.g. a local registry with its own CA).
@@ -497,9 +528,6 @@ impl<C: Connector> Registry<C> {
 
     async fn fetch_token(&mut self, r: &Reference, challenge: Option<String>) -> Result<String> {
         let ch = parse_challenge(&challenge.ok_or(Error::Auth("401 without WWW-Authenticate"))?)?;
-        if !ch.scheme.eq_ignore_ascii_case("bearer") {
-            return Err(Error::Auth("only Bearer authentication is supported"));
-        }
         let realm = ch.param("realm").ok_or(Error::Auth("challenge without realm"))?;
         let mut url = realm.to_string();
         url.push(if realm.contains('?') { '&' } else { '?' });
@@ -517,10 +545,31 @@ impl<C: Connector> Registry<C> {
             Some(sc) => pct_encode(sc, &mut url),
             None => pct_encode(&format!("repository:{}:pull", r.repository), &mut url),
         }
-        // Anonymous: no credentials are ever sent.
-        let mut resp = self.http.get(&url, &[("Accept", "application/json")]).await?;
+        let mut resp = match &self.cred {
+            Some(c) if c.identity_token.is_some() => {
+                // OAuth2 refresh-token grant (POST), as docker does for identity tokens.
+                let mut form = String::from("grant_type=refresh_token&client_id=kr&refresh_token=");
+                pct_encode(c.identity_token.as_deref().unwrap_or(""), &mut form);
+                if let Some(svc) = ch.param("service") {
+                    form.push_str("&service=");
+                    pct_encode(svc, &mut form);
+                }
+                form.push_str("&scope=");
+                match ch.param("scope") {
+                    Some(sc) => pct_encode(sc, &mut form),
+                    None => pct_encode(&format!("repository:{}:pull", r.repository), &mut form),
+                }
+                let hdrs = [("Accept", "application/json"), ("Content-Type", "application/x-www-form-urlencoded")];
+                self.http.request("POST", realm, &hdrs, form.as_bytes()).await?
+            }
+            Some(c) if !c.username.is_empty() => {
+                let auth = c.basic_header();
+                self.http.get(&url, &[("Accept", "application/json"), ("Authorization", &auth)]).await?
+            }
+            _ => self.http.get(&url, &[("Accept", "application/json")]).await?,
+        };
         if resp.status != 200 {
-            return Err(Error::Auth("token endpoint refused anonymous access"));
+            return Err(Error::Auth(if self.cred.is_some() { "token endpoint rejected credentials" } else { "token endpoint refused anonymous access" }));
         }
         let body = resp.read_to_end(MAX_TOKEN_BODY).await?;
         let v = json::parse(&body).map_err(|_| Error::Json("token response is not valid JSON"))?;
@@ -546,6 +595,8 @@ impl<C: Connector> Registry<C> {
             }
             if let Some(b) = &bearer {
                 hdrs.push(("Authorization", b));
+            } else if let Some(b) = &self.basic {
+                hdrs.push(("Authorization", b));
             }
             let resp = self.http.get(&url, &hdrs).await?;
             match resp.status {
@@ -553,11 +604,20 @@ impl<C: Connector> Registry<C> {
                 401 if attempt == 0 => {
                     let challenge = resp.header("www-authenticate").map(|s| s.to_string());
                     drop(resp);
+                    let ch = parse_challenge(challenge.as_deref().ok_or(Error::Auth("401 without WWW-Authenticate"))?)?;
+                    if ch.scheme.eq_ignore_ascii_case("basic") {
+                        let c = self.cred.as_ref().filter(|c| !c.username.is_empty()).ok_or(Error::Auth("registry requires credentials"))?;
+                        self.basic = Some(c.basic_header());
+                        continue;
+                    }
+                    if !ch.scheme.eq_ignore_ascii_case("bearer") {
+                        return Err(Error::Auth("unsupported authentication scheme"));
+                    }
                     let tok = self.fetch_token(r, challenge).await?;
                     self.tokens.retain(|(k, _)| *k != key);
                     self.tokens.push((key.clone(), tok));
                 }
-                401 => return Err(Error::Auth("token rejected")),
+                401 => return Err(Error::Auth(if self.basic.is_some() { "credentials rejected" } else { "token rejected" })),
                 s => return Err(Error::Status(s)),
             }
         }
@@ -735,6 +795,11 @@ mod tests {
         assert_eq!(c.param("error"), Some("invalid_token"));
         assert_eq!(c.param("error_description"), Some(r#"a "quoted, bit""#));
         assert_eq!(parse_challenge("Basic realm=\"x\"").unwrap().scheme, "Basic");
+        let b = parse_challenge(r#"Basic realm="Registry, \"main\"", charset="UTF-8""#).unwrap();
+        assert_eq!((b.param("realm"), b.param("charset")), (Some(r#"Registry, "main""#), Some("UTF-8")));
+        let c = Credential { username: "u".into(), password: "p".into(), identity_token: Some("t".into()) };
+        assert_eq!(c.basic_header(), "Basic dTpw");
+        assert_eq!(format!("{c:?}"), "Credential(<redacted>)");
         assert_eq!(parse_challenge("Bearer").unwrap().params.len(), 0);
         assert!(parse_challenge(r#"Bearer realm="x"#).is_err());
         assert!(parse_challenge("Bearer realm").is_err());
