@@ -26,8 +26,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     The single binary (server, agent, runtime, TLS/crypto, CRDs, webhooks) is ~1.8 MB on x86_64, just under the 2 MB agent budget from PLAN.md (aarch64: ~1.5 MB). Measure before adding large features; avoid `{:?}` on large types, and keep `opt-level = "z"` + LTO + strip.
 
 ## kr-crypto / TLS (ADR-020)
-58. **Constant-time behaviour is by construction, not yet measured** — *open*
-    The plan's dudect-style timing checks on x25519, P-256 signing, Ed25519 signing and the AEADs are still to do (phase 6 fuzz/timing harness).
 60. **P-256 scalar multiplication is a plain ladder (~0.8 ms sign, ~1.5 ms verify)** — *watch*
     That is fine per handshake. Fixed-base tables would speed up the apiserver when there are many clients.
 
@@ -217,6 +215,8 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     - Honours resolv.conf `nameserver`, `search`, `ndots`, `timeout` and `attempts`.
     - Spoofing defences: random ids, connected sockets and question echo checks. Name decompression is strict, with backward-only pointers.
     - No caching yet.
+58. **Constant-time behaviour is by construction, not yet measured** — *fixed* (commit: 290fc9d)
+    `crates/kr-crypto/tests/timing.rs`: dudect-style Welch t-tests on fixed vs random secrets (run in release, `-- --ignored --nocapture --test-threads=1`). First run (x86_64, loaded machine): ct_eq |t|=0.4, x25519 1.4, Ed25519 sign 1.1, P-256 sign 1.9, ChaCha20-Poly1305 1.8, AES-128-GCM 2.1, all under the 4.5 threshold; a deliberately leaky compare scores ~11900, so the harness detects leaks. This is evidence, not proof: no leak at these sample sizes on this CPU. Re-run on new hardware and after crypto changes.
 61. **No TLS 1.2 client** — *fixed* (commit: bb1ac93)
     Client-only and opt-in (`ClientConfig::tls12`, enabled for registry pulls; kr's own connections stay TLS 1.3). ECDHE (X25519, P-256) with ECDSA or RSA certificates, AES-128-GCM or ChaCha20-Poly1305, SHA-256 PRF. Extended Master Secret is required and the RFC 8446 downgrade sentinel is checked; no renegotiation, no resumption, no client certificates. Tested against `openssl s_server -tls1_2`. Not offered: SHA-384 suites (AES-256-GCM), CBC suites.
 
