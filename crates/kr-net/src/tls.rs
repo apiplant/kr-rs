@@ -137,12 +137,18 @@ impl Transport for MaybeTls {
 /// Connects with TLS for `https` URLs and plain TCP otherwise.
 pub struct TlsConnector<R: Resolver = SystemResolver> {
     resolver: R,
-    cfg: Rc<ClientConfig>,
+    /// Swappable (certificate rotation); new connections pick up the current config.
+    cfg: core::cell::RefCell<Rc<ClientConfig>>,
 }
 
 impl<R: Resolver> TlsConnector<R> {
     pub fn new(resolver: R, cfg: Rc<ClientConfig>) -> Self {
-        TlsConnector { resolver, cfg }
+        TlsConnector { resolver, cfg: core::cell::RefCell::new(cfg) }
+    }
+
+    /// Replaces the config for future connections (pooled connections keep theirs).
+    pub fn set_config(&self, cfg: Rc<ClientConfig>) {
+        *self.cfg.borrow_mut() = cfg;
     }
 }
 
@@ -152,7 +158,7 @@ impl TlsConnector {
         let roots = kr_crypto::x509::pem_decode_all(pem, "CERTIFICATE").map_err(|_| Error::BadRef("bad CA bundle"))?;
         Ok(TlsConnector {
             resolver: SystemResolver::system(),
-            cfg: Rc::new(ClientConfig { pinned_ca: None, roots, client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()] }),
+            cfg: core::cell::RefCell::new(Rc::new(ClientConfig { pinned_ca: None, roots, client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()] })),
         })
     }
 }
@@ -164,7 +170,7 @@ impl<R: Resolver> Connector for TlsConnector<R> {
         if url.scheme != Scheme::Https {
             return Ok(MaybeTls::Plain(sock));
         }
-        let hs = TlsStream::connect(sock, self.cfg.clone(), &url.host);
+        let hs = TlsStream::connect(sock, self.cfg.borrow().clone(), &url.host);
         match kr_rt::exec::timeout(timeout_ms, hs).await {
             Ok(r) => r.map(MaybeTls::Tls),
             Err(_) => Err(Error::Timeout),

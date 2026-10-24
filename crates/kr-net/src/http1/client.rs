@@ -211,6 +211,10 @@ impl<C: Connector> Client<C> {
         Client { connector, cfg, pool: Rc::new(RefCell::new(Pool { idle: Vec::new(), max })) }
     }
 
+    pub fn connector(&self) -> &C {
+        &self.connector
+    }
+
     pub fn config(&self) -> &Config {
         &self.cfg
     }

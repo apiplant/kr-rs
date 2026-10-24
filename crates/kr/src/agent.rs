@@ -66,6 +66,19 @@ async fn join(server: &str, token: &str, pki_dir: &str, name: &str, ip: [u8; 4])
     let pin = unhex32(hash).ok_or("bad CA hash in token")?;
     let ca = fetch_ca(server, pin).await?;
     let ca_pem = x509::pem_encode("CERTIFICATE", &ca);
+    let remote = Remote::new(server, RemoteAuth::Bearer(secret.into()), &ca_pem).map_err(|e| e.message)?;
+    let files = request_certs(&remote, name, ip).await?;
+    mkdir_p(pki_dir)?;
+    pki::write_new(&pki::path(pki_dir, "ca.pem"), ca_pem.as_bytes(), 0o644)?;
+    for (file, data, mode) in &files {
+        pki::write_new(&pki::path(pki_dir, file), data.as_bytes(), *mode)?;
+    }
+    Ok(())
+}
+
+/// New client and serving keys, certified by `POST /kr/join` (first join with the bootstrap
+/// token, rotation with the current node certificate). Returns (file, PEM, mode).
+async fn request_certs(remote: &Remote, name: &str, ip: [u8; 4]) -> Result<[(&'static str, String, u32); 4], String> {
     let client_key = pki::new_key();
     let serving_key = pki::new_key();
     let b64 = |k: &SigningKey| kr_fmt::base64::encode(&k.public().spki());
@@ -78,22 +91,66 @@ async fn join(server: &str, token: &str, pki_dir: &str, name: &str, ip: [u8; 4])
         ip[2],
         ip[3]
     );
-    let remote = Remote::new(server, RemoteAuth::Bearer(secret.into()), &ca_pem).map_err(|e| e.message)?;
     let req = kr_fmt::json::parse(body.as_bytes()).map_err(|_| String::from("internal: bad join request"))?;
     let r = remote.create("/kr/join", &req).await.map_err(|e| format!("join refused: {} {}", e.code, e.message))?;
     let s = |f: &str| r.get(f).and_then(kr_fmt::json::Value::as_str).map(String::from).ok_or(format!("join response lacks {f}"));
-    mkdir_p(pki_dir)?;
     let key_pem = |k: &SigningKey| x509::pem_encode("PRIVATE KEY", &x509::private_key_to_pkcs8(k));
-    for (file, data, mode) in [
-        ("ca.pem", ca_pem.clone(), 0o644),
-        ("node.pem", s("clientCert")?, 0o644),
-        ("node.key", key_pem(&client_key), 0o600),
-        ("serving.pem", s("servingCert")?, 0o644),
-        ("serving.key", key_pem(&serving_key), 0o600),
-    ] {
-        pki::write_new(&pki::path(pki_dir, file), data.as_bytes(), mode)?;
+    Ok([("node.pem", s("clientCert")?, 0o644), ("node.key", key_pem(&client_key), 0o600), ("serving.pem", s("servingCert")?, 0o644), ("serving.key", key_pem(&serving_key), 0o600)])
+}
+
+/// (not_before, not_after) of the first certificate in a PEM file.
+fn validity(pki_dir: &str, file: &str) -> Option<(i64, i64)> {
+    let der = load_pem(pki_dir, file, "CERTIFICATE").ok()?.into_iter().next()?;
+    let c = x509::Certificate::parse(&der).ok()?;
+    Some((c.not_before, c.not_after))
+}
+
+fn serving_config(pki_dir: &str) -> Result<Rc<kr_crypto::tls::ServerConfig>, String> {
+    let chain = load_pem(pki_dir, "serving.pem", "CERTIFICATE")?;
+    let key = x509::private_key_from_pkcs8(&load_pem(pki_dir, "serving.key", "PRIVATE KEY")?.pop().ok_or("empty key")?).map_err(|_| "bad serving key")?;
+    let roots = load_pem(pki_dir, "ca.pem", "CERTIFICATE")?;
+    Ok(Rc::new(kr_crypto::tls::ServerConfig { cert_chain: chain, key, client_auth: kr_crypto::tls::ClientAuth::Required(roots), alpn: alloc::vec![b"http/1.1".to_vec()] }))
+}
+
+/// Renews the node certificates at 2/3 of their lifetime (KNOWN_ISSUES #82): new keys via
+/// `/kr/join`, files replaced atomically, then the API client and the kubelet server switch.
+async fn rotate(remote: Remote, pki_dir: String, name: String, ip: [u8; 4], serving: Rc<core::cell::RefCell<Rc<kr_crypto::tls::ServerConfig>>>) {
+    loop {
+        let (nb, na) = validity(&pki_dir, "node.pem").unwrap_or((0, 0));
+        let due = nb + (na - nb) * 2 / 3;
+        let wait = (due - pki::now()).clamp(0, 3600);
+        if wait > 0 {
+            kr_rt::exec::sleep(wait as u64 * 1000).await;
+            continue;
+        }
+        match renew(&remote, &pki_dir, &name, ip).await {
+            Ok(()) => match serving_config(&pki_dir) {
+                Ok(cfg) => {
+                    *serving.borrow_mut() = cfg;
+                    print(b"kr agent: node certificates rotated\n");
+                    // Clock skew must not turn this into a busy loop.
+                    kr_rt::exec::sleep(30_000).await;
+                }
+                Err(e) => eprint(format!("kr agent: reloading serving certificate: {e}\n").as_bytes()),
+            },
+            Err(e) => {
+                eprint(format!("kr agent: certificate rotation failed (retrying in 60s): {e}\n").as_bytes());
+                kr_rt::exec::sleep(60_000).await;
+            }
+        }
     }
-    Ok(())
+}
+
+async fn renew(remote: &Remote, pki_dir: &str, name: &str, ip: [u8; 4]) -> Result<(), String> {
+    let files = request_certs(remote, name, ip).await?;
+    for (file, data, mode) in &files {
+        let tmp = format!("{file}.new");
+        let _ = fs::unlinkat(fs::AT_FDCWD, &pki::path(pki_dir, &tmp), 0);
+        pki::write_new(&pki::path(pki_dir, &tmp), data.as_bytes(), *mode)?;
+        fs::renameat2(fs::AT_FDCWD, &pki::path(pki_dir, &tmp), fs::AT_FDCWD, &pki::path(pki_dir, file), 0).map_err(|e| format!("rename {file}: errno {}", e.0))?;
+    }
+    let (chain, key) = (files[0].1.as_str(), files[1].1.as_str());
+    remote.set_client_cert(chain, key).map_err(|e| e.message)
 }
 
 pub fn main(mut args: Args) -> i32 {
@@ -129,14 +186,8 @@ pub fn main(mut args: Args) -> i32 {
         Ok(r) => r,
         Err(e) => return fail(&e.message),
     };
-    let serving = || -> Result<Rc<kr_crypto::tls::ServerConfig>, String> {
-        let chain = load_pem(&pki_dir, "serving.pem", "CERTIFICATE")?;
-        let key = x509::private_key_from_pkcs8(&load_pem(&pki_dir, "serving.key", "PRIVATE KEY")?.pop().ok_or("empty key")?).map_err(|_| "bad serving key")?;
-        let roots = load_pem(&pki_dir, "ca.pem", "CERTIFICATE")?;
-        Ok(Rc::new(kr_crypto::tls::ServerConfig { cert_chain: chain, key, client_auth: kr_crypto::tls::ClientAuth::Required(roots), alpn: alloc::vec![b"http/1.1".to_vec()] }))
-    };
-    let tls = match serving() {
-        Ok(t) => t,
+    let tls = match serving_config(&pki_dir) {
+        Ok(t) => Rc::new(core::cell::RefCell::new(t)),
         Err(e) => return fail(&e),
     };
     let store = match kr_runtime::store::Store::open(None) {
@@ -144,11 +195,14 @@ pub fn main(mut args: Args) -> i32 {
         Err(_) => return fail("cannot open the image store"),
     };
     let cfg = kr_kubelet::Config { node_name: name.clone(), root: String::from(store.root()), network: ns::getuid() == 0, cgroups: cgroups_available(), node_ip: ip };
+    let rotation = (remote.clone(), pki_dir.clone(), name.clone(), ip, tls.clone());
     let kubelet = kr_kubelet::Kubelet::new(remote, cfg, store);
     print(format!("kr agent: node {name} ({}.{}.{}.{}) -> {server}\n", ip[0], ip[1], ip[2], ip[3]).as_bytes());
     kr_rt::exec::block_on(async move {
         let proxy: Rc<dyn kr_apiserver::api::NodeProxy> = Rc::new(kr_kubelet::stream::Proxy(kubelet.clone()));
         kr_rt::exec::spawn(kr_kubelet::remote::serve(proxy, name, tls));
+        let (r, d, n, ip, s) = rotation;
+        kr_rt::exec::spawn(rotate(r, d, n, ip, s));
         kubelet.run().await;
     });
     0

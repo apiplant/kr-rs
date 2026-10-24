@@ -275,9 +275,10 @@ impl ChunkDecoder {
 
 /// The agent's kubelet HTTPS endpoint (port 10250). Only the API server's kubelet-client
 /// identity is accepted (client certificate from the cluster CA with that CN).
-pub async fn serve(proxy: Rc<dyn NodeProxy>, node: String, tls: Rc<kr_crypto::tls::ServerConfig>) -> kr_net::Result<()> {
+/// `tls` is reloadable: the agent swaps in a rotated serving certificate.
+pub async fn serve(proxy: Rc<dyn NodeProxy>, node: String, tls: Rc<core::cell::RefCell<Rc<kr_crypto::tls::ServerConfig>>>) -> kr_net::Result<()> {
     let listener = server::listen([0, 0, 0, 0], KUBELET_PORT, 128)?;
-    let cfg = Rc::new(server::ServerConfig { tls: Some(tls), idle_timeout_ms: 300_000, ..server::ServerConfig::default() });
+    let cfg = Rc::new(server::ServerConfig { tls_slot: Some(tls), idle_timeout_ms: 300_000, ..server::ServerConfig::default() });
     let handler = move |req: Request| -> server::HandlerFuture {
         let resp = (|| {
             let cn = req

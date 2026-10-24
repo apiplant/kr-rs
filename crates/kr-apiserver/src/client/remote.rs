@@ -33,6 +33,7 @@ pub enum RemoteAuth {
 
 struct Inner {
     base: String,
+    roots: Vec<Vec<u8>>,
     bearer: Option<String>,
     unary: Http<TlsConnector>,
     /// Separate client (own pool, never reuses) with the long idle read limit.
@@ -43,6 +44,23 @@ struct Inner {
 #[derive(Clone)]
 pub struct Remote {
     inner: Rc<Inner>,
+}
+
+/// PEM chain (leaf first) and PKCS#8 or SEC1 key.
+fn client_cert(chain: &str, key: &str) -> Result<(Vec<Vec<u8>>, x509::SigningKey)> {
+    let chain = x509::pem_decode_all(chain, "CERTIFICATE").map_err(|_| bad("invalid client certificate"))?;
+    if chain.is_empty() {
+        return Err(bad("client certificate chain is empty"));
+    }
+    let key = match x509::pem_decode_all(key, "PRIVATE KEY") {
+        Ok(v) if !v.is_empty() => x509::private_key_from_pkcs8(&v[0]),
+        _ => match x509::pem_decode_all(key, "EC PRIVATE KEY") {
+            Ok(v) if !v.is_empty() => x509::private_key_from_sec1(&v[0]),
+            _ => return Err(bad("invalid client key")),
+        },
+    }
+    .map_err(|_| bad("invalid client key"))?;
+    Ok((chain, key))
 }
 
 fn bad(msg: &str) -> ApiError {
@@ -65,23 +83,9 @@ impl Remote {
                 }
                 (None, Some(t))
             }
-            RemoteAuth::ClientCert { chain, key } => {
-                let chain = x509::pem_decode_all(&chain, "CERTIFICATE").map_err(|_| bad("invalid client certificate"))?;
-                if chain.is_empty() {
-                    return Err(bad("client certificate chain is empty"));
-                }
-                let key = match x509::pem_decode_all(&key, "PRIVATE KEY") {
-                    Ok(v) if !v.is_empty() => x509::private_key_from_pkcs8(&v[0]),
-                    _ => match x509::pem_decode_all(&key, "EC PRIVATE KEY") {
-                        Ok(v) if !v.is_empty() => x509::private_key_from_sec1(&v[0]),
-                        _ => return Err(bad("invalid client key")),
-                    },
-                }
-                .map_err(|_| bad("invalid client key"))?;
-                (Some((chain, key)), None)
-            }
+            RemoteAuth::ClientCert { chain, key } => (Some(client_cert(&chain, &key)?), None),
         };
-        let cfg = Rc::new(ClientConfig { pinned_ca: None, roots, client_cert, alpn: alloc::vec![b"http/1.1".to_vec()] });
+        let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: roots.clone(), client_cert, alpn: alloc::vec![b"http/1.1".to_vec()] });
         let unary = Http::with_connector(
             TlsConnector::new(SystemResolver::system(), cfg.clone()),
             HttpConfig { max_redirects: 0, user_agent: "kr-node/0.0.1".to_string(), ..HttpConfig::default() },
@@ -90,7 +94,17 @@ impl Remote {
             TlsConnector::new(SystemResolver::system(), cfg),
             HttpConfig { read_timeout_ms: WATCH_IDLE_MS, max_redirects: 0, max_idle: 0, user_agent: "kr-node/0.0.1".to_string(), ..HttpConfig::default() },
         );
-        Ok(Remote { inner: Rc::new(Inner { base: base.to_string(), bearer, unary, watch }) })
+        Ok(Remote { inner: Rc::new(Inner { base: base.to_string(), roots, bearer, unary, watch }) })
+    }
+
+    /// Switches to a new client certificate (rotation). New connections use it; pooled and
+    /// in-flight ones finish with the old one, which is still valid.
+    pub fn set_client_cert(&self, chain: &str, key: &str) -> Result<()> {
+        let cc = client_cert(chain, key)?;
+        let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: self.inner.roots.clone(), client_cert: Some(cc), alpn: alloc::vec![b"http/1.1".to_vec()] });
+        self.inner.unary.connector().set_config(cfg.clone());
+        self.inner.watch.connector().set_config(cfg);
+        Ok(())
     }
 
     fn url(&self, path: &str, query: &str) -> String {

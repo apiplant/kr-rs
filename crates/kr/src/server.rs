@@ -24,7 +24,7 @@ fn fail(msg: &str) -> i32 {
     1
 }
 
-fn data_dir() -> String {
+pub fn data_dir() -> String {
     let env = kr_runtime::store::env_var;
     if let Some(r) = env("KR_ROOT").filter(|v| !v.is_empty()) {
         return format!("{r}/server");
@@ -184,6 +184,10 @@ pub fn main(mut args: Args) -> i32 {
     let join_setup = || -> Result<(), String> {
         let (name, key, der) = pki::load_ca(&pki_dir)?;
         api.set_ca(name, key, der);
+        // Test knob: short node certificate lifetimes exercise rotation.
+        if let Some(s) = kr_runtime::store::env_var("KR_NODE_CERT_SECONDS").and_then(|v| v.parse().ok()) {
+            api.set_node_cert_lifetime(s);
+        }
         let tok = fs::read_file(&pki::path(&data, "node-token"), 4096).ok().and_then(|b| String::from_utf8(b).ok()).ok_or("cannot read node-token")?;
         let (_, idsec) = tok.trim().split_once("::").ok_or("bad node-token")?;
         let (id, secret) = idsec.split_once('.').ok_or("bad node-token")?;

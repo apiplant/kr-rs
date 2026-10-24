@@ -261,8 +261,8 @@ Living list. Each item: **status** (open / fixing / fixed / accepted), impact, a
     - Routes of removed nodes are not deleted.
 81. **No Node authorizer** — *fixed* (ADR-023)
     Nodes read only the secrets/configmaps/PVCs of their own pods and write only their own Node, Lease and pods. Pods themselves remain readable cluster-wide (as upstream). Token requests are checked by service account, not by `boundObjectRef`.
-82. **Bootstrap token never expires** — *open*
-    Planned: expiration and rotation. Node client certificates (1 year) are not rotated either.
+82. **Bootstrap token never expires** — *fixed* (ADR-023)
+    `kr token create --ttl 24h` mints expiring join tokens; the server's initial `node-token` stays permanent (k3s-style), so delete its Secret (`kube-system/bootstrap-token-<id>`) to retire it. Agents rotate their client and serving certificates at 2/3 of their lifetime and hot-swap them, with no restart. Remaining gaps: expired token Secrets are not garbage-collected, and the server's own certificates (apiserver, admin, kubelet-client; 1 year) are not rotated.
 83. **Node-proxied logs report 200 before contacting the node** — *accepted*
     Errors arrive in the body. A direct `Upgrade: SPDY/3.1` (port-forward, or exec from client-go/sonobuoy) to *remote* nodes is not proxied; it works for pods on the server node, and kubectl's default WebSocket path works everywhere.
 84. **DNS: no negative caching or prefetch** — *accepted*

@@ -80,6 +80,8 @@ pub struct ApiServer {
     node_proxy: RefCell<Option<alloc::rc::Rc<dyn NodeProxy>>>,
     /// Cluster CA (name, key, DER) for issuing node certificates at join.
     ca: RefCell<Option<(kr_crypto::x509::Name, kr_crypto::x509::SigningKey, Vec<u8>)>>,
+    /// Lifetime of issued node certificates, seconds (agents renew at 2/3).
+    node_cert_secs: core::cell::Cell<i64>,
 }
 
 /// Default namespaces created on first start.
@@ -170,7 +172,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None) };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400) };
         for ns in SYSTEM_NAMESPACES {
             api.ensure_default_sa(ns);
         }
@@ -179,6 +181,10 @@ impl ApiServer {
     }
 
     /// Enables node joining (`POST /kr/join`) with the cluster CA.
+    pub fn set_node_cert_lifetime(&self, secs: i64) {
+        self.node_cert_secs.set(secs.max(60));
+    }
+
     pub fn set_ca(&self, name: kr_crypto::x509::Name, key: kr_crypto::x509::SigningKey, ca_der: Vec<u8>) {
         *self.ca.borrow_mut() = Some((name, key, ca_der));
     }
@@ -228,12 +234,18 @@ impl ApiServer {
 
     /// `POST /kr/join`: a bootstrapping node exchanges its public keys for a client
     /// certificate (`system:node:<name>` in `system:nodes`) and a kubelet serving certificate.
+    /// A node authenticated by its current certificate may call it again to rotate (new
+    /// keys, same name).
     fn join(&self, req: &Req, user: &User) -> R<Reply> {
-        if !user.groups.iter().any(|g| g == "system:bootstrappers") {
-            return Err(ApiError::new(403, "Forbidden", "join requires a bootstrap token"));
+        let renewing = crate::node_authz::node_name(&user.name, &user.groups);
+        if renewing.is_none() && !user.groups.iter().any(|g| g == "system:bootstrappers") {
+            return Err(ApiError::new(403, "Forbidden", "join requires a bootstrap token or a node certificate"));
         }
         let b = self.parse_body(req)?;
         let name = b.get("nodeName").and_then(Value::as_str).filter(|n| object::is_dns_subdomain(n)).ok_or_else(|| ApiError::invalid("nodeName must be a DNS subdomain"))?;
+        if renewing.is_some_and(|n| n != name) {
+            return Err(ApiError::new(403, "Forbidden", "a node may only renew its own certificates"));
+        }
         let key = |f: &str| -> R<kr_crypto::x509::PublicKey> {
             let der = b.get(f).and_then(Value::as_str).and_then(|v| kr_fmt::base64::decode(v).ok()).ok_or_else(|| ApiError::invalid(alloc::format!("{f}: base64 SPKI required")))?;
             match kr_crypto::x509::PublicKey::from_spki(&der) {
@@ -249,7 +261,7 @@ impl ApiServer {
         let mut serial = [0u8; 16];
         (self.rng)(&mut serial);
         let subject = kr_crypto::x509::Name { common_name: alloc::format!("system:node:{name}"), organizations: alloc::vec!["system:nodes".into()] };
-        let mut p = kr_crypto::x509::CertParams { serial, subject, not_before: now - 300, not_after: now + 365 * 86400, is_ca: false, server: false, client: true, dns_names: Vec::new(), ip_addrs: Vec::new(), public_key: client_key };
+        let mut p = kr_crypto::x509::CertParams { serial, subject, not_before: now - (self.node_cert_secs.get() / 10).min(300), not_after: now + self.node_cert_secs.get(), is_ca: false, server: false, client: true, dns_names: Vec::new(), ip_addrs: Vec::new(), public_key: client_key };
         let client = kr_crypto::x509::issue(&p, ca_name, ca_key);
         (self.rng)(&mut p.serial);
         p.client = false;

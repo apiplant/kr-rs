@@ -305,5 +305,9 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
   - get of secrets/configmaps/PVCs referenced by pods bound to `<n>`: Allow; other reads: defer to RBAC (which no longer grants them to nodes).
   - writes to pods/pods-status not bound to `<n>`, other Nodes, other node Leases, pod creation, secret writes: Deny (NodeRestriction folded in; the created object's name is read from the body for POSTs).
   - serviceaccounts/token: only for service accounts used by the node's pods.
+- **Credential lifetimes:**
+  - **Join tokens:** `kr token create [--ttl]` creates a bootstrap-token Secret with `expiration`, using the local admin certificate.
+  - **Node certificate rotation:** `/kr/join` also accepts a node's own certificate and re-issues for the same name only. The agent renews at 2/3 of the lifetime with fresh keys, replaces the files via rename, and swaps the TLS configs in place (`Remote::set_client_cert`, the kubelet server's `tls_slot`). There's no CSR API, because kr issues directly.
+  - `KR_NODE_CERT_SECONDS` shortens node certificates for testing.
 
 **Status:** accepted.

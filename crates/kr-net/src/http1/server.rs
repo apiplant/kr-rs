@@ -169,6 +169,8 @@ pub struct ServerConfig {
     /// Connections above this are accepted and closed at once.
     pub max_connections: usize,
     pub tls: Option<Rc<kr_crypto::tls::ServerConfig>>,
+    /// Reloadable TLS config (certificate rotation); takes precedence over `tls`.
+    pub tls_slot: Option<Rc<RefCell<Rc<kr_crypto::tls::ServerConfig>>>>,
 }
 
 impl Default for ServerConfig {
@@ -182,6 +184,7 @@ impl Default for ServerConfig {
             write_timeout_ms: 30_000,
             max_connections: 1024,
             tls: None,
+            tls_slot: None,
         }
     }
 }
@@ -451,7 +454,8 @@ async fn read_body(conn: &mut Conn, buf: &mut Vec<u8>, framing: Framing, cfg: &S
 async fn connection(sock: Async<Fd>, cfg: Rc<ServerConfig>, handler: Rc<dyn Handler>, _guard: ConnGuard) {
     let _ = sys::setsockopt(sock.get_ref().raw(), IPPROTO_TCP, TCP_NODELAY, &1i32.to_ne_bytes());
     let mut peer = PeerInfo { addr: sockname(NR_GETPEERNAME, sock.get_ref().raw()), ..PeerInfo::default() };
-    let mut conn = match &cfg.tls {
+    let tls = cfg.tls_slot.as_ref().map(|s| s.borrow().clone()).or_else(|| cfg.tls.clone());
+    let mut conn = match &tls {
         None => Conn::Plain(sock),
         Some(tls) => match timeout(cfg.head_timeout_ms, TlsStream::accept(sock, tls.clone())).await {
             Ok(Ok(s)) => {
