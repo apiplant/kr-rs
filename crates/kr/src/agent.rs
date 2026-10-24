@@ -222,7 +222,7 @@ pub fn main(mut args: Args) -> i32 {
         Ok(s) => s,
         Err(_) => return fail("cannot open the image store"),
     };
-    let cfg = kr_kubelet::Config { node_name: name.clone(), root: String::from(store.root()), network: ns::getuid() == 0, cgroups: cgroups_available(), node_ip: ip, vxlan: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() != Some("host-gw") };
+    let cfg = kr_kubelet::Config { node_name: name.clone(), root: String::from(store.root()), network: ns::getuid() == 0, cgroups: cgroups_available(), node_ip: ip, vxlan: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() != Some("host-gw"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env() };
     let rotation = (remote.clone(), pki_dir.clone(), name.clone(), ip, tls.clone());
     let kubelet = kr_kubelet::Kubelet::new(remote, cfg, store);
     print(format!("kr agent: node {name} ({}.{}.{}.{}) -> {server}\n", ip[0], ip[1], ip[2], ip[3]).as_bytes());

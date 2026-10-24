@@ -17,6 +17,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod evict;
 pub mod node;
 pub mod dns;
 mod probe;
@@ -36,6 +37,7 @@ use kr_apiserver::client::{meta, Client};
 use kr_apiserver::object::rfc3339;
 use kr_fmt::json::{self, Number, Value};
 use kr_runtime::auth::Cred;
+use kr_runtime::cgroup::PodCgroup;
 use kr_runtime::container::{self, IdMaps, Running, Sandbox, Signaller};
 use kr_runtime::network::{self, Lease, NetConfig};
 use kr_runtime::store::Store;
@@ -52,6 +54,8 @@ pub struct Config {
     pub node_ip: [u8; 4],
     /// Pod network backend: VXLAN overlay (true) or host-gw routes (false, needs one L2 segment).
     pub vxlan: bool,
+    /// Hard eviction: MemAvailable (bytes) below which the node is under memory pressure.
+    pub eviction_memory_bytes: u64,
 }
 
 fn now() -> i64 {
@@ -156,6 +160,15 @@ struct PodRt {
     failed_setup: Option<String>,
     /// Last refresh of configMap/secret/projected volumes (ms).
     volumes_synced: u64,
+    /// Pod-level cgroup (None when cgroups are unavailable).
+    cg: Option<PodCgroup>,
+    qos: &'static str,
+    /// Summed memory requests (plus overhead), the eviction baseline.
+    mem_request: u64,
+    /// system-node-critical / system-cluster-critical or a static pod: never evicted.
+    critical: bool,
+    /// Set once evicted for memory pressure: containers are killed and never restarted.
+    evicted: Option<String>,
 }
 
 struct Exit {
@@ -212,6 +225,10 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         // Sandboxes die with the previous kr process (even after SIGKILL), so every pod lease is
         // stale. Leases owned by anything but a pod uid (`kr ctr run` ids) are left alone.
+        // Containers of a killed kr survive as orphans: kill whatever is left in the pod cgroups.
+        if self.cfg.cgroups {
+            kr_runtime::cgroup::kill_stale_pods();
+        }
         network::gc(alloc::format!("{}/ipam", self.cfg.root).as_bytes(), |owner| !is_pod_uid(owner));
         node::register(&self.c, &self.cfg).await;
         // The API server assigns the pod subnet at registration.
@@ -281,10 +298,59 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         kr_rt::exec::spawn(async move { node::heartbeat_loop(&hb.c, &hb.cfg).await });
         let w = self.clone();
         kr_rt::exec::spawn(async move { w.watch_loop().await });
+        let ev = self.clone();
+        kr_rt::exec::spawn(async move { ev.eviction_loop().await });
         loop {
             self.sync_all().await;
             self.notify.wait(1000).await;
         }
+    }
+
+    /// Every 10 s: taint the node while MemAvailable is below the threshold and evict one pod.
+    async fn eviction_loop(self: &Rc<Self>) {
+        let mut state = evict::PressureState::default();
+        loop {
+            kr_rt::exec::sleep(10_000).await;
+            let pressure = evict::under_pressure(node::memory_available_ki(), self.cfg.eviction_memory_bytes);
+            if let Some(on) = state.observe(pressure) {
+                self.set_memory_taint(on).await;
+            }
+            if pressure {
+                self.evict_one();
+                self.notify.notify();
+            }
+        }
+    }
+
+    /// Evicts the best candidate (if any) and returns its uid.
+    fn evict_one(&self) -> Option<String> {
+        let cands: Vec<evict::Candidate> = self
+            .pods
+            .borrow()
+            .iter()
+            .filter(|(_, p)| p.evicted.is_none() && p.failed_setup.is_none() && !p.ctrs.iter().all(|c| c.signaller.is_none()))
+            .map(|(uid, p)| evict::Candidate { uid: uid.clone(), qos: p.qos, usage: p.cg.as_ref().and_then(|c| c.memory_current()).unwrap_or(0), request: p.mem_request, critical: p.critical })
+            .collect();
+        let uid = evict::pick(&cands)?.uid.clone();
+        if let Some(p) = self.pods.borrow_mut().get_mut(&uid) {
+            p.evicted = Some(evict::message(self.cfg.eviction_memory_bytes));
+        }
+        self.kill_now(&uid);
+        Some(uid)
+    }
+
+    /// Adds or removes the memory-pressure NoSchedule taint (read-modify-write of spec.taints).
+    async fn set_memory_taint(&self, on: bool) {
+        let path = alloc::format!("/api/v1/nodes/{}", self.cfg.node_name);
+        let Ok(node) = self.c.get(&path).await else { return };
+        let mut taints: Vec<Value> = node.pointer(&["spec", "taints"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+        taints.retain(|t| t.get("key").and_then(Value::as_str) != Some(evict::TAINT_KEY));
+        if on {
+            let t = alloc::format!(r#"{{"key":"{}","effect":"NoSchedule"}}"#, evict::TAINT_KEY);
+            taints.push(json::parse(t.as_bytes()).unwrap_or(Value::Null));
+        }
+        let patch = Value::Object(alloc::vec![(String::from("spec"), Value::Object(alloc::vec![(String::from("taints"), Value::Array(taints))]))]);
+        let _ = self.c.patch(&path, "application/merge-patch+json", &patch).await;
     }
 
     /// VXLAN overlay (root mode): device `kr.vxlan`, and per peer node a route to its pod
@@ -481,6 +547,10 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         if self.pods.borrow()[uid].failed_setup.is_some() {
             return;
         }
+        if self.pods.borrow()[uid].evicted.is_some() {
+            self.kill_now(uid);
+            return;
+        }
         if self.pods.borrow()[uid].sandbox.is_none() {
             if let Err(e) = self.start_sandbox(uid, pod) {
                 self.pods.borrow_mut().get_mut(uid).unwrap().failed_setup = Some(e);
@@ -563,7 +633,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 });
             }
         }
-        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ctrs, start_time: now(), kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms() }
+        let prio = pod.pointer(&["spec", "priorityClassName"]).and_then(Value::as_str).unwrap_or("");
+        let critical = prio.starts_with("system-") && prio.ends_with("-critical") || pod.pointer(&["metadata", "annotations", "kubernetes.io/config.mirror"]).is_some();
+        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ctrs, start_time: now(), kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, critical, evicted: None }
     }
 
     fn start_sandbox(&self, uid: &str, pod: &Value) -> Result<(), String> {
@@ -593,11 +665,22 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 return Err(alloc::format!("sandbox: {}: errno {}", e.step, e.errno.0));
             }
         };
+        // Pod cgroup: summed limits, the sandbox in its `pause` leaf, containers underneath.
+        // Skipped silently without a delegated cgroup.
+        let cg = if self.cfg.cgroups {
+            let (limits, _) = spec::pod_resources(pod);
+            PodCgroup::create(spec::qos_class(pod), uid, &limits).ok().inspect(|cg| {
+                let _ = cg.add_sandbox(sb.pid);
+            })
+        } else {
+            None
+        };
         spec::write_etc_hosts(&dir, &hostname, ip).map_err(|_| String::from("cannot write /etc/hosts"))?;
         spec::write_resolv_conf(&dir, pod).map_err(|_| String::from("cannot write /etc/resolv.conf"))?;
         let mut pods = self.pods.borrow_mut();
         let p = pods.get_mut(uid).unwrap();
         p.sandbox = Some(sb);
+        p.cg = cg;
         p.lease = lease;
         p.ip = ip;
         Ok(())
@@ -691,6 +774,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             hostname: b"",
             id: cid.as_bytes(),
             limits,
+            cgroup_parent: p.cg.as_ref().map_or(&[][..], |c| c.rel()),
             user: built.user.as_bytes(),
             maps: &self.maps,
             net: None,
@@ -973,6 +1057,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         if let Some(sb) = &p.sandbox {
             sb.stop();
         }
+        if let Some(cg) = &p.cg {
+            cg.remove();
+        }
         if let Some(l) = p.lease {
             l.release();
         }
@@ -1046,7 +1133,7 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
     let all_running = !apps.is_empty() && apps.iter().all(|c| matches!(c.state, CState::Running { .. }) && c.started && c.ready);
     let all_done = !apps.is_empty() && apps.iter().all(|c| matches!(c.state, CState::Terminated(_)));
     let failed = apps.iter().any(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code != 0)) || p.ctrs.iter().any(|c| c.init && matches!(&c.state, CState::Terminated(t) if t.exit_code != 0) && policy == "Never");
-    let phase = if p.failed_setup.is_some() {
+    let phase = if p.failed_setup.is_some() || p.evicted.is_some() {
         "Failed"
     } else if all_done && policy != "Always" && (policy == "Never" || !failed) {
         if failed { "Failed" } else { "Succeeded" }
@@ -1093,6 +1180,10 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
         f.push(("podIP", Value::from(ip.as_str())));
         f.push(("podIPs", Value::Array(alloc::vec![o(alloc::vec![("ip", Value::from(ip.as_str()))])])));
     }
+    if let Some(msg) = &p.evicted {
+        f.push(("message", Value::from(msg.as_str())));
+        f.push(("reason", Value::from("Evicted")));
+    }
     if let Some(msg) = &p.failed_setup {
         f.push(("message", Value::from(msg.as_str())));
         f.push(("reason", Value::from("SandboxFailed")));
@@ -1117,7 +1208,7 @@ mod status_tests {
         CState::Waiting("ContainerCreating", String::new())
     }
     fn pod(ctrs: Vec<Ctr>) -> PodRt {
-        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ctrs, start_time: 0, kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0 }
+        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ctrs, start_time: 0, kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, critical: false, evicted: None }
     }
     fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
         path.iter().try_fold(v, |v, k| match k.parse::<usize>() {

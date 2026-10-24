@@ -39,6 +39,9 @@ pub struct RunSpec<'a> {
     /// Container id; names the cgroup. Required when `limits` is non-empty.
     pub id: &'a [u8],
     pub limits: Limits,
+    /// Pod cgroup (relative path from `PodCgroup::rel`) the container cgroup is created under;
+    /// empty for a flat cgroup.
+    pub cgroup_parent: &'a [u8],
     /// OCI `user`: `uid|name[:gid|group]`; empty means root. Names resolve against the image's
     /// /etc/passwd and /etc/group, read after pivot_root.
     pub user: &'a [u8],
@@ -496,7 +499,7 @@ pub fn start(spec: &RunSpec) -> Result<Running, RunError> {
     let cgroup = if spec.limits.is_empty() {
         None
     } else {
-        Some(Cgroup::create(spec.id, &spec.limits).map_err(err("create cgroup (is kr in a delegated cgroup? try systemd-run --user --scope -p Delegate=yes)"))?)
+        Some(Cgroup::create_in(spec.cgroup_parent, spec.id, &spec.limits).map_err(err("create cgroup (is kr in a delegated cgroup? try systemd-run --user --scope -p Delegate=yes)"))?)
     };
 
     if let Some(sb) = spec.sandbox {

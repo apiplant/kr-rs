@@ -218,6 +218,30 @@ pub(crate) fn qos_class(pod: &Value) -> &'static str {
     }
 }
 
+/// The pod cgroup's limits (summed container limits plus `spec.overhead`, init containers
+/// counted as upstream: the larger of their peak and the app sum) and the pod's memory request
+/// (summed requests, falling back to limits as the container cgroups do).
+pub(crate) fn pod_resources(pod: &Value) -> (Limits, u64) {
+    let list = |key: &str| -> Vec<Value> { pod.pointer(&["spec", key]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default() };
+    let mem = |c: &Value, kind: &str| quantity(c.pointer(&["resources", kind, "memory"])).and_then(|q| q.value()).and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
+    let cpu = |c: &Value| quantity(c.pointer(&["resources", "limits", "cpu"])).and_then(|q| q.milli_value()).and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
+    let (apps, inits) = (list("containers"), list("initContainers"));
+    let per = |c: &Value| Limits { memory_bytes: mem(c, "limits"), cpu_milli: cpu(c), pids: Some(4096), ..Default::default() };
+    let mut total = kr_runtime::cgroup::sum_limits(&apps.iter().map(per).collect::<Vec<_>>());
+    for i in &inits {
+        let l = per(i);
+        total.memory_bytes = total.memory_bytes.zip(l.memory_bytes).map(|(a, b)| a.max(b));
+        total.cpu_milli = total.cpu_milli.zip(l.cpu_milli).map(|(a, b)| a.max(b));
+    }
+    let overhead = |res: &str| quantity(pod.pointer(&["spec", "overhead", res]));
+    let oh_mem = overhead("memory").and_then(|q| q.value()).and_then(|v| u64::try_from(v).ok()).unwrap_or(0);
+    let oh_cpu = overhead("cpu").and_then(|q| q.milli_value()).and_then(|v| u64::try_from(v).ok()).unwrap_or(0);
+    total.memory_bytes = total.memory_bytes.map(|m| m.saturating_add(oh_mem));
+    total.cpu_milli = total.cpu_milli.map(|m| m.saturating_add(oh_cpu));
+    let request = apps.iter().map(|c| mem(c, "requests").or_else(|| mem(c, "limits")).unwrap_or(0)).sum::<u64>().saturating_add(oh_mem);
+    (total, request)
+}
+
 /// Writes a configMap/secret volume's files into `dir`.
 async fn materialize<C: Client>(c: &C, ns: &str, kind: &str, name: &str, src: &Value, dir: &str, default_mode: u32) -> Result<(), String> {
     let optional = src.get("optional").and_then(Value::as_bool).unwrap_or(false);

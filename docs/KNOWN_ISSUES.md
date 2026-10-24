@@ -42,8 +42,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     - They are republished every 20 s through an atomic `..data` symlink swap; the SA token is renewed at 80% of its lifetime.
     - subPath is resolved with RESOLVE_IN_ROOT inside the container mount namespace.
     - PersistentVolumeClaims work with a built-in local-path provisioner (default StorageClass `local-path`, `WaitForFirstConsumer`, hostPath PVs under `/var/lib/kr/storage` pinned to a node, pvc-protection, static binding, Delete/Retain reclaim, kubelet GC of deleted PV directories; verified live on two nodes). Remaining: other volume types, volume expansion, snapshots, PV protection finalizer, storage capacity limits (no quota on the directories), and unbound Immediate claims do not block scheduling.
-75. **Resource requests are not enforced** — *partly fixed*
-    CPU requests become `cpu.weight` (upstream formula); memory requests become `memory.min` (Guaranteed) or `memory.low` (Burstable), skipped silently when the memory controller is not delegated; `status.qosClass` is computed as upstream; the node `MemoryPressure` condition is True when MemAvailable < 100Mi. Remaining: eviction, a pod-level cgroup grouping (container cgroups are flat siblings), and live verification in docker.
 
 ## Services, DNS, multi-node (phase 5, ADR-022)
 80. **Overlay networking is VXLAN or host-gw only** — *partly fixed*
@@ -233,6 +231,8 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     Remaining limits:
     - The host cannot reach pod IPs directly (use port-forward).
     - Pods have no outbound internet rootless; that needs a user-mode network stack (slirp/pasta-like).
+75. **Resource requests are not enforced** — *fixed*
+    CPU requests become `cpu.weight` (upstream formula); memory requests become `memory.min` (Guaranteed) or `memory.low` (Burstable), skipped silently when the memory controller is not delegated; `status.qosClass` is computed as upstream. Every pod gets a cgroup `kr-pods/<uid>` (Guaranteed), `kr-pods/burstable/<uid>` or `kr-pods/besteffort/<uid>` with the summed container limits (memory/cpu/pids only when every container sets one; init containers count as their peak, `spec.overhead` is added), holding the sandbox in a `pause` leaf and the container cgroups below; it is removed with the pod. Memory-pressure eviction: every 10 s, if MemAvailable is below the threshold (default 100Mi, `KR_EVICTION_MEMORY_AVAILABLE` overrides), the node condition `MemoryPressure` is True, the node gets the `node.kubernetes.io/memory-pressure:NoSchedule` taint (removed when pressure clears; the scheduler already filters NoSchedule taints) and one pod is evicted per tick: BestEffort first, then Burstable/Guaranteed pods whose pod-cgroup `memory.current` exceeds their summed requests (largest excess first). Evicted pods get phase Failed, reason `Evicted`, and are not restarted; `system-*-critical` and static pods are never evicted. Verified live on two docker nodes (cgroup tree, Guaranteed `memory.max` 64Mi, BestEffort evicted and Guaranteed spared). Not done: soft thresholds, disk/pid eviction, pod priority ordering, minimum-reclaim, ephemeral containers added later count against the pod limit, and without a delegated cgroup there is no usage data (only BestEffort pods are evictable).
 76. **Controllers are basic** — *fixed*
     Deployment (pause, progress deadline, minReadySeconds), StatefulSet, DaemonSet, Job (with pod failure backoff), CronJob, Endpoints/EndpointSlice and the namespace controller exist.
     Remaining gaps: no proportional scaling during a rollout, no adoption of orphan ReplicaSets, namespace deletion conditions are limited to `NamespaceContentRemaining`.
@@ -250,6 +250,8 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     `kr agent --token VALUE` exposed the token in /proc/<pid>/cmdline. Use `--token-file` (must be mode 600) or `KR_TOKEN`; `--token` still works but warns.
 90. **Pod sandbox holder costs ~0.6–0.9 MB PSS per pod** — *fixed* (commits: 8f76327, bfd9d3e)
     After setup the holder execveats kr (O_PATH|O_CLOEXEC fd of /proc/self/exe) as `kr pause` with an empty environment and all other fds closed: ~77 kB PSS per pod instead of ~700 kB. If the exec fails it silently falls back to the old in-process pause.
+93. **Containers survive a killed kr as orphans** — *fixed* (with #75)
+    On startup the kubelet kills every process left in the `kr-pods` cgroup tree (`cgroup.kill`, or SIGKILL per pid on older kernels), waits for it to empty and removes the cgroups, before pod sync. Containers started before pod cgroups existed, and rootless/undelegated setups (no cgroups), are not covered.
 
 ## kr-net
 25. **No DNS: only IP literals, `/etc/hosts` and a built-in `localhost`** — *fixed*
