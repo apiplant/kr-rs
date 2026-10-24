@@ -51,6 +51,77 @@ pub fn apply(group: &str, plural: &str, o: &mut Value) {
         ("", "persistentvolumeclaims") => {
             let sp = o.entry_object("spec");
             def(sp, "volumeMode", s("Filesystem"));
+            def(o.entry_object("status"), "phase", s("Pending"));
+        }
+        ("", "persistentvolumes") => {
+            def(o.entry_object("spec"), "persistentVolumeReclaimPolicy", s("Retain"));
+            def(o.entry_object("spec"), "volumeMode", s("Filesystem"));
+            def(o.entry_object("status"), "phase", s("Pending"));
+        }
+        ("", "endpoints") => each(o, "subsets", |ss| each(ss, "ports", |p| def(p, "protocol", s("TCP")))),
+        ("discovery.k8s.io", "endpointslices") => each(o, "ports", |p| def(p, "protocol", s("TCP"))),
+        ("networking.k8s.io", "networkpolicies") => {
+            let sp = o.entry_object("spec");
+            each(sp, "ingress", |r| each(r, "ports", |p| def(p, "protocol", s("TCP"))));
+            each(sp, "egress", |r| each(r, "ports", |p| def(p, "protocol", s("TCP"))));
+            let has_egress = sp.get("egress").is_some_and(|v| !v.is_null());
+            if sp.get("policyTypes").is_none_or(|v| v.as_array().is_none_or(|a| a.is_empty())) {
+                let mut t = alloc::vec![s("Ingress")];
+                if has_egress {
+                    t.push(s("Egress"));
+                }
+                sp.set("policyTypes", Value::Array(t));
+            }
+        }
+        ("storage.k8s.io", "storageclasses") => {
+            def(o, "reclaimPolicy", s("Delete"));
+            def(o, "volumeBindingMode", s("Immediate"));
+        }
+        ("storage.k8s.io", "csidrivers") => {
+            let sp = o.entry_object("spec");
+            def(sp, "attachRequired", Value::Bool(true));
+            def(sp, "podInfoOnMount", Value::Bool(false));
+            def(sp, "storageCapacity", Value::Bool(false));
+            def(sp, "requiresRepublish", Value::Bool(false));
+            def(sp, "seLinuxMount", Value::Bool(false));
+            def(sp, "fsGroupPolicy", s("ReadWriteOnceWithFSType"));
+            def(sp, "volumeLifecycleModes", Value::Array(alloc::vec![s("Persistent")]));
+        }
+        ("scheduling.k8s.io", "priorityclasses") => def(o, "preemptionPolicy", s("PreemptLowerPriority")),
+        ("rbac.authorization.k8s.io", "rolebindings" | "clusterrolebindings") => each(o, "subjects", |sub| {
+            match sub.get("kind").and_then(Value::as_str) {
+                Some("ServiceAccount") => def(sub, "apiGroup", s("")),
+                Some("User" | "Group") => def(sub, "apiGroup", s("rbac.authorization.k8s.io")),
+                _ => {}
+            }
+        }),
+        ("admissionregistration.k8s.io", "validatingwebhookconfigurations") => webhooks(o, false),
+        ("admissionregistration.k8s.io", "mutatingwebhookconfigurations") => webhooks(o, true),
+        ("admissionregistration.k8s.io", "validatingadmissionpolicies") => {
+            let sp = o.entry_object("spec");
+            def(sp, "failurePolicy", s("Fail"));
+            if let Some(m) = obj(sp, "matchConstraints") {
+                def(m, "matchPolicy", s("Equivalent"));
+                def(m, "namespaceSelector", Value::Object(Vec::new()));
+                def(m, "objectSelector", Value::Object(Vec::new()));
+            }
+        }
+        ("flowcontrol.apiserver.k8s.io", "flowschemas") => def(o.entry_object("spec"), "matchingPrecedence", int(1000)),
+        ("flowcontrol.apiserver.k8s.io", "prioritylevelconfigurations") => {
+            let sp = o.entry_object("spec");
+            if sp.get("type").and_then(Value::as_str) == Some("Limited") {
+                let l = sp.entry_object("limited");
+                def(l, "nominalConcurrencyShares", int(30));
+                def(l, "lendablePercent", int(0));
+                if let Some(r) = obj(l, "limitResponse") {
+                    if r.get("type").and_then(Value::as_str) == Some("Queue") {
+                        let q = r.entry_object("queuing");
+                        def(q, "queues", int(64));
+                        def(q, "handSize", int(8));
+                        def(q, "queueLengthLimit", int(50));
+                    }
+                }
+            }
         }
         ("apps", "deployments") => {
             let sp = o.entry_object("spec");
@@ -110,6 +181,20 @@ pub fn apply(group: &str, plural: &str, o: &mut Value) {
         }
         _ => {}
     }
+}
+
+fn webhooks(o: &mut Value, mutating: bool) {
+    each(o, "webhooks", |w| {
+        def(w, "failurePolicy", s("Fail"));
+        def(w, "matchPolicy", s("Equivalent"));
+        def(w, "namespaceSelector", Value::Object(Vec::new()));
+        def(w, "objectSelector", Value::Object(Vec::new()));
+        def(w, "timeoutSeconds", int(10));
+        if mutating {
+            def(w, "reinvocationPolicy", s("Never"));
+        }
+        each(w, "rules", |r| def(r, "scope", s("*")));
+    });
 }
 
 fn template(sp: &mut Value) {
@@ -300,5 +385,82 @@ mod tests {
         let mut s = json::parse_str(r#"{"spec":{"ports":[{"port":80}]}}"#).unwrap();
         apply("", "services", &mut s);
         assert_eq!(s.pointer(&["spec", "ports"]).and_then(|p| p.at(0)).and_then(|p| p.get("targetPort")).and_then(Value::as_i64), Some(80));
+    }
+
+    fn run(g: &str, p: &str, j: &str) -> Value {
+        let mut v = json::parse_str(j).unwrap();
+        apply(g, p, &mut v);
+        v
+    }
+
+    fn st<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
+        v.pointer(path).and_then(Value::as_str)
+    }
+
+    fn proto(v: &Value, path: &[&str]) -> Option<String> {
+        let mut cur = v;
+        for k in path {
+            cur = if let Ok(i) = k.parse::<usize>() { cur.at(i)? } else { cur.get(k)? };
+        }
+        cur.get("protocol").and_then(Value::as_str).map(String::from)
+    }
+
+    #[test]
+    fn networking_storage_core_extras() {
+        let v = run("networking.k8s.io", "networkpolicies", r#"{"spec":{"egress":[{"ports":[{"port":1}]}]}}"#);
+        assert_eq!(v.pointer(&["spec", "policyTypes"]).and_then(|a| a.at(1)).and_then(Value::as_str), Some("Egress"));
+        assert_eq!(proto(&v, &["spec", "egress", "0", "ports", "0"]).as_deref(), Some("TCP"));
+        let v = run("networking.k8s.io", "networkpolicies", r#"{"spec":{}}"#);
+        assert_eq!(v.pointer(&["spec", "policyTypes"]).and_then(Value::as_array).map(|a| a.len()), Some(1));
+        let v = run("storage.k8s.io", "storageclasses", r#"{}"#);
+        assert_eq!(st(&v, &["reclaimPolicy"]), Some("Delete"));
+        assert_eq!(st(&v, &["volumeBindingMode"]), Some("Immediate"));
+        let v = run("storage.k8s.io", "csidrivers", r#"{"spec":{}}"#);
+        assert_eq!(v.pointer(&["spec", "attachRequired"]).and_then(Value::as_bool), Some(true));
+        assert_eq!(v.pointer(&["spec", "podInfoOnMount"]).and_then(Value::as_bool), Some(false));
+        assert_eq!(st(&v, &["spec", "fsGroupPolicy"]), Some("ReadWriteOnceWithFSType"));
+        assert_eq!(v.pointer(&["spec", "volumeLifecycleModes"]).and_then(|a| a.at(0)).and_then(Value::as_str), Some("Persistent"));
+        let v = run("", "persistentvolumes", r#"{"spec":{}}"#);
+        assert_eq!(st(&v, &["spec", "persistentVolumeReclaimPolicy"]), Some("Retain"));
+        assert_eq!(st(&v, &["spec", "volumeMode"]), Some("Filesystem"));
+        assert_eq!(st(&v, &["status", "phase"]), Some("Pending"));
+        let v = run("", "persistentvolumeclaims", r#"{"spec":{}}"#);
+        assert_eq!(st(&v, &["status", "phase"]), Some("Pending"));
+        let v = run("", "endpoints", r#"{"subsets":[{"ports":[{"port":1}]}]}"#);
+        assert_eq!(proto(&v, &["subsets", "0", "ports", "0"]).as_deref(), Some("TCP"));
+        let v = run("discovery.k8s.io", "endpointslices", r#"{"ports":[{"port":1}]}"#);
+        assert_eq!(proto(&v, &["ports", "0"]).as_deref(), Some("TCP"));
+        let v = run("scheduling.k8s.io", "priorityclasses", r#"{}"#);
+        assert_eq!(st(&v, &["preemptionPolicy"]), Some("PreemptLowerPriority"));
+    }
+
+    #[test]
+    fn rbac_webhooks_flowcontrol() {
+        let v = run("rbac.authorization.k8s.io", "rolebindings", r#"{"subjects":[{"kind":"User"},{"kind":"ServiceAccount"}]}"#);
+        let s0 = v.get("subjects").and_then(|a| a.at(0)).unwrap();
+        let s1 = v.get("subjects").and_then(|a| a.at(1)).unwrap();
+        assert_eq!(s0.get("apiGroup").and_then(Value::as_str), Some("rbac.authorization.k8s.io"));
+        assert_eq!(s1.get("apiGroup").and_then(Value::as_str), Some(""));
+        let v = run("admissionregistration.k8s.io", "mutatingwebhookconfigurations", r#"{"webhooks":[{"rules":[{}]}]}"#);
+        let w = v.get("webhooks").and_then(|a| a.at(0)).unwrap();
+        assert_eq!(w.get("failurePolicy").and_then(Value::as_str), Some("Fail"));
+        assert_eq!(w.get("matchPolicy").and_then(Value::as_str), Some("Equivalent"));
+        assert_eq!(w.get("timeoutSeconds").and_then(Value::as_i64), Some(10));
+        assert_eq!(w.get("reinvocationPolicy").and_then(Value::as_str), Some("Never"));
+        assert!(w.get("namespaceSelector").is_some() && w.get("objectSelector").is_some());
+        assert_eq!(w.get("rules").and_then(|r| r.at(0)).and_then(|r| r.get("scope")).and_then(Value::as_str), Some("*"));
+        let v = run("admissionregistration.k8s.io", "validatingwebhookconfigurations", r#"{"webhooks":[{}]}"#);
+        assert!(v.get("webhooks").and_then(|a| a.at(0)).unwrap().get("reinvocationPolicy").is_none());
+        let v = run("admissionregistration.k8s.io", "validatingadmissionpolicies", r#"{"spec":{"matchConstraints":{}}}"#);
+        assert_eq!(st(&v, &["spec", "failurePolicy"]), Some("Fail"));
+        assert_eq!(st(&v, &["spec", "matchConstraints", "matchPolicy"]), Some("Equivalent"));
+        let v = run("flowcontrol.apiserver.k8s.io", "flowschemas", r#"{"spec":{}}"#);
+        assert_eq!(v.pointer(&["spec", "matchingPrecedence"]).and_then(Value::as_i64), Some(1000));
+        let v = run("flowcontrol.apiserver.k8s.io", "prioritylevelconfigurations", r#"{"spec":{"type":"Limited","limited":{"limitResponse":{"type":"Queue"}}}}"#);
+        assert_eq!(v.pointer(&["spec", "limited", "nominalConcurrencyShares"]).and_then(Value::as_i64), Some(30));
+        assert_eq!(v.pointer(&["spec", "limited", "lendablePercent"]).and_then(Value::as_i64), Some(0));
+        assert_eq!(v.pointer(&["spec", "limited", "limitResponse", "queuing", "queues"]).and_then(Value::as_i64), Some(64));
+        assert_eq!(v.pointer(&["spec", "limited", "limitResponse", "queuing", "handSize"]).and_then(Value::as_i64), Some(8));
+        assert_eq!(v.pointer(&["spec", "limited", "limitResponse", "queuing", "queueLengthLimit"]).and_then(Value::as_i64), Some(50));
     }
 }

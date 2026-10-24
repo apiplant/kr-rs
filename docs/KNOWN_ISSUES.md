@@ -56,8 +56,6 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     - Rootless agents have no cross-node pod networking.
     - Cross-node pod traffic is masqueraded (the source pod IP is hidden); the nft rule should exclude the cluster CIDR.
     - Routes of removed nodes are not deleted.
-86. **Defaulting is a subset** — *open*
-    Defaults cover core/apps/batch fields seen by clients; other groups (networking, policy, storage) store what was sent.
 87. **CustomResourceDefinitions are a subset** — *open*
     Served CRD versions become resources at runtime (JSON only; protobuf gets 415). Enforced schema subset: type, nullable, int-or-string, required, properties, additionalProperties, items, enum, minimum/maximum, min/maxLength, min/maxItems, `default`, and pruning (unless `x-kubernetes-preserve-unknown-fields`). Not enforced: pattern, format, allOf/anyOf/oneOf/not, uniqueItems, CEL `x-kubernetes-validations`, list-type semantics, embedded-resource checks, and CRD schema structural validation. Only `conversion.strategy: None` works (apiVersion is rewritten on get/list; watch events keep the stored apiVersion); Webhook conversion is not implemented. Deleting a CRD removes its objects synchronously (no finalizer); there is no aggregated discovery, and removed CRDs leak their small registration strings until restart. Namespaced CR creation is not blocked by `Terminating` CRDs, and CRD storage-version migration is not performed (storedVersions only grows).
 88. **Admission webhooks are a subset** — *open*
@@ -259,6 +257,8 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     Nodes read only the secrets/configmaps/PVCs of their own pods and write only their own Node, Lease and pods. Pods themselves remain readable cluster-wide (as upstream). Token requests are checked by service account, not by `boundObjectRef`.
 82. **Bootstrap token never expires** — *fixed* (ADR-023)
     `kr token create --ttl 24h` mints expiring join tokens; the server's initial `node-token` stays permanent (k3s-style), so delete its Secret (`kube-system/bootstrap-token-<id>`) to retire it. Agents rotate their client and serving certificates at 2/3 of their lifetime and hot-swap them, with no restart. Remaining gaps: expired token Secrets are not garbage-collected, and the server's own certificates (apiserver, admin, kubelet-client; 1 year) are not rotated.
+86. **Defaulting is a subset** — *fixed*
+    Defaults cover core/apps/batch plus networking (NetworkPolicy), storage (StorageClass, CSIDriver), PV/PVC phase, Endpoints/EndpointSlice ports, PriorityClass, RBAC binding subjects, admissionregistration webhooks and ValidatingAdmissionPolicy, and flowcontrol. Remaining: rarely used legacy volume-source and alpha-field defaults.
 89. **Agent join token visible in the process list** — *fixed* (commit: b37c07d)
     `kr agent --token VALUE` exposed the token in /proc/<pid>/cmdline. Use `--token-file` (must be mode 600) or `KR_TOKEN`; `--token` still works but warns.
 90. **Pod sandbox holder costs ~0.6–0.9 MB PSS per pod** — *fixed* (commits: 8f76327, bfd9d3e)
