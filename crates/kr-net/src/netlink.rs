@@ -229,17 +229,24 @@ impl Netlink {
     }
 
     /// Creates a veth pair: `host` in our netns, `peer` directly inside the netns of `peer_pid`.
-    pub fn veth_add(&self, host: &[u8], peer: &[u8], peer_pid: i32) -> Result<(), Errno> {
+    /// `mtu` (0: kernel default) applies to both ends.
+    pub fn veth_add(&self, host: &[u8], peer: &[u8], peer_pid: i32, mtu: u32) -> Result<(), Errno> {
         self.one(|b| {
             b.begin(RTM_NEWLINK, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
             b.raw(&ifinfo(0, 0, 0));
             b.attr_str(IFLA_IFNAME, host);
+            if mtu > 0 {
+                b.attr_u32(IFLA_MTU, mtu);
+            }
             b.nest_begin(IFLA_LINKINFO);
             b.attr_str(IFLA_INFO_KIND, b"veth");
             b.nest_begin(IFLA_INFO_DATA);
             b.nest_begin(VETH_INFO_PEER);
             b.raw(&ifinfo(0, 0, 0));
             b.attr_str(IFLA_IFNAME, peer);
+            if mtu > 0 {
+                b.attr_u32(IFLA_MTU, mtu);
+            }
             b.attr_u32(IFLA_NET_NS_PID, peer_pid as u32);
             b.nest_end();
             b.nest_end();

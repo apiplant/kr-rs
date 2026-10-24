@@ -90,12 +90,20 @@ pub fn host_ifname(id: &[u8]) -> [u8; 11] {
     n
 }
 
+/// MTU for new pod interfaces (0: kernel default). An overlay (VXLAN) sets it to the tunnel's
+/// MTU so pods never send packets that do not fit once encapsulated.
+static POD_MTU: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub fn set_pod_mtu(mtu: u32) {
+    POD_MTU.store(mtu, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Parent side, after clone and before releasing the child: creates the veth pair with the peer
 /// inside `pid`'s netns and plugs the host end into the bridge.
 pub fn attach(pid: i32, id: &[u8]) -> Result<(), Errno> {
     let nl = Netlink::route()?;
     let host = host_ifname(id);
-    nl.veth_add(&host, b"eth0", pid)?;
+    nl.veth_add(&host, b"eth0", pid, POD_MTU.load(core::sync::atomic::Ordering::Relaxed))?;
     let r = (|| {
         let idx = netlink::ifindex(&host)?;
         nl.link_set_master(idx, netlink::ifindex(BRIDGE)?)?;

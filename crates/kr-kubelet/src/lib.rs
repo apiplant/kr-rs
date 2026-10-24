@@ -206,6 +206,10 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
     pub async fn run(self: Rc<Self>) {
+        if self.cfg.vxlan && self.cfg.network {
+            // Before any sandbox: pod interfaces get the tunnel MTU (uplink - VXLAN overhead).
+            network::set_pod_mtu(uplink_mtu().saturating_sub(50));
+        }
         // Sandboxes die with the previous kr process (even after SIGKILL), so every pod lease is
         // stale. Leases owned by anything but a pod uid (`kr ctr run` ids) are left alone.
         network::gc(alloc::format!("{}/ipam", self.cfg.root).as_bytes(), |owner| !is_pod_uid(owner));
