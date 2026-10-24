@@ -10,6 +10,7 @@ use crate::api::{ApiServer, Reply, Req, Route};
 use crate::object::{obj, ApiError, Selector};
 use crate::patch;
 use alloc::boxed::Box;
+use core::cell::RefCell;
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
@@ -44,7 +45,7 @@ fn resource_matches(entries: &[&str], plural: &str, sub: Option<&str>) -> bool {
     })
 }
 
-fn rule_matches(rule: &Value, rt: &Route, op: &str) -> bool {
+fn rule_matches(rule: &Value, rt: &Route, op: &str, exact: bool) -> bool {
     let any = |key: &str, want: &str| {
         let l = strs(rule, key);
         l.iter().any(|x| *x == "*" || *x == want)
@@ -54,11 +55,14 @@ fn rule_matches(rule: &Value, rt: &Route, op: &str) -> bool {
         "Namespaced" => rt.res.namespaced,
         _ => true,
     };
-    any("operations", op) && any("apiGroups", rt.res.group) && any("apiVersions", rt.res.version) && resource_matches(&strs(rule, "resources"), rt.res.plural, rt.sub.as_deref()) && scope_ok
+    any("operations", op) && any("apiGroups", rt.res.group) && (!exact || any("apiVersions", rt.res.version)) && resource_matches(&strs(rule, "resources"), rt.res.plural, rt.sub.as_deref()) && scope_ok
 }
 
+/// `matchPolicy: Equivalent` (the default) matches the same group and resource in any version
+/// (kr serves one version per resource, so no conversion is involved); `Exact` needs the version.
 fn rules_match(wh: &Value, rt: &Route, op: &str) -> bool {
-    wh.get("rules").and_then(Value::as_array).is_some_and(|r| r.iter().any(|r| rule_matches(r, rt, op)))
+    let exact = wh.get("matchPolicy").and_then(Value::as_str) == Some("Exact");
+    wh.get("rules").and_then(Value::as_array).is_some_and(|r| r.iter().any(|r| rule_matches(r, rt, op, exact)))
 }
 
 /// LabelSelector (matchLabels/matchExpressions) as an equivalent [`Selector`]; empty/absent
@@ -423,6 +427,9 @@ fn failed(name: &str, why: &str) -> ApiError {
     ApiError::new(500, "InternalError", format!("Internal error occurred: failed calling webhook \"{name}\": {why}"))
 }
 
+/// Kind (group, version, kind) of `object` when it is not the resource's own.
+type Kind = (&'static str, &'static str, &'static str);
+
 struct Ctx<'a> {
     api: &'a ApiServer,
     rt: &'a Route,
@@ -430,6 +437,11 @@ struct Ctx<'a> {
     user: crate::api::User,
     dry: bool,
     ns: Option<Value>,
+    kind: Option<Kind>,
+    /// The request `options` object, when it is not Create/Update/DeleteOptions (CONNECT).
+    options: Option<Value>,
+    /// Response `warnings`, in order.
+    warns: &'a RefCell<Vec<String>>,
 }
 
 enum Outcome {
@@ -439,7 +451,8 @@ enum Outcome {
 
 impl Ctx<'_> {
     fn gvk(&self) -> Value {
-        obj(alloc::vec![("group", Value::from(self.rt.res.group)), ("version", Value::from(self.rt.res.version)), ("kind", Value::from(self.rt.res.kind))])
+        let (g, v, k) = self.kind.unwrap_or((self.rt.res.group, self.rt.res.version, self.rt.res.kind));
+        obj(alloc::vec![("group", Value::from(g)), ("version", Value::from(v)), ("kind", Value::from(k))])
     }
 
     fn request(&self, cur: &Value, old: &Value) -> Value {
@@ -474,7 +487,7 @@ impl Ctx<'_> {
         r.set("object", cur.clone());
         r.set("oldObject", old.clone());
         r.set("dryRun", Value::Bool(self.dry));
-        r.set("options", obj(alloc::vec![("kind", Value::from(opts)), ("apiVersion", Value::from("meta.k8s.io/v1"))]));
+        r.set("options", self.options.clone().unwrap_or_else(|| obj(alloc::vec![("kind", Value::from(opts)), ("apiVersion", Value::from("meta.k8s.io/v1"))])));
         r
     }
 
@@ -562,6 +575,7 @@ impl Ctx<'_> {
         if r.get("uid").and_then(Value::as_str) != Some(uid.as_str()) {
             return fail("expected response.uid to match request.uid");
         }
+        self.warns.borrow_mut().extend(strs(r, "warnings").into_iter().map(String::from));
         if r.get("allowed").and_then(Value::as_bool) != Some(true) {
             let st = r.get("status");
             let s = |k: &str| st.and_then(|s| s.get(k)).and_then(Value::as_str).filter(|m| !m.is_empty());
@@ -587,67 +601,180 @@ impl Ctx<'_> {
     }
 }
 
-fn gather(api: &ApiServer, plural: &str, rt: &Route, op: &str) -> Vec<Value> {
-    let mut cfgs = api.wh_list(GROUP, "v1", plural);
-    cfgs.sort_by(|a, b| a.pointer(&["metadata", "name"]).and_then(Value::as_str).cmp(&b.pointer(&["metadata", "name"]).and_then(Value::as_str)));
-    cfgs.iter().flat_map(|c| c.get("webhooks").and_then(Value::as_array).unwrap_or(&[]).iter().cloned().collect::<Vec<_>>()).filter(|w| rules_match(w, rt, op)).collect()
+
+/// The parsed webhook configurations: every mutating and every validating webhook, in
+/// configuration-name order.
+pub struct Configs {
+    muts: Vec<Value>,
+    vals: Vec<Value>,
 }
 
-/// Runs webhook admission for a write request. `Ok(None)`: execute the request unchanged.
-/// `Err(reply)`: the request is rejected (or failed built-in admission) with that reply.
-pub async fn run(api: &ApiServer, req: &Req<'_>) -> Result<Option<Rewrite>, Reply> {
-    let op = match req.method {
-        "POST" => "CREATE",
-        "PUT" | "PATCH" => "UPDATE",
-        "DELETE" => "DELETE",
-        _ => return Ok(None),
-    };
-    let Some(rt) = api.wh_route(req.path) else { return Ok(None) };
-    if rt.res.group == GROUP || !matches!(rt.sub.as_deref(), None | Some("status")) || (rt.name.is_none() && op != "CREATE") {
-        return Ok(None);
+/// Parsed configurations, rebuilt only when a configuration object was added, changed or removed.
+fn configs(api: &ApiServer) -> Rc<Configs> {
+    let stamp = api.wh_stamp();
+    if let Some((s, c)) = api.wh_cache.borrow().as_ref() {
+        if *s == stamp {
+            return c.clone();
+        }
     }
-    let muts = gather(api, "mutatingwebhookconfigurations", &rt, op);
-    let vals = gather(api, "validatingwebhookconfigurations", &rt, op);
+    let load = |plural: &str| {
+        let mut cfgs = api.wh_list(GROUP, "v1", plural);
+        cfgs.sort_by(|a, b| a.pointer(&["metadata", "name"]).and_then(Value::as_str).cmp(&b.pointer(&["metadata", "name"]).and_then(Value::as_str)));
+        cfgs.iter().flat_map(|c| c.get("webhooks").and_then(Value::as_array).unwrap_or(&[]).iter().cloned().collect::<Vec<_>>()).collect::<Vec<_>>()
+    };
+    let c = Rc::new(Configs { muts: load("mutatingwebhookconfigurations"), vals: load("validatingwebhookconfigurations") });
+    *api.wh_cache.borrow_mut() = Some((stamp, c.clone()));
+    c
+}
+
+fn gather(api: &ApiServer, mutating: bool, rt: &Route, op: &str) -> Vec<Value> {
+    let c = configs(api);
+    let l = if mutating { &c.muts } else { &c.vals };
+    l.iter().filter(|w| rules_match(w, rt, op)).cloned().collect()
+}
+
+/// How the request is presented to webhooks.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// The resource itself (or `/status`): dry-run through the built-in handler.
+    Resource,
+    /// `*/scale` update: like `Resource`, with a Scale object and the current Scale as old.
+    Scale,
+    /// `pods/binding`, `pods/eviction`, `serviceaccounts/token`: the request body is the object.
+    Body(Kind),
+    /// `pods/exec`, `attach`, `portforward`: no object, the options come from the query.
+    Connect,
+}
+
+fn options_object(sub: &str, query: &str) -> Value {
+    let q = crate::api::Query::parse(query).unwrap_or_else(|_| crate::api::Query::parse("").unwrap());
+    let flag = |k: &str| Value::Bool(matches!(q.get(k), Some("true" | "1")));
+    let strings = |k: &str| Value::Array(q.all(k).into_iter().map(Value::from).collect());
+    if sub == "portforward" {
+        let ports = q.all("ports").into_iter().flat_map(|p| p.split(',')).filter_map(|p| p.trim().parse::<u64>().ok()).map(|p| Value::Number(json::Number::from_u64(p))).collect();
+        return obj(alloc::vec![("kind", Value::from("PodPortForwardOptions")), ("apiVersion", Value::from("v1")), ("ports", Value::Array(ports))]);
+    }
+    let mut o = obj(alloc::vec![
+        ("kind", Value::from(if sub == "exec" { "PodExecOptions" } else { "PodAttachOptions" })),
+        ("apiVersion", Value::from("v1")),
+        ("stdin", flag("stdin")),
+        ("stdout", flag("stdout")),
+        ("stderr", flag("stderr")),
+        ("tty", flag("tty")),
+    ]);
+    if let Some(c) = q.get("container") {
+        o.set("container", Value::from(c));
+    }
+    if sub == "exec" {
+        o.set("command", strings("command"));
+    }
+    o
+}
+
+/// Applies the patch of a mutating webhook's response to `cur`. `(called, changed)`.
+async fn mutate(ctx: &Ctx<'_>, wh: &Value, cur: &mut Value, old: &Value) -> Result<(bool, bool), Reply> {
+    let Outcome::Called(r) = ctx.invoke(wh, cur, old).await.map_err(Reply::err)? else { return Ok((false, false)) };
+    let wname = wh.get("name").and_then(Value::as_str).unwrap_or("");
+    let Some(p) = r.get("patch").and_then(Value::as_str).filter(|p| !p.is_empty() && !cur.is_null()) else { return Ok((true, false)) };
+    let applied = (|| {
+        if r.get("patchType").and_then(Value::as_str) != Some("JSONPatch") {
+            return Err("unsupported patchType".to_string());
+        }
+        let ops = json::parse(&kr_fmt::base64::decode(p).map_err(|_| "invalid patch encoding")?).map_err(|_| "invalid patch")?;
+        let mut n = cur.clone();
+        patch::json_patch(&mut n, &ops).map_err(|e| e.0)?;
+        Ok(n)
+    })();
+    match applied {
+        Ok(n) => {
+            let changed = n != *cur;
+            *cur = n;
+            Ok((true, changed))
+        }
+        Err(_) if wh.get("failurePolicy").and_then(Value::as_str) == Some("Ignore") => Ok((true, false)),
+        Err(e) => Err(Reply::err(failed(wname, &format!("error applying patch: {e}")))),
+    }
+}
+
+/// What [`run`] tells the transport to do.
+pub enum Run {
+    /// Execute the request, as given or rewritten.
+    Pass(Option<Rewrite>),
+    /// The request was already executed (DELETE collection, item by item): this is the answer.
+    Done(Reply),
+}
+
+/// Webhook admission of one object: `rt` addresses it, `req` is the request to dry-run (and to
+/// execute if admitted).
+async fn admit(api: &ApiServer, req: &Req<'_>, rt: &Route, op: &'static str, mode: Mode, user: &crate::api::User, warns: &RefCell<Vec<String>>) -> Result<Option<Rewrite>, Reply> {
+    let muts = gather(api, true, rt, op);
+    let vals = gather(api, false, rt, op);
     if muts.is_empty() && vals.is_empty() {
         return Ok(None);
     }
-    let user = api.authenticate(req).map_err(Reply::err)?;
     let dry = req.query.split('&').any(|p| p == "dryRun=All");
-    let q2 = if req.query.is_empty() { "dryRun=All".to_string() } else { format!("{}&dryRun=All", req.query) };
-    let dreq = Req { method: req.method, path: req.path, query: &q2, content_type: req.content_type, accept: None, body: req.body, user: Some(user.clone()), bearer: req.bearer, headers: req.headers, authz_verb: None };
-    let result = match api.handle(&dreq) {
-        Reply::Json(c, b) if c < 300 => json::parse(b.as_bytes()).map_err(|_| Reply::err(ApiError::new(500, "InternalError", "bad admission result")))?,
-        other => return Err(other),
-    };
     let name = rt.name.clone().unwrap_or_default();
-    let (obj0, old) = match op {
-        "DELETE" => (Value::Null, result),
-        "UPDATE" => (result, api.get_value(&rt, &name).map(|(_, v)| v).unwrap_or(Value::Null)),
-        _ => (result, Value::Null),
+    let sub = rt.sub.as_deref().unwrap_or("");
+    let (mut kind, mut options) = (None, None);
+    let (obj0, old) = match mode {
+        Mode::Connect => {
+            let o = options_object(sub, req.query);
+            let k = o.get("kind").and_then(Value::as_str).unwrap_or("");
+            kind = Some(("", "v1", if k == "PodExecOptions" { "PodExecOptions" } else if k == "PodAttachOptions" { "PodAttachOptions" } else { "PodPortForwardOptions" }));
+            options = Some(o);
+            (Value::Null, Value::Null)
+        }
+        Mode::Body(k) => {
+            kind = Some(k);
+            let b = if req.body.is_empty() { obj(alloc::vec![]) } else { json::parse(req.body).map_err(|_| Reply::err(ApiError::bad_request("invalid request body")))? };
+            (b, Value::Null)
+        }
+        Mode::Resource | Mode::Scale => {
+            let q2 = if req.query.is_empty() { "dryRun=All".to_string() } else { format!("{}&dryRun=All", req.query) };
+            let dreq = Req { method: req.method, path: req.path, query: &q2, content_type: req.content_type, accept: None, body: req.body, user: Some(user.clone()), bearer: req.bearer, headers: req.headers, authz_verb: req.authz_verb };
+            let result = match api.handle(&dreq) {
+                Reply::Json(c, b) if c < 300 => json::parse(b.as_bytes()).map_err(|_| Reply::err(ApiError::new(500, "InternalError", "bad admission result")))?,
+                other => return Err(other),
+            };
+            if mode == Mode::Scale {
+                kind = Some(("autoscaling", "v1", "Scale"));
+                let greq = Req { method: "GET", path: req.path, query: "", content_type: None, accept: None, body: b"", user: Some(user.clone()), bearer: req.bearer, headers: req.headers, authz_verb: None };
+                let old = match api.handle(&greq) {
+                    Reply::Json(200, b) => json::parse(b.as_bytes()).unwrap_or(Value::Null),
+                    _ => Value::Null,
+                };
+                (result, old)
+            } else {
+                match op {
+                    "DELETE" => (Value::Null, result),
+                    "UPDATE" => (result, api.get_value(rt, &name).map(|(_, v)| v).unwrap_or(Value::Null)),
+                    _ => (result, Value::Null),
+                }
+            }
+        }
     };
     let ns = rt.namespace.as_deref().and_then(|n| api.wh_object("", "v1", "namespaces", None, n));
-    let ctx = Ctx { api, rt: &rt, op, user, dry, ns };
+    let ctx = Ctx { api, rt, op, user: user.clone(), dry, ns, kind, options, warns };
     let mut cur = obj0.clone();
-    for wh in &muts {
-        let Outcome::Called(r) = ctx.invoke(wh, &cur, &old).await.map_err(Reply::err)? else { continue };
-        let wname = wh.get("name").and_then(Value::as_str).unwrap_or("");
-        let Some(p) = r.get("patch").and_then(Value::as_str).filter(|p| !p.is_empty() && !cur.is_null()) else { continue };
-        let applied = (|| {
-            if r.get("patchType").and_then(Value::as_str) != Some("JSONPatch") {
-                return Err("unsupported patchType".to_string());
-            }
-            let ops = json::parse(&kr_fmt::base64::decode(p).map_err(|_| "invalid patch encoding")?).map_err(|_| "invalid patch")?;
-            let mut n = cur.clone();
-            patch::json_patch(&mut n, &ops).map_err(|e| e.0)?;
-            Ok(n)
-        })();
-        match applied {
-            Ok(n) => cur = n,
-            Err(e) if wh.get("failurePolicy").and_then(Value::as_str) == Some("Ignore") => {
-                let _ = e;
-            }
-            Err(e) => return Err(Reply::err(failed(wname, &format!("error applying patch: {e}")))),
+    // reinvocationPolicy: IfNeeded webhooks that ran before a later webhook changed the object
+    // run once more (never recursively).
+    let (mut ran, mut stale): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+    for (i, wh) in muts.iter().enumerate() {
+        let (called, changed) = mutate(&ctx, wh, &mut cur, &old).await?;
+        if called && wh.get("reinvocationPolicy").and_then(Value::as_str) == Some("IfNeeded") {
+            ran.push(i);
         }
+        if changed {
+            for j in ran.iter().copied().filter(|j| *j != i) {
+                if !stale.contains(&j) {
+                    stale.push(j);
+                }
+            }
+        }
+    }
+    stale.sort_unstable();
+    for i in stale {
+        mutate(&ctx, &muts[i], &mut cur, &old).await?;
     }
     for wh in &vals {
         ctx.invoke(wh, &cur, &old).await.map_err(Reply::err)?;
@@ -661,6 +788,89 @@ pub async fn run(api: &ApiServer, req: &Req<'_>) -> Result<Option<Rewrite>, Repl
         }
     }
     Ok(Some(Rewrite { method: if op == "CREATE" { "POST" } else { "PUT" }, body: json::to_string(&cur).into_bytes() }))
+}
+
+/// Runs webhook admission for a request. `Ok(Pass(None))`: execute it unchanged. `Err(reply)`: it
+/// is rejected (or failed built-in admission). The warnings go to the client either way.
+pub async fn run(api: &ApiServer, req: &Req<'_>) -> (Result<Run, Reply>, Vec<String>) {
+    let warns = RefCell::new(Vec::new());
+    let r = run_inner(api, req, &warns).await;
+    (r, warns.into_inner())
+}
+
+async fn run_inner(api: &ApiServer, req: &Req<'_>, warns: &RefCell<Vec<String>>) -> Result<Run, Reply> {
+    let Some(rt) = api.wh_route(req.path) else { return Ok(Run::Pass(None)) };
+    if rt.res.group == GROUP {
+        return Ok(Run::Pass(None));
+    }
+    let named = rt.name.is_some();
+    let sub = rt.sub.as_deref();
+    let (op, mode): (&'static str, Mode) = match (req.method, sub) {
+        (_, Some(s)) if !rt.res.subresources.contains(&s) => return Ok(Run::Pass(None)),
+        ("GET" | "POST", Some("exec" | "attach" | "portforward")) if named => ("CONNECT", Mode::Connect),
+        ("POST", Some("binding")) if named => ("CREATE", Mode::Body(("", "v1", "Binding"))),
+        ("POST", Some("eviction")) if named => ("CREATE", Mode::Body(("policy", "v1", "Eviction"))),
+        ("POST", Some("token")) if named => ("CREATE", Mode::Body(("authentication.k8s.io", "v1", "TokenRequest"))),
+        ("PUT" | "PATCH", Some("scale")) if named => ("UPDATE", Mode::Scale),
+        (_, Some(s)) if s != "status" => return Ok(Run::Pass(None)),
+        ("POST", _) => ("CREATE", Mode::Resource),
+        ("PUT" | "PATCH", _) if named => ("UPDATE", Mode::Resource),
+        ("DELETE", _) => ("DELETE", Mode::Resource),
+        _ => return Ok(Run::Pass(None)),
+    };
+    if !named && op != "CREATE" && op != "DELETE" {
+        return Ok(Run::Pass(None));
+    }
+    if gather(api, true, &rt, op).is_empty() && gather(api, false, &rt, op).is_empty() {
+        return Ok(Run::Pass(None));
+    }
+    let user = api.authenticate(req).map_err(Reply::err)?;
+    if named || op != "DELETE" {
+        return admit(api, req, &rt, op, mode, &user, warns).await.map(Run::Pass);
+    }
+    // DELETE collection: admission and deletion per item, as upstream does. A denied item stays
+    // (the first denial is the answer); the other items are still deleted.
+    if rt.res.namespaced && rt.namespace.is_none() {
+        return Ok(Run::Pass(None));
+    }
+    let lq = ["labelSelector", "fieldSelector"].iter().filter_map(|k| crate::api::Query::parse(req.query).ok().and_then(|q| q.get(k).map(|v| format!("{k}={}", v.replace('%', "%25").replace('&', "%26").replace('=', "%3D").replace('+', "%2B"))))).collect::<Vec<_>>().join("&");
+    let lreq = Req { method: "GET", path: req.path, query: &lq, content_type: None, accept: None, body: b"", user: Some(user.clone()), bearer: req.bearer, headers: req.headers, authz_verb: Some("deletecollection") };
+    let list = match api.handle(&lreq) {
+        Reply::Json(c, b) if c < 300 => json::parse(b.as_bytes()).map_err(|_| Reply::err(ApiError::new(500, "InternalError", "bad list result")))?,
+        other => return Err(other),
+    };
+    let dry = req.query.split('&').any(|p| p == "dryRun=All");
+    let (mut deleted, mut first_err) = (Vec::new(), None);
+    for item in list.get("items").and_then(Value::as_array).unwrap_or(&[]) {
+        let Some(n) = item.pointer(&["metadata", "name"]).and_then(Value::as_str) else { continue };
+        let path = format!("{}/{}", req.path.trim_end_matches('/'), n);
+        let irt = Route { res: rt.res, namespace: rt.namespace.clone(), name: Some(n.to_string()), sub: None };
+        let ireq = Req { method: "DELETE", path: &path, query: if dry { "dryRun=All" } else { "" }, content_type: req.content_type, accept: None, body: req.body, user: Some(user.clone()), bearer: req.bearer, headers: req.headers, authz_verb: Some("deletecollection") };
+        match admit(api, &ireq, &irt, "DELETE", Mode::Resource, &user, warns).await {
+            Ok(_) => match api.handle(&ireq) {
+                Reply::Json(c, b) if c < 300 => deleted.push(json::parse(b.as_bytes()).ok().filter(|v| v.get("kind").and_then(Value::as_str) != Some("Status")).unwrap_or_else(|| item.clone())),
+                Reply::Json(404, _) => {}
+                other => {
+                    first_err.get_or_insert(other);
+                }
+            },
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    Ok(Run::Done(Reply::Json(
+        200,
+        json::to_string(&obj(alloc::vec![
+            ("kind", Value::String(format!("{}List", rt.res.kind))),
+            ("apiVersion", Value::String(rt.res.group_version())),
+            ("metadata", obj(alloc::vec![("resourceVersion", Value::String(api.revision().to_string()))])),
+            ("items", Value::Array(deleted)),
+        ])),
+    )))
 }
 
 #[cfg(test)]

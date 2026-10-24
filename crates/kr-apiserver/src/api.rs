@@ -103,6 +103,8 @@ pub struct ApiServer {
     custom: RefCell<Vec<crate::crd::Custom>>,
     /// Group commit: writes reach the log synchronously, fsync happens off the event loop.
     committer: crate::durable::Committer,
+    /// Parsed webhook configurations, valid for the stamp they were built at.
+    pub(crate) wh_cache: RefCell<Option<([u64; 4], alloc::rc::Rc<crate::webhook::Configs>)>>,
 }
 
 /// Default namespaces created on first start.
@@ -146,10 +148,10 @@ fn url_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-struct Query(Vec<(String, String)>);
+pub(crate) struct Query(Vec<(String, String)>);
 
 impl Query {
-    fn parse(q: &str) -> R<Query> {
+    pub(crate) fn parse(q: &str) -> R<Query> {
         let mut v = Vec::new();
         for kv in q.split('&').filter(|p| !p.is_empty()) {
             let (k, val) = kv.split_once('=').unwrap_or((kv, ""));
@@ -158,8 +160,11 @@ impl Query {
         }
         Ok(Query(v))
     }
-    fn get(&self, k: &str) -> Option<&str> {
+    pub(crate) fn get(&self, k: &str) -> Option<&str> {
         self.0.iter().rev().find(|(x, _)| x == k).map(|(_, v)| v.as_str())
+    }
+    pub(crate) fn all(&self, k: &str) -> Vec<&str> {
+        self.0.iter().filter(|(x, _)| x == k).map(|(_, v)| v.as_str()).collect()
     }
     fn flag(&self, k: &str) -> bool {
         matches!(self.get(k), Some("true" | "1"))
@@ -193,7 +198,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new() };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), wh_cache: RefCell::new(None) };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -590,6 +595,19 @@ impl ApiServer {
         let Some(r) = resources::find(group, version, plural) else { return Vec::new() };
         let (items, _) = self.store.borrow().list(&r.prefix(), None, 0);
         items.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect()
+    }
+
+    /// (count, newest mod revision) of the mutating and validating webhook configurations.
+    pub(crate) fn wh_stamp(&self) -> [u64; 4] {
+        let mut s = [0; 4];
+        for (i, p) in ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"].iter().enumerate() {
+            if let Some(r) = resources::find("admissionregistration.k8s.io", "v1", p) {
+                let (items, _) = self.store.borrow().list(&r.prefix(), None, 0);
+                s[i * 2] = items.len() as u64;
+                s[i * 2 + 1] = items.iter().map(|kv| kv.mod_rev).max().unwrap_or(0);
+            }
+        }
+        s
     }
 
     pub(crate) fn wh_uid(&self) -> String {
@@ -1720,7 +1738,7 @@ impl ApiServer {
         if let Some(m) = new.get_mut("metadata") {
             m.remove("resourceVersion");
         }
-        let q = Query(Vec::new());
+        let q = Query::parse(req.query)?;
         match self.update(req, rt, name, false, &q, Some((kv, old, new)))? {
             Reply::Json(200, s) => {
                 let v = json::parse(s.as_bytes()).unwrap_or(Value::Null);

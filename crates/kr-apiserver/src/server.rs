@@ -2,7 +2,9 @@
 //! responses (watches become chunked streams), and runs the listener.
 
 use crate::api::{ApiServer, Reply, Req, User, WatchStream};
+use crate::webhook::Run;
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::String;
 use core::task::{Context, Poll};
@@ -41,23 +43,33 @@ pub async fn handle(api: &ApiServer, req: Request) -> Response {
         bearer: req.header("authorization").and_then(|a| a.strip_prefix("Bearer ").or_else(|| a.strip_prefix("bearer "))).map(str::trim),
         authz_verb: None,
     };
+    let before = api.revision();
+    let (res, warnings) = crate::webhook::run(api, &r).await;
     let rewritten;
-    let r = match crate::webhook::run(api, &r).await {
-        Err(reply) => return respond(reply),
-        Ok(None) => r,
-        Ok(Some(w)) => {
-            rewritten = w;
-            Req { method: rewritten.method, content_type: Some("application/json"), body: &rewritten.body, authz_verb: (r.method == "PATCH").then_some("patch"), ..r }
+    let reply = match res {
+        Err(reply) => reply,
+        Ok(Run::Done(reply)) => reply,
+        Ok(Run::Pass(w)) => {
+            let r = match w {
+                None => r,
+                Some(w) => {
+                    rewritten = w;
+                    Req { method: rewritten.method, content_type: Some("application/json"), body: &rewritten.body, authz_verb: (r.method == "PATCH").then_some("patch"), ..r }
+                }
+            };
+            api.handle(&r)
         }
     };
-    let before = api.revision();
-    let reply = api.handle(&r);
     // A write is acknowledged only once it is on disk (group commit, fsync off the event loop).
     let after = api.revision();
     if after > before && api.commit(after).await.is_err() {
         return respond(Reply::err(crate::object::ApiError::new(500, "InternalError", "storage sync failed")));
     }
-    respond(reply)
+    let mut resp = respond(reply);
+    for w in warnings {
+        resp = resp.with_header("Warning", &format!("299 - \"{}\"", w.replace('\\', "\\\\").replace('"', "\\\"").replace(['\n', '\r'], " ")));
+    }
+    resp
 }
 
 fn respond(reply: Reply) -> Response {

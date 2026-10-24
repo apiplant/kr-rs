@@ -8,6 +8,8 @@ use kr_crypto::x509::{self, CertParams, Name, SigningKey};
 use kr_fmt::json::{self, Value};
 use kr_net::http1::server::{listen, local_addr, serve, HandlerFuture, Request, Response, ServerConfig};
 use kr_rt::exec::{block_on, sleep, spawn};
+use kr_net::http1::client::{Client as Http, Config as HttpConfig};
+use kr_net::tls::TlsConnector;
 use std::rc::Rc;
 use std::sync::Mutex;
 
@@ -58,6 +60,15 @@ thread_local! {
     static SEEN: std::cell::RefCell<Vec<(String, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// The last AdmissionRequest per path.
+    static LAST: std::cell::RefCell<Vec<(String, Value)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn last(path: &str) -> Value {
+    LAST.with(|s| s.borrow().iter().rev().find(|(p, _)| p == path).map(|(_, r)| r.clone()).unwrap())
+}
+
 fn seen(path: &str) -> Vec<bool> {
     SEEN.with(|s| s.borrow().iter().filter(|(p, _)| p == path).map(|(_, d)| *d).collect())
 }
@@ -77,7 +88,11 @@ fn start_webhook(ca_name: &Name, ca_key: &SigningKey) -> u16 {
             let uid = r.get("uid").and_then(Value::as_str).unwrap().to_string();
             let path = req.path().to_string();
             SEEN.with(|s| s.borrow_mut().push((path.clone(), r.get("dryRun").and_then(Value::as_bool).unwrap_or(false))));
+            LAST.with(|s| s.borrow_mut().push((path.clone(), r.clone())));
             let body = match path.as_str() {
+                "/deny-keep" if r.get("name").and_then(Value::as_str) == Some("keep") => format!(r#"{{"response":{{"uid":"{uid}","allowed":false,"status":{{"message":"keep it"}}}}}}"#),
+                "/deny-exec" => format!(r#"{{"response":{{"uid":"{uid}","allowed":false,"status":{{"message":"no exec"}}}}}}"#),
+                "/warn" => format!(r#"{{"response":{{"uid":"{uid}","allowed":true,"warnings":["careful","say \"hi\""]}}}}"#),
                 "/deny" => format!(r#"{{"response":{{"uid":"{uid}","allowed":false,"status":{{"message":"no way"}}}}}}"#),
                 "/mutate" => {
                     let p = kr_fmt::base64::encode(br#"[{"op":"add","path":"/data/mutated","value":"yes"}]"#);
@@ -269,5 +284,102 @@ fn run() {
         assert_eq!(c.get(&format!("{CM}/s3")).await.unwrap_err().code, 404);
         assert_eq!(seen("/allow")[before..], [false, true]);
         uninstall(&c, VWC, "se").await;
+
+        // matchPolicy: Equivalent (default) ignores the rule's version; Exact does not
+        let v9 = wh(&e, "/deny", "").replace(r#""apiVersions":["v1"]"#, r#""apiVersions":["v9"]"#);
+        install(&c, VWC, "eq", &[v9.clone()]).await;
+        assert_eq!(c.create(CM, &cm("m1")).await.unwrap_err().code, 403);
+        uninstall(&c, VWC, "eq").await;
+        install(&c, VWC, "eq", &[v9.replace("\"admissionReviewVersions\"", "\"matchPolicy\":\"Exact\",\"admissionReviewVersions\"")]).await;
+        c.create(CM, &cm("m1")).await.unwrap();
+        uninstall(&c, VWC, "eq").await;
+
+        // reinvocationPolicy: IfNeeded runs again after a later webhook changed the object
+        let before = seen("/ra").len();
+        install(&c, MWC, "1-a", &[wh(&e, "/ra", "")]).await;
+        install(&c, MWC, "2-b", &[wh(&e, "/mutate", "")]).await;
+        c.create(CM, &cm("r1")).await.unwrap();
+        assert_eq!(seen("/ra").len() - before, 1);
+        uninstall(&c, MWC, "1-a").await;
+        install(&c, MWC, "1-a", &[wh(&e, "/ra", r#","reinvocationPolicy":"IfNeeded""#)]).await;
+        c.create(CM, &cm("r2")).await.unwrap();
+        assert_eq!(seen("/ra").len() - before, 3);
+        uninstall(&c, MWC, "1-a").await;
+        uninstall(&c, MWC, "2-b").await;
+
+        // DELETE collection: one admission per item; a denied item stays, the rest go
+        for n in ["dc1", "dc2", "keep"] {
+            let mut o = cm(n);
+            o.entry_object("metadata").set("labels", v(r#"{"g":"1"}"#));
+            c.create(CM, &o).await.unwrap();
+        }
+        let before = seen("/deny-keep").len();
+        install(&c, VWC, "dc", &[wh(&e, "/deny-keep", "")]).await;
+        let err = c.delete(&format!("{CM}?labelSelector=g%3D1")).await.unwrap_err();
+        assert_eq!(err.code, 403, "{err:?}");
+        assert!(err.message.contains("keep it"), "{}", err.message);
+        assert_eq!(seen("/deny-keep").len() - before, 3);
+        assert_eq!(c.get(&format!("{CM}/dc1")).await.unwrap_err().code, 404);
+        assert_eq!(c.get(&format!("{CM}/dc2")).await.unwrap_err().code, 404);
+        c.get(&format!("{CM}/keep")).await.unwrap();
+        uninstall(&c, VWC, "dc").await;
+        let l = c.delete(&format!("{CM}?labelSelector=g%3D1")).await.unwrap();
+        assert_eq!(l.get("items").and_then(Value::as_array).map(|a| a.len()), Some(1));
+
+        // response warnings become Warning headers
+        install(&c, VWC, "warn", &[wh(&e, "/warn", "")]).await;
+        let (code, warnings) = raw(&e, "POST", CM, &cm("w1")).await;
+        assert_eq!(code, 201);
+        assert_eq!(warnings, ["299 - \"careful\"", "299 - \"say \\\"hi\\\"\""]);
+        uninstall(&c, VWC, "warn").await;
+
+        // subresources: CONNECT with options, scale, token
+        let sub = |path: &str, ops: &str, group: &str, res: &str| {
+            wh(&e, path, "").replace(r#""operations":["CREATE","UPDATE","DELETE"]"#, &format!(r#""operations":[{ops}]"#)).replace(r#""apiGroups":[""]"#, &format!(r#""apiGroups":["{group}"]"#)).replace(r#""resources":["configmaps"]"#, &format!(r#""resources":["{res}"]"#))
+        };
+        install(&c, VWC, "exec", &[sub("/deny-exec", r#""CONNECT""#, "", "pods/exec")]).await;
+        let err = c.create("/api/v1/namespaces/default/pods/nopod/exec?command=ls&command=-l&container=main&stdout=true", &v("{}")).await.unwrap_err();
+        assert_eq!(err.code, 403, "{err:?}");
+        assert!(err.message.contains("no exec"), "{}", err.message);
+        let r = last("/deny-exec");
+        let s = |p: &[&str]| r.pointer(p).and_then(Value::as_str).map(String::from);
+        assert_eq!((s(&["operation"]).as_deref(), s(&["subResource"]).as_deref(), s(&["kind", "kind"]).as_deref(), s(&["name"]).as_deref()), (Some("CONNECT"), Some("exec"), Some("PodExecOptions"), Some("nopod")));
+        assert_eq!(r.get("object"), Some(&Value::Null));
+        let o = r.get("options").unwrap();
+        assert_eq!((o.get("kind").and_then(Value::as_str), o.get("container").and_then(Value::as_str), o.get("stdout").and_then(Value::as_bool), o.get("tty").and_then(Value::as_bool)), (Some("PodExecOptions"), Some("main"), Some(true), Some(false)));
+        assert_eq!(json::to_string(o.get("command").unwrap()), r#"["ls","-l"]"#);
+        uninstall(&c, VWC, "exec").await;
+
+        let dep = v(r#"{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"d"},"spec":{"replicas":1,"selector":{"matchLabels":{"a":"b"}},"template":{"metadata":{"labels":{"a":"b"}},"spec":{"containers":[{"name":"c","image":"i"}]}}}}"#);
+        c.create("/apis/apps/v1/namespaces/default/deployments", &dep).await.unwrap();
+        install(&c, VWC, "scale", &[sub("/deny", r#""UPDATE""#, "apps", "deployments/scale")]).await;
+        let sc = v(r#"{"apiVersion":"autoscaling/v1","kind":"Scale","metadata":{"name":"d"},"spec":{"replicas":3}}"#);
+        let err = c.update("/apis/apps/v1/namespaces/default/deployments/d/scale", &sc).await.unwrap_err();
+        assert_eq!(err.code, 403, "{err:?}");
+        let r = last("/deny");
+        assert_eq!((r.pointer(&["kind", "kind"]).and_then(Value::as_str), r.pointer(&["object", "spec", "replicas"]).and_then(Value::as_i64), r.pointer(&["oldObject", "spec", "replicas"]).and_then(Value::as_i64)), (Some("Scale"), Some(3), Some(1)));
+        uninstall(&c, VWC, "scale").await;
+        let got = c.get("/apis/apps/v1/namespaces/default/deployments/d").await.unwrap();
+        assert_eq!(got.pointer(&["spec", "replicas"]).and_then(Value::as_i64), Some(1));
+
+        c.create("/api/v1/namespaces/default/serviceaccounts", &v(r#"{"apiVersion":"v1","kind":"ServiceAccount","metadata":{"name":"sa1"}}"#)).await.unwrap();
+        install(&c, VWC, "token", &[sub("/deny", r#""CREATE""#, "", "serviceaccounts/token")]).await;
+        let err = c.create("/api/v1/namespaces/default/serviceaccounts/sa1/token", &v(r#"{"spec":{"audiences":["x"]}}"#)).await.unwrap_err();
+        assert_eq!(err.code, 403, "{err:?}");
+        let r = last("/deny");
+        assert_eq!((r.pointer(&["kind", "kind"]).and_then(Value::as_str), r.pointer(&["kind", "group"]).and_then(Value::as_str), r.pointer(&["subResource"]).and_then(Value::as_str)), (Some("TokenRequest"), Some("authentication.k8s.io"), Some("token")));
+        uninstall(&c, VWC, "token").await;
     });
+}
+
+/// One request with the admin client certificate: the status and the `Warning` headers.
+async fn raw(e: &Env, method: &str, path: &str, body: &Value) -> (u16, Vec<String>) {
+    let chain = x509::pem_decode_all(&e.chain_pem, "CERTIFICATE").unwrap();
+    let k = x509::private_key_from_pkcs8(&x509::pem_decode_all(&e.key_pem, "PRIVATE KEY").unwrap()[0]).unwrap();
+    let roots = x509::pem_decode_all(&e.ca_pem, "CERTIFICATE").unwrap();
+    let cfg = Rc::new(kr_crypto::tls::ClientConfig { pinned_ca: None, roots, client_cert: Some((chain, k)), alpn: vec![b"http/1.1".to_vec()], tls12: false });
+    let http = Http::with_connector(TlsConnector::new(kr_net::dns::SystemResolver::system(), cfg), HttpConfig::default());
+    let mut resp = http.request(method, &format!("{}{path}", e.url), &[("Content-Type", "application/json")], json::to_string(body).as_bytes()).await.unwrap();
+    let _ = resp.read_to_end(1 << 20).await;
+    (resp.status, resp.headers().iter().filter(|(n, _)| n.eq_ignore_ascii_case("warning")).map(|(_, v)| v.clone()).collect())
 }
