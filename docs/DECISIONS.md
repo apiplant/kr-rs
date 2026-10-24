@@ -344,3 +344,43 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **NAT:** the masquerade rule already skips cluster-CIDR destinations, so pod source IPs survive.
 
 **Status:** accepted.
+
+## ADR-026: kr-raft, replicating the kr-store log across servers (HA)
+
+**Context:** kr-store (ADR-021) lives on one server, so losing it stops the control plane. HA needs 3 (or 5) servers that agree on one ordered history of writes, survive the loss of a minority, and give every server identical revisions (`resourceVersion`) and watch streams.
+
+**Decision:**
+- **What is replicated:** kr-store's own write-ahead records (op, revision, create revision, key, value), not API requests.
+  - The leader's store applies a write as today. The records it produces become the payload of a Raft log entry.
+  - Followers apply committed records verbatim, through the same path startup replay uses.
+  - Revisions are therefore assigned once, by the leader, and are identical everywhere.
+  - Precondition failures (409) produce no record, so they never reach the log.
+- **Consensus:** Raft (Ongaro & Ousterhout), in a sans-I/O crate `kr-raft`.
+  - Covered: leader election with randomized timeouts and pre-vote, log replication with conflict-index backtracking, a commit rule restricted to current-term entries, snapshots with InstallSnapshot, and single-server membership changes (one at a time, effective on append).
+  - It is driven by `tick()`, `step(msg)` and `propose()`, and its output (messages, entries to persist, committed entries, snapshots) is handed back in a `Ready` value. It is tested with a simulated network that drops, reorders, duplicates and partitions messages, while invariants are checked continuously.
+- **Durability:**
+  - The Raft log and hard state (term, vote) on each server replace the kr-store log file.
+  - A write is acknowledged when its entry is committed, meaning a majority has fsynced it. The local fsync still goes through the ADR-024 helper.
+  - Snapshots are kr-store snapshots tagged with the Raft index, term and membership.
+- **Speculative state on the leader:**
+  - The leader's store already holds writes that aren't committed yet.
+  - Watch events are released only up to the committed revision.
+  - If a leader steps down with uncommitted entries that the new leader then overwrites, it rebuilds its store from the snapshot plus the committed log.
+  - Plain reads on a leader can see an uncommitted write during that window. Only failover exposes this, and the writer never received an acknowledgement. This is documented and accepted.
+- **Serving:**
+  - **Reads and watches** are served locally on every server. They are as fresh as that server's committed state, like etcd's serializable reads.
+  - **Writes reaching a follower** are forwarded to the leader. An HTTP request is proxied over TLS with the original user and groups passed as request-header identity, which the leader trusts only from server certificates.
+  - **In-process clients** on followers forward the same way.
+  - **Controllers and the scheduler** run only on the leader. They start and stop with leadership.
+- **Transport:**
+  - Server-to-server TLS on port 6444, with mutual authentication.
+  - Each server gets a certificate from the cluster CA in the group `system:kr-servers`, and only those certificates are accepted.
+  - Messages are length-prefixed binary.
+- **Joining:**
+  - `kr server --server https://<existing>:6443 --token <server token>` fetches the CA, pinned to the token's hash.
+  - It then calls `POST /kr/join-server`, which needs a separate *server* token: agent tokens must never grant membership, because servers hold the CA and service-account signing keys.
+  - The response returns the CA and service-account keys plus fresh server certificates.
+  - The new server is then added as a voting member and catches up from a snapshot.
+- **Single server:** a single-member Raft group. It commits on the local fsync, so existing installs keep working. Their store is imported as the initial snapshot.
+
+**Status:** accepted (in progress).
