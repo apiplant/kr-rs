@@ -752,6 +752,43 @@ impl ApiServer {
         !(review || stream)
     }
 
+    /// Rejects admission webhook configurations whose matchConditions do not compile.
+    fn check_webhook_config(rt: &Route, o: &Value) -> R<()> {
+        if rt.res.group != "admissionregistration.k8s.io" || !matches!(rt.res.plural, "mutatingwebhookconfigurations" | "validatingwebhookconfigurations") {
+            return Ok(());
+        }
+        let mut errs = Vec::new();
+        for (i, w) in o.get("webhooks").and_then(Value::as_array).unwrap_or(&[]).iter().enumerate() {
+            for (j, c) in w.get("matchConditions").and_then(Value::as_array).unwrap_or(&[]).iter().enumerate() {
+                let ex = c.get("expression").and_then(Value::as_str).unwrap_or("");
+                if let Err(e) = crate::cel::Program::compile(ex, &["object", "oldObject", "request", "authorizer"]) {
+                    errs.push(alloc::format!("webhooks[{i}].matchConditions[{j}].expression: Invalid value: {ex:?}: compilation failed: {e}"));
+                }
+            }
+        }
+        if errs.is_empty() {
+            return Ok(());
+        }
+        let name = o.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("");
+        Err(ApiError::invalid(alloc::format!("{}.{} \"{name}\" is invalid: {}", rt.res.kind, rt.res.group, errs.join(", "))))
+    }
+
+    /// Server-side apply reports unknown fields of the applied configuration as typed-patch
+    /// conversion errors (`.spec.x: field not declared in schema`), not as strict decoding errors.
+    fn apply_strict_error(req: &Req, rt: &Route, e: ApiError) -> ApiError {
+        let Some(list) = e.message.strip_prefix("strict decoding error: ") else { return e };
+        if !req.content_type.is_some_and(|c| c.starts_with("application/apply-patch")) {
+            return e;
+        }
+        let mut out = alloc::format!("failed to create typed patch object ({}; {}, Kind={}): errors:", req.path, rt.res.group_version(), rt.res.kind);
+        for m in list.split(", ") {
+            if let Some(p) = m.strip_prefix("unknown field \"").and_then(|m| m.strip_suffix('"')) {
+                out.push_str(&alloc::format!("\n  .{p}: field not declared in schema"));
+            }
+        }
+        ApiError::new(e.code, e.reason, out)
+    }
+
     /// Applies `fieldValidation` to unknown/duplicate field messages: reject (Strict), warn
     /// (Warn) or ignore.
     fn fv_report(&self, msgs: Vec<String>) -> R<()> {
@@ -1046,7 +1083,8 @@ impl ApiServer {
                 Ok(Reply::Json(200, self.table(rt.res, &[kv], rev, None)))
             }
             ("GET", Some(n), _) => {
-                let (_, v) = self.get_value(rt, n)?;
+                let (_, mut v) = self.get_value(rt, n)?;
+                self.default_on_read(rt, &mut v);
                 Ok(Reply::ok(&v))
             }
             ("POST", None, None) => self.create(req, rt, q),
@@ -1063,7 +1101,7 @@ impl ApiServer {
             }
             ("PATCH", Some(n), Some("ephemeralcontainers")) => self.patch(req, rt, n, false, q, true),
             ("PUT", Some(n), s) => self.update(req, rt, n, s == Some("status"), q, None),
-            ("PATCH", Some(n), s) => self.patch(req, rt, n, s == Some("status"), q, false),
+            ("PATCH", Some(n), s) => self.patch(req, rt, n, s == Some("status"), q, false).map_err(|e| Self::apply_strict_error(req, rt, e)),
             ("DELETE", Some(n), None) => self.delete(req, rt, n, q),
             ("DELETE", None, None) => self.delete_collection(rt, q),
             _ => Err(ApiError::new(405, "MethodNotAllowed", alloc::format!("method {} not allowed here", req.method))),
@@ -1086,6 +1124,20 @@ impl ApiServer {
         match &rt.namespace {
             Some(ns) if rt.res.namespaced => alloc::format!("{}{ns}/", rt.res.prefix()),
             _ => rt.res.prefix(),
+        }
+    }
+
+    /// The schema of a custom resource that declares defaults: objects stored before a default
+    /// was added get it when read.
+    fn read_defaults(&self, rt: &Route) -> Option<Value> {
+        let custom = self.custom.borrow();
+        let c = custom.iter().find(|c| core::ptr::eq(c.res, rt.res))?;
+        c.schema.as_ref().filter(|s| json::to_string(s).contains("\"default\"")).cloned()
+    }
+
+    fn default_on_read(&self, rt: &Route, v: &mut Value) {
+        if let Some(s) = self.read_defaults(rt) {
+            crate::crd::prune(&s, v, true);
         }
     }
 
@@ -1177,11 +1229,19 @@ impl ApiServer {
             out.push_str(&alloc::format!(",\"remainingItemCount\":{n}"));
         }
         out.push_str("},\"items\":[");
+        let defaulted = self.read_defaults(rt);
         for (i, kv) in items.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
-            out.push_str(core::str::from_utf8(&kv.value).unwrap_or("null"));
+            match &defaulted {
+                Some(sch) => {
+                    let mut v = json::parse(&kv.value).unwrap_or(Value::Null);
+                    crate::crd::prune(sch, &mut v, true);
+                    out.push_str(&json::to_string(&v));
+                }
+                None => out.push_str(core::str::from_utf8(&kv.value).unwrap_or("null")),
+            }
         }
         out.push_str("]}");
         Ok(Reply::Json(200, out))
@@ -1249,14 +1309,26 @@ impl ApiServer {
             })?
         } else if ct.starts_with("application/yaml") || ct.starts_with("application/apply-patch+yaml") {
             let s = core::str::from_utf8(req.body).map_err(|_| ApiError::bad_request("body is not UTF-8"))?;
-            kr_fmt::yaml::parse(s).map_err(|_| ApiError::bad_request("invalid YAML body"))?
+            kr_fmt::yaml::parse(s).map_err(|e| {
+                if e.kind == kr_fmt::yaml::ErrorKind::DuplicateKey {
+                    // The decoder names the repeated key: `line 9: key "foo" already set in map`.
+                    let key = s.lines().nth(e.line.saturating_sub(1)).and_then(|l| l.trim_start().split(':').next()).unwrap_or("").trim_matches(['"', '\'']);
+                    return ApiError::bad_request(alloc::format!("error converting YAML to JSON: yaml: line {}: key \"{key}\" already set in map", e.line));
+                }
+                ApiError::bad_request("invalid YAML body")
+            })?
         } else {
             json::parse(req.body).map_err(|_| ApiError::bad_request("invalid JSON body"))?
         };
         if v.has_duplicate_keys() && self.fv_mode.get() != crate::fieldval::Mode::Ignore {
             let mut d = Vec::new();
             crate::fieldval::duplicates(&v, "", &mut d);
-            self.fv_report(d.into_iter().map(|p| alloc::format!("duplicate field \"{p}\"")).collect())?;
+            // Upstream lists the unknown fields before the duplicates in one error.
+            let gv = v.get("apiVersion").and_then(Value::as_str).unwrap_or("");
+            let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
+            let mut msgs: Vec<String> = crate::fieldval::unknown_builtin(gv, kind, &v).unwrap_or_default().into_iter().map(|p| alloc::format!("unknown field \"{p}\"")).collect();
+            msgs.extend(d.into_iter().map(|p| alloc::format!("duplicate field \"{p}\"")));
+            self.fv_report(msgs)?;
         }
         Ok(v)
     }
@@ -1459,6 +1531,7 @@ impl ApiServer {
             let st = crate::policy::type_check_status(self, o);
             o.set("status", st);
         }
+        Self::check_webhook_config(rt, o)?;
         self.admit_custom(rt, o, None, false)?;
         if rt.res.plural == "pods" {
             let ns = rt.namespace.clone().unwrap_or_default();
@@ -1560,6 +1633,7 @@ impl ApiServer {
             let st = crate::policy::type_check_status(self, &new);
             new.set("status", st);
         }
+        Self::check_webhook_config(rt, &new)?;
         self.admit_custom(rt, &mut new, Some(&old), status)?;
         if rt.res.plural == "services" && !status {
             self.admit_service(&mut new, Some(&old))?;
