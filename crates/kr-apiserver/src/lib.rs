@@ -13,6 +13,7 @@ pub mod admit;
 pub mod api;
 pub mod client;
 pub mod cluster;
+pub mod convert;
 pub mod cel;
 pub mod crd;
 pub mod defaults;

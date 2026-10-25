@@ -24,8 +24,9 @@ pub struct Custom {
     pub schema: Option<Value>,
     /// (specReplicasPath, statusReplicasPath, labelSelectorPath) when `scale` is enabled.
     pub scale: Option<[String; 3]>,
-    /// The CRD converts between versions with a webhook (unsupported).
-    pub webhook: bool,
+    /// The CRD converts between versions with a webhook: its `clientConfig`. `None`: only
+    /// apiVersion changes.
+    pub webhook: Option<Value>,
 }
 
 impl Custom {
@@ -220,7 +221,7 @@ pub fn build(crd: &Value, existing: &[Custom]) -> Vec<Custom> {
     let namespaced = str_at(crd, &["spec", "scope"]) == "Namespaced";
     let short = strs(crd.pointer(&["spec", "names", "shortNames"]));
     let cats = strs(crd.pointer(&["spec", "names", "categories"]));
-    let webhook = str_at(crd, &["spec", "conversion", "strategy"]) == "Webhook";
+    let webhook = (str_at(crd, &["spec", "conversion", "strategy"]) == "Webhook").then(|| crd.pointer(&["spec", "conversion", "webhook", "clientConfig"]).cloned().unwrap_or(Value::Null));
     let mut vs: Vec<&Value> = crd.pointer(&["spec", "versions"]).and_then(Value::as_array).unwrap_or(&[]).iter().filter(|v| is_true(v.get("served"))).collect();
     vs.sort_by(|a, b| version_rank(str_at(b, &["name"])).cmp(&version_rank(str_at(a, &["name"]))).then(str_at(a, &["name"]).cmp(str_at(b, &["name"]))));
     let mut out = Vec::new();
@@ -262,7 +263,7 @@ pub fn build(crd: &Value, existing: &[Custom]) -> Vec<Custom> {
                 categories: leak_all(&cats),
             }))
         });
-        out.push(Custom { res, crd: str_at(crd, &["metadata", "name"]).to_string(), schema: v.pointer(&["schema", "openAPIV3Schema"]).cloned(), scale, webhook });
+        out.push(Custom { res, crd: str_at(crd, &["metadata", "name"]).to_string(), schema: v.pointer(&["schema", "openAPIV3Schema"]).cloned(), scale, webhook: webhook.clone() });
     }
     out
 }

@@ -311,6 +311,8 @@ impl ApiServer {
                 let strip = |v: &Value| {
                     let mut v = v.clone();
                     v.remove("metadata");
+                    // A stored object of another version is rewritten as this one.
+                    v.remove("apiVersion");
                     if has_status {
                         v.remove("status");
                     }
@@ -329,6 +331,10 @@ impl ApiServer {
         let multi = {
             let custom = self.custom.borrow();
             let Some(c) = custom.iter().find(|c| core::ptr::eq(c.res, rt.res)) else { return reply };
+            // Webhook conversion is done by the transport (`convert::post`).
+            if c.webhook.is_some() {
+                return reply;
+            }
             custom.iter().filter(|x| x.crd == c.crd).count() > 1
         };
         let reply = match reply {
@@ -828,6 +834,11 @@ impl ApiServer {
         let Some(u) = crate::fieldval::unknown_builtin(&gv, rt.res.kind, new) else { return Ok(()) };
         let o = old.and_then(|o| crate::fieldval::unknown_builtin(&gv, rt.res.kind, o)).unwrap_or_default();
         self.fv_report(crate::fieldval::messages(u, &o))
+    }
+
+    /// The conversion webhook `clientConfig` of a custom resource, if its CRD converts with one.
+    pub(crate) fn conversion_webhook(&self, res: &'static Resource) -> Option<Value> {
+        self.custom.borrow().iter().find(|c| core::ptr::eq(c.res, res))?.webhook.clone()
     }
 
     /// Parses a resource URL (for the webhook layer).
@@ -1766,6 +1777,11 @@ impl ApiServer {
             }
             other => other?,
         };
+        let mut old = old;
+        if self.custom.borrow().iter().any(|c| core::ptr::eq(c.res, rt.res)) {
+            // The object may have been stored as another served version.
+            old.set("apiVersion", Value::from(rt.res.group_version().as_str()));
+        }
         if let (true, Some(mgr)) = (is_apply, manager) {
             // Server-side apply: the body is the manager's full intent.
             let scope = self.ssa_scope(rt, status);

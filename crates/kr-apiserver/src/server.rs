@@ -86,6 +86,9 @@ pub async fn handle(api: &ApiServer, req: Request) -> Response {
         }
     }
     let before = api.revision();
+    if let Some(reply) = crate::convert::pre(api, &r).await {
+        return respond(reply);
+    }
     let (res, warnings) = crate::webhook::run(api, &r).await;
     let rewritten;
     let reply = match res {
@@ -99,7 +102,8 @@ pub async fn handle(api: &ApiServer, req: Request) -> Response {
                     Req { method: rewritten.method, content_type: Some("application/json"), body: &rewritten.body, authz_verb: (r.method == "PATCH").then_some("patch"), ..r }
                 }
             };
-            api.handle(&r)
+            let reply = api.handle(&r);
+            crate::convert::post(api, &r, reply).await
         }
     };
     if let Reply::Proxy(t) = reply {
