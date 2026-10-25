@@ -75,3 +75,24 @@ fn crd_schemas_are_published() {
     let (_, v2) = call(&api, "GET", "/openapi/v2", "", "");
     assert!(v2.pointer(&["definitions", "com.example.test.v1.Foo"]).is_none());
 }
+
+#[test]
+fn unserving_a_version_removes_its_definition() {
+    let api = server();
+    let crd = |v6_served: bool| format!(r#"{{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{{"name":"multis.test.example.com"}},
+     "spec":{{"group":"test.example.com","scope":"Namespaced","names":{{"plural":"multis","singular":"multi","kind":"Multi","listKind":"MultiList"}},
+     "versions":[{{"name":"v6alpha1","served":{v6_served},"storage":false,"schema":{{"openAPIV3Schema":{{"type":"object"}}}}}},{{"name":"v5","served":true,"storage":true,"schema":{{"openAPIV3Schema":{{"type":"object"}}}}}}]}}}}"#);
+    assert_eq!(call(&api, "POST", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions", "application/json", &crd(true)).0, 201);
+    let (_, v2) = call(&api, "GET", "/openapi/v2", "", "");
+    assert!(v2.pointer(&["definitions", "com.example.test.v6alpha1.Multi"]).is_some());
+    let (_, cur) = call(&api, "GET", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/multis.test.example.com", "", "");
+    let mut upd = kr_fmt::json::parse(crd(false).as_bytes()).unwrap();
+    upd.entry_object("metadata").set("resourceVersion", cur.pointer(&["metadata", "resourceVersion"]).cloned().unwrap());
+    assert_eq!(call(&api, "PUT", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/multis.test.example.com", "application/json", &json::to_string(&upd)).0, 200);
+    let (_, v2) = call(&api, "GET", "/openapi/v2", "", "");
+    assert!(v2.pointer(&["definitions", "com.example.test.v6alpha1.Multi"]).is_none());
+    assert!(v2.pointer(&["definitions", "com.example.test.v5.Multi"]).is_some());
+    for p in ["/apis", "/apis/test.example.com", "/apis/test.example.com/v5", "/openapi/v3", "/openapi/v3/apis/test.example.com/v5"] {
+        assert_eq!(call(&api, "GET", p, "", "").0, 200, "{p}");
+    }
+}
