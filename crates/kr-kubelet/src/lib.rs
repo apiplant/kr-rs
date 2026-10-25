@@ -155,6 +155,8 @@ struct PodRt {
     sandbox: Option<Sandbox>,
     lease: Option<Lease>,
     ip: Option<[u8; 4]>,
+    /// The node's InternalIP: status.hostIP, and the pod IP of hostNetwork pods.
+    node_ip: [u8; 4],
     ctrs: Vec<Ctr>,
     start_time: i64,
     /// Kill deadline (ms) once termination started.
@@ -711,7 +713,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         let prio = pod.pointer(&["spec", "priorityClassName"]).and_then(Value::as_str).unwrap_or("");
         let critical = prio.starts_with("system-") && prio.ends_with("-critical") || pod.pointer(&["metadata", "annotations", "kubernetes.io/config.mirror"]).is_some();
-        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ctrs, start_time: now(), kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod) }
+        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, node_ip: self.cfg.node_ip, ctrs, start_time: now(), kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod) }
     }
 
     fn start_sandbox(&self, uid: &str, pod: &Value) -> Result<(), String> {
@@ -719,16 +721,24 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         kr_runtime::store::mkdir_p(&dir, 0o711).map_err(|_| String::from("cannot create pod directory"))?;
         let mut lease = None;
         let rootless_net = self.infra.borrow().is_some();
-        if self.cfg.network || rootless_net {
+        // hostNetwork pods share the kubelet's network namespace: no veth, no pod IP lease.
+        let host_net = pod.pointer(&["spec", "hostNetwork"]).and_then(Value::as_bool) == Some(true);
+        if (self.cfg.network || rootless_net) && !host_net {
             let ipam = alloc::format!("{}/ipam", self.cfg.root);
             let _ = kr_runtime::store::mkdir_p(&ipam, 0o700);
             lease = network::allocate_in(ipam.as_bytes(), uid.as_bytes(), &self.podnet.get()).ok();
         }
-        let ip = lease.as_ref().map(|l: &Lease| l.ip);
+        let ip = if host_net { Some(self.cfg.node_ip) } else { lease.as_ref().map(|l: &Lease| l.ip) };
         let pn = self.podnet.get();
         let net = ip.map(|ip| NetConfig { ip, prefix: pn.prefix, gateway: pn.gateway });
-        let hostname = spec::pod_hostname(pod);
+        // hostNetwork pods report the node's hostname (upstream: unless spec.hostname is set).
+        let hostname = if host_net && pod.pointer(&["spec", "hostname"]).and_then(Value::as_str).is_none_or(str::is_empty) {
+            String::from_utf8(kr_sys::fs::read_file(b"/proc/sys/kernel/hostname\0", 256).unwrap_or_default()).unwrap_or_default().trim().to_string()
+        } else {
+            spec::pod_hostname(pod)
+        };
         let started = match self.infra.borrow().as_ref() {
+            _ if host_net => container::start_host_sandbox(uid.as_bytes(), hostname.as_bytes(), &self.maps),
             Some(infra) => container::start_sandbox_in(infra, uid.as_bytes(), hostname.as_bytes(), &self.maps, net),
             None => container::start_sandbox(uid.as_bytes(), hostname.as_bytes(), &self.maps, net),
         };
@@ -838,7 +848,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 return;
             }
         }
-        let built = match spec::build(&self.c, pod, cspec.unwrap_or(&Value::Null), &img, &pod_dir, pod_ip, &self.cfg.node_name, &self.store).await {
+        let built = match spec::build(&self.c, pod, cspec.unwrap_or(&Value::Null), &img, &pod_dir, pod_ip, &self.cfg.node_name, &fmt_ip(self.cfg.node_ip), &self.store).await {
             Ok(b) => b,
             Err(msg) => {
                 // A claim that is not bound yet is the pod waiting for its volume, not a config error.
@@ -1359,10 +1369,12 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
         if n.is_empty() { String::new() } else { alloc::format!("containers with unready status: [{}]", n.join(" ")) }
     }));
     let ip = p.ip.map(|a| alloc::format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]));
+    let host_ip = fmt_ip(p.node_ip);
     let mut f = alloc::vec![
         ("phase", Value::from(phase)),
         ("conditions", Value::Array(alloc::vec![cond("PodScheduled", true, None), cond("Initialized", inits_done, init_why), cond("Ready", all_running, notready()), cond("ContainersReady", all_running, notready())])),
-        ("hostIP", Value::from("127.0.0.1")),
+        ("hostIP", Value::from(host_ip.as_str())),
+        ("hostIPs", Value::Array(alloc::vec![o(alloc::vec![("ip", Value::from(host_ip.as_str()))])])),
         ("startTime", t(p.start_time)),
         ("containerStatuses", Value::Array(apps.iter().map(|c| cstat(c)).collect())),
     ];
@@ -1395,10 +1407,12 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
 /// (hostIP, protocol, hostPort) of every container port that asks for a host port.
 fn host_ports(pod: &Value) -> Vec<(String, String, u64)> {
     let mut out = Vec::new();
+    // hostNetwork: containerPort is the host port (hostPort, if set, must equal it).
+    let host_net = pod.pointer(&["spec", "hostNetwork"]).and_then(Value::as_bool) == Some(true);
     for key in ["initContainers", "containers"] {
         for c in pod.pointer(&["spec", key]).and_then(Value::as_array).unwrap_or(&[]) {
             for p in c.get("ports").and_then(Value::as_array).unwrap_or(&[]) {
-                let hp = p.get("hostPort").and_then(Value::as_u64).unwrap_or(0);
+                let hp = p.get(if host_net { "containerPort" } else { "hostPort" }).and_then(Value::as_u64).unwrap_or(0);
                 if hp > 0 {
                     let proto = p.get("protocol").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or("TCP");
                     out.push((p.get("hostIP").and_then(Value::as_str).unwrap_or("").to_string(), proto.to_string(), hp));
@@ -1427,7 +1441,7 @@ mod status_tests {
         CState::Waiting("ContainerCreating", String::new())
     }
     fn pod(ctrs: Vec<Ctr>) -> PodRt {
-        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ctrs, start_time: 0, kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new() }
+        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, node_ip: [10, 0, 0, 1], ctrs, start_time: 0, kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new() }
     }
     fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
         path.iter().try_fold(v, |v, k| match k.parse::<usize>() {
@@ -1457,6 +1471,15 @@ mod status_tests {
         assert_eq!(s(&st, &["initContainerStatuses", "1", "state", "waiting", "reason"]), Some("PodInitializing"));
         let st = status_json(&pod(vec![ctr("init1", true, false, creating()), ctr("init2", true, false, creating())]), "Always");
         assert_eq!(s(&st, &["initContainerStatuses", "0", "state", "waiting", "reason"]), Some("ContainerCreating"));
+    }
+
+    #[test]
+    fn host_ip_and_host_network_ports() {
+        let st = status_json(&pod(vec![ctr("run1", false, false, creating())]), "Always");
+        assert_eq!(s(&st, &["hostIP"]), Some("10.0.0.1"));
+        assert_eq!(s(&st, &["hostIPs", "0", "ip"]), Some("10.0.0.1"));
+        let hn = kr_fmt::json::parse_str(r#"{"spec":{"hostNetwork":true,"containers":[{"ports":[{"containerPort":8080}]}]}}"#).unwrap();
+        assert_eq!(host_ports(&hn), vec![(String::new(), "TCP".to_string(), 8080)]);
     }
 
     #[test]

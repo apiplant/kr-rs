@@ -80,6 +80,8 @@ pub struct Mount {
 pub struct ExecTarget {
     pidfd: Rc<Fd>,
     cgroup: Option<i32>,
+    /// The pod shares the host's network namespace (hostNetwork): never joined.
+    host_net: bool,
 }
 
 /// A process to start inside a running container.
@@ -156,14 +158,14 @@ fn fork_into(pidfd: &Fd, nstype: u64, cgroup: Option<i32>, child: impl FnOnce() 
             let _ = kr_sys::write(f.raw(), &fmt_u32(pid as u32));
         }
     }
-    Ok(Running { pid, pidfd: Rc::new(pidfd), cgroup: None })
+    Ok(Running { pid, pidfd: Rc::new(pidfd), cgroup: None, host_net: false })
 }
 
 /// Starts `spec` inside a running container (all of its namespaces and its cgroup), with the
 /// same privilege drop as the container's own processes. Exit 127 = could not exec.
 pub fn exec_in(target: &ExecTarget, spec: &ExecSpec) -> Result<Running, RunError> {
     let full_map = spec.maps.full();
-    fork_into(&target.pidfd, ALL_NS, target.cgroup, || {
+    fork_into(&target.pidfd, if target.host_net { ALL_NS & !ns::CLONE_NEWNET } else { ALL_NS }, target.cgroup, || {
         let null = ns::open(b"/dev/null\0", ns::O_RDWR, 0).ok();
         let nfd = null.as_ref().map(|n| n.raw()).unwrap_or(-1);
         for (src, dst) in [(spec.stdin.unwrap_or(nfd), 0), (spec.stdout.unwrap_or(nfd), 1), (spec.stderr.unwrap_or(nfd), 2)] {
@@ -179,7 +181,7 @@ pub fn exec_in(target: &ExecTarget, spec: &ExecSpec) -> Result<Running, RunError
 /// Runs `f` in a child that joined the user and network namespaces of a pod (via any of its
 /// processes), e.g. for tcpSocket/httpGet probes that must reach the pod without a pod IP.
 pub fn in_pod_net(target: &ExecTarget, f: impl FnOnce() -> i32) -> Result<Running, RunError> {
-    fork_into(&target.pidfd, ns::CLONE_NEWUSER | ns::CLONE_NEWNET, None, f)
+    fork_into(&target.pidfd, if target.host_net { ns::CLONE_NEWUSER } else { ns::CLONE_NEWUSER | ns::CLONE_NEWNET }, None, f)
 }
 
 /// A pod sandbox: a parked process owning the pod's user, network, UTS and IPC namespaces.
@@ -187,18 +189,19 @@ pub fn in_pod_net(target: &ExecTarget, f: impl FnOnce() -> i32) -> Result<Runnin
 pub struct Sandbox {
     pub pid: i32,
     pidfd: Fd,
+    host_net: bool,
 }
 
 impl Sandbox {
     /// A handle on a sandbox owned by another process (the shared `kr ctr` network namespace),
     /// good for joining its namespaces. Do not `stop` it.
     pub fn open(pid: i32) -> Result<Sandbox, Errno> {
-        Ok(Sandbox { pid, pidfd: ns::pidfd_open(pid)? })
+        Ok(Sandbox { pid, pidfd: ns::pidfd_open(pid)?, host_net: false })
     }
 
     /// A target for joining the pod's network (probes); the sandbox owns the netns.
     pub fn target(&self) -> Result<ExecTarget, Errno> {
-        Ok(ExecTarget { pidfd: Rc::new(ns::pidfd_open(self.pid)?), cgroup: None })
+        Ok(ExecTarget { pidfd: Rc::new(ns::pidfd_open(self.pid)?), cgroup: None, host_net: self.host_net })
     }
 
     /// Kills and reaps the sandbox (its namespaces disappear with the last member).
@@ -214,7 +217,13 @@ impl Sandbox {
 
 /// Starts a pod sandbox. `net` (root only) attaches it to the bridge with that address.
 pub fn start_sandbox(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>) -> Result<Sandbox, RunError> {
-    sandbox_inner(id, hostname, maps, net, false).map(|(pid, pidfd)| Sandbox { pid, pidfd: pidfd.expect("pidfd without CLONE_PARENT") })
+    sandbox_inner(id, hostname, maps, net, false, false).map(|(pid, pidfd)| Sandbox { pid, pidfd: pidfd.expect("pidfd without CLONE_PARENT"), host_net: false })
+}
+
+/// Starts a hostNetwork pod sandbox: like `start_sandbox` but without a network namespace, so
+/// the pod's processes share the caller's (the host's, or the rootless user's own).
+pub fn start_host_sandbox(id: &[u8], hostname: &[u8], maps: &IdMaps) -> Result<Sandbox, RunError> {
+    sandbox_inner(id, hostname, maps, None, false, true).map(|(pid, pidfd)| Sandbox { pid, pidfd: pidfd.expect("pidfd without CLONE_PARENT"), host_net: true })
 }
 
 /// Starts a pod sandbox whose user and network namespaces are children of `parent`'s (the
@@ -223,7 +232,7 @@ pub fn start_sandbox(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetC
 pub fn start_sandbox_in(parent: &Sandbox, id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>) -> Result<Sandbox, RunError> {
     let nested = maps.nested();
     let (pid_r, pid_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
-    let helper = fork_into(&parent.pidfd, ns::CLONE_NEWUSER | ns::CLONE_NEWNET, None, move || match sandbox_inner(id, hostname, &nested, net, true) {
+    let helper = fork_into(&parent.pidfd, ns::CLONE_NEWUSER | ns::CLONE_NEWNET, None, move || match sandbox_inner(id, hostname, &nested, net, true, false) {
         Ok((pid, _)) => {
             let _ = kr_sys::write(pid_w.raw(), &(pid as u32).to_le_bytes());
             0
@@ -248,7 +257,7 @@ pub fn start_sandbox_in(parent: &Sandbox, id: &[u8], hostname: &[u8], maps: &IdM
     let pid = first as i32;
     // The sandbox is kr's (unreaped) child via CLONE_PARENT: the pid cannot be reused.
     let pidfd = ns::pidfd_open(pid).map_err(err("pidfd_open"))?;
-    Ok(Sandbox { pid, pidfd })
+    Ok(Sandbox { pid, pidfd, host_net: false })
 }
 
 /// Runs `f` inside `sb`'s user and network namespaces and waits for it (e.g. to configure
@@ -272,13 +281,16 @@ fn init_exe_fd() {
 
 /// Shared sandbox start. With `clone_parent` the sandbox becomes the caller's parent's child
 /// (used from a helper inside the pod-network namespaces) and no pidfd is returned.
-fn sandbox_inner(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>, clone_parent: bool) -> Result<(i32, Option<Fd>), RunError> {
+fn sandbox_inner(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>, clone_parent: bool, host_net: bool) -> Result<(i32, Option<Fd>), RunError> {
     init_exe_fd();
     let (go_r, go_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     let (rep_r, rep_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     let (uid, gid) = (ns::getuid(), ns::getgid());
     let mut pidfd: i32 = -1;
-    let mut args = CloneArgs { flags: ns::CLONE_NEWUSER | ns::CLONE_NEWNET | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC, ..Default::default() };
+    let mut args = CloneArgs { flags: ns::CLONE_NEWUSER | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC, ..Default::default() };
+    if !host_net {
+        args.flags |= ns::CLONE_NEWNET;
+    }
     if clone_parent {
         // clone3 requires exit_signal 0 with CLONE_PARENT (the parent's own signal is used).
         args.flags |= ns::CLONE_PARENT;
@@ -299,7 +311,10 @@ fn sandbox_inner(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfi
             kr_sys::exit_group(1);
         }
         let r = (|| -> Result<(), (u8, Errno)> {
-            ns::link_up(b"lo").map_err(|e| (19, e))?;
+            // The host's loopback is not ours to touch.
+            if !host_net {
+                ns::link_up(b"lo").map_err(|e| (19, e))?;
+            }
             if let Some(n) = &net {
                 network::configure_child(n).map_err(|e| (23, e))?;
             }
@@ -428,6 +443,7 @@ pub struct Running {
     pub pid: i32,
     pidfd: Rc<Fd>,
     cgroup: Option<Cgroup>,
+    host_net: bool,
 }
 
 /// Sends signals to a container's pid 1; usable from another task while `wait` runs.
@@ -453,12 +469,12 @@ impl Running {
 
     /// A handle for running more processes inside this container (exec, probes).
     pub fn target(&self) -> ExecTarget {
-        ExecTarget { pidfd: self.pidfd.clone(), cgroup: self.cgroup_fd() }
+        ExecTarget { pidfd: self.pidfd.clone(), cgroup: self.cgroup_fd(), host_net: self.host_net }
     }
 
     /// Waits for exit without blocking the executor (pidfd becomes readable on exit).
     pub async fn wait(self) -> Result<Exit, RunError> {
-        let Running { pid: _, pidfd, cgroup } = self;
+        let Running { pid: _, pidfd, cgroup, host_net: _ } = self;
         let code = match kr_rt::exec::Async::new(pidfd) {
             Ok(fd) => loop {
                 match ns::pidfd_try_wait(fd.get_ref()) {
@@ -551,7 +567,7 @@ pub fn start(spec: &RunSpec) -> Result<Running, RunError> {
 
     drop(go_r);
     drop(rep_w);
-    let running = Running { pid, pidfd: Rc::new(Fd(pidfd)), cgroup };
+    let running = Running { pid, pidfd: Rc::new(Fd(pidfd)), cgroup, host_net: false };
     if let Err(e) = spec.maps.apply(pid, uid, gid) {
         let _ = ns::kill(pid, ns::SIGKILL);
         let _ = ns::wait4(pid);
@@ -833,7 +849,7 @@ fn start_in_sandbox(spec: &RunSpec, sb: &Sandbox, cgroup: Option<Cgroup>, rootle
         drop(go_w);
         drop(rep_r);
         drop(pid_r);
-        if let Err(e) = ns::setns(&sb.pidfd, ns::CLONE_NEWUSER | ns::CLONE_NEWNET | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC) {
+        if let Err(e) = ns::setns(&sb.pidfd, if sb.host_net { ns::CLONE_NEWUSER | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC } else { ns::CLONE_NEWUSER | ns::CLONE_NEWNET | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC }) {
             report_exit(&rep_w, 24, e);
         }
         let mut args = CloneArgs { flags: ns::CLONE_NEWNS | ns::CLONE_NEWPID | ns::CLONE_NEWCGROUP | ns::CLONE_PARENT, ..Default::default() };
@@ -884,7 +900,7 @@ fn start_in_sandbox(spec: &RunSpec, sb: &Sandbox, cgroup: Option<Cgroup>, rootle
             return Err(RunError { step: "pidfd_open", errno: e });
         }
     };
-    let running = Running { pid, pidfd: Rc::new(pidfd), cgroup };
+    let running = Running { pid, pidfd: Rc::new(pidfd), cgroup, host_net: sb.host_net };
     let _ = kr_sys::write(go_w.raw(), b"g");
     drop(go_w);
     let mut rep = [0u8; 3];
