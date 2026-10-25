@@ -9,6 +9,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod admit;
 pub mod api;
 pub mod client;
 pub mod cluster;

@@ -1290,6 +1290,7 @@ impl ApiServer {
         if rt.res.plural == "pods" {
             let ns = rt.namespace.clone().unwrap_or_default();
             self.admit_pod(o, &ns)?;
+            self.admit_pod_classes(o, &ns)?;
         }
         if rt.res.plural == "jobs" {
             admit_job(o, &name)?;
@@ -2108,6 +2109,25 @@ impl ApiServer {
                 Some(Value::Array(v)) => v.push(vol),
                 _ => spec.set("volumes", Value::Array(alloc::vec![vol])),
             }
+        }
+        Ok(())
+    }
+
+    /// Sysctl validation, then the RuntimeClass and LimitRanger admission plugins for a new pod.
+    fn admit_pod_classes(&self, o: &mut Value, ns: &str) -> R<()> {
+        let pod_name = o.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("").to_string();
+        let forbid = |e: String| ApiError::new(403, "Forbidden", alloc::format!("pod \"{pod_name}\" is forbidden: {e}"));
+        let spec = o.entry_object("spec");
+        crate::admit::validate_sysctls(spec).map_err(|e| ApiError::invalid(alloc::format!("Pod \"{pod_name}\" is invalid: {e}")))?;
+        if let Some(name) = spec.get("runtimeClassName").and_then(Value::as_str).filter(|n| !n.is_empty()).map(String::from) {
+            let res = resources::find("node.k8s.io", "v1", "runtimeclasses").unwrap();
+            let rc = self.store.borrow().get(&res.key(None, &name)).and_then(|kv| json::parse(&kv.value).ok());
+            crate::admit::runtime_class(spec, &name, rc.as_ref()).map_err(|e| forbid(e))?;
+        }
+        let lr = resources::find("", "v1", "limitranges").unwrap();
+        let ranges: Vec<Value> = self.store.borrow().list(&alloc::format!("{}{ns}/", lr.prefix()), None, 0).0.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect();
+        if !ranges.is_empty() {
+            crate::admit::limit_ranger(spec, &ranges).map_err(|e| forbid(e))?;
         }
         Ok(())
     }
