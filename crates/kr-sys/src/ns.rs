@@ -20,6 +20,7 @@ mod n {
     pub const UNLINKAT: usize = 263;
     pub const CAPSET: usize = 126;
     pub const NANOSLEEP: usize = 35;
+    pub const SETSID: usize = 112;
     pub const IOCTL: usize = 16;
     pub const SECCOMP: usize = 317;
     pub const SETRESUID: usize = 117;
@@ -49,6 +50,7 @@ mod n {
     pub const UNLINKAT: usize = 35;
     pub const CAPSET: usize = 91;
     pub const NANOSLEEP: usize = 101;
+    pub const SETSID: usize = 157;
     pub const IOCTL: usize = 29;
     pub const SECCOMP: usize = 277;
     pub const SETRESUID: usize = 147;
@@ -264,6 +266,12 @@ pub fn getgid() -> u32 {
 pub fn prctl(option: usize, arg2: usize) -> Result<()> {
     // SAFETY: only integer options are used by callers (no pointer arguments).
     check(unsafe { syscall5(n::PRCTL, option, arg2, 0, 0, 0) }).map(|_| ())
+}
+
+/// Detaches from the controlling terminal and process group (daemonizing).
+pub fn setsid() -> Result<()> {
+    // SAFETY: no arguments.
+    check(unsafe { super::syscall0(n::SETSID) }).map(|_| ())
 }
 
 pub fn kill(pid: i32, sig: i32) -> Result<()> {

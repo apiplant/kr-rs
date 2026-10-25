@@ -251,20 +251,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 Ok(infra) => {
                     // ip_forward + bridge inside the infra namespaces; outbound NAT is not
                     // possible rootless (no route out), so a failure there is tolerated.
-                    let ok = container::run_in_net(&infra, || {
-                        let nl = match kr_net::netlink::Netlink::route() {
-                            Ok(n) => n,
-                            Err(_) => return 1,
-                        };
-                        let _ = nl.bridge_add(network::BRIDGE);
-                        let Ok(br) = kr_net::netlink::ifindex(network::BRIDGE) else { return 2 };
-                        let _ = nl.addr_add(br, pn.gateway, pn.prefix);
-                        if nl.link_up(br).is_err() {
-                            return 3;
-                        }
-                        let _ = kr_sys::ns::write_file(b"/proc/sys/net/ipv4/ip_forward\0", b"1");
-                        0
-                    });
+                    let ok = container::run_in_net(&infra, || network::setup_infra_bridge(&pn));
                     match ok {
                         Ok(0) => *self.infra.borrow_mut() = Some(infra),
                         r => {

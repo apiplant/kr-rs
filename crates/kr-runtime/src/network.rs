@@ -1,5 +1,6 @@
 //! Built-in bridge network (KNOWN_ISSUES #50, ADR-019): replaces the CNI bridge + host-local
-//! plugins. Requires real root on the host; rootless containers keep loopback-only networking.
+//! plugins. Real root uses the host namespace; rootless, the bridge lives in an infra user+net
+//! namespace (ADR-022) that has no route out, so rootless containers reach each other only.
 //!
 //! Layout: bridge `kr0` owns the gateway address of a /16; each container gets one address from
 //! a file-based IPAM, a veth pair whose peer is created directly inside the container's netns as
@@ -78,6 +79,24 @@ pub fn setup_host_with(pn: &PodNet) -> Result<(), Errno> {
     nl.link_up(br)?;
     ns::write_file(b"/proc/sys/net/ipv4/ip_forward\0", b"1")?;
     kr_net::nft::ensure_masquerade(&kr_net::nft::Masquerade { table: NFT_TABLE, cidr: CLUSTER_CIDR.0, prefix: CLUSTER_CIDR.1, bridge: BRIDGE })
+}
+
+/// Rootless: run inside the infra namespaces (`container::run_in_net`); creates the bridge with
+/// its gateway address and enables forwarding. Returns an exit code (0 = ok). No NAT: the
+/// infra namespace has no route out.
+pub fn setup_infra_bridge(pn: &PodNet) -> i32 {
+    let nl = match Netlink::route() {
+        Ok(n) => n,
+        Err(_) => return 1,
+    };
+    let _ = nl.bridge_add(BRIDGE);
+    let Ok(br) = netlink::ifindex(BRIDGE) else { return 2 };
+    let _ = nl.addr_add(br, pn.gateway, pn.prefix);
+    if nl.link_up(br).is_err() {
+        return 3;
+    }
+    let _ = ns::write_file(b"/proc/sys/net/ipv4/ip_forward\0", b"1");
+    0
 }
 
 /// Host-side veth name for a container: `krv` + 8 hex digits of an FNV-1a hash of its id.
@@ -194,7 +213,7 @@ pub fn allocate_in(dir: &[u8], owner: &[u8], pn: &PodNet) -> Result<Lease, Errno
 }
 
 /// Start time (clock ticks since boot, field 22 of `/proc/<pid>/stat`) of a live process.
-fn proc_start(pid: u32) -> Option<u64> {
+pub fn proc_start(pid: u32) -> Option<u64> {
     let mut p = alloc::format!("/proc/{pid}/stat").into_bytes();
     p.push(0);
     let b = kr_sys::fs::read_file(&p, 4096).ok()?;
@@ -224,6 +243,21 @@ pub fn owner_alive(owner: &[u8]) -> Option<bool> {
     let (pid, start) = s.rsplit_once(" pid=")?.1.split_once(':')?;
     let (pid, start): (u32, u64) = (pid.parse().ok()?, start.parse().ok()?);
     Some(proc_start(pid) == Some(start))
+}
+
+/// Contents of the file that publishes the shared rootless infra namespace of `kr ctr`:
+/// the supervising process (a [`process_owner`]) and the pid of the namespace holder.
+pub fn infra_record(supervisor: &[u8], infra_pid: i32) -> Vec<u8> {
+    let mut r = supervisor.to_vec();
+    r.extend_from_slice(alloc::format!("\n{infra_pid}").as_bytes());
+    r
+}
+
+/// The holder's pid from an [`infra_record`], if its supervisor still runs.
+pub fn infra_pid(record: &[u8]) -> Option<i32> {
+    let (owner, pid) = record.split_at(record.iter().position(|b| *b == b'\n')?);
+    let pid = core::str::from_utf8(&pid[1..]).ok()?.parse().ok()?;
+    owner_alive(owner).filter(|alive| *alive).map(|_| pid)
 }
 
 /// Garbage-collects leases whose owner (the id recorded in the file) fails `keep`, e.g. leases
@@ -304,6 +338,18 @@ mod tests {
         assert_eq!(a, host_ifname(b"ctr-1"));
         assert_ne!(a, host_ifname(b"ctr-2"));
         assert!(a.starts_with(b"krv"));
+    }
+
+    #[test]
+    fn infra_record_roundtrip() {
+        let me = process_owner(b"ctr-net");
+        assert_eq!(infra_pid(&infra_record(&me, 4242)), Some(4242));
+        // A supervisor that is gone (or a garbled record) yields nothing.
+        assert_eq!(infra_pid(&infra_record(b"ctr-net pid=4000000000:1", 7)), None);
+        assert_eq!(infra_pid(b"ctr-net"), None);
+        let mut garbled = infra_record(&me, 1);
+        garbled.push(b'x');
+        assert_eq!(infra_pid(&garbled), None);
     }
 
     #[test]
