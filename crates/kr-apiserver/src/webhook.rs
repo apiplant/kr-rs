@@ -209,18 +209,20 @@ impl Ctx<'_> {
             let host = format!("{sn}.{sns}.svc");
             (format!("https://{host}:{port}{path}"), format!("{ip} {host}\n"))
         };
+        // Like upstream, the request carries its timeout: `?timeout=1s`.
+        let secs = wh.get("timeoutSeconds").and_then(Value::as_u64).unwrap_or(10).clamp(1, 30);
+        let url = format!("{url}{}timeout={secs}s", if url.contains('?') { '&' } else { '?' });
         let roots = match cc.get("caBundle").and_then(Value::as_str) {
             Some(b) => x509::pem_decode_all(core::str::from_utf8(&kr_fmt::base64::decode(b).map_err(|_| "invalid caBundle")?).map_err(|_| "invalid caBundle")?, "CERTIFICATE").map_err(|_| "invalid caBundle")?,
             None => Vec::new(),
         };
         let cfg = Rc::new(ClientConfig { pinned_ca: None, roots, client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
-        let secs = wh.get("timeoutSeconds").and_then(Value::as_u64).unwrap_or(10).clamp(1, 30);
         let http = Http::with_connector(
             TlsConnector::new(WhResolver(HostsResolver::from_contents(&hosts)), cfg),
             HttpConfig { max_redirects: 0, max_idle: 0, connect_timeout_ms: secs * 1000, head_timeout_ms: secs * 1000, read_timeout_ms: secs * 1000, user_agent: "kr-apiserver".to_string(), ..HttpConfig::default() },
         );
         let fut = async {
-            let mut resp = http.request("POST", &url, &[("Content-Type", "application/json"), ("Accept", "application/json")], review.as_bytes()).await.map_err(|e| format!("Post \"{url}\": {e:?}"))?;
+            let mut resp = http.request("POST", &url, &[("Content-Type", "application/json"), ("Accept", "application/json")], review.as_bytes()).await.map_err(|e| if format!("{e:?}").contains("Timeout") { format!("Post \"{url}\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)") } else { format!("Post \"{url}\": {e:?}") })?;
             if resp.status != 200 {
                 return Err(format!("Post \"{url}\": webhook returned status {}", resp.status));
             }
