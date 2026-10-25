@@ -221,6 +221,22 @@ fn check_type(o: &Value, t: &Target) -> Result<(), ApiError> {
     }
 }
 
+/// JSON equality that ignores object key order (clients re-serialize with their own order).
+pub fn same_json(a: &Option<&Value>, b: &Option<&Value>) -> bool {
+    fn eq(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Object(x), Value::Object(y)) => x.len() == y.len() && x.iter().all(|(k, v)| b.get(k).is_some_and(|w| eq(v, w)) && a.get(k).is_some()),
+            (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| eq(p, q)),
+            _ => a == b,
+        }
+    }
+    match (a, b) {
+        (Some(x), Some(y)) => eq(x, y),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// Normalises a new object: type fields, name (or generateName), namespace, uid,
 /// creationTimestamp, generation, and resourceVersion = `rev` (the revision it will get).
 pub fn prepare_create(o: &mut Value, t: &Target, clock: &Clock, rev: u64) -> Result<String, ApiError> {
@@ -313,7 +329,7 @@ pub fn prepare_update(old: &Value, new: &mut Value, t: &Target, rev: u64, has_st
     new.set("apiVersion", Value::from(t.api_version));
     new.set("kind", Value::from(t.kind));
     let generation = old.pointer(&["metadata", "generation"]).and_then(Value::as_u64);
-    let spec_changed = old.get("spec") != new.get("spec");
+    let spec_changed = !same_json(&old.get("spec"), &new.get("spec"));
     let om = old.get("metadata").cloned().unwrap_or(Value::Object(Vec::new()));
     let meta = new.entry_object("metadata");
     for f in ["name", "namespace", "uid", "creationTimestamp", "deletionTimestamp", "deletionGracePeriodSeconds"] {
@@ -543,6 +559,21 @@ mod tests {
         assert_eq!(s.pointer(&["spec", "replicas"]).unwrap().as_u64(), Some(3)); // status update ignores spec
         assert_eq!(s.pointer(&["status", "replicas"]).unwrap().as_u64(), Some(3));
         assert_eq!(s.pointer(&["metadata", "generation"]).unwrap().as_u64(), Some(2));
+    }
+
+    #[test]
+    fn generation_ignores_key_order_and_client_value() {
+        let t = Target { api_version: "v1", kind: "Pod", namespace: Some("d"), name_is_label: false };
+        let clock = Clock { now: 0, rng };
+        let mut o = parse_str(r#"{"metadata":{"name":"p","generation":100},"spec":{"a":1,"c":[{"x":1,"y":2}],"b":{"k":"v","j":"w"}}}"#).unwrap();
+        prepare_create(&mut o, &t, &clock, 1).unwrap();
+        assert_eq!(o.pointer(&["metadata", "generation"]).unwrap().as_u64(), Some(1));
+        let mut n = parse_str(r#"{"metadata":{"name":"p","generation":7},"spec":{"b":{"j":"w","k":"v"},"c":[{"y":2,"x":1}],"a":1}}"#).unwrap();
+        prepare_update(&o, &mut n, &t, 2, true, false).unwrap();
+        assert_eq!(n.pointer(&["metadata", "generation"]).unwrap().as_u64(), Some(1));
+        let mut n = parse_str(r#"{"metadata":{"name":"p"},"spec":{"b":{"j":"w","k":"v"},"c":[{"y":3,"x":1}],"a":1}}"#).unwrap();
+        prepare_update(&o, &mut n, &t, 3, true, false).unwrap();
+        assert_eq!(n.pointer(&["metadata", "generation"]).unwrap().as_u64(), Some(2));
     }
 
     #[test]

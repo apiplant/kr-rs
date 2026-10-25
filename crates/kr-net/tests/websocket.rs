@@ -396,6 +396,7 @@ fn subprotocol_prefers_v5_over_v4() {
             ("v4.channel.k8s.io, v5.channel.k8s.io", Some("v5.channel.k8s.io")),
             ("v5.channel.k8s.io,v4.channel.k8s.io", Some("v5.channel.k8s.io")),
             ("v3.channel.k8s.io, v4.channel.k8s.io", Some("v4.channel.k8s.io")),
+            ("channel.k8s.io", Some("channel.k8s.io")),
         ] {
             let (head, _) = Client::connect(port, "/exec", &format!("Sec-WebSocket-Protocol: {offer}\r\n"));
             assert!(head.starts_with("HTTP/1.1 101 "), "{head}");

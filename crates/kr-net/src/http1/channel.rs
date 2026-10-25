@@ -1,6 +1,7 @@
 //! The Kubernetes streaming channel protocol over WebSocket binary messages.
 //!
-//! `v4.channel.k8s.io` / `v5.channel.k8s.io` (exec, attach): every message is
+//! `v4.channel.k8s.io` / `v5.channel.k8s.io` (exec, attach; plain `channel.k8s.io` is the same
+//! framing without the final status message on success): every message is
 //! `[channel byte][payload]`. Channels: 0 stdin, 1 stdout, 2 stderr, 3 error (a `metav1.Status`
 //! JSON), 4 resize (`{"Width":w,"Height":h}`), and in v5 only 255 close-stream (payload: one
 //! byte, the channel to close).
@@ -24,6 +25,7 @@ pub const CLOSE: u8 = 255;
 
 pub const V5: &str = "v5.channel.k8s.io";
 pub const V4: &str = "v4.channel.k8s.io";
+pub const V1: &str = "channel.k8s.io";
 pub const PORTFORWARD_V2: &str = "v2.portforward.k8s.io";
 pub const PORTFORWARD_V1: &str = "portforward.k8s.io";
 /// SPDY/3.1 tunneled in binary WebSocket messages (KEP-4006; no channel byte, the message
@@ -31,13 +33,14 @@ pub const PORTFORWARD_V1: &str = "portforward.k8s.io";
 pub const PORTFORWARD_SPDY_TUNNEL: &str = "SPDY/3.1+portforward.k8s.io";
 
 /// Exec/attach subprotocols in server preference order, for [`super::websocket::handshake`].
-pub const EXEC_PROTOCOLS: [&str; 2] = [V5, V4];
+pub const EXEC_PROTOCOLS: [&str; 3] = [V5, V4, V1];
 /// Port-forward subprotocols in server preference order.
 pub const PORTFORWARD_PROTOCOLS: [&str; 2] = [PORTFORWARD_V2, PORTFORWARD_V1];
 
 /// A negotiated subprotocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Protocol {
+    V1,
     V4,
     V5,
     PortForwardV2,
@@ -49,6 +52,7 @@ impl Protocol {
         Some(match t {
             V5 => Protocol::V5,
             V4 => Protocol::V4,
+            V1 => Protocol::V1,
             PORTFORWARD_V2 => Protocol::PortForwardV2,
             PORTFORWARD_V1 => Protocol::PortForwardV1,
             _ => return None,
@@ -59,6 +63,7 @@ impl Protocol {
         match self {
             Protocol::V5 => V5,
             Protocol::V4 => V4,
+            Protocol::V1 => V1,
             Protocol::PortForwardV2 => PORTFORWARD_V2,
             Protocol::PortForwardV1 => PORTFORWARD_V1,
         }

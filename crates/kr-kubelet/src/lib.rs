@@ -169,6 +169,8 @@ struct PodRt {
     critical: bool,
     /// Set once evicted for memory pressure: containers are killed and never restarted.
     evicted: Option<String>,
+    /// Last reported status and transition time (s) of each pod condition.
+    conds: Vec<(String, bool, i64)>,
 }
 
 struct Exit {
@@ -659,7 +661,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         let prio = pod.pointer(&["spec", "priorityClassName"]).and_then(Value::as_str).unwrap_or("");
         let critical = prio.starts_with("system-") && prio.ends_with("-critical") || pod.pointer(&["metadata", "annotations", "kubernetes.io/config.mirror"]).is_some();
-        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ctrs, start_time: now(), kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, critical, evicted: None }
+        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ctrs, start_time: now(), kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, critical, evicted: None, conds: Vec::new() }
     }
 
     fn start_sandbox(&self, uid: &str, pod: &Value) -> Result<(), String> {
@@ -760,7 +762,33 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let pods = self.pods.borrow();
             (pods[uid].dir.clone(), pods[uid].ip)
         };
-        let built = match spec::build(&self.c, pod, cspec.unwrap_or(&Value::Null), &img, &pod_dir, pod_ip, &self.cfg.node_name).await {
+        // Image volumes (`volumes[].image`) need their image pulled first.
+        let first = self.pods.borrow()[uid].ctrs[i].seq == 0;
+        for vol in pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]) {
+            let Some(iv) = vol.get("image") else { continue };
+            let vimage = iv.get("reference").and_then(Value::as_str).unwrap_or("");
+            let vpolicy = iv.get("pullPolicy").and_then(Value::as_str).unwrap_or("");
+            let vlatest = !vimage.contains(':') || vimage.ends_with(":latest");
+            let need = self.store.image(vimage).is_none() || (first && (vpolicy == "Always" || (vpolicy.is_empty() && vlatest)));
+            let vkey = spec::pull_key(pod, vimage);
+            let vgate = if need && vpolicy != "Never" { self.pull_gate(&vkey, vimage) } else { PullGate::Ready };
+            if matches!(vgate, PullGate::Start) {
+                let creds = self.pull_creds(pod).await;
+                self.start_pull(vkey.clone(), vimage.to_string(), creds);
+            }
+            if !matches!(vgate, PullGate::Ready) {
+                let failed = match self.pulls.borrow().get(&vkey) {
+                    Some(Pull::Failed { msg, .. }) => Some(msg.clone()),
+                    _ => None,
+                };
+                match failed {
+                    Some(m) => self.set_waiting(uid, i, "ImagePullBackOff", m),
+                    None => self.set_waiting(uid, i, "ContainerCreating", alloc::format!("pulling image {vimage}")),
+                }
+                return;
+            }
+        }
+        let built = match spec::build(&self.c, pod, cspec.unwrap_or(&Value::Null), &img, &pod_dir, pod_ip, &self.cfg.node_name, &self.store).await {
             Ok(b) => b,
             Err(msg) => {
                 // A claim that is not bound yet is the pod waiting for its volume, not a config error.
@@ -1098,10 +1126,12 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     /// Builds the pod status and patches it if it changed.
     async fn report_status(&self, uid: &str, pod: &Value) {
         let (status, path) = {
-            let pods = self.pods.borrow();
-            let Some(p) = pods.get(uid) else { return };
+            let mut pods = self.pods.borrow_mut();
+            let Some(p) = pods.get_mut(uid) else { return };
             let policy = pod.pointer(&["spec", "restartPolicy"]).and_then(Value::as_str).unwrap_or("Always");
-            (status_json(p, policy), alloc::format!("/api/v1/namespaces/{}/pods/{}/status", p.ns, p.name))
+            let mut status = status_json(p, policy);
+            stamp_conditions(p, &mut status, pod.pointer(&["metadata", "generation"]).and_then(Value::as_i64).unwrap_or(0));
+            (status, alloc::format!("/api/v1/namespaces/{}/pods/{}/status", p.ns, p.name))
         };
         let text = json::to_string(&status);
         if self.pods.borrow().get(uid).is_some_and(|p| p.last_status == text) {
@@ -1120,6 +1150,32 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     }
 }
 
+
+/// Gives each condition the time its status last changed and stamps `observedGeneration` (the
+/// pod's `metadata.generation` this status was computed for) on the status and its conditions.
+fn stamp_conditions(p: &mut PodRt, status: &mut Value, generation: i64) {
+    let gen = Value::Number(Number::from_i64(generation));
+    let Some(Value::Array(conds)) = status.get_mut("conditions") else { return };
+    for c in conds.iter_mut() {
+        let ty = c.get("type").and_then(Value::as_str).unwrap_or("").to_string();
+        let ok = c.get("status").and_then(Value::as_str) == Some("True");
+        let at = match p.conds.iter_mut().find(|(t, _, _)| *t == ty) {
+            Some(e) => {
+                if e.1 != ok {
+                    *e = (ty, ok, now());
+                }
+                e.2
+            }
+            None => {
+                p.conds.push((ty, ok, p.start_time));
+                p.start_time
+            }
+        };
+        c.set("lastTransitionTime", Value::String(rfc3339(at)));
+        c.set("observedGeneration", gen.clone());
+    }
+    status.set("observedGeneration", gen);
+}
 
 fn status_json(p: &PodRt, policy: &str) -> Value {
     let t = |s: i64| Value::String(rfc3339(s));
@@ -1152,6 +1208,10 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
             ("restartCount", Value::Number(Number::from_u64(c.restart_count as u64))),
             ("state", match &c.state {
                 CState::Waiting("ContainerCreating", m) if !c.init && !c.eph && !inits_done => state_json(&CState::Waiting("PodInitializing", m.clone())),
+                // Init containers queued behind one that has not completed yet.
+                CState::Waiting("ContainerCreating", m) if c.init && p.ctrs.iter().take_while(|o| !core::ptr::eq(*o, c)).any(|o| o.init && !matches!(&o.state, CState::Terminated(t) if t.exit_code == 0)) => {
+                    state_json(&CState::Waiting("PodInitializing", m.clone()))
+                }
                 s => state_json(s),
             }),
         ];
@@ -1237,7 +1297,7 @@ mod status_tests {
         CState::Waiting("ContainerCreating", String::new())
     }
     fn pod(ctrs: Vec<Ctr>) -> PodRt {
-        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ctrs, start_time: 0, kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, critical: false, evicted: None }
+        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ctrs, start_time: 0, kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, critical: false, evicted: None, conds: Vec::new() }
     }
     fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
         path.iter().try_fold(v, |v, k| match k.parse::<usize>() {
@@ -1263,6 +1323,30 @@ mod status_tests {
         assert_eq!(s(i, &["message"]), Some("containers with incomplete status: [init1 init2]"));
         assert_eq!(s(cond(&st, "Ready"), &["reason"]), Some("ContainersNotReady"));
         assert_eq!(s(&st, &["initContainerStatuses", "1", "name"]), Some("init2"));
+        // Queued behind init1; init1 itself is the one being created.
+        assert_eq!(s(&st, &["initContainerStatuses", "1", "state", "waiting", "reason"]), Some("PodInitializing"));
+        let st = status_json(&pod(vec![ctr("init1", true, false, creating()), ctr("init2", true, false, creating())]), "Always");
+        assert_eq!(s(&st, &["initContainerStatuses", "0", "state", "waiting", "reason"]), Some("ContainerCreating"));
+    }
+
+    #[test]
+    fn condition_times_and_generation() {
+        let mut p = pod(vec![ctr("run1", false, false, creating())]);
+        p.start_time = 100;
+        p.ctrs[0].ready = false;
+        let mut st = status_json(&p, "Always");
+        stamp_conditions(&mut p, &mut st, 3);
+        assert_eq!(s(cond(&st, "Ready"), &["lastTransitionTime"]), Some(rfc3339(100).as_str()));
+        assert_eq!(at(&st, &["observedGeneration"]).and_then(Value::as_i64), Some(3));
+        assert_eq!(at(cond(&st, "Ready"), &["observedGeneration"]).and_then(Value::as_i64), Some(3));
+        p.ctrs[0].state = run();
+        p.ctrs[0].ready = true;
+        let mut st = status_json(&p, "Always");
+        stamp_conditions(&mut p, &mut st, 4);
+        assert_eq!(s(cond(&st, "Ready"), &["status"]), Some("True"));
+        assert_ne!(s(cond(&st, "Ready"), &["lastTransitionTime"]), Some(rfc3339(100).as_str()));
+        assert_eq!(s(cond(&st, "PodScheduled"), &["lastTransitionTime"]), Some(rfc3339(100).as_str()));
+        assert_eq!(at(cond(&st, "Ready"), &["observedGeneration"]).and_then(Value::as_i64), Some(4));
     }
 
     #[test]
