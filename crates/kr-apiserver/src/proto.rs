@@ -392,10 +392,206 @@ fn raw_json(buf: &[u8]) -> R<Value> {
     json::parse(raw).map_err(|_| "protobuf: invalid embedded JSON")
 }
 
+// ---------------------------------------------------------------- encoding (responses)
+
+/// Encodes a JSON object of a kind in [`s::KINDS`] as a `k8s\0` protobuf body (the inverse of
+/// [`decode_body`]); `None` if the kind has no protobuf form (custom resources, Tables) or a
+/// value does not fit its field, in which case the caller answers in JSON. Fields the tables
+/// do not know are dropped, as a typed Go client would.
+pub fn encode_body(v: &Value) -> Option<Vec<u8>> {
+    let api_version = v.get("apiVersion")?.as_str()?;
+    let kind = v.get("kind")?.as_str()?;
+    let idx = s::KINDS.iter().find(|k| k.0 == api_version && k.1 == kind)?.2;
+    let mut raw = Writer::new();
+    encode_message(&mut raw, v, idx, 0)?;
+    let mut w = Writer::new();
+    w.message(1, |t| {
+        t.string(1, api_version);
+        t.string(2, kind);
+    });
+    w.bytes(2, raw.as_bytes());
+    w.string(3, "");
+    w.string(4, "");
+    let mut out = MAGIC.to_vec();
+    out.extend_from_slice(w.as_bytes());
+    Some(out)
+}
+
+use kr_fmt::proto::Writer;
+
+/// Writes the fields of message `idx` found in the JSON object `v`.
+fn encode_message(w: &mut Writer, v: &Value, idx: u16, depth: usize) -> Option<()> {
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    let Value::Object(_) = v else { return None };
+    for fd in fields_of(idx) {
+        let num = u32::from(fd.num);
+        let kind = fd.kind & s::K_MASK;
+        if fd.kind & s::F_INLINE != 0 {
+            // The embedded message's fields live in this object.
+            let mut sub = Writer::new();
+            encode_message(&mut sub, v, fd.arg, depth + 1)?;
+            if !sub.as_bytes().is_empty() {
+                w.bytes(num, sub.as_bytes());
+            }
+            continue;
+        }
+        let Some(x) = v.get(field_name(fd)) else { continue };
+        if matches!(x, Value::Null) {
+            continue;
+        }
+        if kind == s::K_MAP {
+            let &(_, _, vk, va) = s::MAPS.get(fd.arg as usize)?;
+            let Value::Object(m) = x else { return None };
+            for (k, val) in m {
+                let mut e = Writer::new();
+                e.string(1, k);
+                if !matches!(val, Value::Null) {
+                    encode_value(&mut e, 2, vk, va, val, depth)?;
+                }
+                w.bytes(num, e.as_bytes());
+            }
+            continue;
+        }
+        if fd.kind & s::F_REPEATED != 0 {
+            let Value::Array(items) = x else { return None };
+            for it in items {
+                encode_value(w, num, kind, fd.arg, it, depth)?;
+            }
+            continue;
+        }
+        encode_value(w, num, kind, fd.arg, x, depth)?;
+    }
+    Some(())
+}
+
+fn encode_value(w: &mut Writer, num: u32, kind: u8, arg: u16, v: &Value, depth: usize) -> Option<()> {
+    match kind {
+        s::K_STRING => {
+            w.string(num, v.as_str()?);
+        }
+        s::K_BYTES => {
+            w.bytes(num, &kr_fmt::base64::decode(v.as_str()?).ok()?);
+        }
+        s::K_BOOL => {
+            w.bool(num, v.as_bool()?);
+        }
+        s::K_INT32 => {
+            let i = i32::try_from(v.as_i64()?).ok()?;
+            w.int64(num, i64::from(i));
+        }
+        s::K_INT64 => {
+            w.int64(num, v.as_i64()?);
+        }
+        s::K_UINT32 | s::K_UINT64 => {
+            w.varint(num, v.as_u64()?);
+        }
+        s::K_DOUBLE => {
+            w.fixed64(num, v.as_number()?.as_f64().to_bits());
+        }
+        s::K_FLOAT => {
+            w.fixed32(num, (v.as_number()?.as_f64() as f32).to_bits());
+        }
+        s::K_MESSAGE => {
+            let mut sub = Writer::new();
+            encode_special(&mut sub, v, arg, depth + 1)?;
+            w.bytes(num, sub.as_bytes());
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// A message value: the hand-written JSON forms, else a plain object.
+fn encode_special(w: &mut Writer, v: &Value, idx: u16, depth: usize) -> Option<()> {
+    match idx {
+        s::M_TIME | s::M_MICRO_TIME => {
+            let (secs, nanos) = parse_time(v.as_str()?)?;
+            if secs != 0 {
+                w.int64(1, secs);
+            }
+            if nanos != 0 {
+                w.int64(2, i64::from(nanos));
+            }
+        }
+        s::M_DURATION => {
+            w.int64(1, kr_fmt::quantity::parse_duration(v.as_str()?).ok()?);
+        }
+        s::M_INT_OR_STRING => match v {
+            Value::String(st) => {
+                w.varint(1, 1).string(3, st);
+            }
+            _ => {
+                let i = i32::try_from(v.as_i64()?).ok()?;
+                w.varint(1, 0).int64(2, i64::from(i));
+            }
+        },
+        s::M_QUANTITY => match v {
+            Value::String(q) => {
+                w.string(1, q);
+            }
+            Value::Number(n) => {
+                w.string(1, &json::to_string(&Value::Number(n.clone())));
+            }
+            _ => return None,
+        },
+        s::M_RAW_EXTENSION | s::M_FIELDS_V1 | s::M_EXT_JSON => {
+            w.bytes(1, json::to_string(v).as_bytes());
+        }
+        s::M_SCHEMA_OR_ARRAY | s::M_SCHEMA_OR_BOOL | s::M_SCHEMA_OR_STRINGS => {
+            let schema_num = if idx == s::M_SCHEMA_OR_BOOL { 2 } else { 1 };
+            let schema_idx = fields_of(idx).iter().find(|f| f.num == schema_num)?.arg;
+            match v {
+                Value::Bool(b) if idx == s::M_SCHEMA_OR_BOOL => {
+                    w.bool(1, *b);
+                }
+                Value::Object(_) => {
+                    if idx == s::M_SCHEMA_OR_BOOL {
+                        w.bool(1, true);
+                    }
+                    let mut sub = Writer::new();
+                    encode_message(&mut sub, v, schema_idx, depth + 1)?;
+                    w.bytes(u32::from(schema_num), sub.as_bytes());
+                }
+                Value::Array(items) if idx != s::M_SCHEMA_OR_BOOL => {
+                    for it in items {
+                        if idx == s::M_SCHEMA_OR_STRINGS {
+                            w.string(2, it.as_str()?);
+                        } else {
+                            let mut sub = Writer::new();
+                            encode_message(&mut sub, it, schema_idx, depth + 1)?;
+                            w.bytes(2, sub.as_bytes());
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+        _ => encode_message(w, v, idx, depth)?,
+    }
+    Some(())
+}
+
+/// `YYYY-MM-DDTHH:MM:SS[.fraction]Z` to (seconds, nanos).
+fn parse_time(t: &str) -> Option<(i64, i32)> {
+    let (head, nanos) = match t.split_once('.') {
+        Some((h, frac)) => {
+            let digits = frac.strip_suffix('Z')?;
+            if digits.is_empty() || digits.len() > 9 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let n: i32 = digits.parse().ok()?;
+            (alloc::format!("{h}Z"), n * 10i32.pow(9 - digits.len() as u32))
+        }
+        None => (String::from(t), 0),
+    };
+    Some((crate::printers::parse_rfc3339(&head)?, nanos))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kr_fmt::proto::Writer;
 
     fn envelope(api_version: &str, kind: &str, raw: &[u8]) -> Vec<u8> {
         let mut w = Writer::new();
@@ -528,6 +724,45 @@ mod tests {
         e.bytes(1, meta.as_bytes());
         let v = decode_body(&envelope("policy/v1", "Eviction", e.as_bytes())).unwrap();
         assert_eq!(v.pointer(&["metadata", "name"]).and_then(Value::as_str), Some("p"));
+    }
+
+    fn sorted(v: &Value) -> Value {
+        match v {
+            Value::Object(o) => {
+                let mut o: Vec<(String, Value)> = o.iter().map(|(k, x)| (k.clone(), sorted(x))).collect();
+                o.sort_by(|a, b| a.0.cmp(&b.0));
+                Value::Object(o)
+            }
+            Value::Array(a) => Value::Array(a.iter().map(sorted).collect()),
+            x => x.clone(),
+        }
+    }
+
+    fn roundtrip(src: &[u8]) {
+        let v = json::parse(src).unwrap();
+        let b = encode_body(&v).expect("encodes");
+        assert_eq!(sorted(&decode_body(&b).unwrap()), sorted(&v), "{}", core::str::from_utf8(src).unwrap());
+    }
+
+    #[test]
+    fn responses_roundtrip() {
+        roundtrip(br#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"p","namespace":"d","uid":"u-1","resourceVersion":"42","creationTimestamp":"2024-05-17T13:04:05Z","labels":{"app":"web"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"rs","uid":"u-2","controller":true}],
+            "managedFields":[{"manager":"kubectl","operation":"Update","apiVersion":"v1","time":"2024-05-17T13:04:05Z","fieldsType":"FieldsV1","fieldsV1":{"f:spec":{}}}]},
+            "spec":{"containers":[{"name":"c","image":"busybox","command":["sleep","3600"],"ports":[{"containerPort":80,"protocol":"TCP"}],
+            "resources":{"limits":{"memory":"64Mi","cpu":"500m"}},"livenessProbe":{"httpGet":{"path":"/","port":"http"},"periodSeconds":10},"readinessProbe":{"tcpSocket":{"port":8080}}}],
+            "terminationGracePeriodSeconds":30,"nodeName":"n1","securityContext":{}},
+            "status":{"phase":"Running","podIP":"10.42.0.5","startTime":"2024-05-17T13:04:06Z","conditions":[{"type":"Ready","status":"True","lastTransitionTime":"2024-05-17T13:04:07Z"}],
+            "containerStatuses":[{"name":"c","ready":true,"restartCount":0,"image":"busybox","imageID":"sha256:x","state":{"running":{"startedAt":"2024-05-17T13:04:07Z"}}}]}}"#);
+        roundtrip(br#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"7","continue":"abc"},"items":[{"metadata":{"name":"a"}},{"metadata":{"name":"b"}}]}"#);
+        roundtrip(br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Failure","message":"pods x not found","reason":"NotFound","details":{"name":"x","kind":"pods"},"code":404}"#);
+        roundtrip(br#"{"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"n"},"spec":{"holderIdentity":"n","leaseDurationSeconds":40,"renewTime":"2024-05-17T13:04:05.123456Z"}}"#);
+        roundtrip(br#"{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{"name":"w.example.com"},"spec":{"group":"example.com","names":{"plural":"w","kind":"W"},"scope":"Namespaced",
+            "versions":[{"name":"v1","served":true,"storage":true,"schema":{"openAPIV3Schema":{"type":"object","properties":{"n":{"type":"integer","default":3},"l":{"type":"array","items":{"type":"string"}},"m":{"type":"object","additionalProperties":{"type":"string"}}},"additionalProperties":false,"required":["n"],"x-kubernetes-preserve-unknown-fields":true}}}]}}"#);
+        // No protobuf form: custom resources and Tables stay JSON.
+        assert!(encode_body(&json::parse(br#"{"apiVersion":"example.com/v1","kind":"W"}"#).unwrap()).is_none());
+        assert!(encode_body(&json::parse(br#"{"apiVersion":"meta.k8s.io/v1","kind":"Table"}"#).unwrap()).is_none());
+        // A value that does not fit its field refuses (the caller falls back to JSON).
+        assert!(encode_body(&json::parse(br#"{"apiVersion":"v1","kind":"Pod","spec":{"containers":"x"}}"#).unwrap()).is_none());
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 use crate::api::{ApiServer, Reply, Req, User, WatchStream};
 use crate::cluster::forward;
+use kr_fmt::json;
 use crate::webhook::Run;
 use alloc::boxed::Box;
 use alloc::format;
@@ -106,7 +107,7 @@ pub async fn handle(api: &ApiServer, req: Request) -> Response {
     if after > before && api.commit(after).await.is_err() {
         return respond(Reply::err(crate::object::ApiError::new(500, "InternalError", "storage sync failed")));
     }
-    let mut resp = respond(reply);
+    let mut resp = respond_to(reply, req.header("accept"));
     if is_forwarded {
         resp = resp.with_header(forward::REVISION, &format!("{}", api.revision()));
     }
@@ -114,6 +115,24 @@ pub async fn handle(api: &ApiServer, req: Request) -> Response {
         resp = resp.with_header("Warning", &format!("299 - \"{}\"", w.replace('\\', "\\\\").replace('"', "\\\"").replace(['\n', '\r'], " ")));
     }
     resp
+}
+
+/// The client's first acceptable media type is plain protobuf (client-go typed clients send
+/// `application/vnd.kubernetes.protobuf, */*`); conversions such as `as=Table` stay JSON.
+fn wants_protobuf(accept: Option<&str>) -> bool {
+    let Some(first) = accept.and_then(|a| a.split(',').map(str::trim).find(|m| !m.is_empty())) else { return false };
+    let mut parts = first.split(';').map(str::trim);
+    parts.next() == Some("application/vnd.kubernetes.protobuf") && parts.all(|p| !p.starts_with("as="))
+}
+
+/// Like [`respond`], in protobuf when the client prefers it and the kind has a protobuf form.
+fn respond_to(reply: Reply, accept: Option<&str>) -> Response {
+    if let (true, Reply::Json(code, body)) = (wants_protobuf(accept), &reply) {
+        if let Some(b) = json::parse(body.as_bytes()).ok().as_ref().and_then(crate::proto::encode_body) {
+            return Response::new(*code, b).with_header("Content-Type", "application/vnd.kubernetes.protobuf");
+        }
+    }
+    respond(reply)
 }
 
 fn respond(reply: Reply) -> Response {

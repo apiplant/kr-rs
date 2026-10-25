@@ -65,7 +65,8 @@ EXTRA_ROOTS = [("v1", "DeleteOptions", META + ".DeleteOptions"),
                ("authorization.k8s.io/v1", "SelfSubjectAccessReview", "k8s.io.api.authorization.v1.SelfSubjectAccessReview"),
                ("authorization.k8s.io/v1", "SubjectAccessReview", "k8s.io.api.authorization.v1.SubjectAccessReview"),
                ("v1", "Binding", "k8s.io.api.core.v1.Binding"),
-               ("policy/v1", "Eviction", "k8s.io.api.policy.v1.Eviction")]
+               ("policy/v1", "Eviction", "k8s.io.api.policy.v1.Eviction"),
+               ("v1", "Status", META + ".Status")]
 # Fields whose JSON name legitimately differs from the proto name (message, number) -> json name.
 NAME_OVERRIDES = {("k8s.io.api.admissionregistration.v1.Variable", 2): "expression", ("k8s.io.api.admissionregistration.v1.Variable", 1): "name", ("k8s.io.api.admissionregistration.v1.Validation", 1): "expression", ("k8s.io.api.admissionregistration.v1.MutatingWebhookConfiguration", 2): "webhooks", ("k8s.io.api.admissionregistration.v1.ValidatingWebhookConfiguration", 2): "webhooks", ("k8s.io.api.authentication.v1.BoundObjectReference", 4): "uid", ("k8s.io.api.networking.v1.IngressClassParametersReference", 1): "apiGroup"}
 
@@ -181,6 +182,8 @@ def roots(protos):
         g, v, kind = m.groups()
         pkg = GROUP_PKG.get(g, "k8s.io.api." + (g.split(".")[0] if g else "core")) + "." + v
         out.append(((g + "/" + v) if g else v, kind, pkg + "." + kind))
+    # Lists (protobuf responses): `<Kind>List` next to every served kind.
+    out += [(av, kind + "List", full + "List") for av, kind, full in list(out) if full + "List" in protos]
     out += EXTRA_ROOTS
     for av, kind, full in out:
         if full not in protos:
