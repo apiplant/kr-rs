@@ -624,9 +624,16 @@ fn deployment_progress_deadline_exceeded_then_recovers() {
         c.create("/api/v1/nodes", &node("n1", "{}", "[]", "4")).await.unwrap();
         HOLD_ALL.store(true, Ordering::SeqCst);
         c.create(DEPLOYMENTS, &deployment(2, "app:1", r#","progressDeadlineSeconds":20"#)).await.unwrap();
-        wait_until("Progressing=True", || async { cond(&deployment_status(&c).await, "Progressing").is_some_and(|p| str_at(p, &["status"]) == "True" && str_at(p, &["reason"]) != "NewReplicaSetAvailable") }).await;
+        // Wait for the replica counts too: a count that changes after the clock moves is
+        // progress, and would rightly restart the deadline (the test raced on loaded machines).
+        wait_until("Progressing=True with 2 updated replicas", || async {
+            let d = deployment_status(&c).await;
+            cond(&d, "Progressing").is_some_and(|p| str_at(p, &["status"]) == "True" && str_at(p, &["reason"]) != "NewReplicaSetAvailable") && int_at(&d, &["status", "replicas"], 0) == 2 && int_at(&d, &["status", "updatedReplicas"], 0) == 2
+        })
+        .await;
         let d = deployment_status(&c).await;
         assert_eq!(str_at(cond(&d, "Available").unwrap(), &["reason"]), "MinimumReplicasUnavailable");
+        sleep(300).await;
         advance_clock(10);
         sleep(400).await;
         assert_eq!(str_at(cond(&deployment_status(&c).await, "Progressing").unwrap(), &["status"]), "True", "not yet due");
