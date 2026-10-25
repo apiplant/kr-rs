@@ -55,6 +55,21 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 104. **Pod behaviour gaps (conformance round 7, 29 tests)** — *mostly fixed*
     Fixed: sidecar init containers (`restartPolicy: Always`: started, then treated as initialized; restarted on any exit; stopped after the app containers), which the lifecycle-hook tests use to relay hooks; termination messages (file bind-mounted at `terminationMessagePath`, writable by any user, `FallbackToLogsOnError` = last 80 lines / 2 KiB); `activeDeadlineSeconds` (also when updated: phase Failed, reason DeadlineExceeded); `pods/<name>[:port]/proxy` (sent from the transport on non-blocking sockets, one 30 s budget, host-local pod IPs refused); `subPathExpr` (expansion, absolute/`..`/backtick results fail the container); `hostAliases` and the node's /etc/hosts for hostNetwork pods; pod admission (`admit.rs`): sysctl name validation (422), RuntimeClass (403 when missing; overhead, nodeSelector and tolerations merged) and LimitRanger (container defaults, min/max/ratio); pod `generation` (order-insensitive spec comparison, graceful delete bumps it) and `observedGeneration` on status and conditions; real condition transition times; `PodInitializing` for init containers queued behind one that has not finished; gRPC probes (health v1 over h2c); image volumes (`volumes[].image`, read-only); exec websockets with the bare `channel.k8s.io` protocol. Verified with unit and in-process tests and live on throwaway two-node clusters (not yet by the e2e suite).
     Remaining: sidecars are not stopped when every app container of a Never/OnFailure pod finished; LimitRanger ignores Pod and PVC limit types; unsafe sysctls are not rejected; gRPC probes over TLS; services/proxy; pod proxy cannot reach pod IPs in rootless mode; the termination log fallback can include earlier restarts' output.
+105. **Missing APIs, validation, webhook and CRD gaps (conformance round 7)** — *partly fixed*
+    Fixed (in-process tests, not yet the e2e suite):
+    - TokenReview and SubjectAccessReview / LocalSubjectAccessReview, using the same token verification (signature, expiry, audience, ServiceAccount/pod revocation) and authorizer as requests; both need RBAC `create` (`tests/reviews.rs`). Tokens carry a `jti`, reported as the credential id with pod and node extras.
+    - Newly served: events.k8s.io/v1 Event, apiregistration.k8s.io/v1 APIService (stored only, no aggregation), PodCertificateRequest, DeviceTaintRule, StorageVersionMigration; CSR `spec.signerName` and events.k8s.io field selectors.
+    - `kube-root-ca.crt` is recreated or reset after ConfigMap writes in live namespaces.
+    - List chunking keeps the first page's resourceVersion, reports `remainingItemCount`, and expires continue tokens after 300 s with 410 and an inconsistent continue.
+    - Table requests to review APIs get 406.
+    - Immutable ConfigMaps/Secrets, data key validation, immutable PriorityClass `value`.
+    - Status updates keep label and annotation changes.
+    - Namespace deletion removes pods before anything else.
+    - Webhook configurations with uncompilable matchConditions are rejected (422); webhook calls carry `?timeout=Ns` and report timeouts as upstream does.
+    - Custom resources are defaulted on read; client-written CRD status conditions are kept.
+    - `kubectl logs --timestamps` (times are approximate: the file mtime, or the read time when following).
+    - Field validation messages: unknown and duplicate fields together; server-side apply's "field not declared in schema"; YAML duplicate keys.
+    Remaining: CRD conversion webhooks (and patching a CR in a non-storage version); API aggregation; review APIs in discovery; protobuf tables and spec validation for the new kinds; per-line log timestamps; `kubectl attach` denial message; `kubectl describe service` panic; the Guestbook test.
 
 ## Node agent and controllers (phase 4)
 73. **Volume and token gaps** — *mostly fixed*

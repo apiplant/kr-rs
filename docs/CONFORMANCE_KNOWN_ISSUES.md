@@ -113,6 +113,8 @@ All addressed since round 7 (KNOWN_ISSUES #104); to be confirmed by the next run
 
 ## Admission webhooks and CRDs (15)
 
+Partly addressed (KNOWN_ISSUES #105); open: CRD conversion webhooks and CRs in a non-storage version.
+
 - [sig-api-machinery] AdmissionWebhook should be able to deny attaching pod — `unexpected 'kubectl attach' error message. expected to contain "attaching to pod 'to-be-attached-pod' is not allowed", got "timed out waiting for command /usr/l…`
 - [sig-api-machinery] AdmissionWebhook should honor timeout — `expect an HTTP/dial timeout error querying the slow webhook, got: "Internal error occurred: failed calling webhook \"allow-configmap-with-delay-webhook.k8s.io\"…`
 - [sig-api-machinery] AdmissionWebhook should mutate custom resource with different stored version — `failed to patch custom resource cr-instance-1 in namespace: webhook-3661: the body is webhook.example.com/v1/e2e-test-webhook-3661-5563-crd but the URL addresse…`
@@ -148,6 +150,8 @@ All addressed since round 7 (KNOWN_ISSUES #104); to be confirmed by the next run
 
 ## Missing or partial APIs (23)
 
+Mostly addressed since round 7 (KNOWN_ISSUES #105); open: aggregation (sample API server). To be confirmed by the next run.
+
 - [sig-api-machinery] AggregatedDiscovery should support aggregated discovery interface — `Expected apiregistration.k8s.io/v1, Resource=apiservices to be present`
 - [sig-api-machinery] AggregatedDiscovery should support raw aggregated discovery endpoint Accept headers — `Expected gvr apiregistration.k8s.io v1 apiservices to exist in discovery`
 - [sig-api-machinery] Aggregator Should be able to support the 1.17 Sample API Server using the current Aggregator — `deploying extension apiserver in namespace aggregator-395: error waiting for deployment "sample-apiserver-deployment" status to match expectation: deployment st…`
@@ -174,12 +178,16 @@ All addressed since round 7 (KNOWN_ISSUES #104); to be confirmed by the next run
 
 ## Validation and immutability (4)
 
+Addressed (KNOWN_ISSUES #105); to be confirmed by the next run.
+
 - [sig-api-machinery] Namespaces should apply changes to a namespace status — `patched object should have the applied annotation`
 - [sig-node] Secrets should fail to create secret due to empty secret key — `created secret "secret-emptykey-test-7aa773b4-3808-46dc-a608-dae569fa116f" with empty key in namespace "secrets-9535"`
 - [sig-storage] ConfigMap should be immutable if `immutable` field is set — `expected 'invalid' as error, got instead: <nil>`
 - [sig-storage] Secrets should be immutable if `immutable` field is set — `expected 'invalid' as error, got instead: <nil>`
 
 ## kubectl (5)
+
+Log timestamps fixed (KNOWN_ISSUES #105); open: describe, attach denial message, Guestbook.
 
 - [sig-cli] Kubectl client Guestbook application should create and stop a working application — `Frontend service did not start serving content in 600 seconds.`
 - [sig-cli] Kubectl client Kubectl describe should check if kubectl describe prints relevant information for rc and pods — `error running /usr/local/bin/kubectl --kubeconfig=/tmp/kubeconfig-2164501684 --namespace=kubectl-2997 describe service agnhost-primary:`
