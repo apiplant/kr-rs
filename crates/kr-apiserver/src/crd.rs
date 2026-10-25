@@ -152,17 +152,44 @@ pub fn admit(o: &mut Value, old: Option<&Value>, now: i64) -> Result<(), ApiErro
             ("message", Value::from(message)),
         ])
     };
+    let mut conds = alloc::vec![
+        cond("NamesAccepted", "NoConflicts", "no conflicts found"),
+        cond("Established", "InitialNamesAccepted", "the initial names have been accepted"),
+    ];
+    if o.pointer(&["metadata", "deletionTimestamp"]).is_some() {
+        conds.push(terminating(old, now));
+    }
+    if old.is_none() {
+        // Upstream adds the cleanup finalizer at creation; the controller removes it once the
+        // custom resources are gone.
+        let m = o.entry_object("metadata");
+        let mut fin: Vec<Value> = m.get("finalizers").and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+        if !fin.iter().any(|f| f.as_str() == Some(FINALIZER)) {
+            fin.push(Value::from(FINALIZER));
+            m.set("finalizers", Value::Array(fin));
+        }
+    }
     let st = o.entry_object("status");
     st.set("acceptedNames", names);
     st.set("storedVersions", Value::Array(stored.iter().map(|s| Value::from(s.as_str())).collect()));
-    st.set(
-        "conditions",
-        Value::Array(alloc::vec![
-            cond("NamesAccepted", "NoConflicts", "no conflicts found"),
-            cond("Established", "InitialNamesAccepted", "the initial names have been accepted"),
-        ]),
-    );
+    st.set("conditions", Value::Array(conds));
     Ok(())
+}
+
+/// The finalizer that keeps a CRD until its custom resources are deleted.
+pub const FINALIZER: &str = "customresourcecleanup.apiextensions.k8s.io";
+
+/// The `Terminating` condition of a CRD whose deletion is in progress (keeps an earlier transition time).
+pub fn terminating(old: Option<&Value>, now: i64) -> Value {
+    let prev = old.and_then(|o| o.pointer(&["status", "conditions"])).and_then(Value::as_array).and_then(|c| c.iter().find(|c| str_at(c, &["type"]) == "Terminating"));
+    let at = prev.map(|c| str_at(c, &["lastTransitionTime"]).to_string()).unwrap_or_else(|| rfc3339(now));
+    crate::object::obj(alloc::vec![
+        ("type", Value::from("Terminating")),
+        ("status", Value::from("True")),
+        ("lastTransitionTime", Value::String(at)),
+        ("reason", Value::from("InstanceDeletionInProgress")),
+        ("message", Value::from("CustomResource deletion is in progress")),
+    ])
 }
 
 /// Version priority as in kube-aware ordering: GA over beta over alpha, higher numbers first.

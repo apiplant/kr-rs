@@ -14,6 +14,7 @@
 //! * [`cronjob`]: cron parsing and Job creation with concurrency policies.
 //! * [`endpoints`]: Endpoints and EndpointSlices for Services with selectors.
 //! * [`namespace`]: finishes the deletion of Terminating namespaces (empties, then finalizes).
+//! * [`crd`]: finishes the deletion of Terminating CustomResourceDefinitions (deletes instances, drops the finalizer).
 //! * [`pvc`]: PVC/PV binding, a local-path provisioner and pvc-protection.
 //! * [`gc`]: deletes dependents whose owner no longer exists (background propagation).
 //!
@@ -41,6 +42,7 @@ pub mod deployment;
 pub mod endpoints;
 pub mod gc;
 pub mod job;
+pub mod crd;
 pub mod namespace;
 pub mod pvc;
 pub mod quota;
@@ -102,6 +104,7 @@ pub async fn run_all_with<C: Client + Clone + 'static>(c: C, cfg: Config) {
         spawn(endpoints::run(c.clone(), cfg)),
         spawn(quota::run(c.clone(), cfg)),
         spawn(namespace::run(c.clone(), cfg)),
+        spawn(crd::run(c.clone(), cfg)),
         spawn(pvc::run(c.clone(), cfg)),
         spawn(gc::run(c, cfg)),
     ]);
