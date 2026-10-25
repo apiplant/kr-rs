@@ -557,3 +557,35 @@ fn deployment_min_ready_seconds_gates_availability() {
         wait_until("available after minReadySeconds", || complete(&c, 2)).await;
     });
 }
+
+#[test]
+fn pdb_status_and_eviction() {
+    scenario(|c| async move {
+        let pp = "/api/v1/namespaces/default/pods";
+        let bp = "/apis/policy/v1/namespaces/default/poddisruptionbudgets";
+        for n in ["a", "b", "c"] {
+            c.create(pp, &v(&alloc::format!(r#"{{"metadata":{{"name":"{n}","labels":{{"app":"x"}}}},"spec":{{"nodeName":"n1","containers":[{{"name":"c","image":"i"}}]}}}}"#))).await.unwrap();
+        }
+        c.create(bp, &v(r#"{"metadata":{"name":"b"},"spec":{"minAvailable":2,"selector":{"matchLabels":{"app":"x"}}}}"#)).await.unwrap();
+        wait_until("pdb status", || async {
+            let b = c.get(&alloc::format!("{bp}/b")).await.unwrap();
+            int_at(&b, &["status", "disruptionsAllowed"], -1) == 1 && int_at(&b, &["status", "currentHealthy"], -1) == 3 && int_at(&b, &["status", "desiredHealthy"], -1) == 2 && int_at(&b, &["status", "expectedPods"], -1) == 3 && int_at(&b, &["status", "observedGeneration"], -1) == 1
+        })
+        .await;
+        let ev = |n: &str| alloc::format!(r#"{{"apiVersion":"policy/v1","kind":"Eviction","metadata":{{"name":"{n}","namespace":"default"}},"deleteOptions":{{"gracePeriodSeconds":0}}}}"#);
+        c.create(&alloc::format!("{pp}/a/eviction"), &v(&ev("a"))).await.unwrap();
+        let b = c.get(&alloc::format!("{bp}/b")).await.unwrap();
+        assert!(b.pointer(&["status", "disruptedPods", "a"]).is_some());
+        let e = c.create(&alloc::format!("{pp}/b/eviction"), &v(&ev("b"))).await.unwrap_err();
+        assert_eq!(e.code, 429, "{}", e.message);
+        wait_until("pod a gone", || async { c.get(&alloc::format!("{pp}/a")).await.is_err() }).await;
+        // Two healthy pods left and two wanted: nothing may be evicted until a replacement is Ready.
+        wait_until("allowance 0", || async {
+            let b = c.get(&alloc::format!("{bp}/b")).await.unwrap();
+            int_at(&b, &["status", "currentHealthy"], -1) == 2 && int_at(&b, &["status", "disruptionsAllowed"], -1) == 0 && b.pointer(&["status", "disruptedPods"]).is_none()
+        })
+        .await;
+        c.create(pp, &v(r#"{"metadata":{"name":"d","labels":{"app":"x"}},"spec":{"nodeName":"n1","containers":[{"name":"c","image":"i"}]}}"#)).await.unwrap();
+        wait_until("allowance back", || async { int_at(&c.get(&alloc::format!("{bp}/b")).await.unwrap(), &["status", "disruptionsAllowed"], -1) == 1 }).await;
+    });
+}

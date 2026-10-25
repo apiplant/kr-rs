@@ -32,13 +32,17 @@ fn resource_entries(r: &Resource) -> Vec<Value> {
         ("storageVersionHash", s("")),
     ])];
     for sub in r.subresources {
-        let (kind, group, version) = if *sub == "scale" { ("Scale", "autoscaling", "v1") } else { (r.kind, "", "") };
+        let (kind, group, version) = match *sub {
+            "scale" => ("Scale", "autoscaling", "v1"),
+            "eviction" => ("Eviction", "policy", "v1"),
+            _ => (r.kind, "", ""),
+        };
         let mut fields = alloc::vec![
             ("name", Value::String(alloc::format!("{}/{sub}", r.plural))),
             ("singularName", s("")),
             ("namespaced", Value::Bool(r.namespaced)),
             ("kind", s(kind)),
-            ("verbs", strings(&["get", "patch", "update"])),
+            ("verbs", if *sub == "eviction" { strings(&["create"]) } else { strings(&["get", "patch", "update"]) }),
         ];
         if !group.is_empty() {
             fields.push(("group", s(group)));
@@ -178,8 +182,13 @@ fn agg_resource(r: &Resource) -> Value {
         .subresources
         .iter()
         .map(|sub| {
-            let resp = if *sub == "scale" { rk("Scale", "autoscaling", "v1") } else { rk(r.kind, r.group, r.version) };
-            obj(alloc::vec![("subresource", s(sub)), ("responseKind", resp), ("verbs", strings(&["get", "patch", "update"]))])
+            let resp = match *sub {
+                "scale" => rk("Scale", "autoscaling", "v1"),
+                "eviction" => rk("Eviction", "policy", "v1"),
+                _ => rk(r.kind, r.group, r.version),
+            };
+            let verbs = if *sub == "eviction" { strings(&["create"]) } else { strings(&["get", "patch", "update"]) };
+            obj(alloc::vec![("subresource", s(sub)), ("responseKind", resp), ("verbs", verbs)])
         })
         .collect();
     obj(alloc::vec![

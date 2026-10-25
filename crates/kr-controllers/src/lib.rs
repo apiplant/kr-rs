@@ -38,6 +38,7 @@ extern crate std;
 pub mod cronjob;
 pub mod daemonset;
 pub mod deployment;
+pub mod disruption;
 pub mod endpoints;
 pub mod gc;
 pub mod job;
@@ -101,6 +102,7 @@ pub async fn run_all_with<C: Client + Clone + 'static>(c: C, cfg: Config) {
         spawn(cronjob::run(c.clone(), cfg)),
         spawn(endpoints::run(c.clone(), cfg)),
         spawn(quota::run(c.clone(), cfg)),
+        spawn(disruption::run(c.clone(), cfg)),
         spawn(namespace::run(c.clone(), cfg)),
         spawn(pvc::run(c.clone(), cfg)),
         spawn(gc::run(c, cfg)),
