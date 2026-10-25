@@ -144,3 +144,15 @@ fn review_has_no_table() {
         _ => panic!(),
     }
 }
+
+/// The review APIs disclose authorization decisions and token validity: callers need RBAC
+/// permission, like upstream (`create` on the review resource).
+#[test]
+fn reviews_need_permission() {
+    let api = server();
+    let nobody = || Some(User { name: "nobody".into(), groups: vec!["system:authenticated".into()] });
+    let sar = r#"{"spec":{"user":"x","resourceAttributes":{"verb":"list","resource":"secrets"}}}"#;
+    assert_eq!(call_as(&api, nobody(), "POST", "/apis/authorization.k8s.io/v1/subjectaccessreviews", sar).0, 403);
+    assert_eq!(call_as(&api, nobody(), "POST", "/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews", sar).0, 403);
+    assert_eq!(call_as(&api, None, "POST", "/apis/authentication.k8s.io/v1/tokenreviews", r#"{"spec":{"token":"x"}}"#).0 / 100, 4);
+}
