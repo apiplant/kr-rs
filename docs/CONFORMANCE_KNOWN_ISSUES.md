@@ -24,6 +24,8 @@ Regenerate the list after a run: `tools/test/conformance.sh results DIR`, then t
 
 ## Pod behaviour (kubelet) (29)
 
+All addressed since round 7 (KNOWN_ISSUES #104); to be confirmed by the next run.
+
 - [sig-node] Container Lifecycle Hook when create a pod with lifecycle hook should execute poststart exec hook properly — `Timed out after 300.001s.`
 - [sig-node] Container Lifecycle Hook when create a pod with lifecycle hook should execute poststart http hook properly — `Timed out after 300.000s.`
 - [sig-node] Container Lifecycle Hook when create a pod with lifecycle hook should execute prestop exec hook properly — `Timed out after 300.001s.`
