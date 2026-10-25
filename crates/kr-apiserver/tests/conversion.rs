@@ -1,6 +1,6 @@
 //! CRD conversion: strategy None and a Webhook (HTTPS on loopback), with a mixed-version store.
 
-use kr_apiserver::api::ApiServer;
+use kr_apiserver::api::{ApiServer, Reply, Req, User};
 use kr_apiserver::client::{Client, Remote, RemoteAuth};
 use kr_crypto::tls::{ClientAuth, ServerConfig as TlsConfig};
 use kr_crypto::x509::{self, CertParams, Name, SigningKey};
@@ -101,6 +101,7 @@ fn start_webhook(ca_name: &Name, ca_key: &SigningKey) -> u16 {
 }
 
 struct Env {
+    api: Rc<ApiServer>,
     url: String,
     ca_pem: String,
     wh_port: u16,
@@ -121,9 +122,10 @@ async fn setup() -> Env {
     let api = Rc::new(ApiServer::new(kr_store::Store::in_memory(), now, rng, "127.0.0.1".into()).unwrap());
     let tls = Rc::new(TlsConfig { cert_chain: vec![srv], key: srv_key, client_auth: ClientAuth::Optional(vec![ca.clone()]), alpn: vec![b"http/1.1".to_vec()] });
     let port = free_port();
-    spawn(kr_apiserver::server::run(api, [127, 0, 0, 1], port, tls));
+    spawn(kr_apiserver::server::run(api.clone(), [127, 0, 0, 1], port, tls));
     sleep(20).await; // let the listeners bind
     Env {
+        api,
         url: format!("https://127.0.0.1:{port}"),
         ca_pem: x509::pem_encode("CERTIFICATE", &ca),
         wh_port,
@@ -132,6 +134,17 @@ async fn setup() -> Env {
     }
 }
 
+
+/// The request to the API server in-process, bypassing the transport (so no conversion): what is stored.
+fn raw(api: &ApiServer, method: &str, path: &str, body: &Value) -> Value {
+    let b = json::to_string(body).into_bytes();
+    let user = User { name: "admin".into(), groups: vec!["system:masters".into()] };
+    match api.handle(&Req { method, path, query: "", content_type: Some("application/json"), accept: None, body: &b, user: Some(user), bearer: None, headers: &[], authz_verb: None }) {
+        Reply::Json(c, body) if c < 300 => v(&body),
+        Reply::Json(c, body) => panic!("{method} {path}: {c} {body}"),
+        _ => panic!("unexpected reply"),
+    }
+}
 
 const CRDS: &str = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions";
 const CRS: &str = "/apis/conv.example.com";
@@ -194,6 +207,55 @@ fn run() {
         // patching "one" (stored v1) through v2
         let p = c.patch(&format!("{v2}/one"), "application/merge-patch+json", &v(r#"{"dummy":"test"}"#)).await.unwrap();
         assert_eq!((s(&p, "apiVersion").as_deref(), s(&p, "host").as_deref(), s(&p, "dummy").as_deref()), (Some("conv.example.com/v2"), Some("localhost"), Some("test")));
+        // writes are stored in the storage version (v1), whatever version they came through
+        let stored = |name: &str| raw(&e.api, "GET", &format!("{v1}/{name}"), &Value::Null);
+        let two = stored("two");
+        assert_eq!((s(&two, "apiVersion").as_deref(), s(&two, "hostPort").as_deref(), two.get("host")), (Some("conv.example.com/v1"), Some("h:9"), None), "{two:?}");
+        let one = stored("one");
+        assert_eq!((s(&one, "apiVersion").as_deref(), s(&one, "dummy").as_deref(), s(&one, "hostPort").as_deref()), (Some("conv.example.com/v1"), Some("test"), Some("localhost:8080")), "{one:?}");
+        // the reply to a v2 write is in v2; PUT through v2 and a status-less update keep v1 storage
+        let mut put = c.get(&format!("{v2}/two")).await.unwrap();
+        put.set("port", Value::from("10"));
+        let r = c.update(&format!("{v2}/two"), &put).await.unwrap();
+        assert_eq!((s(&r, "apiVersion").as_deref(), s(&r, "port").as_deref()), (Some("conv.example.com/v2"), Some("10")), "{r:?}");
+        assert_eq!(s(&stored("two"), "hostPort").as_deref(), Some("h:10"));
+        // dry-run leaves nothing behind; a strict unknown-field request is judged on the v2 object
+        c.create(&format!("{v2}?dryRun=All"), &cr("v2", "Hook", "ghost", r#""host":"g","port":"1""#)).await.unwrap();
+        assert_eq!(c.get(&format!("{v1}/ghost")).await.unwrap_err().code, 404);
+        // an object stored before writes were converted (v2) is read, patched through v1 and stored as v1
+        raw(&e.api, "POST", &v2, &cr("v2", "Hook", "legacy", r#""host":"l","port":"5""#));
+        assert_eq!(s(&stored("legacy"), "apiVersion").as_deref(), Some("conv.example.com/v2"));
+        let p = c.patch(&format!("{v1}/legacy"), "application/merge-patch+json", &v(r#"{"dummy":"x"}"#)).await.unwrap();
+        assert_eq!((s(&p, "apiVersion").as_deref(), s(&p, "hostPort").as_deref()), (Some("conv.example.com/v1"), Some("l:5")), "{p:?}");
+        assert_eq!(s(&stored("legacy"), "apiVersion").as_deref(), Some("conv.example.com/v1"));
+        // strategy None: a v2 write is stored as v1
+        let nv2 = format!("{CRS}/v2/namespaces/default/nones");
+        c.create(&nv2, &cr("v2", "None", "viav2", r#""data":{"y":"2"}"#)).await.unwrap();
+        let n = raw(&e.api, "GET", &format!("{base}/viav2"), &Value::Null);
+        assert_eq!(s(&n, "apiVersion").as_deref(), Some("conv.example.com/v1"), "{n:?}");
+        let n = c.get(&format!("{nv2}/viav2")).await.unwrap();
+        assert_eq!(s(&n, "apiVersion").as_deref(), Some("conv.example.com/v2"));
+
+        // watch in v2: events of objects stored as v1 arrive converted
+        let mut w = c.watch(&v2, "").await.unwrap();
+        let writer = {
+            let (c, v1) = (c.clone(), v1.clone());
+            spawn(async move {
+                sleep(100).await;
+                c.patch(&format!("{v1}/one"), "application/merge-patch+json", &v(r#"{"dummy":"changed"}"#)).await.unwrap();
+                c.create(&v1, &cr("v1", "Hook", "three", r#""hostPort":"t:3""#)).await.unwrap();
+            })
+        };
+        // the initial ADDED events (one, two, legacy), then the changes
+        let mut kinds = Vec::new();
+        while kinds.len() < 5 {
+            let ev = w.next().await.expect("watch ended early");
+            assert_eq!(s(&ev.object, "apiVersion").as_deref(), Some("conv.example.com/v2"), "{ev:?}");
+            assert!(ev.object.get("hostPort").is_none() && ev.object.get("host").is_some(), "{:?}", ev.object);
+            kinds.push(ev.kind);
+        }
+        writer.await.unwrap();
+        assert_eq!(kinds, ["ADDED", "ADDED", "ADDED", "MODIFIED", "ADDED"]);
         // a webhook that changes metadata is refused
         c.create(CRDS, &crd(&e, "Webhook", "/bad-meta", "v1")).await.unwrap();
         sleep(100).await;
@@ -202,5 +264,11 @@ fn run() {
         let err = c.get(&format!("{CRS}/v2/namespaces/default/bads/b")).await.unwrap_err();
         assert_eq!(err.code, 500, "{err:?}");
         assert!(err.message.contains("changed the metadata"), "{}", err.message);
+        // a conversion failure in a watch is an ERROR event, then the stream ends
+        let mut w = c.watch(&format!("{CRS}/v2/namespaces/default/bads"), "").await.unwrap();
+        let ev = w.next().await.expect("no event");
+        assert_eq!(ev.kind, "ERROR", "{ev:?}");
+        assert_eq!((ev.object.get("code").and_then(Value::as_u64), s(&ev.object, "kind").as_deref()), (Some(500), Some("Status")), "{:?}", ev.object);
+        assert!(w.next().await.is_none());
     });
 }

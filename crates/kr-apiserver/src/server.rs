@@ -31,7 +31,7 @@ impl ResponseStream for Watch {
     }
 }
 
-pub async fn handle(api: &ApiServer, req: Request) -> Response {
+pub async fn handle(api: &Rc<ApiServer>, req: Request) -> Response {
     // Another server forwarding a write for one of its clients (ADR-026).
     let peer_cert = req.peer.client_certs.as_deref().and_then(|c| c.first()).map(|c| c.as_slice());
     let forwarded = forward::trusted_identity(peer_cert, req.header(forward::IDENTITY));
@@ -89,7 +89,7 @@ pub async fn handle(api: &ApiServer, req: Request) -> Response {
     if let Some(reply) = crate::convert::pre(api, &r).await {
         return respond(reply);
     }
-    let (res, warnings) = crate::webhook::run(api, &r).await;
+    let (res, mut warnings) = crate::webhook::run(api, &r).await;
     let rewritten;
     let reply = match res {
         Err(reply) => reply,
@@ -102,8 +102,14 @@ pub async fn handle(api: &ApiServer, req: Request) -> Response {
                     Req { method: rewritten.method, content_type: Some("application/json"), body: &rewritten.body, authz_verb: (r.method == "PATCH").then_some("patch"), ..r }
                 }
             };
-            let reply = api.handle(&r);
-            crate::convert::post(api, &r, reply).await
+            // Admission saw the request's version; the write is stored as the storage version.
+            let (reply, w) = match crate::convert::write(api, &r).await {
+                Some(done) => done,
+                None => api.handle_w(&r),
+            };
+            warnings.extend(w);
+            let reply = crate::convert::post(api, &r, reply).await;
+            crate::convert::watch(api, &r, reply)
         }
     };
     if let Reply::Proxy(t) = reply {
