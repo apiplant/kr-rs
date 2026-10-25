@@ -15,6 +15,8 @@ pub enum ListKind {
     Atomic,
     Map(Vec<String>),
     Set,
+    /// Not a list: an object marked `x-kubernetes-map-type: atomic`, owned and replaced as one field.
+    AtomicMap,
 }
 
 /// Looks up the kind of the list at a field-name path (the list's own name is last).
@@ -48,6 +50,9 @@ pub fn schema_lists(schema: &Value, path: &[&str]) -> ListKind {
             Some(n) => n,
             None => return ListKind::Atomic,
         };
+    }
+    if s.get("x-kubernetes-map-type").and_then(Value::as_str) == Some("atomic") {
+        return ListKind::AtomicMap;
     }
     match s.get("x-kubernetes-list-type").and_then(Value::as_str) {
         Some("map") => {
@@ -116,6 +121,12 @@ pub fn fields(v: &Value, old: Option<&Value>, lists: Lists, scope: Scope) -> Val
 fn walk(v: &Value, old: Option<&Value>, names: &mut Vec<String>, lists: Lists, scope: Scope) -> Option<Value> {
     match v {
         Value::Object(fs) if !fs.is_empty() => {
+            if !names.is_empty() {
+                let nm: Vec<&str> = names.iter().map(String::as_str).collect();
+                if lists(&nm) == ListKind::AtomicMap {
+                    return (old != Some(v)).then(empty);
+                }
+            }
             let mut out = Vec::new();
             for (k, c) in fs {
                 if names.is_empty() {
@@ -140,7 +151,7 @@ fn walk(v: &Value, old: Option<&Value>, names: &mut Vec<String>, lists: Lists, s
         Value::Array(items) => {
             let nm: Vec<&str> = names.iter().map(String::as_str).collect();
             match lists(&nm) {
-                ListKind::Atomic => (old != Some(v)).then(empty),
+                ListKind::Atomic | ListKind::AtomicMap => (old != Some(v)).then(empty),
                 ListKind::Set => {
                     let prev = old.and_then(Value::as_array).unwrap_or(&[]);
                     let out: Vec<(String, Value)> = items.iter().filter(|i| !prev.contains(i)).map(|i| (alloc::format!("v:{}", json::to_string(i)), empty())).collect();
@@ -395,6 +406,32 @@ pub fn is_reset(mf: &Value) -> bool {
     mf.as_array().is_some_and(|a| a.is_empty() || (a.len() == 1 && is_empty(&a[0])))
 }
 
+/// `obj` without what changes on a rewrite that alters nothing: `resourceVersion` and the
+/// managedFields timestamps, with map keys in sorted order (rewrites may reorder them).
+pub fn comparable(obj: &Value) -> Value {
+    fn sorted(v: &Value) -> Value {
+        match v {
+            Value::Object(fs) => {
+                let mut out: Vec<(String, Value)> = fs.iter().map(|(k, c)| (k.clone(), sorted(c))).collect();
+                out.sort_by(|a, b| a.0.cmp(&b.0));
+                Value::Object(out)
+            }
+            Value::Array(a) => Value::Array(a.iter().map(sorted).collect()),
+            other => other.clone(),
+        }
+    }
+    let mut o = obj.clone();
+    if let Some(m) = o.get_mut("metadata") {
+        m.remove("resourceVersion");
+        if let Some(Value::Array(mf)) = m.get_mut("managedFields") {
+            for e in mf.iter_mut() {
+                e.remove("time");
+            }
+        }
+    }
+    sorted(&o)
+}
+
 /// Records an Update by `manager`: it owns `changed`, everyone else loses it.
 pub fn record_update(entries: &mut Vec<Entry>, changed: &Value, manager: &str, sub: &str, api_version: &str, now: &str) {
     if is_empty(changed) {
@@ -435,6 +472,13 @@ pub fn store(obj: &mut Value, mut entries: Vec<Entry>) {
 fn merge(target: &mut Value, applied: &Value, names: &mut Vec<String>, lists: Lists) {
     match applied {
         Value::Object(fs) => {
+            if !names.is_empty() {
+                let nm: Vec<&str> = names.iter().map(String::as_str).collect();
+                if lists(&nm) == ListKind::AtomicMap {
+                    *target = applied.clone();
+                    return;
+                }
+            }
             if !matches!(target, Value::Object(_)) {
                 *target = empty();
             }
@@ -453,7 +497,7 @@ fn merge(target: &mut Value, applied: &Value, names: &mut Vec<String>, lists: Li
         Value::Array(items) => {
             let nm: Vec<&str> = names.iter().map(String::as_str).collect();
             let kind = lists(&nm);
-            if kind == ListKind::Atomic {
+            if matches!(kind, ListKind::Atomic | ListKind::AtomicMap) {
                 *target = applied.clone();
                 return;
             }
@@ -483,7 +527,7 @@ fn merge(target: &mut Value, applied: &Value, names: &mut Vec<String>, lists: Li
                             }
                         }
                     }
-                    ListKind::Atomic => {}
+                    ListKind::Atomic | ListKind::AtomicMap => {}
                 }
             }
             *target = Value::Array(list);

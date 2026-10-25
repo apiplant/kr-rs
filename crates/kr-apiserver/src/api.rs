@@ -1384,6 +1384,10 @@ impl ApiServer {
             };
             ssa::store(&mut new, entries);
         }
+        // Upstream skips the write when nothing but timestamps and the resourceVersion changed.
+        if crate::ssa::comparable(&old) == crate::ssa::comparable(&new) {
+            return Ok(Reply::ok(&old));
+        }
         if q.get("dryRun") == Some("All") {
             return Ok(Reply::ok(&new));
         }
