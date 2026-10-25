@@ -68,7 +68,8 @@ pub(crate) fn check(resp: &Value, uid: &str, desired: &str, objs: &[Value]) -> R
         if c.get("kind") != o.get("kind") {
             return Err("webhook changed the kind of an object".to_string());
         }
-        if meta_key(c) != meta_key(o) {
+        // Webhooks re-serialize the metadata with their own key order.
+        if !crate::object::same_json(&Some(&meta_key(c)), &Some(&meta_key(o))) {
             return Err("webhook changed the metadata of an object".to_string());
         }
     }
@@ -312,5 +313,21 @@ impl ResponseStream for ConvWatch {
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_order_is_irrelevant() {
+        // Go webhooks re-serialize the metadata with sorted keys.
+        let o = json::parse_str(r#"{"apiVersion":"g/v1","kind":"K","metadata":{"name":"a","uid":"u","labels":{"x":"1"}}}"#).unwrap();
+        let c = json::parse_str(r#"{"apiVersion":"g/v2","kind":"K","metadata":{"uid":"u","name":"a","labels":{"y":"2"}}}"#).unwrap();
+        let resp = json::parse_str(&format!(r#"{{"response":{{"uid":"id","result":{{"status":"Success"}},"convertedObjects":[{}]}}}}"#, json::to_string(&c))).unwrap();
+        assert_eq!(check(&resp, "id", "g/v2", &[o.clone()]).err(), None);
+        let bad = json::parse_str(&json::to_string(&resp).replace(r#""uid":"u""#, r#""uid":"w""#)).unwrap();
+        assert!(check(&bad, "id", "g/v2", &[o]).is_err());
     }
 }
