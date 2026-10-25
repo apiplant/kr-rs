@@ -254,6 +254,18 @@ impl ApiServer {
         }
     }
 
+    /// Refuses creating custom resources of a CRD that is being deleted.
+    fn check_crd_terminating(&self, rt: &Route) -> R<()> {
+        let Some(crd) = self.custom.borrow().iter().find(|c| core::ptr::eq(c.res, rt.res)).map(|c| c.crd.clone()) else { return Ok(()) };
+        let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") else { return Ok(()) };
+        let kv = self.store.borrow().get(&r.key(None, &crd));
+        let terminating = kv.and_then(|kv| json::parse(&kv.value).ok()).is_some_and(|v| v.pointer(&["metadata", "deletionTimestamp"]).is_some());
+        if terminating {
+            return Err(ApiError::new(405, "MethodNotAllowed", "create not allowed while custom resource definition is terminating"));
+        }
+        Ok(())
+    }
+
     /// Defaulting, pruning, validation and generation rules for a custom object.
     fn admit_custom(&self, rt: &Route, o: &mut Value, old: Option<&Value>, status: bool) -> R<()> {
         let custom = self.custom.borrow();
@@ -1258,6 +1270,7 @@ impl ApiServer {
         let rev = self.store.borrow().revision() + 1;
         let name = object::prepare_create(o, &t, &self.clock(), rev)?;
         self.check_namespace(rt, &name)?;
+        self.check_crd_terminating(rt)?;
         crate::defaults::apply(rt.res.group, rt.res.plural, o);
         let is_crd = crate::crd::is_crd(rt.res);
         if is_crd {
@@ -1393,6 +1406,9 @@ impl ApiServer {
         let no_spec_finalizers = rt.res.plural != "namespaces" || new.pointer(&["spec", "finalizers"]).and_then(Value::as_array).is_none_or(|f| f.is_empty());
         if deleting && no_finalizers && no_spec_finalizers {
             self.store.borrow_mut().delete(&kv.key, Some(kv.mod_rev)).map_err(|e| store_err(e, rt.res.singular, name))?;
+            if crate::crd::is_crd(rt.res) {
+                self.unregister_crd(&new);
+            }
             self.sync()?;
             return Ok(Reply::ok(&new));
         }
@@ -1510,6 +1526,7 @@ impl ApiServer {
             }
             return Ok(Reply::ok(&v));
         }
+        let is_crd = crate::crd::is_crd(rt.res);
         let has_finalizers = v.pointer(&["metadata", "finalizers"]).and_then(Value::as_array).is_some_and(|f| !f.is_empty());
         if has_finalizers {
             if v.pointer(&["metadata", "deletionTimestamp"]).is_none() {
@@ -1518,10 +1535,20 @@ impl ApiServer {
                 m.set("deletionTimestamp", Value::String(object::rfc3339((self.now)())));
                 m.set("deletionGracePeriodSeconds", Value::Number(Number::from_u64(0)));
                 m.set("resourceVersion", Value::String(rev.to_string()));
+                if is_crd {
+                    // Established stays; new custom resources are refused from now on.
+                    let t = crate::crd::terminating(Some(&v), (self.now)());
+                    let st = v.entry_object("status");
+                    let mut conds: Vec<Value> = st.get("conditions").and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+                    conds.retain(|c| c.get("type").and_then(Value::as_str) != Some("Terminating"));
+                    conds.push(t);
+                    st.set("conditions", Value::Array(conds));
+                }
                 self.store.borrow_mut().update(&kv.key, json::to_string(&v).into_bytes(), Some(kv.mod_rev)).map_err(|e| store_err(e, rt.res.singular, name))?;
                 self.sync()?;
             }
-            return Ok(Reply::Json(202, json::to_string(&v)));
+            // Like upstream, a CRD answers 200 with the (terminating) object.
+            return Ok(if is_crd { Reply::ok(&v) } else { Reply::Json(202, json::to_string(&v)) });
         }
         self.store.borrow_mut().delete(&kv.key, Some(kv.mod_rev)).map_err(|e| store_err(e, rt.res.singular, name))?;
         if crate::crd::is_crd(rt.res) {

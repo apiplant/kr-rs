@@ -184,13 +184,68 @@ fn discovery_lists_custom_resources_and_delete_removes_them() {
     assert_eq!(c, 200);
     assert!(doc.pointer(&["paths", "/apis/example.com/v1/namespaces/{namespace}/widgets"]).is_some());
 
-    assert_eq!(j(&api, "DELETE", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.com", "").0, 200);
+    drop_crd(&api);
     assert_eq!(j(&api, "GET", W, "").0, 404);
     assert_eq!(j(&api, "GET", "/apis/example.com/v1", "").0, 404);
     assert_eq!(j(&api, "GET", "/apis/example.com", "").0, 404);
     assert!(j(&api, "GET", "/openapi/v3", "").1.pointer(&["paths", "apis/example.com/v1"]).is_none());
     // Re-creating the CRD finds no leftover objects.
     assert_eq!(j(&api, "POST", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions", CRD).0, 201);
+    assert_eq!(j(&api, "GET", W, "").1.get("items").unwrap().as_array().unwrap().len(), 0);
+}
+
+const WIDGETS_CRD: &str = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.com";
+
+/// Deletes the widgets CRD the way the controller finishes it: the finalizer is removed.
+fn drop_crd(api: &ApiServer) {
+    let (c, v) = j(api, "DELETE", WIDGETS_CRD, "");
+    assert_eq!(c, 200);
+    assert!(v.pointer(&["metadata", "deletionTimestamp"]).is_some());
+    let (_, mut crd) = j(api, "GET", WIDGETS_CRD, "");
+    crd.get_mut("metadata").unwrap().set("finalizers", Value::Array(vec![]));
+    assert_eq!(j(api, "PUT", WIDGETS_CRD, &json::to_string(&crd)).0, 200);
+    assert_eq!(j(api, "GET", WIDGETS_CRD, "").0, 404);
+}
+
+#[test]
+fn crd_deletion_goes_through_the_cleanup_finalizer() {
+    let api = crd_installed();
+    let (_, crd) = j(&api, "GET", WIDGETS_CRD, "");
+    let fin = crd.pointer(&["metadata", "finalizers"]).unwrap().as_array().unwrap();
+    assert_eq!(fin.len(), 1);
+    assert_eq!(fin[0].as_str(), Some("customresourcecleanup.apiextensions.k8s.io"));
+    assert_eq!(j(&api, "POST", W, &widget("a", r#"{"size":1}"#)).0, 201);
+
+    let (c, v) = j(&api, "DELETE", WIDGETS_CRD, "");
+    assert_eq!(c, 200);
+    assert!(v.pointer(&["metadata", "deletionTimestamp"]).is_some());
+    let conds = v.pointer(&["status", "conditions"]).unwrap().as_array().unwrap();
+    let find = |t: &str| conds.iter().find(|c| c.get("type").unwrap().as_str() == Some(t)).cloned();
+    let term = find("Terminating").unwrap();
+    assert_eq!(term.get("status").unwrap().as_str(), Some("True"));
+    assert_eq!(term.get("reason").unwrap().as_str(), Some("InstanceDeletionInProgress"));
+    assert_eq!(term.get("message").unwrap().as_str(), Some("CustomResource deletion is in progress"));
+    assert!(find("Established").is_some());
+
+    // Existing objects stay usable, new ones are refused.
+    let (c, v) = j(&api, "POST", W, &widget("b", r#"{"size":1}"#));
+    assert_eq!(c, 405);
+    assert_eq!(v.get("message").unwrap().as_str(), Some("create not allowed while custom resource definition is terminating"));
+    assert_eq!(j(&api, "GET", &format!("{W}/a"), "").0, 200);
+    assert_eq!(j(&api, "GET", W, "").1.get("items").unwrap().as_array().unwrap().len(), 1);
+    // The terminating condition survives updates of the CRD.
+    let (_, cur) = j(&api, "GET", WIDGETS_CRD, "");
+    assert_eq!(j(&api, "PUT", WIDGETS_CRD, &json::to_string(&cur)).0, 200);
+    assert!(j(&api, "GET", WIDGETS_CRD, "").1.pointer(&["status", "conditions"]).unwrap().as_array().unwrap().iter().any(|c| c.get("type").unwrap().as_str() == Some("Terminating")));
+
+    // The instance goes, then removing the finalizer deletes the CRD and unregisters the resource.
+    assert_eq!(j(&api, "DELETE", &format!("{W}/a"), "").0, 200);
+    let (_, mut crd) = j(&api, "GET", WIDGETS_CRD, "");
+    crd.get_mut("metadata").unwrap().set("finalizers", Value::Array(vec![]));
+    assert_eq!(j(&api, "PUT", WIDGETS_CRD, &json::to_string(&crd)).0, 200);
+    assert_eq!(j(&api, "GET", WIDGETS_CRD, "").0, 404);
+    assert_eq!(j(&api, "GET", W, "").0, 404);
+    assert_eq!(j(&api, "POST", CRDS, CRD).0, 201);
     assert_eq!(j(&api, "GET", W, "").1.get("items").unwrap().as_array().unwrap().len(), 0);
 }
 

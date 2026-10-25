@@ -1085,3 +1085,32 @@ fn namespace_deletion_is_asynchronous_and_empties_everything() {
         assert_eq!(c.get(NS_DOOMED).await.unwrap_err().code, 404);
     });
 }
+
+#[test]
+fn crd_deletion_removes_instances_then_the_crd() {
+    scenario(|c| async move {
+        let crds = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions";
+        let crd = v(r#"{"metadata":{"name":"gadgets.x.io"},"spec":{"group":"x.io","scope":"Namespaced","names":{"plural":"gadgets","singular":"gadget","kind":"Gadget"},
+            "versions":[{"name":"v1","served":true,"storage":true,"schema":{"openAPIV3Schema":{"type":"object","x-kubernetes-preserve-unknown-fields":true}}}]}}"#);
+        let made = c.create(crds, &crd).await.unwrap();
+        assert_eq!(made.pointer(&["metadata", "finalizers"]).and_then(Value::as_array).map(|f| f.len()), Some(1));
+        let g = "/apis/x.io/v1/namespaces/default/gadgets";
+        let body = |n: &str, fin: &str| v(&alloc::format!(r#"{{"apiVersion":"x.io/v1","kind":"Gadget","metadata":{{"name":"{n}","finalizers":[{fin}]}},"spec":{{"a":1}}}}"#));
+        c.create(g, &body("plain", "")).await.unwrap();
+        c.create(g, &body("held", r#""x.io/hold""#)).await.unwrap();
+
+        let r = c.delete(&alloc::format!("{crds}/gadgets.x.io")).await.unwrap();
+        assert!(r.pointer(&["metadata", "deletionTimestamp"]).is_some());
+        assert_eq!(c.create(g, &body("late", "")).await.unwrap_err().code, 405);
+        wait_until("plain instance deleted", || async { c.get(&alloc::format!("{g}/plain")).await.is_err() }).await;
+        sleep(400).await;
+        assert!(c.get(&alloc::format!("{g}/held")).await.unwrap().pointer(&["metadata", "deletionTimestamp"]).is_some());
+        assert!(c.get(&alloc::format!("{crds}/gadgets.x.io")).await.is_ok(), "waits for the finalizer of the instance");
+
+        let mut held = c.get(&alloc::format!("{g}/held")).await.unwrap();
+        held.entry_object("metadata").set("finalizers", Value::Array(Vec::new()));
+        c.update(&alloc::format!("{g}/held"), &held).await.unwrap();
+        wait_until("crd gone", || async { c.get(&alloc::format!("{crds}/gadgets.x.io")).await.is_err() }).await;
+        assert_eq!(c.list(g, "").await.unwrap_err().code, 404);
+    });
+}
