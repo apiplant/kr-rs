@@ -27,6 +27,8 @@ pub struct Custom {
     /// The CRD converts between versions with a webhook: its `clientConfig`. `None`: only
     /// apiVersion changes.
     pub webhook: Option<Value>,
+    /// The CRD's storage version (new objects are stored as this one).
+    pub storage: String,
 }
 
 impl Custom {
@@ -224,6 +226,7 @@ pub fn build(crd: &Value, existing: &[Custom]) -> Vec<Custom> {
     let webhook = (str_at(crd, &["spec", "conversion", "strategy"]) == "Webhook").then(|| crd.pointer(&["spec", "conversion", "webhook", "clientConfig"]).cloned().unwrap_or(Value::Null));
     let mut vs: Vec<&Value> = crd.pointer(&["spec", "versions"]).and_then(Value::as_array).unwrap_or(&[]).iter().filter(|v| is_true(v.get("served"))).collect();
     vs.sort_by(|a, b| version_rank(str_at(b, &["name"])).cmp(&version_rank(str_at(a, &["name"]))).then(str_at(a, &["name"]).cmp(str_at(b, &["name"]))));
+    let storage = crd.pointer(&["spec", "versions"]).and_then(Value::as_array).unwrap_or(&[]).iter().find(|v| is_true(v.get("storage"))).map(|v| str_at(v, &["name"]).to_string()).unwrap_or_default();
     let mut out = Vec::new();
     for v in vs {
         let vn = str_at(v, &["name"]);
@@ -263,7 +266,7 @@ pub fn build(crd: &Value, existing: &[Custom]) -> Vec<Custom> {
                 categories: leak_all(&cats),
             }))
         });
-        out.push(Custom { res, crd: str_at(crd, &["metadata", "name"]).to_string(), schema: v.pointer(&["schema", "openAPIV3Schema"]).cloned(), scale, webhook: webhook.clone() });
+        out.push(Custom { res, crd: str_at(crd, &["metadata", "name"]).to_string(), schema: v.pointer(&["schema", "openAPIV3Schema"]).cloned(), scale, webhook: webhook.clone(), storage: storage.clone() });
     }
     out
 }

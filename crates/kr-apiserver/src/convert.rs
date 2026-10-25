@@ -1,19 +1,28 @@
 //! CRD conversion webhooks (apiextensions.k8s.io/v1 ConversionReview).
 //!
-//! Objects are stored as written, each with the apiVersion of the version it was written in
-//! (a mixed list is the normal state after the storage version changed). With `strategy: None`
-//! the handlers only retag apiVersion (`ApiServer::convert_reply`). With `strategy: Webhook`
-//! the webhook calls are network I/O, so the transport runs them around the synchronous
-//! handlers: [`pre`] converts an object about to be patched into the requested version, and
-//! [`post`] converts the objects of a response (single, list) that are not in it. Watch events
-//! and in-process clients see objects as stored.
+//! New objects are stored in the CRD's storage version; objects written before that was done
+//! (or before the storage version changed) keep the version they were written in, and a list may
+//! mix versions. With `strategy: None` the handlers only retag apiVersion (`ApiServer::route`
+//! rewrites a write to the storage version's URL, `ApiServer::convert_reply` retags the reply).
+//! With `strategy: Webhook` the webhook calls are network I/O, so the transport runs them around
+//! the synchronous handlers. Order of a write: authorization, [`pre`] (PATCH: the stored object
+//! in the requested version), admission webhooks (they see the request's version, as upstream),
+//! [`write`] (validation in the requested version, conversion to the storage version, execution
+//! at the storage version's URL), [`post`] (the reply in the requested version). Watch events
+//! are converted by [`watch`]. In-process clients see objects as stored.
 
-use crate::api::{ApiServer, Reply, Req};
+use crate::api::{version_path, ApiServer, Reply, Req, WatchStream};
 use crate::object::{obj, ApiError};
+use alloc::boxed::Box;
 use alloc::format;
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 use kr_fmt::json::{self, Value};
+use kr_net::http1::server::{Body, Response, ResponseStream};
 
 /// Upstream gives a conversion webhook 30 seconds.
 const TIMEOUT_SECS: u64 = 30;
@@ -90,8 +99,10 @@ async fn convert_items(api: &ApiServer, cc: &Value, gv: &str, items: &mut [&mut 
     Ok(())
 }
 
-/// Before a PATCH of a webhook-converted custom resource: stores the object as the requested
-/// version, so the patch applies to (and the result is in) that version. `Some`: the answer.
+/// Before a PATCH of a webhook-converted custom resource: converts the stored object to the
+/// requested version when it was stored as another one, and remembers it for the synchronous
+/// handlers ([`ApiServer::cache_converted`]), so the patch applies to (and admission sees) the
+/// object in that version. `Some`: the answer, an error.
 pub async fn pre(api: &ApiServer, req: &Req<'_>) -> Option<Reply> {
     if req.method != "PATCH" {
         return None;
@@ -103,7 +114,7 @@ pub async fn pre(api: &ApiServer, req: &Req<'_>) -> Option<Reply> {
     }
     let cc = api.conversion_webhook(rt.res)?;
     let gv = rt.res.group_version();
-    let (_, mut old) = api.get_value(&rt, &name).ok()?;
+    let (kv, mut old) = api.get_value(&rt, &name).ok()?;
     if old.get("apiVersion").and_then(Value::as_str).is_none_or(|v| v == gv) {
         return None;
     }
@@ -115,12 +126,84 @@ pub async fn pre(api: &ApiServer, req: &Req<'_>) -> Option<Reply> {
     if let Err(e) = convert_items(api, &cc, &gv, &mut [&mut old]).await {
         return Some(Reply::err(e));
     }
-    let body = json::to_string(&old).into_bytes();
-    let put = Req { method: "PUT", path: req.path, query: "", content_type: Some("application/json"), accept: None, body: &body, user: Some(user), bearer: req.bearer, headers: req.headers, authz_verb: Some("patch") };
-    match api.handle(&put) {
-        Reply::Json(c, _) if c < 300 => None,
-        other => Some(other),
+    api.cache_converted(&rt, &name, &kv, old);
+    None
+}
+
+/// `query` with `fieldValidation` replaced by `Ignore`.
+fn ignore_validation(query: &str) -> String {
+    let mut q: Vec<&str> = query.split('&').filter(|p| !p.is_empty() && !p.starts_with("fieldValidation=")).collect();
+    q.push("fieldValidation=Ignore");
+    q.join("&")
+}
+
+/// A write (POST, PUT, PATCH) to a webhook-converted custom resource in a version other than the
+/// storage version: validates it in the requested version (so `fieldValidation` and errors are
+/// about the object the client sent), converts the object to the storage version and executes the
+/// write at the storage version's URL. The reply is in the storage version (see [`post`]).
+///
+/// Runs after admission, which sees the object in the requested version (as upstream does).
+/// `None`: nothing to convert, execute the request as it is.
+pub async fn write(api: &ApiServer, req: &Req<'_>) -> Option<(Reply, Vec<String>)> {
+    if !matches!(req.method, "POST" | "PUT" | "PATCH") {
+        return None;
     }
+    let rt = api.wh_route(req.path)?;
+    if rt.sub.as_deref().is_some_and(|s| s != "status") {
+        return None;
+    }
+    let cc = api.conversion_webhook(rt.res)?;
+    let sv = api.storage_version(rt.res)?;
+    let gv = rt.res.group_version();
+    let sgv = format!("{}/{sv}", rt.res.group);
+    let user = api.authenticate(req).ok()?;
+    // Only callers allowed to write get a webhook call made on their behalf.
+    if let Err(e) = api.authorize_request(req, &user) {
+        return Some((Reply::err(e), Vec::new()));
+    }
+    let dry_q = if req.query.is_empty() { "dryRun=All".to_string() } else { format!("{}&dryRun=All", req.query) };
+    let dreq = Req { method: req.method, path: req.path, query: &dry_q, content_type: req.content_type, accept: None, body: req.body, user: Some(user.clone()), bearer: req.bearer, headers: req.headers, authz_verb: req.authz_verb };
+    let (dreply, mut warns) = api.handle_w(&dreq);
+    let Reply::Json(code, dbody) = &dreply else { return Some((dreply, warns)) };
+    if *code >= 300 {
+        return Some((dreply, warns));
+    }
+    let dry = req.query.split('&').any(|p| p == "dryRun=All");
+    let mut path = version_path(req.path, &sv);
+    let mut method = if req.method == "POST" { "POST" } else { "PUT" };
+    let mut o = if req.method == "PATCH" {
+        // The patched object, in the requested version; the write replaces the stored object
+        // it was computed from (a concurrent change conflicts).
+        if dry {
+            return Some((dreply, warns));
+        }
+        json::parse(dbody.as_bytes()).ok()?
+    } else {
+        json::parse(req.body).ok()?
+    };
+    if o.get("apiVersion").and_then(Value::as_str) != Some(gv.as_str()) {
+        return None;
+    }
+    if req.method == "PATCH" {
+        match rt.name.as_deref().map(|n| api.get_value(&rt, n)) {
+            Some(Ok((kv, _))) => o.entry_object("metadata").set("resourceVersion", Value::String(kv.mod_rev.to_string())),
+            // Server-side apply of an object that does not exist yet.
+            _ => {
+                method = "POST";
+                path.truncate(path.trim_end_matches('/').rfind('/')?);
+            }
+        }
+    }
+    if let Err(e) = convert_items(api, &cc, &sgv, &mut [&mut o]).await {
+        return Some((Reply::err(e), warns));
+    }
+    let body = json::to_string(&o).into_bytes();
+    // Field validation was done on the object as sent; the converted one is the webhook's.
+    let q = ignore_validation(req.query);
+    let sreq = Req { method, path: &path, query: &q, content_type: Some("application/json"), accept: None, body: &body, user: Some(user), bearer: req.bearer, headers: req.headers, authz_verb: (req.method == "PATCH").then_some("patch").or(req.authz_verb) };
+    let (reply, w) = api.handle_w(&sreq);
+    warns.extend(w);
+    Some((reply, warns))
 }
 
 /// Converts the objects in a successful response of a webhook-converted custom resource to the
@@ -152,5 +235,82 @@ pub async fn post(api: &ApiServer, req: &Req<'_>, reply: Reply) -> Reply {
     match r {
         Ok(()) => Reply::Json(code, json::to_string(&v)),
         Err(e) => Reply::err(e),
+    }
+}
+
+type Pending = Pin<Box<dyn Future<Output = (Vec<u8>, bool)>>>;
+
+/// A watch of a webhook-converted custom resource: delivers each event's object in the requested
+/// version. Events are converted a chunk at a time (one webhook call per stored version in it),
+/// with at most one conversion in flight; the executor is never blocked. A failed conversion is
+/// sent as an ERROR event (Status 500) and ends the stream, as upstream does.
+struct ConvWatch {
+    api: Rc<ApiServer>,
+    cc: Value,
+    gv: String,
+    inner: WatchStream,
+    pending: Option<Pending>,
+    done: bool,
+}
+
+/// Wraps a watch reply of a webhook-converted custom resource in a [`ConvWatch`].
+pub fn watch(api: &Rc<ApiServer>, req: &Req<'_>, reply: Reply) -> Reply {
+    let Reply::Watch(inner) = reply else { return reply };
+    let Some(rt) = api.wh_route(req.path) else { return Reply::Watch(inner) };
+    let Some(cc) = api.conversion_webhook(rt.res) else { return Reply::Watch(inner) };
+    let w = ConvWatch { api: api.clone(), cc, gv: rt.res.group_version(), inner, pending: None, done: false };
+    Reply::Http(Response { status: 200, headers: alloc::vec![("Content-Type".into(), "application/json".into())], body: Body::Stream(Box::new(w)) })
+}
+
+/// Whether the event's object has to be converted to `gv`.
+fn needs(ev: &Value, gv: &str) -> bool {
+    matches!(ev.get("type").and_then(Value::as_str), Some("ADDED" | "MODIFIED" | "DELETED")) && ev.pointer(&["object", "apiVersion"]).and_then(Value::as_str).is_some_and(|v| v != gv)
+}
+
+/// Converts the events in `chunk` (newline-delimited watch events). The flag: the stream ends.
+async fn convert_chunk(api: Rc<ApiServer>, cc: Value, gv: String, chunk: Vec<u8>) -> (Vec<u8>, bool) {
+    let mut evs: Vec<Value> = chunk.split(|b| *b == b'\n').filter(|l| !l.is_empty()).filter_map(|l| json::parse(l).ok()).collect();
+    let mut objs: Vec<&mut Value> = evs.iter_mut().filter(|e| needs(e, &gv)).filter_map(|e| e.get_mut("object")).collect();
+    if let Err(e) = convert_items(&api, &cc, &gv, &mut objs).await {
+        let Reply::Json(_, status) = Reply::err(e) else { return (Vec::new(), true) };
+        let mut out = format!("{{\"type\":\"ERROR\",\"object\":{status}}}").into_bytes();
+        out.push(b'\n');
+        return (out, true);
+    }
+    let mut out = Vec::new();
+    for e in &evs {
+        out.extend_from_slice(json::to_string(e).as_bytes());
+        out.push(b'\n');
+    }
+    (out, false)
+}
+
+impl ResponseStream for ConvWatch {
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+        loop {
+            if let Some(f) = self.pending.as_mut() {
+                let (out, end) = match f.as_mut().poll(cx) {
+                    Poll::Ready(r) => r,
+                    Poll::Pending => return Poll::Pending,
+                };
+                self.pending = None;
+                self.done = end;
+                return Poll::Ready(Some(out));
+            }
+            if self.done {
+                return Poll::Ready(None);
+            }
+            match self.inner.poll_chunk(cx) {
+                Poll::Ready(Some(chunk)) => {
+                    let convert = chunk.split(|b| *b == b'\n').filter(|l| !l.is_empty()).any(|l| json::parse(l).is_ok_and(|e| needs(&e, &self.gv)));
+                    if !convert {
+                        return Poll::Ready(Some(chunk));
+                    }
+                    self.pending = Some(Box::pin(convert_chunk(self.api.clone(), self.cc.clone(), self.gv.clone(), chunk)));
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }

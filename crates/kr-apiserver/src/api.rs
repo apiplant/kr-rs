@@ -29,6 +29,15 @@ pub struct User {
     pub groups: Vec<String>,
 }
 
+/// `path` (`/apis/<group>/<version>/...`) addressing `version` instead.
+pub(crate) fn version_path(path: &str, version: &str) -> String {
+    let mut segs: Vec<&str> = path.split('/').collect();
+    if segs.len() > 3 && segs[1] == "apis" {
+        segs[3] = version;
+    }
+    segs.join("/")
+}
+
 pub struct Req<'a> {
     pub method: &'a str,
     pub path: &'a str,
@@ -116,6 +125,10 @@ pub struct ApiServer {
     warnings: RefCell<Vec<String>>,
     /// Parsed webhook configurations, valid for the stamp they were built at.
     pub(crate) wh_cache: RefCell<Option<([u64; 12], alloc::rc::Rc<crate::webhook::Configs>)>>,
+    /// Stored custom objects already converted for a request in another version, so the
+    /// synchronous handlers can read them in that version: (store key, mod revision, apiVersion).
+    /// Valid by construction (a new revision misses); bounded.
+    pub(crate) conv_cache: RefCell<VecDeque<((String, u64, String), Value)>>,
 }
 
 /// Default namespaces created on first start.
@@ -218,7 +231,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), wh_cache: RefCell::new(None) };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()) };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -1029,6 +1042,23 @@ impl ApiServer {
         };
         let _ = (group, version, rest);
         let route = resource.ok_or_else(|| ApiError::not_found("path", path))?;
+        // Writes through a non-storage version of a CRD without a conversion webhook are stored
+        // as the storage version (only apiVersion differs); the reply is retagged back.
+        if matches!(req.method, "POST" | "PUT" | "PATCH") && self.conversion_webhook(route.res).is_none() {
+            if let Some(sv) = self.storage_version(route.res) {
+                let spath = version_path(req.path, &sv);
+                let mut body = req.body.to_vec();
+                if req.method != "PATCH" && route.sub.as_deref().is_none_or(|s| s == "status") {
+                    if let Ok(mut b) = json::parse(req.body) {
+                        let gv = alloc::format!("{}/{sv}", route.res.group);
+                        b.set("apiVersion", Value::from(gv.as_str()));
+                        body = json::to_string(&b).into_bytes();
+                    }
+                }
+                let sreq = Req { method: req.method, path: &spath, query: req.query, content_type: req.content_type, accept: req.accept, body: &body, user: req.user.clone(), bearer: req.bearer, headers: req.headers, authz_verb: req.authz_verb };
+                return self.route(&sreq).map(|r| self.convert_reply(&route, r));
+            }
+        }
         let reply = self.dispatch(req, &route, &q)?;
         if route.res.plural == "configmaps" && route.res.group.is_empty() && Self::mutates(req) {
             if let Some(ns) = &route.namespace {
@@ -1174,8 +1204,33 @@ impl ApiServer {
 
     pub(crate) fn get_value(&self, rt: &Route, name: &str) -> R<(Kv, Value)> {
         let kv = self.get_kv(rt, name)?;
+        if let Some(v) = self.converted(rt, name, &kv) {
+            return Ok((kv, v));
+        }
         let v = json::parse(&kv.value).map_err(|_| ApiError::new(500, "InternalError", "stored object is corrupt"))?;
         Ok((kv, v))
+    }
+
+    /// The stored object `kv` as converted to the version of `rt` by the transport, if it was.
+    fn converted(&self, rt: &Route, name: &str, kv: &Kv) -> Option<Value> {
+        let k = (rt.res.key(rt.namespace.as_deref(), name), kv.mod_rev, rt.res.group_version());
+        self.conv_cache.borrow().iter().find(|(c, _)| *c == k).map(|(_, v)| v.clone())
+    }
+
+    /// Remembers `obj`, the stored object `kv` of `rt`'s resource converted to `rt`'s version.
+    pub(crate) fn cache_converted(&self, rt: &Route, name: &str, kv: &Kv, obj: Value) {
+        let mut c = self.conv_cache.borrow_mut();
+        if c.len() >= 16 {
+            c.pop_front();
+        }
+        c.push_back(((rt.res.key(rt.namespace.as_deref(), name), kv.mod_rev, rt.res.group_version()), obj));
+    }
+
+    /// The storage version of the CRD of `res` when `res` is another served version of it.
+    pub(crate) fn storage_version(&self, res: &'static Resource) -> Option<String> {
+        let custom = self.custom.borrow();
+        let c = custom.iter().find(|c| core::ptr::eq(c.res, res))?;
+        (c.storage != res.version && custom.iter().any(|x| x.crd == c.crd && x.res.version == c.storage)).then(|| c.storage.clone())
     }
 
     fn list_prefix(&self, rt: &Route) -> String {
