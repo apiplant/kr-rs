@@ -271,13 +271,19 @@ async fn step<C: Client>(c: &C, sts: &Value, by_ord: &BTreeMap<usize, Value>, re
     }
 
     // Scale down: condemned pods, highest ordinal first.
-    let condemned: Vec<&Value> = by_ord.range(replicas..).rev().map(|(_, p)| p).collect();
+    let condemned: Vec<(&usize, &Value)> = by_ord.range(replicas..).rev().collect();
     if !condemned.is_empty() {
-        for p in condemned {
+        // OrderedReady: an unhealthy condemned pod halts the scale down, unless it is the
+        // lowest-ordinal unhealthy pod of the set (then it is the one being fixed by deleting).
+        let first_unhealthy = by_ord.iter().find(|(_, p)| !healthy(p)).map(|(o, _)| *o);
+        for (ord, p) in condemned {
             if deleting(p) {
                 if parallel {
                     continue;
                 }
+                return Ok(None);
+            }
+            if !parallel && !healthy(p) && Some(*ord) != first_unhealthy {
                 return Ok(None);
             }
             delete_ok(c, &pod_path(name(p))).await?;

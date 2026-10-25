@@ -497,6 +497,19 @@ pub async fn adopt<C: Client>(c: &C, path: &str, owner: &Value, api_version: &st
     }
 }
 
+/// Drops the owner's reference from an object that no longer matches the owner's selector.
+/// A vanished or concurrently changed object is fine (the next pass sees the new state).
+pub async fn release_owner<C: Client>(c: &C, path: &str, owner_uid: &str, o: &Value) -> Result<()> {
+    let refs: Vec<Value> = o.pointer(&["metadata", "ownerReferences"]).and_then(Value::as_array).map(|a| a.iter().filter(|r| str_at(r, &["uid"]) != owner_uid).cloned().collect()).unwrap_or_default();
+    let refs = if refs.is_empty() { Value::Null } else { Value::Array(refs) };
+    let meta = obj(alloc::vec![("ownerReferences", refs), ("resourceVersion", Value::from(str_at(o, &["metadata", "resourceVersion"])))]);
+    match c.patch(&alloc::format!("{path}/{}", name(o)), MERGE, &obj(alloc::vec![("metadata", meta)])).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.code == 404 || e.code == 409 => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// A pod built from `tpl` (a pod template) and owned by `owner`. `name` is either a fixed name
 /// or a `generateName` prefix. Extra labels and annotations are merged over the template's.
 pub fn pod_from_template(owner: &Value, api_version: &str, kind: &str, tpl: &Value, fixed_name: Option<&str>, generate_prefix: &str, labels: &[(&str, &str)], annotations: &[(&str, &str)]) -> Value {
@@ -625,7 +638,9 @@ pub async fn ensure_revision<C: Client>(c: &C, owner: &Value, kind: &str, templa
         }
         None => {
             let mut labels = owner.pointer(&["spec", "selector", "matchLabels"]).cloned().unwrap_or(Value::Object(Vec::new()));
-            labels.set("controller.kubernetes.io/hash", Value::String(rname[name(owner).len() + 1..].to_string()));
+            let hash = rname[name(owner).len() + 1..].to_string();
+            labels.set("controller.kubernetes.io/hash", Value::String(hash.clone()));
+            labels.set("controller-revision-hash", Value::String(hash));
             let rev = obj(alloc::vec![
                 ("apiVersion", Value::from("apps/v1")),
                 ("kind", Value::from("ControllerRevision")),

@@ -293,9 +293,14 @@ pub fn prepare_update(old: &Value, new: &mut Value, t: &Target, rev: u64, has_st
         }
     }
     if status_only {
-        // Everything but status comes from the stored object.
+        // Everything but status (and the metadata maps, which the status endpoints let a
+        // client change too) comes from the stored object.
         let status = new.remove("status");
+        let keep: Vec<(&str, Value)> = ["labels", "annotations"].into_iter().filter_map(|f| new.pointer(&["metadata", f]).map(|v| (f, v.clone()))).collect();
         *new = old.clone();
+        for (f, v) in keep {
+            new.entry_object("metadata").set(f, v);
+        }
         match status {
             Some(s) => new.set("status", s),
             None => {

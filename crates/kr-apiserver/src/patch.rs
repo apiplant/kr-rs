@@ -285,6 +285,7 @@ fn smp_list<'p>(cur: &mut Value, items: &'p [Value], mk: &str, path: &mut Vec<&'
         return Ok(());
     }
     let mut list = cur.as_array().map(|a| a.to_vec()).unwrap_or_default();
+    let mut added = 0;
     for it in items {
         let Some(key) = key_of(it, mk) else {
             if it.as_object().is_some() {
@@ -310,8 +311,15 @@ fn smp_list<'p>(cur: &mut Value, items: &'p [Value], mk: &str, path: &mut Vec<&'
                 let mut e = Value::Object(Vec::new());
                 smp_map(&mut e, it, path)?;
                 list.push(e);
+                added += 1;
             }
         }
+    }
+    // Containers the patch adds come before the existing ones (the order upstream's merge
+    // produces without a `$setElementOrder` directive; clients rely on `containers[0]`).
+    if matches!(path.last().copied(), Some("containers" | "initContainers")) && added > 0 {
+        let fresh = list.split_off(list.len() - added);
+        list.splice(0..0, fresh);
     }
     *cur = Value::Array(list);
     Ok(())

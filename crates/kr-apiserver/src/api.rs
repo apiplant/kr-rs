@@ -117,6 +117,10 @@ pub struct ApiServer {
 }
 
 /// Default namespaces created on first start.
+/// Kinds whose deletion can orphan or wait for dependents (the garbage collector handles the
+/// `orphan` and `foregroundDeletion` finalizers on them).
+const GC_OWNERS: &[&str] = &["deployments", "replicasets", "replicationcontrollers", "statefulsets", "daemonsets", "jobs", "cronjobs"];
+
 const SYSTEM_NAMESPACES: &[&str] = &["default", "kube-system", "kube-public", "kube-node-lease"];
 
 type R<T> = Result<T, ApiError>;
@@ -476,6 +480,11 @@ impl ApiServer {
         for (name, role, subjects) in crate::rbac::bootstrap_bindings() {
             let body = alloc::format!(r#"{{"metadata":{{"name":"{name}","labels":{{"kubernetes.io/bootstrapping":"rbac-defaults"}}}},"roleRef":{{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"{role}"}},"subjects":{subjects}}}"#);
             self.bootstrap_object(crbr, None, name, "ClusterRoleBinding", &body);
+        }
+        let pcr = resources::find("scheduling.k8s.io", "v1", "priorityclasses").unwrap();
+        for (name, value) in [("system-node-critical", 2_000_001_000i64), ("system-cluster-critical", 2_000_000_000)] {
+            let body = alloc::format!(r#"{{"metadata":{{"name":"{name}"}},"value":{value},"description":"Used for system critical pods that must not be moved from their current node."}}"#);
+            self.bootstrap_object(pcr, None, name, "PriorityClass", &body);
         }
         // The default ServiceCIDR (the allocator's range) and the mandatory API priority and
         // fairness objects; kr does not enforce APF, these exist for API clients.
@@ -1290,6 +1299,7 @@ impl ApiServer {
         if rt.res.plural == "pods" {
             let ns = rt.namespace.clone().unwrap_or_default();
             self.admit_pod(o, &ns)?;
+            self.admit_priority(o)?;
         }
         if rt.res.plural == "jobs" {
             admit_job(o, &name)?;
@@ -1382,6 +1392,13 @@ impl ApiServer {
             crate::crd::admit(&mut new, Some(&old), (self.now)())?;
         }
         self.admit_custom(rt, &mut new, Some(&old), status)?;
+        if rt.res.plural == "priorityclasses" {
+            for f in ["value", "preemptionPolicy"] {
+                if new.get(f) != old.get(f) {
+                    return Err(ApiError::invalid(alloc::format!("PriorityClass.scheduling.k8s.io \"{name}\" is invalid: {f}: Forbidden: may not be changed in an update.")));
+                }
+            }
+        }
         if rt.res.plural == "services" && !status {
             self.admit_service(&mut new, Some(&old))?;
         }
@@ -1527,9 +1544,27 @@ impl ApiServer {
         if rt.res.plural == "namespaces" {
             return self.delete_namespace(&kv, v, name);
         }
+        // Orphan / Foreground propagation: the object stays, with a finalizer, until the garbage
+        // collector has detached (or deleted) its dependents. Background is the plain delete.
+        let policy = q.get("propagationPolicy").or_else(|| opts.get("propagationPolicy").and_then(Value::as_str)).unwrap_or("");
+        let orphan_dependents = q.get("orphanDependents") == Some("true") || opts.get("orphanDependents").and_then(Value::as_bool) == Some(true);
+        let propagation_finalizer = match policy {
+            "Orphan" => Some("orphan"),
+            "Foreground" => Some("foregroundDeletion"),
+            "" if orphan_dependents => Some("orphan"),
+            _ => None,
+        };
+        if let Some(f) = propagation_finalizer.filter(|_| GC_OWNERS.contains(&rt.res.plural) && v.pointer(&["metadata", "deletionTimestamp"]).is_none()) {
+            let m = v.entry_object("metadata");
+            let mut fins: Vec<Value> = m.get("finalizers").and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+            if !fins.iter().any(|x| x.as_str() == Some(f)) {
+                fins.push(Value::from(f));
+                m.set("finalizers", Value::Array(fins));
+            }
+        }
         // Graceful pod deletion: a bound pod only gets a deletionTimestamp; its kubelet stops
         // the containers and then deletes it with gracePeriodSeconds=0.
-        let grace = q.get("gracePeriodSeconds").and_then(|g| g.parse::<i64>().ok()).or_else(|| opts.get("gracePeriodSeconds").and_then(Value::as_i64));
+        let grace =q.get("gracePeriodSeconds").and_then(|g| g.parse::<i64>().ok()).or_else(|| opts.get("gracePeriodSeconds").and_then(Value::as_i64));
         let bound = v.pointer(&["spec", "nodeName"]).and_then(Value::as_str).is_some_and(|n| !n.is_empty());
         if rt.res.plural == "pods" && bound && grace != Some(0) {
             if v.pointer(&["metadata", "deletionTimestamp"]).is_none() {
@@ -2059,6 +2094,36 @@ impl ApiServer {
         r.set("kind", Value::from("SelfSubjectAccessReview"));
         r.set("status", obj(alloc::vec![("allowed", Value::Bool(ok))]));
         Ok(Reply::Json(201, json::to_string(&r)))
+    }
+
+    /// Priority admission for pods: `spec.priority` and `spec.preemptionPolicy` come from the
+    /// PriorityClass named by `spec.priorityClassName` (the global default class when unnamed).
+    fn admit_priority(&self, o: &mut Value) -> R<()> {
+        let pcr = resources::find("scheduling.k8s.io", "v1", "priorityclasses").unwrap();
+        let name = o.pointer(&["spec", "priorityClassName"]).and_then(Value::as_str).unwrap_or("").to_string();
+        let class = if name.is_empty() {
+            let store = self.store.borrow();
+            let all: Vec<Value> = store.list(&pcr.prefix(), None, 0).0.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect();
+            all.into_iter().find(|c| c.get("globalDefault").and_then(Value::as_bool) == Some(true))
+        } else {
+            match self.store.borrow().get(&pcr.key(None, &name)) {
+                Some(kv) => json::parse(&kv.value).ok(),
+                None => return Err(ApiError::new(403, "Forbidden", alloc::format!("pods \"{}\" is forbidden: no PriorityClass with name {name} was found", o.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("")))),
+            }
+        };
+        let spec = o.entry_object("spec");
+        match class {
+            Some(c) => {
+                spec.set("priorityClassName", Value::String(c.get("metadata").and_then(|m| m.get("name")).and_then(Value::as_str).unwrap_or("").to_string()));
+                spec.set("priority", Value::Number(Number::from_i64(c.get("value").and_then(Value::as_i64).unwrap_or(0))));
+                spec.set("preemptionPolicy", Value::String(c.get("preemptionPolicy").and_then(Value::as_str).unwrap_or("PreemptLowerPriority").to_string()));
+            }
+            None => {
+                spec.remove("priorityClassName");
+                spec.set("priority", Value::Number(Number::from_i64(0)));
+            }
+        }
+        Ok(())
     }
 
     /// ServiceAccount admission for pods: default `serviceAccountName`, require it to exist,

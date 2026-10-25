@@ -19,6 +19,7 @@
 
 use crate::util::*;
 use crate::Config;
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use kr_apiserver::client::{Client, Result};
@@ -89,19 +90,64 @@ async fn schedule_one<C: Client>(c: &C, cfg: &Config, ns: &str, name: &str) -> R
                 ("apiVersion", Value::from("v1")),
                 ("kind", Value::from("Binding")),
                 ("metadata", obj(alloc::vec![("name", Value::from(name))])),
-                ("target", obj(alloc::vec![("apiVersion", Value::from("v1")), ("kind", Value::from("Node")), ("name", Value::from(node))])),
+                ("target", obj(alloc::vec![("apiVersion", Value::from("v1")), ("kind", Value::from("Node")), ("name", Value::from(node.as_str()))])),
             ]);
             match c.create(&alloc::format!("{path}/binding"), &body).await {
-                Ok(_) => Ok(None),
+                Ok(_) => {
+                    emit_event(c, cfg, &pod, "Normal", "Scheduled", &alloc::format!("Successfully assigned {ns}/{name} to {node}")).await;
+                    Ok(None)
+                }
                 Err(e) if e.code == 409 || e.code == 404 => Ok(None), // already bound / gone
                 Err(e) => Err(e),
             }
         }
         Err(msg) => {
             mark_unschedulable(c, cfg, &path, &pod, &msg).await?;
+            if let Some((node, victims)) = preemption(&pod, &nodes, &all_pods, &pinned) {
+                preempt(c, cfg, &path, &pod, name_of(node), &victims).await?;
+            }
             Ok(Some(cfg.retry_ms))
         }
     }
+}
+
+fn name_of(n: &Value) -> &str {
+    name(n)
+}
+
+/// Evicts the victims (marking them with `DisruptionTarget`) and nominates the pod to the node.
+async fn preempt<C: Client>(c: &C, cfg: &Config, path: &str, pod: &Value, node: &str, victims: &[&Value]) -> Result<()> {
+    let msg = alloc::format!("default-scheduler: preempting to accommodate a higher priority pod {}/{}", namespace(pod), name(pod));
+    for v in victims.iter().filter(|v| !deleting(v)) {
+        let vpath = alloc::format!("{}/{}", pods(Some(namespace(v))), name(v));
+        let mut conds: Vec<Value> = v.pointer(&["status", "conditions"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+        set_condition(
+            &mut conds,
+            obj(alloc::vec![
+                ("type", Value::from("DisruptionTarget")),
+                ("status", Value::from("True")),
+                ("reason", Value::from("PreemptionByScheduler")),
+                ("message", Value::from(msg.as_str())),
+                ("lastTransitionTime", Value::String(kr_apiserver::object::rfc3339((cfg.now)()))),
+            ]),
+        );
+        let patch = obj(alloc::vec![("status", obj(alloc::vec![("conditions", Value::Array(conds))]))]);
+        match c.patch(&alloc::format!("{vpath}/status"), MERGE, &patch).await {
+            Ok(_) => {}
+            Err(e) if e.code == 404 => continue,
+            Err(e) => return Err(e),
+        }
+        delete_ok(c, &vpath).await?;
+        emit_event(c, cfg, v, "Normal", "Preempted", &alloc::format!("Preempted by pod {} on node {node}", uid(pod))).await;
+    }
+    if str_at(pod, &["status", "nominatedNodeName"]) != node {
+        let patch = obj(alloc::vec![("status", obj(alloc::vec![("nominatedNodeName", Value::from(node))]))]);
+        match c.patch(&alloc::format!("{path}/status"), MERGE, &patch).await {
+            Err(e) if e.code != 404 => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Why the pod's claims block scheduling: a missing PVC, or an unbound one whose class is not
@@ -170,8 +216,32 @@ async fn mark_unschedulable<C: Client>(c: &C, cfg: &Config, path: &str, pod: &Va
     let patch = obj(alloc::vec![("status", obj(alloc::vec![("conditions", Value::Array(conds))]))]);
     match c.patch(&alloc::format!("{path}/status"), MERGE, &patch).await {
         Err(e) if e.code == 404 => Ok(()),
-        r => r.map(|_| ()),
+        Ok(_) => {
+            emit_event(c, cfg, pod, "Warning", "FailedScheduling", msg).await;
+            Ok(())
+        }
+        Err(e) => Err(e),
     }
+}
+
+/// Records a scheduling event for the pod (best effort).
+async fn emit_event<C: Client>(c: &C, cfg: &Config, pod: &Value, ty: &str, reason: &str, msg: &str) {
+    let (ns, now) = (namespace(pod), Value::String(kr_apiserver::object::rfc3339((cfg.now)())));
+    let ev = obj(alloc::vec![
+        ("apiVersion", Value::from("v1")),
+        ("kind", Value::from("Event")),
+        ("metadata", obj(alloc::vec![("generateName", Value::String(alloc::format!("{}.", name(pod)))), ("namespace", Value::from(ns))])),
+        ("involvedObject", obj(alloc::vec![("apiVersion", Value::from("v1")), ("kind", Value::from("Pod")), ("namespace", Value::from(ns)), ("name", Value::from(name(pod))), ("uid", Value::from(uid(pod)))])),
+        ("type", Value::from(ty)),
+        ("reason", Value::from(reason)),
+        ("message", Value::from(msg)),
+        ("source", obj(alloc::vec![("component", Value::from("default-scheduler"))])),
+        ("reportingComponent", Value::from("default-scheduler")),
+        ("firstTimestamp", now.clone()),
+        ("lastTimestamp", now),
+        ("count", num(1)),
+    ]);
+    let _ = c.create(&alloc::format!("/api/v1/namespaces/{ns}/events"), &ev).await;
 }
 
 // ---- filtering and scoring (pure) ----
@@ -205,6 +275,153 @@ fn requests(pod: &Value) -> Res {
         sum.mem = sum.mem.max(r.mem);
     }
     sum
+}
+
+fn qty(v: Option<&Value>) -> i128 {
+    match v {
+        Some(Value::String(s)) => Quantity::parse(s).ok().and_then(|q| q.value()).unwrap_or(0),
+        Some(n) => n.as_i64().unwrap_or(0) as i128,
+        None => 0,
+    }
+}
+
+/// Requests of extended resources (everything but cpu, memory and ephemeral storage): the sum
+/// over the containers, at least the biggest init container. A container that only sets a limit
+/// requests that much.
+fn ext_requests(pod: &Value) -> BTreeMap<String, i128> {
+    let of = |c: &Value| -> BTreeMap<String, i128> {
+        let mut m = BTreeMap::new();
+        for field in ["limits", "requests"] {
+            for (k, v) in c.pointer(&["resources", field]).and_then(Value::as_object).unwrap_or(&[]) {
+                if !matches!(k.as_str(), "cpu" | "memory" | "ephemeral-storage") {
+                    m.insert(k.clone(), qty(Some(v)));
+                }
+            }
+        }
+        m
+    };
+    let mut sum: BTreeMap<String, i128> = BTreeMap::new();
+    for c in pod.pointer(&["spec", "containers"]).and_then(Value::as_array).unwrap_or(&[]) {
+        for (k, v) in of(c) {
+            *sum.entry(k).or_insert(0) += v;
+        }
+    }
+    for c in pod.pointer(&["spec", "initContainers"]).and_then(Value::as_array).unwrap_or(&[]) {
+        for (k, v) in of(c) {
+            let e = sum.entry(k).or_insert(0);
+            *e = (*e).max(v);
+        }
+    }
+    sum
+}
+
+fn priority(pod: &Value) -> i64 {
+    int_at(pod, &["spec", "priority"], 0)
+}
+
+/// Why a pod does not fit the node's resources.
+enum Lack {
+    Cpu,
+    Mem,
+    Pods,
+    Ext(String),
+}
+
+/// Resource filter: the pod on top of the `on_node` pods must fit `status.allocatable`. Returns
+/// what the node has in use (without the pod) and the pod count, for scoring.
+fn fit(pod: &Value, n: &Value, on_node: &[&Value]) -> core::result::Result<(Res, usize), Lack> {
+    let want = requests(pod);
+    let want_ext = ext_requests(pod);
+    let mut used = Res::default();
+    let mut used_ext: BTreeMap<String, i128> = BTreeMap::new();
+    for p in on_node {
+        let r = requests(p);
+        used.cpu_milli += r.cpu_milli;
+        used.mem += r.mem;
+        for (k, v) in ext_requests(p) {
+            *used_ext.entry(k).or_insert(0) += v;
+        }
+    }
+    let alloc_cpu = cpu_milli(n.pointer(&["status", "allocatable", "cpu"]));
+    let alloc_mem = bytes(n.pointer(&["status", "allocatable", "memory"]));
+    if used.cpu_milli + want.cpu_milli > alloc_cpu {
+        return Err(Lack::Cpu);
+    }
+    if used.mem + want.mem > alloc_mem {
+        return Err(Lack::Mem);
+    }
+    for (k, w) in &want_ext {
+        let have = qty(n.pointer(&["status", "allocatable", k.as_str()]));
+        if *w > 0 && used_ext.get(k).copied().unwrap_or(0) + w > have {
+            return Err(Lack::Ext(k.clone()));
+        }
+    }
+    if let Some(max) = n.pointer(&["status", "allocatable", "pods"]).and_then(Value::as_str).and_then(|s| s.parse::<usize>().ok()) {
+        if on_node.len() + 1 > max {
+            return Err(Lack::Pods);
+        }
+    }
+    Ok((used, on_node.len()))
+}
+
+/// Pods that count against a node for `pod`: the ones bound there, and the ones nominated to it
+/// by a preemption that are at least as important (the room is kept for them).
+fn on_node<'a>(pod: &Value, nname: &str, all_pods: &'a [Value]) -> Vec<&'a Value> {
+    all_pods
+        .iter()
+        .filter(|p| {
+            if pod_terminal(p) {
+                return false;
+            }
+            if str_at(p, &["spec", "nodeName"]) == nname {
+                return true;
+            }
+            str_at(p, &["spec", "nodeName"]).is_empty() && str_at(p, &["status", "nominatedNodeName"]) == nname && uid(p) != uid(pod) && priority(p) >= priority(pod)
+        })
+        .collect()
+}
+
+/// Node-level filters that preemption cannot fix.
+fn node_eligible(pod: &Value, n: &Value, pinned: &[Value]) -> bool {
+    node_ready(n) && selector_matches(pod, n) && pod.get("spec").is_none_or(|s| node_affinity_matches(s, n)) && pinned.iter().all(|s| node_affinity_matches(s, n)) && !untolerated_taint(pod, n)
+}
+
+/// Preemption: the node where evicting the fewest (then least important) lower-priority pods
+/// makes room for `pod`, with those victims. Victims are reprieved from the most important
+/// down while the pod still fits.
+fn preemption<'a>(pod: &Value, nodes: &'a [Value], all_pods: &'a [Value], pinned: &[Value]) -> Option<(&'a Value, Vec<&'a Value>)> {
+    if str_at(pod, &["spec", "preemptionPolicy"]) == "Never" {
+        return None;
+    }
+    let prio = priority(pod);
+    let mut best: Option<((usize, i64, &str), &Value, Vec<&Value>)> = None;
+    for n in nodes {
+        if !node_eligible(pod, n, pinned) {
+            continue;
+        }
+        let nname = name(n);
+        let here = on_node(pod, nname, all_pods);
+        let (mut lower, keep): (Vec<&Value>, Vec<&Value>) = here.into_iter().partition(|p| str_at(p, &["spec", "nodeName"]) == nname && priority(p) < prio);
+        if lower.is_empty() || fit(pod, n, &keep).is_err() {
+            continue;
+        }
+        lower.sort_by_key(|p| core::cmp::Reverse(priority(p)));
+        let mut kept = keep;
+        let mut victims = Vec::new();
+        for p in lower {
+            kept.push(p);
+            if fit(pod, n, &kept).is_err() {
+                kept.pop();
+                victims.push(p);
+            }
+        }
+        let top = victims.iter().map(|p| priority(p)).max().unwrap_or(0);
+        let key = (victims.len(), top, nname);
+        if best.as_ref().is_none_or(|(k, ..)| key < *k) {
+            best = Some((key, n, victims));
+        }
+    }
+    best.map(|(_, n, v)| (n, v))
 }
 
 fn node_ready(n: &Value) -> bool {
@@ -284,13 +501,14 @@ fn pick(pod: &Value, nodes: &[Value], all_pods: &[Value], pinned: &[Value]) -> c
     let want = requests(pod);
     let (mut volume, mut not_ready, mut taint, mut selector, mut cpu, mut mem, mut count, mut ports) = (0, 0, 0, 0, 0, 0, 0, 0);
     let mut best: Option<(i128, usize, &str)> = None; // (score, pods on node, name)
+    let mut ext: BTreeMap<String, usize> = BTreeMap::new();
     for n in nodes {
         let nname = name(n);
         if !node_ready(n) {
             not_ready += 1;
             continue;
         }
-        if !selector_matches(pod, n) {
+        if !selector_matches(pod, n) || !pod.get("spec").is_none_or(|s| node_affinity_matches(s, n)) {
             selector += 1;
             continue;
         }
@@ -306,30 +524,28 @@ fn pick(pod: &Value, nodes: &[Value], all_pods: &[Value], pinned: &[Value]) -> c
             ports += 1;
             continue;
         }
-        let mut used = Res::default();
-        let mut npods = 0usize;
-        for p in all_pods.iter().filter(|p| str_at(p, &["spec", "nodeName"]) == nname && !pod_terminal(p)) {
-            let r = requests(p);
-            used.cpu_milli += r.cpu_milli;
-            used.mem += r.mem;
-            npods += 1;
-        }
-        let alloc_cpu = cpu_milli(n.pointer(&["status", "allocatable", "cpu"]));
-        let alloc_mem = bytes(n.pointer(&["status", "allocatable", "memory"]));
-        if used.cpu_milli + want.cpu_milli > alloc_cpu {
-            cpu += 1;
-            continue;
-        }
-        if used.mem + want.mem > alloc_mem {
-            mem += 1;
-            continue;
-        }
-        if let Some(max) = n.pointer(&["status", "allocatable", "pods"]).and_then(Value::as_str).and_then(|s| s.parse::<usize>().ok()) {
-            if npods + 1 > max {
+        let here = on_node(pod, nname, all_pods);
+        let (used, npods) = match fit(pod, n, &here) {
+            Ok(r) => r,
+            Err(Lack::Cpu) => {
+                cpu += 1;
+                continue;
+            }
+            Err(Lack::Mem) => {
+                mem += 1;
+                continue;
+            }
+            Err(Lack::Pods) => {
                 count += 1;
                 continue;
             }
-        }
+            Err(Lack::Ext(k)) => {
+                *ext.entry(k).or_insert(0) += 1;
+                continue;
+            }
+        };
+        let alloc_cpu = cpu_milli(n.pointer(&["status", "allocatable", "cpu"]));
+        let alloc_mem = bytes(n.pointer(&["status", "allocatable", "memory"]));
         // Least requested: average free permille of cpu and memory after placement.
         let free = |alloc: i128, used: i128, req: i128| if alloc > 0 { (alloc - used - req) * 1000 / alloc } else { 0 };
         let score = (free(alloc_cpu, used.cpu_milli, want.cpu_milli) + free(alloc_mem, used.mem, want.mem)) / 2;
@@ -358,6 +574,9 @@ fn pick(pod: &Value, nodes: &[Value], all_pods: &[Value], pinned: &[Value]) -> c
         if n > 0 {
             reasons.push(alloc::format!("{n} {what}"));
         }
+    }
+    for (k, n) in &ext {
+        reasons.push(alloc::format!("{n} Insufficient {k}"));
     }
     Err(alloc::format!("0/{} nodes are available: {}.", nodes.len(), if reasons.is_empty() { String::from("no nodes registered") } else { reasons.join(", ") }))
 }

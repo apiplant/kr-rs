@@ -407,6 +407,105 @@ fn replicaset_adopts_orphans() {
 }
 
 #[test]
+fn replicaset_releases_non_matching_pods() {
+    scenario(|c| async move {
+        c.create("/api/v1/nodes", &node("n1", "{}", "[]", "64")).await.unwrap();
+        let rs = c
+            .create(RS, &v(r#"{"metadata":{"name":"rel"},"spec":{"replicas":2,"selector":{"matchLabels":{"app":"x"}},"template":{"metadata":{"labels":{"app":"x"}},"spec":{"containers":[{"name":"c","image":"i"}]}}}}"#))
+            .await
+            .unwrap();
+        wait_until("2 pods", || async { live_pods(&c).await.len() == 2 }).await;
+        let victim = name(&live_pods(&c).await[0]).to_string();
+        let path = alloc::format!("{PODS}/{victim}");
+        c.patch(&path, MERGE, &v(r#"{"metadata":{"labels":{"app":"y"}}}"#)).await.unwrap();
+        wait_until("released and replaced", || async {
+            let p = c.get(&path).await.unwrap();
+            controller_ref(&p).is_none() && live_pods(&c).await.len() == 3
+        })
+        .await;
+        // Matching again: adopted back, so the set is one too many and shrinks.
+        c.patch(&path, MERGE, &v(r#"{"metadata":{"labels":{"app":"x"}}}"#)).await.unwrap();
+        wait_until("adopted", || async { c.get(&path).await.ok().and_then(|p| controller_ref(&p).map(|r| str_at(r, &["uid"]) == uid(&rs))).unwrap_or(false) || c.get(&path).await.is_err() }).await;
+        wait_until("two again", || async { live_pods(&c).await.len() == 2 }).await;
+    });
+}
+
+#[test]
+fn delete_with_orphan_propagation_keeps_dependents() {
+    scenario(|c| async move {
+        c.create("/api/v1/nodes", &node("n1", "{}", "[]", "64")).await.unwrap();
+        let rs = c
+            .create(RS, &v(r#"{"metadata":{"name":"orph"},"spec":{"replicas":2,"selector":{"matchLabels":{"app":"o"}},"template":{"metadata":{"labels":{"app":"o"}},"spec":{"containers":[{"name":"c","image":"i"}]}}}}"#))
+            .await
+            .unwrap();
+        wait_until("2 pods", || async { live_pods(&c).await.len() == 2 }).await;
+        c.delete(&alloc::format!("{RS}/orph?propagationPolicy=Orphan")).await.unwrap();
+        wait_until("rs gone", || async { c.get(&alloc::format!("{RS}/orph")).await.is_err() }).await;
+        sleep(300).await;
+        let pods = live_pods(&c).await;
+        assert_eq!(pods.len(), 2, "orphaned pods survive");
+        assert!(pods.iter().all(|p| controller_ref(p).is_none() && !p.pointer(&["metadata", "ownerReferences"]).and_then(Value::as_array).is_some_and(|a| a.iter().any(|r| str_at(r, &["uid"]) == uid(&rs)))));
+    });
+}
+
+#[test]
+fn delete_with_foreground_propagation_waits_for_dependents() {
+    scenario(|c| async move {
+        c.create("/api/v1/nodes", &node("n1", "{}", "[]", "64")).await.unwrap();
+        c.create(RS, &v(r#"{"metadata":{"name":"fg"},"spec":{"replicas":2,"selector":{"matchLabels":{"app":"f"}},"template":{"metadata":{"labels":{"app":"f"}},"spec":{"containers":[{"name":"c","image":"i"}]}}}}"#)).await.unwrap();
+        wait_until("2 pods", || async { live_pods(&c).await.len() == 2 }).await;
+        let names: Vec<String> = live_pods(&c).await.iter().map(|p| name(p).to_string()).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        hold_delete(&names);
+        c.delete(&alloc::format!("{RS}/fg?propagationPolicy=Foreground")).await.unwrap();
+        let rs = c.get(&alloc::format!("{RS}/fg")).await.unwrap();
+        assert!(deleting(&rs), "kept with a deletionTimestamp");
+        sleep(400).await;
+        assert!(c.get(&alloc::format!("{RS}/fg")).await.is_ok(), "waits while its pods are terminating");
+        release_delete(&names);
+        wait_until("rs and pods gone", || async { c.get(&alloc::format!("{RS}/fg")).await.is_err() && all_pods_empty(&c).await }).await;
+    });
+}
+
+async fn all_pods_empty(c: &InProcess) -> bool {
+    items(&c.list(PODS, "").await.unwrap()).is_empty()
+}
+
+#[test]
+fn scheduler_preempts_lower_priority_pods() {
+    scenario(|c| async move {
+        let mut n = node("n1", "{}", "[]", "64");
+        n.entry_object("status").entry_object("allocatable").set("example.com/slot", Value::from("2"));
+        c.create("/api/v1/nodes", &n).await.unwrap();
+        for (name, value) in [("lo", 10), ("hi", 1000)] {
+            c.create("/apis/scheduling.k8s.io/v1/priorityclasses", &v(&alloc::format!(r#"{{"metadata":{{"name":"{name}"}},"value":{value}}}"#))).await.unwrap();
+        }
+        let mk = |n: &str, class: &str, slots: &str| v(&alloc::format!(r#"{{"metadata":{{"name":"{n}"}},"spec":{{"priorityClassName":"{class}","containers":[{{"name":"c","image":"i","resources":{{"requests":{{"example.com/slot":"{slots}"}},"limits":{{"example.com/slot":"{slots}"}}}}}}]}}}}"#));
+        c.create(PODS, &mk("victim", "lo", "1")).await.unwrap();
+        c.create(PODS, &mk("bystander", "hi", "1")).await.unwrap();
+        wait_until("both bound", || async {
+            let mut bound = true;
+            for n in ["victim", "bystander"] {
+                bound &= !str_at(&c.get(&alloc::format!("{PODS}/{n}")).await.unwrap(), &["spec", "nodeName"]).is_empty();
+            }
+            bound
+        })
+        .await;
+        assert_eq!(int_at(&c.get(&alloc::format!("{PODS}/victim")).await.unwrap(), &["spec", "priority"], -1), 10);
+
+        c.create(PODS, &mk("preemptor", "hi", "1")).await.unwrap();
+        wait_until("preemptor bound after the victim went", || async {
+            let p = c.get(&alloc::format!("{PODS}/preemptor")).await.unwrap();
+            str_at(&p, &["spec", "nodeName"]) == "n1" && c.get(&alloc::format!("{PODS}/victim")).await.is_err()
+        })
+        .await;
+        let p = c.get(&alloc::format!("{PODS}/preemptor")).await.unwrap();
+        assert_eq!(str_at(&p, &["status", "nominatedNodeName"]), "n1");
+        assert!(c.get(&alloc::format!("{PODS}/bystander")).await.is_ok(), "equal priority is never preempted");
+    });
+}
+
+#[test]
 fn replicationcontroller_creates_pods() {
     scenario(|c| async move {
         c.create("/api/v1/nodes", &node("n1", "{}", "[]", "64")).await.unwrap();
