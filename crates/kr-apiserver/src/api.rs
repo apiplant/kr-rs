@@ -902,6 +902,7 @@ impl ApiServer {
             ("POST", None, None) => self.create(req, rt, q),
             ("POST", Some(n), Some("binding")) => self.bind(req, rt, n),
             ("POST", Some(n), Some("token")) => self.token_request(req, rt, n),
+            ("POST", Some(n), Some("eviction")) => self.evict(req, rt, n),
             ("PUT", Some(n), Some("scale")) => self.update_scale(req, rt, n, false),
             ("PATCH", Some(n), Some("scale")) => self.update_scale(req, rt, n, true),
             ("PUT", Some(n), Some("ephemeralcontainers")) => {
@@ -1490,9 +1491,13 @@ impl ApiServer {
     }
 
     fn delete(&self, req: &Req, rt: &Route, name: &str, q: &Query) -> R<Reply> {
-        let (kv, mut v) = self.get_value(rt, name)?;
+        let (kv, v) = self.get_value(rt, name)?;
         // DeleteOptions arrive as JSON or (client-go default for typed clients) protobuf.
         let opts = if req.body.is_empty() { Value::Null } else { self.parse_body_as(req, Some(("v1", "DeleteOptions"))).map_err(|e| ApiError::bad_request(alloc::format!("invalid DeleteOptions: {}", e.message)))? };
+        self.delete_with(rt, name, q, kv, v, &opts)
+    }
+
+    fn delete_with(&self, rt: &Route, name: &str, q: &Query, kv: Kv, mut v: Value, opts: &Value) -> R<Reply> {
         {
             if let Some(pre) = opts.get("preconditions") {
                 if let Some(uid) = pre.get("uid").and_then(Value::as_str) {
@@ -1621,6 +1626,78 @@ impl ApiServer {
         self.store.borrow_mut().update(&kv.key, json::to_string(&new).into_bytes(), Some(kv.mod_rev)).map_err(|e| store_err(e, "pod", name))?;
         self.sync()?;
         Ok(Reply::Json(201, json::to_string(&object::status_value(201, "", "Success"))))
+    }
+
+    /// `pods/eviction`: deletes the pod unless a PodDisruptionBudget forbids it. A pod that is
+    /// already terminal or terminating, or that no budget selects, is simply deleted; a single
+    /// matching budget must have `disruptionsAllowed` left (the PDB controller maintains it) and
+    /// is charged one; several budgets are refused, like upstream.
+    fn evict(&self, req: &Req, rt: &Route, name: &str) -> R<Reply> {
+        let b = self.parse_body_as(req, Some(("policy/v1", "Eviction")))?;
+        if let Some(n) = b.pointer(&["metadata", "name"]).and_then(Value::as_str).filter(|n| !n.is_empty()) {
+            if n != name {
+                return Err(ApiError::bad_request("name in URL does not match name in Eviction object"));
+            }
+        }
+        let ns = rt.namespace.clone().unwrap_or_default();
+        if let Some(n) = b.pointer(&["metadata", "namespace"]).and_then(Value::as_str).filter(|n| !n.is_empty()) {
+            if n != ns {
+                return Err(ApiError::bad_request("namespace in URL does not match namespace in Eviction object"));
+            }
+        }
+        let opts = b.get("deleteOptions").cloned().unwrap_or(Value::Null);
+        let q = Query::parse("")?;
+        let (kv, pod) = self.get_value(rt, name)?;
+        let done = |s: &Self, pod: Value| -> R<Reply> {
+            s.delete_with(rt, name, &q, kv.clone(), pod, &opts)?;
+            Ok(Reply::Json(201, json::to_string(&object::status_value(201, "", "Success"))))
+        };
+        let terminal = matches!(pod.pointer(&["status", "phase"]).and_then(Value::as_str), Some("Succeeded" | "Failed"));
+        if terminal || pod.pointer(&["metadata", "deletionTimestamp"]).is_some() {
+            return done(self, pod);
+        }
+        let pdb_res = resources::find("policy", "v1", "poddisruptionbudgets").unwrap();
+        let prefix = alloc::format!("{}{ns}/", pdb_res.prefix());
+        let (pdbs, _) = self.store.borrow().list(&prefix, None, 0);
+        let mut hits: Vec<(Kv, Value)> = Vec::new();
+        for kv in pdbs {
+            let Ok(p) = json::parse(&kv.value) else { continue };
+            // An empty selector selects every pod in the namespace; a missing one selects none.
+            let Some(sel) = p.pointer(&["spec", "selector"]) else { continue };
+            if crate::webhook::label_selector(Some(sel)).is_some_and(|s| s.matches(&pod)) {
+                hits.push((kv, p));
+            }
+        }
+        let (pkv, mut pdb) = match hits.len() {
+            0 => return done(self, pod),
+            1 => hits.remove(0),
+            _ => return Err(ApiError::new(500, "InternalError", "This pod has more than one PodDisruptionBudget, which the eviction subresource does not support.")),
+        };
+        let pdb_name = pdb.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("").to_string();
+        let st = |k: &str| pdb.pointer(&["status", k]).and_then(Value::as_i64).unwrap_or(0);
+        let observed = st("observedGeneration") >= pdb.pointer(&["metadata", "generation"]).and_then(Value::as_i64).unwrap_or(0);
+        if !observed || st("disruptionsAllowed") <= 0 {
+            let msg = alloc::format!("The disruption budget {pdb_name} needs {} healthy pods and has {} currently", st("desiredHealthy"), st("currentHealthy"));
+            let cause = obj(alloc::vec![("reason", Value::from("DisruptionBudget")), ("message", Value::String(msg))]);
+            let mut status = object::status_value(429, "TooManyRequests", "Cannot evict pod as it would violate the pod's disruption budget.");
+            status.set("details", obj(alloc::vec![("causes", Value::Array(alloc::vec![cause]))]));
+            return Ok(Reply::Json(429, json::to_string(&status)));
+        }
+        let allowed = st("disruptionsAllowed") - 1;
+        let stat = pdb.entry_object("status");
+        stat.set("disruptionsAllowed", Value::Number(Number::from_i64(allowed)));
+        if !matches!(stat.get("disruptedPods"), Some(Value::Object(_))) {
+            stat.set("disruptedPods", Value::Object(Vec::new()));
+        }
+        if let Some(Value::Object(m)) = stat.get_mut("disruptedPods") {
+            m.retain(|(k, _)| k != name);
+            m.push((name.to_string(), Value::String(object::rfc3339((self.now)()))));
+        }
+        let rev = self.store.borrow().revision() + 1;
+        pdb.entry_object("metadata").set("resourceVersion", Value::String(rev.to_string()));
+        self.store.borrow_mut().update(&pkv.key, json::to_string(&pdb).into_bytes(), Some(pkv.mod_rev)).map_err(|e| store_err(e, "poddisruptionbudget", &pdb_name))?;
+        self.sync()?;
+        done(self, pod)
     }
 
     /// Service defaulting and allocation: type, ports (protocol, targetPort), ClusterIP from

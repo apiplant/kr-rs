@@ -66,7 +66,7 @@ fn rules_match(wh: &Value, rt: &Route, op: &str) -> bool {
 
 /// LabelSelector (matchLabels/matchExpressions) as an equivalent [`Selector`]; empty/absent
 /// selects everything.
-fn label_selector(v: Option<&Value>) -> Option<Selector> {
+pub(crate) fn label_selector(v: Option<&Value>) -> Option<Selector> {
     let Some(v) = v else { return Some(Selector::default()) };
     let mut parts: Vec<String> = Vec::new();
     for (k, x) in v.get("matchLabels").and_then(Value::as_object).unwrap_or(&[]) {
