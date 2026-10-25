@@ -151,3 +151,61 @@ fn status_writes_record_subresource() {
     assert_eq!(e.get("subresource").and_then(Value::as_str), Some("status"));
     assert!(e.get("fieldsV1").unwrap().pointer(&["f:status", "f:replicas"]).is_some());
 }
+
+static CLOCK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1_700_000_000);
+
+fn tick() -> i64 {
+    CLOCK.fetch_add(10, std::sync::atomic::Ordering::SeqCst) + 10
+}
+
+fn rv(o: &Value) -> String {
+    o.pointer(&["metadata", "resourceVersion"]).and_then(Value::as_str).unwrap().to_string()
+}
+
+fn times(o: &Value) -> Vec<String> {
+    o.pointer(&["metadata", "managedFields"]).and_then(Value::as_array).unwrap().iter().map(|e| e.get("time").and_then(Value::as_str).unwrap().to_string()).collect()
+}
+
+#[test]
+fn noop_writes_keep_resource_version_and_time() {
+    let api = ApiServer::new(kr_store::Store::in_memory(), tick, rng, "127.0.0.1".into()).unwrap();
+    let cm = "/api/v1/namespaces/default/configmaps";
+    let (_, o) = call(&api, "POST", cm, "application/json", r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"c"},"data":{"a":"1"}}"#);
+    let (rv0, t0) = (rv(&o), times(&o));
+    // Identical PUT (with the current resourceVersion, as clients send it).
+    let body = json::to_string(&o);
+    let (c, u) = call(&api, "PUT", &format!("{cm}/c"), "application/json", &body);
+    assert_eq!(c, 200, "{}", json::to_string(&u));
+    assert_eq!((rv(&u), times(&u)), (rv0.clone(), t0.clone()));
+    // Merge patch to the same value.
+    let (_, p) = call(&api, "PATCH", &format!("{cm}/c"), "application/merge-patch+json", r#"{"data":{"a":"1"}}"#);
+    assert_eq!((rv(&p), times(&p)), (rv0.clone(), t0.clone()));
+    // Re-applying the same intent is a no-op too.
+    let ap = r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"a"},"data":{"x":"1"}}"#;
+    let (_, a1) = call(&api, "PATCH", &format!("{cm}/a?fieldManager=m"), APPLY, ap);
+    let (_, a2) = call(&api, "PATCH", &format!("{cm}/a?fieldManager=m"), APPLY, ap);
+    assert_eq!((rv(&a2), times(&a2)), (rv(&a1), times(&a1)));
+    // No store revision was consumed: the next write gets the next number.
+    let (_, n) = call(&api, "PATCH", &format!("{cm}/c"), "application/merge-patch+json", r#"{"data":{"a":"2"}}"#);
+    assert_eq!(rv(&n).parse::<u64>().unwrap(), rv(&a1).parse::<u64>().unwrap() + 1);
+    assert_ne!(times(&n), t0);
+}
+
+#[test]
+fn atomic_map_is_owned_and_replaced_whole() {
+    let api = server();
+    let crd = r#"{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{"name":"gizmos.example.com"},
+"spec":{"group":"example.com","scope":"Namespaced","names":{"plural":"gizmos","kind":"Gizmo"},
+"versions":[{"name":"v1","served":true,"storage":true,"schema":{"openAPIV3Schema":{"type":"object","properties":{"spec":{"type":"object","properties":{"sel":{"type":"object","x-kubernetes-map-type":"atomic","properties":{"a":{"type":"string"},"b":{"type":"string"}}}}}}}}}]}}"#;
+    let (c, v) = call(&api, "POST", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions", "application/json", crd);
+    assert_eq!(c, 201, "{}", json::to_string(&v));
+    let g = "/apis/example.com/v1/namespaces/default/gizmos";
+    let body = |s: &str| format!(r#"{{"apiVersion":"example.com/v1","kind":"Gizmo","metadata":{{"name":"g"}},"spec":{{"sel":{s}}}}}"#);
+    let (c, o) = call(&api, "PATCH", &format!("{g}/g?fieldManager=m"), APPLY, &body(r#"{"a":"1","b":"2"}"#));
+    assert_eq!(c, 201, "{}", json::to_string(&o));
+    let f = mf(&o, "m", "Apply").get("fieldsV1").unwrap();
+    assert_eq!(json::to_string(f.pointer(&["f:spec", "f:sel"]).unwrap()), "{}");
+    let (c, o) = call(&api, "PATCH", &format!("{g}/g?fieldManager=m"), APPLY, &body(r#"{"b":"3"}"#));
+    assert_eq!(c, 200, "{}", json::to_string(&o));
+    assert_eq!(json::to_string(o.pointer(&["spec", "sel"]).unwrap()), r#"{"b":"3"}"#);
+}
