@@ -382,5 +382,11 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
   - The response returns the CA and service-account keys plus fresh server certificates.
   - The new server is then added as a voting member and catches up from a snapshot.
 - **Single server:** a single-member Raft group. It commits on the local fsync, so existing installs keep working. Their store is imported as the initial snapshot.
+- **Amendment (implementation):**
+  - HA is opt-in, like k3s: `kr server --cluster-init` founds a cluster; a plain `kr server` keeps the ADR-021 store and its behaviour. Once `raft/` exists the server stays in HA mode.
+  - The server token (`server-token`, `K10<ca hash>::server:<secret>`) is created only on HA servers and copied to joiners.
+  - Joining is two-phase: `/kr/join-server` (token) returns key material and the current server addresses; the joiner issues its own certificates, starts Raft as a non-member that answers the known servers, then calls `/kr/add-server` with its `system:kr-server:<id>` certificate (the id comes from the certificate, never the body). The voter is added only once the newcomer listens, so a 1→2 change can commit.
+  - Forwarded requests carry `Kr-Forwarded-Identity` (base64 JSON user and groups), honoured only from `system:kr-servers` certificates and forwarded at most once; the leader returns `Kr-Revision` and the follower waits to apply it before answering.
+  - Leader-only components run under `Cluster::while_leader` (started when the leader is ready, aborted on step-down).
 
-**Status:** accepted (in progress).
+**Status:** accepted (implemented; gaps in KNOWN_ISSUES #97).

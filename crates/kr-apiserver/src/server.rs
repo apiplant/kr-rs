@@ -48,9 +48,22 @@ pub async fn handle(api: &ApiServer, req: Request) -> Response {
         bearer: req.header("authorization").and_then(|a| a.strip_prefix("Bearer ").or_else(|| a.strip_prefix("bearer "))).map(str::trim),
         authz_verb: None,
     };
+    // Raft state of this server, for cluster admins (diagnostics, tools/test/ha.sh).
+    if r.method == "GET" && r.path == "/kr/debug/raft" {
+        let admin = api.authenticate(&r).is_ok_and(|u| u.groups.iter().any(|g| g == "system:masters"));
+        return match api.cluster() {
+            _ if !admin => respond(Reply::err(crate::object::ApiError::new(403, "Forbidden", "requires system:masters"))),
+            Some(c) => Response::new(200, format!("id={} {}\n", c.id, c.debug_state()).into_bytes()).with_header("Content-Type", "text/plain"),
+            None => respond(Reply::err(crate::object::ApiError::new(404, "NotFound", "not an HA server"))),
+        };
+    }
     if let Some(c) = api.cluster().filter(|_| ApiServer::mutates(&r)) {
         match c.route(5_000).await {
-            Ok(None) => {}
+            Ok(None) => {
+                if let Some(reply) = c.membership(api, &r).await {
+                    return respond(reply);
+                }
+            }
             // Forward once; a forwarded request reaching a non-leader is refused (no loops).
             Ok(Some(leader)) if !is_forwarded => {
                 let user = match api.authenticate(&r) {

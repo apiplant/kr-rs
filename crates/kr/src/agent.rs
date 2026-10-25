@@ -38,7 +38,7 @@ fn data_dir() -> String {
     format!("{}/.local/share/kr/agent", env("HOME").unwrap_or_else(|| "/tmp".into()))
 }
 
-fn unhex32(s: &str) -> Option<[u8; 32]> {
+pub(crate) fn unhex32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
     }
@@ -50,7 +50,7 @@ fn unhex32(s: &str) -> Option<[u8; 32]> {
 }
 
 /// Fetches /cacerts trusting only a CA whose SHA-256 matches the token's pin.
-async fn fetch_ca(server: &str, pin: [u8; 32]) -> Result<Vec<u8>, String> {
+pub(crate) async fn fetch_ca(server: &str, pin: [u8; 32]) -> Result<Vec<u8>, String> {
     let cfg = Rc::new(kr_crypto::tls::ClientConfig { roots: Vec::new(), pinned_ca: Some(pin), client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
     let conn = kr_net::tls::TlsConnector::new(kr_net::dns::SystemResolver::system(), cfg);
     let client = kr_net::http1::Client::with_connector(conn, kr_net::http1::Config::default());
@@ -157,7 +157,7 @@ async fn renew(remote: &Remote, pki_dir: &str, name: &str, ip: [u8; 4]) -> Resul
 }
 
 /// Reads the join token from a file that only its owner can read.
-fn read_token_file(path: &str) -> Result<String, String> {
+pub(crate) fn read_token_file(path: &str) -> Result<String, String> {
     let c = format!("{path}\0");
     let st = fs::newfstatat(fs::AT_FDCWD, c.as_bytes(), 0).map_err(|e| format!("token file {path}: errno {}", e.0))?;
     if st.mode & 0o077 != 0 {

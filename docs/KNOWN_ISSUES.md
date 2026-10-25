@@ -35,6 +35,16 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 70. **Conformance gaps** — *open; tracked as C1–C9 in PLAN.md*
     Done since: CRDs (#87), admission webhooks (#88), aggregated discovery, ResourceQuota, hostPort, lifecycle hooks, ephemeral containers, storage (PVC/SC/PV #73).
     Remaining: protobuf responses, typed schemas (#63), SSA managedFields (#65), and whatever the current Sonobuoy run reports (`tools/test/conformance.sh results`).
+97. **HA (kr-raft, ADR-026) gaps** — *partly fixed*
+    `kr server --cluster-init` starts a Raft-replicated control plane; `kr server --server https://<any server>:6443 --token-file <server-token>` joins one (2-phase: key material, then `POST /kr/add-server` with its own server certificate); `POST /kr/remove-server {"id":N}` (system:masters) removes one. Followers serve reads and watches locally and forward writes (HTTP and in-process) to the leader; controllers and the scheduler run on the leader only. `tools/test/ha.sh` (3 servers + agent: join, forwarding, kill -9 of the leader, controller hand-over, catch-up, identical stores, removal) passes; Raft itself is checked by a chaos simulation (`crates/kr-raft/src/tests.rs`).
+    Remaining:
+    - An existing single-server datastore cannot be converted to HA yet (refused at start); plan: import its image as the initial Raft snapshot.
+    - Agents talk to the one server in `--server`; no client-side failover or load-balanced address yet (plan: agents learn the `kubernetes` endpoints and rotate on failure).
+    - A removed server never sees its own removal and keeps pre-campaigning until it is stopped (harmless: pre-vote, and its log is behind). Stop and wipe removed servers.
+    - No learners: a joining server is a voter as soon as its add commits, so a 1→2 cluster stalls if the newcomer dies before catching up. Join one server at a time.
+    - A server's address is re-registered only when it becomes leader or rejoins; an IP change of a follower needs a restart with `--server`.
+    - Follower reads are as fresh as its applied log (serializable, like etcd's); only the forwarding client gets read-your-writes.
+    - Snapshots are sent whole in one message (512 MB frame limit).
 
 ## Node agent and controllers (phase 4)
 73. **Volume and token gaps** — *mostly fixed*

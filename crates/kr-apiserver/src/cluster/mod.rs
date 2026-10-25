@@ -13,6 +13,7 @@
 //! the committed log; writes that did replicate are applied again when they commit.
 
 pub mod forward;
+pub mod join;
 pub mod transport;
 
 use crate::api::ApiServer;
@@ -94,6 +95,7 @@ pub struct Cluster {
     /// HTTP client for forwarding writes to the leader (created on first use).
     /// This server's own address, registered under [`SERVERS_PREFIX`] when it leads.
     self_addr: RefCell<Option<ServerAddr>>,
+    join_secrets: RefCell<Option<join::JoinSecrets>>,
     forwarder: RefCell<Option<Rc<kr_net::http1::client::Client<kr_net::tls::TlsConnector>>>>,
 }
 
@@ -124,6 +126,7 @@ impl Cluster {
             was_ready: Cell::new(false),
             epoch: Cell::new(0),
             self_addr: RefCell::new(None),
+            join_secrets: RefCell::new(None),
             forwarder: RefCell::new(None),
         };
         api.store.borrow_mut().set_visible(c.committed_rev.get());
@@ -295,7 +298,11 @@ impl Cluster {
 
     /// Updates the outbound links from the current voters and their stored addresses.
     fn sync_peers(&self, api: &ApiServer) {
-        let voters = self.voters();
+        let mut voters = self.voters();
+        if !voters.contains(&self.id) {
+            // Joining: answer the servers we were told about until we learn the membership.
+            voters.extend(self.seeds.borrow().keys().filter(|id| !voters.contains(id)).copied().collect::<Vec<_>>());
+        }
         let store = api.store.borrow();
         let mut peers = self.peers.borrow_mut();
         peers.retain(|id, _| voters.contains(id));
@@ -345,7 +352,7 @@ impl Cluster {
                 }
             }
             self.leadership_changes(&api);
-            if self.peers.borrow().len() + 1 < self.voters().len() {
+            if self.peers.borrow().len() + 1 < self.voters().len() || !self.voters().contains(&self.id) {
                 self.sync_peers(&api); // still missing links (addresses not known yet)
             }
             let wait = next_tick.saturating_sub(kr_rt::exec::now_ms()).max(1);

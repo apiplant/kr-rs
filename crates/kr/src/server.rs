@@ -68,7 +68,7 @@ fn issue(dir: &str, file: &str, ca: &(Name, x509::SigningKey, Vec<u8>), subject:
 }
 
 /// Creates the CA, the apiserver serving cert and the admin client cert if missing.
-fn bootstrap(data: &str, port: u16) -> Result<(), String> {
+fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
     let pki_dir = format!("{data}/pki");
     mkdir_p(&pki_dir)?;
     if !exists(&pki::path(&pki_dir, "ca.pem")) {
@@ -102,6 +102,15 @@ fn bootstrap(data: &str, port: u16) -> Result<(), String> {
         let hash: String = kr_crypto::sha2::sha256(&ca.2).iter().map(|b| alloc::format!("{b:02x}")).collect();
         let token = format!("K10{hash}::{}.{}\n", &t[..6], &t[6..]);
         pki::write_new(&pki::path(data, "node-token"), token.as_bytes(), 0o600)?;
+    }
+    if ha && !exists(&pki::path(data, "server-token")) {
+        // Admits new *servers* (they receive the CA and signing keys): never the node token.
+        let mut rnd = [0u8; 32];
+        kr_sys::getrandom(&mut rnd);
+        const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        let t: String = rnd.iter().map(|b| ALPHA[*b as usize % ALPHA.len()] as char).collect();
+        let hash: String = kr_crypto::sha2::sha256(&ca.2).iter().map(|b| alloc::format!("{b:02x}")).collect();
+        pki::write_new(&pki::path(data, "server-token"), format!("K10{hash}::server:{t}\n").as_bytes(), 0o600)?;
     }
     if !exists(&pki::path(&pki_dir, "sa.key")) {
         let key = pki::new_key();
@@ -157,6 +166,81 @@ fn server_identity(data: &str, advertise: [u8; 4]) -> Result<u64, String> {
     Ok(id)
 }
 
+/// Files a joining server receives (relative to the data dir) and their modes.
+const JOIN_FILES: [(&str, u32); 5] = [("pki/ca.pem", 0o644), ("pki/ca.key", 0o600), ("pki/sa.key", 0o600), ("node-token", 0o600), ("server-token", 0o600)];
+
+/// What this server hands to joining servers (`/kr/join-server`).
+fn join_secrets(data: &str) -> Result<kr_apiserver::cluster::join::JoinSecrets, String> {
+    let mut files = Vec::new();
+    for (f, _) in JOIN_FILES {
+        let b = fs::read_file(&pki::path(data, f), 1 << 20).map_err(|e| format!("read {f}: errno {}", e.0))?;
+        files.push((String::from(f), String::from_utf8(b).map_err(|_| format!("{f} is not UTF-8"))?));
+    }
+    let tok = &files[4].1;
+    let token_secret = tok.trim().split_once("::server:").map(|(_, s)| String::from(s)).ok_or("bad server-token")?;
+    Ok(kr_apiserver::cluster::join::JoinSecrets { token_secret, files })
+}
+
+/// First start of a server joining an existing cluster: fetch the CA pinned to the server
+/// token's hash, then the cluster's key material; returns the current servers.
+async fn join_cluster(server: &str, token: &str, data: &str) -> Result<Vec<(u64, kr_apiserver::cluster::ServerAddr)>, String> {
+    let (hash, secret) = token.trim().strip_prefix("K10").and_then(|t| t.split_once("::server:")).ok_or("a server token looks like K10<hash>::server:<secret> (see server-token on an existing server)")?;
+    let pin = crate::agent::unhex32(hash).ok_or("bad CA hash in token")?;
+    let ca = crate::agent::fetch_ca(server, pin).await?;
+    let cfg = Rc::new(kr_crypto::tls::ClientConfig { roots: alloc::vec![ca], pinned_ca: None, client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
+    let client = kr_net::http1::Client::with_connector(kr_net::tls::TlsConnector::new(kr_net::dns::SystemResolver::system(), cfg), kr_net::http1::Config { max_redirects: 0, ..kr_net::http1::Config::default() });
+    let mut body = String::from(r#"{"token":"#);
+    kr_fmt::json::write_str(secret, &mut body);
+    body.push('}');
+    let mut r = client.request("POST", &format!("{server}/kr/join-server"), &[("Content-Type", "application/json")], body.as_bytes()).await.map_err(|_| String::from("cannot reach the server"))?;
+    let status = r.status;
+    let resp = r.read_to_end(4 << 20).await.map_err(|_| String::from("reading the join response failed"))?;
+    if status != 200 {
+        return Err(format!("join refused ({status}): {}", String::from_utf8_lossy(&resp)));
+    }
+    let v = kr_fmt::json::parse(&resp).map_err(|_| String::from("bad join response"))?;
+    let files = v.get("files").ok_or("join response lacks files")?;
+    mkdir_p(&format!("{data}/pki"))?;
+    for (f, mode) in JOIN_FILES {
+        let c = files.get(f).and_then(kr_fmt::json::Value::as_str).ok_or(format!("join response lacks {f}"))?;
+        pki::write_new(&pki::path(data, f), c.as_bytes(), mode)?;
+    }
+    let servers = v.get("servers").and_then(kr_fmt::json::Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+    Ok(servers
+        .iter()
+        .filter_map(|s| {
+            let ip = kr_apiserver::object::parse_ipv4(s.get("ip")?.as_str()?)?;
+            Some((s.get("id")?.as_u64()?, kr_apiserver::cluster::ServerAddr { ip, raft_port: s.get("raftPort")?.as_u64()? as u16, api_port: s.get("apiPort")?.as_u64()? as u16 }))
+        })
+        .collect())
+}
+
+/// Asks the cluster (through `server`) to make this server a voter, until it is one.
+async fn become_voter(c: Rc<kr_apiserver::cluster::Cluster>, server: String, pki_dir: String, me: kr_apiserver::cluster::ServerAddr) {
+    let read = |f: &str| fs::read_file(&pki::path(&pki_dir, f), 1 << 20).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
+    let remote = match kr_apiserver::client::Remote::new(&server, kr_apiserver::client::RemoteAuth::ClientCert { chain: read("server.pem"), key: read("server.key") }, &read("ca.pem")) {
+        Ok(r) => r,
+        Err(e) => {
+            eprint(format!("kr server: cannot join as a voter: {}\n", e.message).as_bytes());
+            return;
+        }
+    };
+    let ip = me.ip;
+    let body = format!(r#"{{"ip":"{}.{}.{}.{}","raftPort":{},"apiPort":{}}}"#, ip[0], ip[1], ip[2], ip[3], me.raft_port, me.api_port);
+    let body = kr_fmt::json::parse(body.as_bytes()).unwrap();
+    use kr_apiserver::client::Client;
+    while !c.voters().contains(&c.id) {
+        match remote.create("/kr/add-server", &body).await {
+            Ok(_) => print(format!("kr server: joined as voter {}\n", c.id).as_bytes()),
+            Err(e) => {
+                eprint(format!("kr server: joining as a voter: {} {}; retrying\n", e.code, e.message).as_bytes());
+                kr_rt::exec::sleep(2000).await;
+            }
+        }
+        kr_rt::exec::sleep(500).await;
+    }
+}
+
 /// TLS configurations for the Raft listener and for outbound server-to-server connections.
 fn server_tls(pki_dir: &str) -> Result<(Rc<ServerConfig>, Rc<kr_crypto::tls::ClientConfig>), String> {
     let chain = load_pem(pki_dir, "server.pem", "CERTIFICATE")?;
@@ -169,6 +253,7 @@ fn server_tls(pki_dir: &str) -> Result<(Rc<ServerConfig>, Rc<kr_crypto::tls::Cli
 
 pub fn main(mut args: Args) -> i32 {
     let (mut port, mut data, mut cluster_init) = (6443u16, None, false);
+    let (mut join_url, mut token, mut token_file): (Option<String>, Option<String>, Option<String>) = (None, None, None);
     while let Some(a) = args.next() {
         let v = args.next().and_then(|v| core::str::from_utf8(v).ok());
         match (a, v) {
@@ -183,20 +268,52 @@ pub fn main(mut args: Args) -> i32 {
                     return fail(&format!("unexpected argument {v}"));
                 }
             }
-            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init]"),
+            (b"--server", Some(v)) => join_url = Some(String::from(v.trim_end_matches('/'))),
+            (b"--token", Some(v)) => {
+                eprint(b"kr server: warning: --token exposes the server token to local users via the process list; use --token-file or KR_TOKEN\n");
+                token = Some(String::from(v))
+            }
+            (b"--token-file", Some(v)) => token_file = Some(String::from(v)),
+            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]]"),
         }
     }
     let data = data.unwrap_or_else(data_dir);
-    if let Err(e) = mkdir_p(&data).and_then(|_| bootstrap(&data, port)) {
-        return fail(&e);
+    if cluster_init && join_url.is_some() {
+        return fail("--cluster-init starts a new cluster; --server joins an existing one");
     }
     let pki_dir = format!("{data}/pki");
-    // The address pods, agents and other servers use to reach this API server.
-    let advertise = kr_sys::ns::route_source([1, 1, 1, 1]).unwrap_or([127, 0, 0, 1]);
-    // HA once initialised (the Raft directory exists), or when asked to start a cluster.
     let raft_dir = format!("{data}/raft");
     let raft_fresh = !exists(&pki::path(&raft_dir, "hardstate")) && !exists(&pki::path(&raft_dir, "log"));
-    let ha = cluster_init || !raft_fresh;
+    // A server joining a cluster: everything but its own certificates comes from the cluster.
+    let mut join_seeds = Vec::new();
+    if let Some(url) = join_url.as_ref().filter(|_| !exists(&pki::path(&pki_dir, "ca.pem"))) {
+        let token = match (token, token_file) {
+            (Some(t), _) => t,
+            (None, Some(f)) => match crate::agent::read_token_file(&f) {
+                Ok(t) => t,
+                Err(e) => return fail(&e),
+            },
+            (None, None) => match kr_runtime::store::env_var("KR_TOKEN").filter(|t| !t.trim().is_empty()) {
+                Some(t) => t,
+                None => return fail("joining needs the server token (--token-file FILE or KR_TOKEN)"),
+            },
+        };
+        if let Err(e) = mkdir_p(&data) {
+            return fail(&e);
+        }
+        let (u, d) = (url.clone(), data.clone());
+        match kr_rt::exec::block_on(async move { join_cluster(&u, &token, &d).await }) {
+            Ok(s) => join_seeds = s,
+            Err(e) => return fail(&e),
+        }
+    }
+    // HA once initialised (the Raft directory exists), or when starting or joining a cluster.
+    let ha = cluster_init || join_url.is_some() || !raft_fresh;
+    if let Err(e) = mkdir_p(&data).and_then(|_| bootstrap(&data, port, ha)) {
+        return fail(&e);
+    }
+    // The address pods, agents and other servers use to reach this API server.
+    let advertise = kr_sys::ns::route_source([1, 1, 1, 1]).unwrap_or([127, 0, 0, 1]);
     if ha && raft_fresh && exists(&pki::path(&format!("{data}/db"), "log")) {
         // TODO(kr-raft): import the single-server store as the initial Raft snapshot.
         return fail("this server already has a single-server datastore; converting it to HA is not supported yet");
@@ -232,11 +349,18 @@ pub fn main(mut args: Args) -> i32 {
             let id = server_identity(&data, advertise)?;
             let (srv_tls, cli_tls) = server_tls(&pki_dir)?;
             mkdir_p(&raft_dir)?;
-            let voters = if raft_fresh { alloc::vec![id] } else { Vec::new() };
+            // Founding a cluster: just us. Joining: nobody yet (the leader adds us).
+            let voters = if raft_fresh && join_url.is_none() { alloc::vec![id] } else { Vec::new() };
             let mut seed = [0u8; 8];
             kr_sys::getrandom(&mut seed);
             let c = kr_apiserver::cluster::Cluster::open(&api, id, &raft_dir, voters, cli_tls, u64::from_le_bytes(seed))?;
             c.set_self_addr(kr_apiserver::cluster::ServerAddr { ip: advertise, raft_port: kr_apiserver::cluster::transport::PORT, api_port: port });
+            c.set_join_secrets(join_secrets(&data)?);
+            for (sid, a) in join_seeds.drain(..) {
+                if sid != id {
+                    c.add_seed(sid, a);
+                }
+            }
             api.set_cluster(c.clone());
             let l = kr_net::http1::server::listen([0, 0, 0, 0], kr_apiserver::cluster::transport::PORT, 64).map_err(|_| format!("cannot listen on :{}", kr_apiserver::cluster::transport::PORT))?;
             Ok((c, l, srv_tls, id))
@@ -306,6 +430,10 @@ pub fn main(mut args: Args) -> i32 {
             Some((c, l, srv_tls, id)) => {
                 kr_rt::exec::spawn(kr_apiserver::cluster::transport::serve(l, srv_tls, id, c.inbox.clone()));
                 kr_rt::exec::spawn(c.clone().run(api.clone()));
+                if let Some(url) = join_url {
+                    let me = kr_apiserver::cluster::ServerAddr { ip: advertise, raft_port: kr_apiserver::cluster::transport::PORT, api_port: port };
+                    kr_rt::exec::spawn(become_voter(c.clone(), url, pki_dir.clone(), me));
+                }
                 // Exactly one copy of the controllers and the scheduler: on the leader.
                 kr_rt::exec::spawn(c.while_leader(move || kr_controllers::run_all_with(controllers.clone(), cfg)));
             }

@@ -1838,6 +1838,13 @@ impl ApiServer {
     }
 
     /// Creates `default/kubernetes` (pointing at `advertise:port`) and `kube-system/kube-dns`.
+    /// Rewrites the kubernetes Service endpoints (after the set of servers changed).
+    pub fn refresh_endpoints(&self) {
+        if let Some((ip, port)) = self.boot_services.get() {
+            let _ = self.ensure_builtin_services(ip, port);
+        }
+    }
+
     pub fn ensure_builtin_services(&self, advertise: [u8; 4], port: u16) -> Result<(), ApiError> {
         self.boot_services.set(Some((advertise, port)));
         if !self.writable() {
