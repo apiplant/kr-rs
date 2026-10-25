@@ -77,7 +77,7 @@ fn create_configmap_over_protobuf() {
     use kr_apiserver::api::{ApiServer, Reply, Req, User};
     let json_of = |r: Reply| match r {
         Reply::Json(c, b) => (c, b),
-        Reply::Watch(_) | Reply::Http(_) => panic!("unexpected streaming reply"),
+        Reply::Watch(_) | Reply::Http(_) | Reply::Proxy(_) => panic!("unexpected streaming reply"),
     };
     let server = ApiServer::new(kr_store::Store::in_memory(), || 1_700_000_000, |b| b.fill(7), "127.0.0.1:6443".into()).unwrap();
     let body = unhex(include_str!("vectors/configmap.pb.hex"));

@@ -62,6 +62,8 @@ pub enum Reply {
     Watch(WatchStream),
     /// A raw HTTP response (node proxy: logs, exec upgrades).
     Http(kr_net::http1::server::Response),
+    /// `pods/proxy`: the transport sends it ([`crate::podproxy::forward`]) and relays the answer.
+    Proxy(crate::podproxy::Target),
 }
 
 impl Reply {
@@ -905,7 +907,19 @@ impl ApiServer {
         .ok_or_else(|| ApiError::bad_request("invalid port"))?;
         let path = req.path.split_once("/proxy").map_or("/", |(_, t)| t);
         let path = if path.is_empty() { "/" } else { path };
-        Ok(Reply::Http(crate::podproxy::forward(req.method, ip, port, path, req.query, req.content_type, req.accept, req.body)))
+        if !crate::podproxy::proxyable(ip) {
+            return Err(ApiError::bad_request(alloc::format!("address not allowed: pod {pod_name} reports a host-local IP")));
+        }
+        Ok(Reply::Proxy(crate::podproxy::Target {
+            method: req.method.into(),
+            ip,
+            port,
+            path: path.into(),
+            query: req.query.into(),
+            content_type: req.content_type.map(Into::into),
+            accept: req.accept.map(Into::into),
+            body: req.body.to_vec(),
+        }))
     }
 
     fn dispatch(&self, req: &Req, rt: &Route, q: &Query) -> R<Reply> {

@@ -102,6 +102,9 @@ pub async fn handle(api: &ApiServer, req: Request) -> Response {
             api.handle(&r)
         }
     };
+    if let Reply::Proxy(t) = reply {
+        return crate::podproxy::forward(t).await;
+    }
     // A write is acknowledged only once it is on disk (group commit, fsync off the event loop).
     let after = api.revision();
     if after > before && api.commit(after).await.is_err() {
@@ -142,6 +145,7 @@ fn respond(reply: Reply) -> Response {
             Response::new(code, body.into_bytes()).with_header("Content-Type", ct)
         }
         Reply::Http(r) => r,
+        Reply::Proxy(_) => Response::new(500, b"proxy reply outside the transport".to_vec()),
         Reply::Watch(w) => Response { status: 200, headers: alloc::vec![("Content-Type".into(), "application/json".into())], body: Body::Stream(Box::new(Watch(w))) },
     }
 }
