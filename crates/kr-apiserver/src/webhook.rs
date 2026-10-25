@@ -68,6 +68,11 @@ fn rules_match(wh: &Value, rt: &Route, op: &str) -> bool {
 /// selects everything.
 pub(crate) fn label_selector(v: Option<&Value>) -> Option<Selector> {
     let Some(v) = v else { return Some(Selector::default()) };
+    Selector::parse(&label_selector_string(v)?).ok()
+}
+
+/// A LabelSelector object in `labelSelector=` query syntax; `None` for unknown operators.
+pub fn label_selector_string(v: &Value) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for (k, x) in v.get("matchLabels").and_then(Value::as_object).unwrap_or(&[]) {
         parts.push(format!("{k}={}", x.as_str().unwrap_or("")));
@@ -83,7 +88,7 @@ pub(crate) fn label_selector(v: Option<&Value>) -> Option<Selector> {
             _ => return None,
         });
     }
-    Selector::parse(&parts.join(",")).ok()
+    Some(parts.join(","))
 }
 pub use crate::cel::cel_bool;
 

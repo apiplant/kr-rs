@@ -336,12 +336,61 @@ fn resource_field_ref(pod: &Value, container: Option<&str>, rf: &Value) -> Optio
         (None, "requests", "cpu" | "memory" | "ephemeral-storage") => return Some(String::from("0")),
         _ => return None,
     };
-    let divisor = quantity(rf.get("divisor")).unwrap_or_else(|| Quantity::from_i64(1, kr_fmt::quantity::Format::DecimalSI));
+    // A zero divisor ("0", as the API server defaults it) means 1, as upstream.
+    let one = || Quantity::from_i64(1, kr_fmt::quantity::Format::DecimalSI);
+    let divisor = quantity(rf.get("divisor")).filter(|d| d.milli_value() != Some(0)).unwrap_or_else(one);
     let (n, d) = if res == "cpu" { (q.milli_value()?, divisor.milli_value()?) } else { (q.value()?, divisor.value()?) };
     if d <= 0 {
         return None;
     }
     Some(alloc::format!("{}", (n + d - 1).div_euclid(d)))
+}
+
+/// A projected `clusterTrustBundle` source: one bundle by `name`, or every bundle of
+/// `signerName` matching `labelSelector` (unset matches none, empty matches all). The
+/// certificates are deduplicated and written to `path`; `optional` tolerates no match.
+async fn cluster_trust_bundle<C: Client>(c: &C, t: &Value, stage: &str, mode: u32) -> Result<(), String> {
+    let path = t.get("path").and_then(Value::as_str).unwrap_or("");
+    let optional = t.get("optional").and_then(Value::as_bool).unwrap_or(false);
+    const CTB: &str = "/apis/certificates.k8s.io/v1/clustertrustbundles";
+    let bundles: Vec<Value> = if let Some(name) = t.get("name").and_then(Value::as_str) {
+        c.get(&alloc::format!("{CTB}/{name}")).await.ok().into_iter().collect()
+    } else if let (Some(signer), Some(sel)) = (t.get("signerName").and_then(Value::as_str), t.get("labelSelector")) {
+        let sel = kr_apiserver::webhook::label_selector_string(sel).ok_or_else(|| alloc::format!("clusterTrustBundle {path}: invalid labelSelector"))?;
+        let list = c.list(CTB, &alloc::format!("labelSelector={}", query_escape(&sel))).await.map_err(|_| alloc::format!("clusterTrustBundle {path}: cannot list bundles"))?;
+        let items = list.get("items").and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+        items.into_iter().filter(|b| b.pointer(&["spec", "signerName"]).and_then(Value::as_str) == Some(signer)).collect()
+    } else {
+        Vec::new()
+    };
+    let mut certs: Vec<String> = Vec::new();
+    for b in &bundles {
+        let pem = b.pointer(&["spec", "trustBundle"]).and_then(Value::as_str).unwrap_or("");
+        for block in pem.split("-----END CERTIFICATE-----") {
+            let Some(start) = block.find("-----BEGIN CERTIFICATE-----") else { continue };
+            let cert = alloc::format!("{}-----END CERTIFICATE-----\n", block[start..].trim_end());
+            if !certs.contains(&cert) {
+                certs.push(cert);
+            }
+        }
+    }
+    if certs.is_empty() {
+        return if optional { Ok(()) } else { Err(alloc::format!("clusterTrustBundle {path}: no matching bundle")) };
+    }
+    write_item(stage, path, certs.concat().as_bytes(), mode)
+}
+
+/// Percent-encodes a query value (unreserved characters pass).
+fn query_escape(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&alloc::format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Writes a configMap/secret/projected/downwardAPI volume's files into `stage`.
@@ -372,6 +421,8 @@ async fn stage_volume<C: Client>(c: &C, pod: &Value, vol: &Value, dir: &str, sta
                 materialize(c, ns, "secrets", sec.get("name").and_then(Value::as_str).unwrap_or(""), sec, stage, mode).await?;
             } else if let Some(d) = src.get("downwardAPI") {
                 downward(pod, d, stage, mode)?;
+            } else if let Some(t) = src.get("clusterTrustBundle") {
+                cluster_trust_bundle(c, t, stage, mode).await?;
             }
         }
         Ok(())
@@ -815,5 +866,21 @@ mod qos_tests {
         assert_eq!(qos_class(&pod(init_ok)), "Guaranteed");
         // Only non-cpu/memory resources do not count.
         assert_eq!(qos_class(&pod(r#"{"spec":{"containers":[{"resources":{"limits":{"ephemeral-storage":"1Gi"}}}]}}"#)), "BestEffort");
+    }
+}
+
+#[cfg(test)]
+mod resource_field_tests {
+    use super::*;
+
+    #[test]
+    fn zero_divisor_means_one() {
+        let p = |s: &str| kr_fmt::json::parse(s.as_bytes()).unwrap();
+        let pod = p(r#"{"spec":{"containers":[{"name":"c","resources":{"limits":{"cpu":"1250m","memory":"64Mi"}}}]}}"#);
+        let rf = |r: &str, d: &str| p(&alloc::format!(r#"{{"containerName":"c","resource":"{r}","divisor":"{d}"}}"#));
+        assert_eq!(resource_field_ref(&pod, None, &rf("limits.cpu", "0")).as_deref(), Some("2"));
+        assert_eq!(resource_field_ref(&pod, None, &rf("limits.cpu", "1m")).as_deref(), Some("1250"));
+        assert_eq!(resource_field_ref(&pod, None, &rf("limits.memory", "0")).as_deref(), Some("67108864"));
+        assert_eq!(resource_field_ref(&pod, None, &rf("limits.memory", "1Mi")).as_deref(), Some("64"));
     }
 }

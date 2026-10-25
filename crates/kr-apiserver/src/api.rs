@@ -849,9 +849,10 @@ impl ApiServer {
             ["api", "v1"] => return Ok(Reply::Json(200, discovery::resource_list(&extra, "", "v1").unwrap())),
             ["apis"] => return Ok(Reply::Json(200, discovery::group_list(&extra))),
             ["openapi", "v3"] => return Ok(Reply::Json(200, crate::openapi::index(&extra))),
+            ["openapi", "v2"] => return Ok(Reply::Json(200, crate::openapi::v2(&self.custom.borrow()))),
             ["openapi", "v3", rest @ ..] => {
                 let p = rest.join("/");
-                return crate::openapi::group_version(&extra, &p).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("openapi", &p));
+                return crate::openapi::group_version(&extra, &self.custom.borrow(), &p).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("openapi", &p));
             }
             ["apis", g] => return discovery::group(&extra, g).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("group", g)),
             ["apis", g, v] => return discovery::resource_list(&extra, g, v).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("groupVersion", v)),
