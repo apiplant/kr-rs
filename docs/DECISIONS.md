@@ -213,7 +213,7 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
   - Each container gets a veth pair; the parent creates the peer directly in the child's netns as `eth0` before releasing the child, and the child configures address, link and default route itself.
   - Outbound traffic goes through nftables masquerade in table `ip kr`.
   - Everything is programmed via netlink (`kr-net::netlink`, `kr-net::nft`). The veth disappears with the netns, and the lease is released by the supervisor.
-  - Rootless networking (slirp/pasta-style) is out of scope; rootless containers stay loopback-only.
+  - Rootless networking (slirp/pasta-style) is out of scope; rootless containers stay loopback-only (superseded: rootless `kr ctr run` now shares an infra namespace bridge, see KNOWN_ISSUES #50).
 - **Supervision:** `start()` returns a `Running` with a `CLONE_PIDFD` pidfd. `wait()` is async on the epoll executor. SIGINT/SIGTERM are forwarded through a signalfd and `pidfd_send_signal`.
 
 **Status:** accepted.

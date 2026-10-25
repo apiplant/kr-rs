@@ -15,7 +15,8 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     Remaining:
     - Kubelet pod leases are garbage-collected at startup (`network::gc`; leases owned by pod uids are stale after a kr crash). Fixed: leases of standalone `kr ctr run` containers record the owning process (pid + start time, so reused pids don't count; zombies count as dead) and are collected by the next `kr ctr run` or kubelet start once that process is gone (verified with SIGKILL in a container).
     - IPv4 only.
-    - Standalone `kr ctr run` containers are still loopback-only when rootless.
+    - Fixed: rootless `kr ctr run` containers get a bridge address: concurrent runs share one infra user+net namespace (a detached supervisor holds it, published in `<root>/ctr-net`, gone 5 s after the last run) and lease from the same ipam dir as pods. Verified as a non-root user: two containers ping and wget each other, a SIGKILLed run's lease is reclaimed. Like rootless pods they have no egress (the infra namespace has no route out) and no published ports. Also fixed: the nested rootless uid map was written as one extent (`0 0 1+N`) and failed with EPERM whenever the user has a subuid range.
+    - Rootless pods and `kr ctr run` containers have no outbound connectivity (no slirp/pasta-style egress).
 
 ## Build (cont.)
 53. **Binary size** — *watch*
