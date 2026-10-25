@@ -363,21 +363,26 @@ async fn cluster_trust_bundle<C: Client>(c: &C, t: &Value, stage: &str, mode: u3
     } else {
         Vec::new()
     };
+    let certs = pem_certs(bundles.iter().map(|b| b.pointer(&["spec", "trustBundle"]).and_then(Value::as_str).unwrap_or("")));
+    if certs.is_empty() {
+        return if optional { Ok(()) } else { Err(alloc::format!("clusterTrustBundle {path}: no matching bundle")) };
+    }
+    write_item(stage, path, certs.concat().as_bytes(), mode)
+}
+
+/// The distinct certificates of PEM bundles, each re-emitted as one canonical PEM block.
+fn pem_certs<'a>(bundles: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut certs: Vec<String> = Vec::new();
-    for b in &bundles {
-        let pem = b.pointer(&["spec", "trustBundle"]).and_then(Value::as_str).unwrap_or("");
+    for pem in bundles {
         for block in pem.split("-----END CERTIFICATE-----") {
             let Some(start) = block.find("-----BEGIN CERTIFICATE-----") else { continue };
-            let cert = alloc::format!("{}-----END CERTIFICATE-----\n", block[start..].trim_end());
+            let cert = alloc::format!("{}\n-----END CERTIFICATE-----\n", block[start..].trim_end());
             if !certs.contains(&cert) {
                 certs.push(cert);
             }
         }
     }
-    if certs.is_empty() {
-        return if optional { Ok(()) } else { Err(alloc::format!("clusterTrustBundle {path}: no matching bundle")) };
-    }
-    write_item(stage, path, certs.concat().as_bytes(), mode)
+    certs
 }
 
 /// Percent-encodes a query value (unreserved characters pass).
@@ -882,5 +887,19 @@ mod resource_field_tests {
         assert_eq!(resource_field_ref(&pod, None, &rf("limits.cpu", "1m")).as_deref(), Some("1250"));
         assert_eq!(resource_field_ref(&pod, None, &rf("limits.memory", "0")).as_deref(), Some("67108864"));
         assert_eq!(resource_field_ref(&pod, None, &rf("limits.memory", "1Mi")).as_deref(), Some("64"));
+    }
+}
+
+#[cfg(test)]
+mod pem_tests {
+    use super::pem_certs;
+
+    #[test]
+    fn blocks_keep_their_line_structure() {
+        let a = "-----BEGIN CERTIFICATE-----\nAAAA\nBBBB\n-----END CERTIFICATE-----\n";
+        let b = "-----BEGIN CERTIFICATE-----\nCCCC\n-----END CERTIFICATE-----";
+        let both = alloc::format!("{a}{b}\n");
+        let got = pem_certs([both.as_str(), a].into_iter());
+        assert_eq!(got, [a, "-----BEGIN CERTIFICATE-----\nCCCC\n-----END CERTIFICATE-----\n"]);
     }
 }
