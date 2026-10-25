@@ -32,6 +32,8 @@ pub struct Claims {
     pub pod: Option<(String, String)>, // (name, uid)
     pub audiences: Vec<String>,
     pub exp: i64,
+    /// Token id (`jti`), the credential id reported by TokenReview.
+    pub jti: String,
 }
 
 /// JWS uses unpadded base64url, which is exactly kr-fmt's URL-safe codec.
@@ -66,11 +68,17 @@ impl Signer {
         if let Some((pn, pu)) = pod {
             k8s.push(("pod".into(), Value::Object(alloc::vec![("name".into(), Value::from(pn)), ("uid".into(), Value::from(pu))])));
         }
+        // jti: a digest of everything that identifies this issuance (distinct tokens differ in
+        // audience, subject, bound pod or time).
+        let ident = alloc::format!("{ns}/{name}/{sa_uid}/{pod:?}/{audiences:?}/{now}/{ttl}");
+        let d = sha256(ident.as_bytes());
+        let jti = alloc::format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}", d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
         let claims = Value::Object(alloc::vec![
             ("aud".into(), Value::Array(auds)),
             ("exp".into(), Value::from((now + ttl) as u64)),
             ("iat".into(), Value::from(now as u64)),
             ("iss".into(), Value::from(ISSUER)),
+            ("jti".into(), Value::String(jti)),
             ("kubernetes.io".into(), Value::Object(k8s)),
             ("nbf".into(), Value::from(now as u64)),
             ("sub".into(), Value::String(alloc::format!("system:serviceaccount:{ns}:{name}"))),
@@ -127,6 +135,7 @@ impl Signer {
             pod,
             audiences,
             exp,
+            jti: claims.get("jti").and_then(Value::as_str).unwrap_or("").to_string(),
         })
     }
 
