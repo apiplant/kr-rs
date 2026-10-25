@@ -13,6 +13,7 @@
 //! * [`job`]: run-to-completion pods (completions, parallelism, indexed, backoff, TTL).
 //! * [`cronjob`]: cron parsing and Job creation with concurrency policies.
 //! * [`endpoints`]: Endpoints and EndpointSlices for Services with selectors.
+//! * [`mirror`]: EndpointSlices for hand-written Endpoints of Services without a selector.
 //! * [`namespace`]: finishes the deletion of Terminating namespaces (empties, then finalizes).
 //! * [`crd`]: finishes the deletion of Terminating CustomResourceDefinitions (deletes instances, drops the finalizer).
 //! * [`pvc`]: PVC/PV binding, a local-path provisioner and pvc-protection.
@@ -43,6 +44,7 @@ pub mod disruption;
 pub mod endpoints;
 pub mod gc;
 pub mod job;
+pub mod mirror;
 pub mod crd;
 pub mod namespace;
 pub mod pvc;
@@ -103,6 +105,7 @@ pub async fn run_all_with<C: Client + Clone + 'static>(c: C, cfg: Config) {
         spawn(job::run(c.clone(), cfg)),
         spawn(cronjob::run(c.clone(), cfg)),
         spawn(endpoints::run(c.clone(), cfg)),
+        spawn(mirror::run(c.clone(), cfg)),
         spawn(quota::run(c.clone(), cfg)),
         spawn(disruption::run(c.clone(), cfg)),
         spawn(namespace::run(c.clone(), cfg)),

@@ -310,9 +310,19 @@ pub fn prepare_update(old: &Value, new: &mut Value, t: &Target, rev: u64, has_st
         }
     }
     if status_only {
-        // Everything but status comes from the stored object.
+        // Everything but status (and labels and annotations, which a status update may set, as
+        // upstream) comes from the stored object.
         let status = new.remove("status");
+        let kept: Vec<(&str, Option<Value>)> = ["labels", "annotations"].iter().map(|f| (*f, new.pointer(&["metadata", f]).cloned())).collect();
         *new = old.clone();
+        for (f, v) in kept {
+            match v {
+                Some(v) => new.entry_object("metadata").set(f, v),
+                None => {
+                    new.entry_object("metadata").remove(f);
+                }
+            }
+        }
         match status {
             Some(s) => new.set("status", s),
             None => {
@@ -560,6 +570,12 @@ mod tests {
         assert_eq!(s.pointer(&["spec", "replicas"]).unwrap().as_u64(), Some(3)); // status update ignores spec
         assert_eq!(s.pointer(&["status", "replicas"]).unwrap().as_u64(), Some(3));
         assert_eq!(s.pointer(&["metadata", "generation"]).unwrap().as_u64(), Some(2));
+        // Labels and annotations may be set through status (upstream's services/status test patches an annotation).
+        let mut a = parse_str(r#"{"metadata":{"name":"web","annotations":{"x":"1"},"labels":{"l":"v"},"finalizers":["f"]},"status":{"replicas":4}}"#).unwrap();
+        prepare_update(&s, &mut a, &t, 4, true, true).unwrap();
+        assert_eq!(a.pointer(&["metadata", "annotations", "x"]).unwrap().as_str(), Some("1"));
+        assert_eq!(a.pointer(&["metadata", "labels", "l"]).unwrap().as_str(), Some("v"));
+        assert!(a.pointer(&["metadata", "finalizers"]).is_none());
     }
 
     #[test]

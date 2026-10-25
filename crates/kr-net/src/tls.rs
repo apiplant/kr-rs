@@ -37,6 +37,12 @@ impl<T: Transport> TlsStream<T> {
         Self::handshake(inner, conn).await
     }
 
+    /// Client handshake that accepts any server certificate (`Connection::client_insecure`).
+    pub async fn connect_insecure(inner: T, cfg: Rc<ClientConfig>, server_name: &str) -> Result<Self> {
+        let conn = Connection::client_insecure(cfg, server_name.as_bytes(), rng, unix_now());
+        Self::handshake(inner, conn).await
+    }
+
     /// Server handshake on an accepted connection.
     pub async fn accept(inner: T, cfg: Rc<ServerConfig>) -> Result<Self> {
         Self::handshake(inner, Connection::server(cfg, rng, unix_now())).await

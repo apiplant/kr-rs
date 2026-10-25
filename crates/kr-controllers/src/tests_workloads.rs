@@ -1027,8 +1027,42 @@ fn endpoints_leave_selectorless_services_alone() {
         sleep(400).await;
         let after = get(&c, &alloc::format!("{EPS}/manual")).await;
         assert_eq!(str_at(&after, &["metadata", "resourceVersion"]), str_at(&ep, &["metadata", "resourceVersion"]), "untouched");
+        // The mirroring controller publishes it; the selector controller leaves it alone.
         let all = items(&c.list(SLICES, "").await.unwrap());
-        assert!(all.iter().all(|s| str_at(s, &["metadata", "labels", "kubernetes.io/service-name"]) == "web"), "no slice for the selectorless service");
+        for s in all.iter().filter(|s| str_at(s, &["metadata", "labels", "kubernetes.io/service-name"]) == "manual") {
+            assert_eq!(str_at(s, &["metadata", "labels", "endpointslice.kubernetes.io/managed-by"]), "endpointslicemirroring-controller.k8s.io");
+        }
+    });
+}
+
+#[test]
+fn endpoints_of_selectorless_services_are_mirrored() {
+    scenario(|c| async move {
+        c.create(SVCS, &v(r#"{"metadata":{"name":"manual"},"spec":{"ports":[{"name":"p","port":80}]}}"#)).await.unwrap();
+        let mirrored = || async { items(&c.list(SLICES, "labelSelector=kubernetes.io%2Fservice-name%3Dmanual").await.unwrap()) };
+        c.create(EPS, &v(r#"{"metadata":{"name":"manual","labels":{"a":"b"}},"subsets":[{"addresses":[{"ip":"10.1.2.3"}],"notReadyAddresses":[{"ip":"10.1.2.4"}],"ports":[{"name":"p","port":80}]}]}"#)).await.unwrap();
+        wait_until("mirrored", || async { mirrored().await.len() == 1 }).await;
+        let s = mirrored().await.remove(0);
+        assert_eq!(str_at(&s, &["metadata", "labels", "a"]), "b");
+        assert_eq!(str_at(&s, &["addressType"]), "IPv4");
+        let eps = s.get("endpoints").and_then(Value::as_array).unwrap();
+        assert_eq!(eps.len(), 2);
+        assert_eq!(eps[1].pointer(&["conditions", "ready"]).and_then(Value::as_bool), Some(false));
+        // An update replaces the addresses in place; deleting the Endpoints removes the slice.
+        let mut ep = get(&c, &alloc::format!("{EPS}/manual")).await;
+        ep.set("subsets", v(r#"[{"addresses":[{"ip":"10.2.3.4"}],"ports":[{"name":"p","port":80}]}]"#));
+        c.update(&alloc::format!("{EPS}/manual"), &ep).await.unwrap();
+        wait_until("updated", || async {
+            let m = mirrored().await;
+            m.len() == 1 && m[0].pointer(&["endpoints"]).and_then(Value::as_array).is_some_and(|e| e.len() == 1 && e[0].pointer(&["addresses"]).and_then(Value::as_array).unwrap()[0].as_str() == Some("10.2.3.4"))
+        })
+        .await;
+        c.delete(&alloc::format!("{EPS}/manual")).await.unwrap();
+        wait_until("deleted", || async { mirrored().await.is_empty() }).await;
+        // skip-mirror keeps it out.
+        c.create(EPS, &v(r#"{"metadata":{"name":"manual","labels":{"endpointslice.kubernetes.io/skip-mirror":"true"}},"subsets":[{"addresses":[{"ip":"10.9.9.9"}],"ports":[{"port":80}]}]}"#)).await.unwrap();
+        sleep(500).await;
+        assert!(mirrored().await.is_empty());
     });
 }
 

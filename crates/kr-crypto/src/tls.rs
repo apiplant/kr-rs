@@ -610,6 +610,8 @@ pub struct Connection {
     read_epoch: u32,
     /// TLS 1.2 was negotiated (client only).
     tls12: bool,
+    /// Client only: accept any server certificate (see [`Connection::client_insecure`]).
+    insecure: bool,
     client_random: [u8; 32],
     server_random: [u8; 32],
     /// TLS 1.2 server ECDHE (group, public point) from ServerKeyExchange.
@@ -647,6 +649,7 @@ impl Connection {
             peer_closed: false,
             read_epoch: 0,
             tls12: false,
+            insecure: false,
             client_random: [0; 32],
             server_random: [0; 32],
             kx12: None,
@@ -668,6 +671,15 @@ impl Connection {
             now,
         );
         c.send_client_hello(false);
+        c
+    }
+
+    /// A client that does not verify the server certificate (TLS 1.3 only), for proxying to
+    /// workloads that present self-signed certificates. The signature of the handshake is still
+    /// checked against the presented key.
+    pub fn client_insecure(cfg: Rc<ClientConfig>, server_name: &[u8], rng: Rng, now: i64) -> Connection {
+        let mut c = Connection::client(cfg, server_name, rng, now);
+        c.insecure = true;
         c
     }
 
@@ -1218,6 +1230,7 @@ impl Connection {
                 let roots: Vec<&[u8]> = roots.iter().map(|c| &c[..]).collect();
                 x509::verify_chain(&refs, &roots, self.now, Usage::Client)
             }
+            Role::Client { .. } if self.insecure => Ok(()),
             Role::Client { cfg, server_name, .. } => {
                 let mut roots: Vec<&[u8]> = cfg.roots.iter().map(|c| &c[..]).collect();
                 if let Some(pin) = cfg.pinned_ca {

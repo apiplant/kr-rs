@@ -219,10 +219,11 @@ impl<C: Client + Clone + 'static> Proxy<C> {
 
     /// Desired listeners from Services + Endpoints, diffed against the running ones.
     async fn reconcile(self: &Rc<Self>) {
-        let (Ok(svcs), Ok(eps)) = (self.c.list("/api/v1/services", "").await, self.c.list("/api/v1/endpoints", "").await) else { return };
+        let (Ok(svcs), Ok(eps), Ok(slices)) = (self.c.list("/api/v1/services", "").await, self.c.list("/api/v1/endpoints", "").await, self.c.list("/apis/discovery.k8s.io/v1/endpointslices", "").await) else { return };
         let empty = Vec::new();
         let svcs = svcs.get("items").and_then(Value::as_array).unwrap_or(&empty);
         let eps = eps.get("items").and_then(Value::as_array).unwrap_or(&empty);
+        let slices = slices.get("items").and_then(Value::as_array).unwrap_or(&empty);
         let mut desired: BTreeMap<Key, Backends> = BTreeMap::new();
         for s in svcs {
             if s.pointer(&["metadata", "annotations", "kr.io/builtin"]).is_some() {
@@ -241,7 +242,23 @@ impl<C: Client + Clone + 'static> Proxy<C> {
                 let Some(port) = p.get("port").and_then(Value::as_u64) else { continue };
                 let pname = p.get("name").and_then(Value::as_str).unwrap_or("");
                 let mut list = Vec::new();
-                for sub in ep.and_then(|e| e.get("subsets")).and_then(Value::as_array).unwrap_or(&[]) {
+                // EndpointSlices win: Services without a selector may have only hand-written ones.
+                let own: Vec<&Value> = slices.iter().filter(|sl| kr_apiserver::client::meta(sl, "namespace") == ns_ && sl.pointer(&["metadata", "labels", "kubernetes.io/service-name"]).and_then(Value::as_str) == Some(name)).collect();
+                for sl in &own {
+                    let target = sl.get("ports").and_then(Value::as_array).and_then(|ps| ps.iter().find(|sp| sp.get("name").and_then(Value::as_str).unwrap_or("") == pname)).and_then(|sp| sp.get("port")).and_then(Value::as_u64);
+                    let Some(tp) = target else { continue };
+                    for e in sl.get("endpoints").and_then(Value::as_array).unwrap_or(&[]) {
+                        if e.pointer(&["conditions", "ready"]).and_then(Value::as_bool) == Some(false) {
+                            continue;
+                        }
+                        for a in e.get("addresses").and_then(Value::as_array).unwrap_or(&[]) {
+                            if let Some(ip) = a.as_str().and_then(ip4) {
+                                list.push((ip, tp as u16));
+                            }
+                        }
+                    }
+                }
+                for sub in ep.filter(|_| own.is_empty()).and_then(|e| e.get("subsets")).and_then(Value::as_array).unwrap_or(&[]) {
                     let target = sub.get("ports").and_then(Value::as_array).and_then(|ps| ps.iter().find(|ep| ep.get("name").and_then(Value::as_str).unwrap_or("") == pname)).and_then(|ep| ep.get("port")).and_then(Value::as_u64);
                     let Some(tp) = target else { continue };
                     for a in sub.get("addresses").and_then(Value::as_array).unwrap_or(&[]) {

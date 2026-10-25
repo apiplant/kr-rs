@@ -894,10 +894,8 @@ impl ApiServer {
     /// `pods/<name>[:port]/proxy[/path]`: relays the request to the pod's IP (default port: the
     /// first container port, else 80).
     fn pod_proxy(&self, req: &Req, rt: &Route, name: &str) -> R<Reply> {
-        let (pod_name, port) = match name.split_once(':') {
-            Some((n, p)) => (n, Some(p)),
-            None => (name, None),
-        };
+        let (scheme, pod_name, port) = proxy_name(name)?;
+        let port = (!port.is_empty()).then_some(port);
         let (_, pod) = self.get_value(rt, pod_name)?;
         let ip = pod.pointer(&["status", "podIP"]).and_then(Value::as_str).and_then(object::parse_ipv4).ok_or_else(|| ApiError::bad_request(alloc::format!("pod {pod_name} does not have an IP yet")))?;
         let port = match port {
@@ -905,21 +903,60 @@ impl ApiServer {
             None => pod.pointer(&["spec", "containers"]).and_then(Value::as_array).and_then(|cs| cs.iter().find_map(|c| c.get("ports")?.as_array()?.first()?.get("containerPort")?.as_u64())).map(|p| p as u16).or(Some(80)),
         }
         .ok_or_else(|| ApiError::bad_request("invalid port"))?;
-        let path = req.path.split_once("/proxy").map_or("/", |(_, t)| t);
-        let path = if path.is_empty() { "/" } else { path };
+        self.proxy_reply(req, scheme, ip, port, pod_name)
+    }
+
+    /// `scheme` is "https" to speak TLS to the backend (certificates are not verified, like
+    /// upstream's proxy transport).
+    fn proxy_reply(&self, req: &Req, scheme: &str, ip: [u8; 4], port: u16, what: &str) -> R<Reply> {
+        // /api/v1/namespaces/<ns>/<pods|services>/<name>/proxy[/<path>]
+        let segs: Vec<&str> = req.path.splitn(9, '/').collect();
+        let prefix = segs[..segs.len().min(8)].join("/");
+        let path = alloc::format!("/{}", segs.get(8).copied().unwrap_or(""));
         if !crate::podproxy::proxyable(ip) {
-            return Err(ApiError::bad_request(alloc::format!("address not allowed: pod {pod_name} reports a host-local IP")));
+            return Err(ApiError::bad_request(alloc::format!("address not allowed: {what} reports a host-local IP")));
         }
         Ok(Reply::Proxy(crate::podproxy::Target {
             method: req.method.into(),
             ip,
             port,
-            path: path.into(),
+            tls: scheme == "https",
+            prefix,
+            path,
             query: req.query.into(),
             content_type: req.content_type.map(Into::into),
             accept: req.accept.map(Into::into),
             body: req.body.to_vec(),
         }))
+    }
+
+    /// `services/[scheme:]<name>[:port]/proxy[/path]`: relays the request to a ready endpoint of
+    /// the Service port (`port` is a number or a port name; default: the first port).
+    fn service_proxy(&self, req: &Req, rt: &Route, name: &str) -> R<Reply> {
+        let (scheme, svc_name, port) = proxy_name(name)?;
+        let (_, svc) = self.get_value(rt, svc_name)?;
+        let sport = svc
+            .pointer(&["spec", "ports"])
+            .and_then(Value::as_array)
+            .and_then(|ps| ps.iter().find(|p| port.is_empty() || p.get("name").and_then(Value::as_str) == Some(port) || p.get("port").and_then(Value::as_u64).map(|n| alloc::format!("{n}")).as_deref() == Some(port)))
+            .ok_or_else(|| ApiError::not_found("service port", port))?;
+        let pname = sport.get("name").and_then(Value::as_str).unwrap_or("");
+        let ert = Route { res: resources::find("", "v1", "endpoints").unwrap(), namespace: rt.namespace.clone(), name: None, sub: None };
+        let (_, ep) = self.get_value(&ert, svc_name).map_err(|_| ApiError::new(503, "ServiceUnavailable", alloc::format!("no endpoints available for service \"{svc_name}\"")))?;
+        let mut targets: Vec<([u8; 4], u16)> = Vec::new();
+        for sub in ep.get("subsets").and_then(Value::as_array).unwrap_or(&[]) {
+            let Some(tp) = sub.get("ports").and_then(Value::as_array).and_then(|ps| ps.iter().find(|p| p.get("name").and_then(Value::as_str).unwrap_or("") == pname)).and_then(|p| p.get("port")).and_then(Value::as_u64) else { continue };
+            for a in sub.get("addresses").and_then(Value::as_array).unwrap_or(&[]) {
+                if let Some(ip) = a.get("ip").and_then(Value::as_str).and_then(object::parse_ipv4) {
+                    targets.push((ip, tp as u16));
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Err(ApiError::new(503, "ServiceUnavailable", alloc::format!("no endpoints available for service \"{svc_name}\"")));
+        }
+        let (ip, port) = targets[((self.now)() as usize) % targets.len()];
+        self.proxy_reply(req, scheme, ip, port, svc_name)
     }
 
     fn dispatch(&self, req: &Req, rt: &Route, q: &Query) -> R<Reply> {
@@ -930,6 +967,7 @@ impl ApiServer {
             }
         }
         match (req.method, &rt.name, sub) {
+            (_, Some(n), Some("proxy")) if rt.res.plural == "services" => self.service_proxy(req, rt, n),
             (_, Some(n), Some("proxy")) => self.pod_proxy(req, rt, n),
             ("GET" | "POST", Some(n), Some(sub @ ("log" | "exec" | "attach" | "portforward"))) => {
                 let (_, pod) = self.get_value(rt, n)?;
@@ -2053,6 +2091,13 @@ impl ApiServer {
         let key = ep.key(Some("default"), "kubernetes");
         let _ = self.store.borrow_mut().delete(&key, None);
         self.bootstrap_object(ep, Some("default"), "kubernetes", "Endpoints", &body);
+        // The same addresses as an EndpointSlice (no controller owns the Service's endpoints).
+        let eps = resources::find("discovery.k8s.io", "v1", "endpointslices").unwrap();
+        let endpoints: Vec<String> = addrs.iter().map(|(a, _)| alloc::format!(r#"{{"addresses":["{}.{}.{}.{}"],"conditions":{{"ready":true,"serving":true,"terminating":false}}}}"#, a[0], a[1], a[2], a[3])).collect();
+        let body = alloc::format!(r#"{{"metadata":{{"name":"kubernetes","labels":{{"kubernetes.io/service-name":"kubernetes"}}}},"addressType":"IPv4","endpoints":[{}],"ports":[{{"name":"https","port":{port},"protocol":"TCP"}}]}}"#, endpoints.join(","));
+        let key = eps.key(Some("default"), "kubernetes");
+        let _ = self.store.borrow_mut().delete(&key, None);
+        self.bootstrap_object(eps, Some("default"), "kubernetes", "EndpointSlice", &body);
         self.bootstrap_object(svc, Some("kube-system"), "kube-dns", "Service", r#"{"metadata":{"name":"kube-dns","labels":{"k8s-app":"kube-dns","kubernetes.io/name":"CoreDNS"},"annotations":{"kr.io/builtin":"dns"}},"spec":{"type":"ClusterIP","clusterIP":"10.96.0.10","clusterIPs":["10.96.0.10"],"ipFamilies":["IPv4"],"ipFamilyPolicy":"SingleStack","sessionAffinity":"None","internalTrafficPolicy":"Cluster","ports":[{"name":"dns","port":53,"protocol":"UDP","targetPort":53},{"name":"dns-tcp","port":53,"protocol":"TCP","targetPort":53}]}}"#);
         self.sync()
     }
@@ -2407,6 +2452,22 @@ fn wants_table(accept: Option<&str>) -> bool {
     accept.is_some_and(|a| a.split(',').next().is_some_and(|first| first.contains("as=Table")))
 }
 
+/// `[scheme:]<name>[:port]` of a proxy request: `(scheme, name, port)`, empty when absent.
+fn proxy_name(name: &str) -> R<(&str, &str, &str)> {
+    let parts: Vec<&str> = name.split(':').collect();
+    let (scheme, n, port) = match parts.as_slice() {
+        [n] => ("", *n, ""),
+        [s @ ("http" | "https"), n] => (*s, *n, ""),
+        [n, p] => ("", *n, *p),
+        [s, n, p] => (*s, *n, *p),
+        _ => return Err(ApiError::bad_request("invalid proxy name")),
+    };
+    if !matches!(scheme, "" | "http" | "https") || n.is_empty() {
+        return Err(ApiError::bad_request("invalid proxy name"));
+    }
+    Ok((scheme, n, port))
+}
+
 fn parse_route(extra: &[&'static Resource], group: &str, version: &str, rest: &[&str]) -> Option<Route> {
     let ok_seg = |s: &str| !s.is_empty() && s != "." && s != "..";
     if !rest.iter().all(|s| ok_seg(s)) {
@@ -2424,8 +2485,8 @@ fn parse_route(extra: &[&'static Resource], group: &str, version: &str, rest: &[
         [p] => (*p, None, None),
         [p, n] => (*p, Some(n.to_string()), None),
         [p, n, s] => (*p, Some(n.to_string()), Some(s.to_string())),
-        // pods/<name>[:port]/proxy/<path...>: the path is re-read from the request.
-        [p @ "pods", n, "proxy", ..] => (*p, Some(n.to_string()), Some(String::from("proxy"))),
+        // pods|services/<name>[:port]/proxy/<path...>: the path is re-read from the request.
+        [p @ ("pods" | "services"), n, "proxy", ..] => (*p, Some(n.to_string()), Some(String::from("proxy"))),
         _ => return None,
     };
     let res = resources::find_in(extra, group, version, plural)?;
