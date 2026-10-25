@@ -447,6 +447,8 @@ impl FieldSelector {
                 "involvedObject.kind", "involvedObject.namespace", "involvedObject.name", "involvedObject.uid", "involvedObject.apiVersion", "involvedObject.resourceVersion", "involvedObject.fieldPath", "reason", "reportingComponent", "source", "type",
                 // secrets / services / namespaces / replicasets / jobs
                 "spec.clusterIP", "spec.type", "status.replicas", "status.successful",
+                // certificatesigningrequests, events.k8s.io events
+                "spec.signerName", "regarding.kind", "regarding.namespace", "regarding.name", "regarding.uid", "regarding.apiVersion", "regarding.fieldPath", "reportingController",
             ];
             let f = k.trim();
             if !FIELDS.contains(&f) {

@@ -535,15 +535,22 @@ impl ApiServer {
         let Some(token) = req.bearer else {
             return Ok(User { name: "system:anonymous".into(), groups: alloc::vec!["system:unauthenticated".into()] });
         };
-        let unauthorized = || ApiError::new(401, "Unauthorized", "Unauthorized");
+        self.verify_bearer(token, &[]).map(|(u, _)| u).map_err(|_| ApiError::new(401, "Unauthorized", "Unauthorized"))
+    }
+
+    /// Validates a bearer token (bootstrap token or ServiceAccount JWT); `audiences` empty means
+    /// the API server's own. Returns the user and, for JWTs, the verified claims plus the
+    /// audiences that matched.
+    fn verify_bearer(&self, token: &str, audiences: &[String]) -> Result<(User, Option<(crate::tokens::Claims, Vec<String>)>), &'static str> {
         if let Some(u) = self.bootstrap_user(token) {
-            return Ok(u);
+            return Ok((u, None));
         }
         let sa = self.sa.borrow();
-        let (signer, _) = sa.as_ref().ok_or_else(unauthorized)?;
-        let c = signer.verify(token, (self.now)()).ok_or_else(unauthorized)?;
-        if !c.audiences.iter().any(|a| crate::tokens::API_AUDIENCES.contains(&a.as_str())) {
-            return Err(unauthorized());
+        let (signer, _) = sa.as_ref().ok_or("no service account issuer")?;
+        let c = signer.verify(token, (self.now)()).ok_or("invalid bearer token")?;
+        let matched: Vec<String> = c.audiences.iter().filter(|a| if audiences.is_empty() { crate::tokens::API_AUDIENCES.contains(&a.as_str()) } else { audiences.contains(a) }).cloned().collect();
+        if matched.is_empty() {
+            return Err("invalid audience");
         }
         // Revocation: the ServiceAccount (and a bound pod) must still exist with the same uid.
         let store = self.store.borrow();
@@ -553,17 +560,66 @@ impl ApiServer {
             json::parse(&kv.value).ok()?.pointer(&["metadata", "uid"]).and_then(Value::as_str).map(String::from)
         };
         if uid_of("serviceaccounts", &c.sa_name).as_deref() != Some(c.sa_uid.as_str()) {
-            return Err(unauthorized());
+            return Err("service account no longer exists");
         }
         if let Some((pod, puid)) = &c.pod {
             if uid_of("pods", pod).as_deref() != Some(puid.as_str()) {
-                return Err(unauthorized());
+                return Err("bound pod no longer exists");
             }
         }
-        Ok(User {
+        let user = User {
             name: alloc::format!("system:serviceaccount:{}:{}", c.namespace, c.sa_name),
             groups: alloc::vec!["system:serviceaccounts".into(), alloc::format!("system:serviceaccounts:{}", c.namespace), "system:authenticated".into()],
-        })
+        };
+        Ok((user, Some((c, matched))))
+    }
+
+    /// `authentication.k8s.io/v1` TokenReview: validates the token exactly as request
+    /// authentication does. A rejected token is a 201 with `status.authenticated: false`.
+    fn token_review(&self, req: &Req) -> R<Reply> {
+        let mut r = self.parse_body(req)?;
+        let token = r.pointer(&["spec", "token"]).and_then(Value::as_str).unwrap_or("").to_string();
+        if token.is_empty() {
+            return Err(ApiError::invalid("TokenReview.authentication.k8s.io is invalid: spec.token: Required value"));
+        }
+        let auds: Vec<String> = r.pointer(&["spec", "audiences"]).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+        let mut status = obj(alloc::vec![]);
+        match self.verify_bearer(&token, &auds) {
+            Ok((u, claims)) => {
+                status.set("authenticated", Value::Bool(true));
+                let mut user = obj(alloc::vec![("username", Value::String(u.name.clone()))]);
+                if let Some((c, matched)) = &claims {
+                    user.set("uid", Value::String(c.sa_uid.clone()));
+                    let mut extra = alloc::vec![("authentication.kubernetes.io/credential-id".to_string(), Value::Array(alloc::vec![Value::String(alloc::format!("JTI={}", c.jti))]))];
+                    if let Some((pn, pu)) = &c.pod {
+                        extra.push(("authentication.kubernetes.io/pod-name".into(), Value::Array(alloc::vec![Value::String(pn.clone())])));
+                        extra.push(("authentication.kubernetes.io/pod-uid".into(), Value::Array(alloc::vec![Value::String(pu.clone())])));
+                        let pods = resources::find("", "v1", "pods").unwrap();
+                        let node = self.store.borrow().get(&pods.key(Some(&c.namespace), pn)).and_then(|kv| json::parse(&kv.value).ok()).and_then(|p| p.pointer(&["spec", "nodeName"]).and_then(Value::as_str).map(String::from)).filter(|n| !n.is_empty());
+                        if let Some(n) = node {
+                            let nodes = resources::find("", "v1", "nodes").unwrap();
+                            let nuid = self.store.borrow().get(&nodes.key(None, &n)).and_then(|kv| json::parse(&kv.value).ok()).and_then(|v| v.pointer(&["metadata", "uid"]).and_then(Value::as_str).map(String::from));
+                            extra.push(("authentication.kubernetes.io/node-name".into(), Value::Array(alloc::vec![Value::String(n)])));
+                            if let Some(nu) = nuid {
+                                extra.push(("authentication.kubernetes.io/node-uid".into(), Value::Array(alloc::vec![Value::String(nu)])));
+                            }
+                        }
+                    }
+                    user.set("extra", Value::Object(extra));
+                    status.set("audiences", Value::Array(matched.iter().map(|a| Value::String(a.clone())).collect()));
+                }
+                user.set("groups", Value::Array(u.groups.iter().map(|g| Value::String(g.clone())).collect()));
+                status.set("user", user);
+            }
+            Err(e) => {
+                status.set("authenticated", Value::Bool(false));
+                status.set("error", Value::from(e));
+            }
+        }
+        r.set("apiVersion", Value::from("authentication.k8s.io/v1"));
+        r.set("kind", Value::from("TokenReview"));
+        r.set("status", status);
+        Ok(Reply::Json(201, json::to_string(&r)))
     }
 
     /// RBAC decision for `a` (system:masters short-circuits).
@@ -844,6 +900,9 @@ impl ApiServer {
                 return self.sa.borrow().as_ref().map(|(s, _)| Reply::Json(200, s.jwks())).ok_or_else(|| ApiError::not_found("jwks", "jwks"));
             }
             ["apis", "authorization.k8s.io", "v1", "selfsubjectaccessreviews"] if req.method == "POST" => return self.self_subject_access_review(req, &user),
+            ["apis", "authorization.k8s.io", "v1", "subjectaccessreviews"] if req.method == "POST" => return self.subject_access_review(req, None),
+            ["apis", "authorization.k8s.io", "v1", "namespaces", ns, "localsubjectaccessreviews"] if req.method == "POST" => return self.subject_access_review(req, Some(ns)),
+            ["apis", "authentication.k8s.io", "v1", "tokenreviews"] if req.method == "POST" => return self.token_review(req),
             ["api"] | ["apis"] if req.method == "GET" && discovery::negotiate(req.accept) != discovery::Negotiated::Legacy => return Ok(Reply::aggregated_discovery(req, &extra, segs.len() == 1 && segs[0] == "api")),
             ["api"] => return Ok(Reply::Json(200, discovery::core_versions(&self.server_address))),
             ["api", "v1"] => return Ok(Reply::Json(200, discovery::resource_list(&extra, "", "v1").unwrap())),
@@ -2058,6 +2117,44 @@ impl ApiServer {
         r.set("apiVersion", Value::from("authorization.k8s.io/v1"));
         r.set("kind", Value::from("SelfSubjectAccessReview"));
         r.set("status", obj(alloc::vec![("allowed", Value::Bool(ok))]));
+        Ok(Reply::Json(201, json::to_string(&r)))
+    }
+
+    /// `authorization.k8s.io/v1` SubjectAccessReview / LocalSubjectAccessReview: the decision for
+    /// the user named in the spec, by the same authorizer as real requests.
+    fn subject_access_review(&self, req: &Req, local_ns: Option<&str>) -> R<Reply> {
+        let mut r = self.parse_body(req)?;
+        let kind = if local_ns.is_some() { "LocalSubjectAccessReview" } else { "SubjectAccessReview" };
+        if let Some(ns) = local_ns {
+            let bns = r.pointer(&["metadata", "namespace"]).and_then(Value::as_str).unwrap_or("");
+            if !bns.is_empty() && bns != ns {
+                return Err(ApiError::bad_request("the namespace of the provided object does not match the namespace sent on the request"));
+            }
+        }
+        let spec = r.get("spec").cloned().unwrap_or(Value::Null);
+        let user = spec.get("user").and_then(Value::as_str).unwrap_or("").to_string();
+        let groups: Vec<String> = spec.get("groups").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+        let (ra, nra) = (spec.get("resourceAttributes"), spec.get("nonResourceAttributes"));
+        if user.is_empty() && groups.is_empty() {
+            return Err(ApiError::invalid(alloc::format!("{kind} is invalid: spec.user: Invalid value: \"\": at least one of user or group must be specified")));
+        }
+        if ra.is_some() == nra.is_some() {
+            return Err(ApiError::invalid(alloc::format!("{kind} is invalid: spec.resourceAttributes: Invalid value: exactly one of nonResourceAttributes or resourceAttributes must be specified")));
+        }
+        let f = |v: Option<&Value>, k: &str| v.and_then(|x| x.get(k)).and_then(Value::as_str).unwrap_or("").to_string();
+        let attrs = if ra.is_some() {
+            let namespace = match local_ns {
+                Some(ns) => ns.to_string(),
+                None => f(ra, "namespace"),
+            };
+            crate::rbac::Attrs { verb: f(ra, "verb"), api_group: f(ra, "group"), resource: f(ra, "resource"), subresource: f(ra, "subresource"), namespace, name: f(ra, "name"), resource_request: true, path: String::new() }
+        } else {
+            crate::rbac::Attrs { verb: f(nra, "verb"), path: f(nra, "path"), ..Default::default() }
+        };
+        let ok = self.authorize(&User { name: user, groups }, &attrs, None);
+        r.set("apiVersion", Value::from("authorization.k8s.io/v1"));
+        r.set("kind", Value::from(kind));
+        r.set("status", obj(alloc::vec![("allowed", Value::Bool(ok)), ("denied", Value::Bool(false))]));
         Ok(Reply::Json(201, json::to_string(&r)))
     }
 
