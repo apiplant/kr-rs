@@ -432,3 +432,20 @@ fn watch_events_carry_the_requested_version() {
     let v1 = lines("/apis/example.com/v1/namespaces/default/widgets", q);
     assert!(v1.contains(r#""apiVersion":"example.com/v1""#), "{v1}");
 }
+
+/// CRD schemas (free-form `default`, `items`/`additionalProperties` unions) are neither unknown
+/// fields nor type errors for the built-in schema checks.
+#[test]
+fn crd_schema_passes_strict_field_validation() {
+    let api = server();
+    let crd = r#"{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{"name":"gadgets.example.com"},
+"spec":{"group":"example.com","scope":"Namespaced","names":{"plural":"gadgets","kind":"Gadget"},
+"versions":[{"name":"v1","served":true,"storage":true,"schema":{"openAPIV3Schema":{"type":"object","properties":{"spec":{"type":"object",
+"properties":{"n":{"type":"integer","default":3},"tags":{"type":"array","items":{"type":"string"}},"labels":{"type":"object","additionalProperties":{"type":"string"}},
+"open":{"type":"object","additionalProperties":true}}}}}}}]}}"#;
+    let (c, v) = j(&api, "POST", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions?fieldValidation=Strict", crd);
+    assert_eq!(c, 201, "{v:?}");
+    // A real type error in the CRD itself is still caught.
+    let bad = crd.replace(r#""scope":"Namespaced""#, r#""scope":7"#).replace("gadgets.example.com", "g2.example.com").replace(r#""plural":"gadgets""#, r#""plural":"g2""#);
+    assert_eq!(j(&api, "POST", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions", &bad).0, 400);
+}

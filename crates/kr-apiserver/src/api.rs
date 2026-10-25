@@ -690,10 +690,15 @@ impl ApiServer {
 
     /// Unknown fields of a built-in kind's object (those `old` already had are not reported).
     fn fv_builtin(&self, rt: &Route, new: &Value, old: Option<&Value>) -> R<()> {
+        let gv = rt.res.group_version();
+        // Wrong JSON types fail decoding whatever the fieldValidation mode.
+        if let Some(e) = crate::fieldval::type_error(&gv, rt.res.kind, new) {
+            let (k, v) = (rt.res.kind, rt.res.version);
+            return Err(ApiError::bad_request(alloc::format!("{k} in version \"{v}\" cannot be handled as a {k}: {e}")));
+        }
         if self.fv_mode.get() == crate::fieldval::Mode::Ignore {
             return Ok(());
         }
-        let gv = rt.res.group_version();
         let Some(u) = crate::fieldval::unknown_builtin(&gv, rt.res.kind, new) else { return Ok(()) };
         let o = old.and_then(|o| crate::fieldval::unknown_builtin(&gv, rt.res.kind, o)).unwrap_or_default();
         self.fv_report(crate::fieldval::messages(u, &o))
@@ -1272,6 +1277,10 @@ impl ApiServer {
         let name = object::prepare_create(o, &t, &self.clock(), rev)?;
         self.check_namespace(rt, &name)?;
         self.check_crd_terminating(rt)?;
+        if rt.res.group.is_empty() && matches!(rt.res.plural, "persistentvolumes" | "persistentvolumeclaims") {
+            // Status is not writable on create: a new volume or claim always starts Pending.
+            o.remove("status");
+        }
         crate::defaults::apply(rt.res.group, rt.res.plural, o);
         let is_crd = crate::crd::is_crd(rt.res);
         if is_crd {

@@ -57,7 +57,7 @@ fn lookup(idx: u16, key: &str, depth: usize) -> Option<&'static s::Field> {
 
 /// Messages with a hand-written JSON form: their content is not validated.
 fn opaque(idx: u16) -> bool {
-    matches!(idx, s::M_TIME | s::M_MICRO_TIME | s::M_DURATION | s::M_FIELDS_V1 | s::M_INT_OR_STRING | s::M_QUANTITY | s::M_RAW_EXTENSION)
+    matches!(idx, s::M_TIME | s::M_MICRO_TIME | s::M_DURATION | s::M_FIELDS_V1 | s::M_INT_OR_STRING | s::M_QUANTITY | s::M_RAW_EXTENSION | s::M_EXT_JSON | s::M_SCHEMA_OR_ARRAY | s::M_SCHEMA_OR_BOOL | s::M_SCHEMA_OR_STRINGS)
 }
 
 fn join(path: &str, k: &str) -> String {
@@ -116,6 +116,132 @@ pub fn unknown_builtin(api_version: &str, kind: &str, v: &Value) -> Option<Vec<S
     let mut out = Vec::new();
     message(v, idx, "", true, &mut out, 0);
     Some(out)
+}
+
+fn json_type(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn go_type(kind: u8, repeated: bool) -> String {
+    let base = match kind {
+        s::K_STRING => "string",
+        s::K_BYTES => "[]uint8",
+        s::K_INT32 => "int32",
+        s::K_INT64 => "int64",
+        s::K_BOOL => "bool",
+        s::K_DOUBLE => "float64",
+        s::K_FLOAT => "float32",
+        s::K_UINT32 => "uint32",
+        s::K_UINT64 => "uint64",
+        s::K_MAP => "map[string]object",
+        _ => "object",
+    };
+    if repeated { format!("[]{base}") } else { base.to_string() }
+}
+
+/// Whether the non-null scalar `v` decodes into a field of `kind` (Go `encoding/json` rules).
+fn scalar_ok(v: &Value, kind: u8) -> bool {
+    match (kind, v) {
+        (s::K_STRING, Value::String(_)) | (s::K_BOOL, Value::Bool(_)) => true,
+        (s::K_BYTES, Value::String(b)) => b.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'=' | b'-' | b'_')),
+        (s::K_DOUBLE | s::K_FLOAT, Value::Number(_)) => true,
+        (s::K_INT32 | s::K_INT64 | s::K_UINT32 | s::K_UINT64, Value::Number(n)) => {
+            let (lo, hi) = match kind {
+                s::K_INT32 => (i32::MIN as i128, i32::MAX as i128),
+                s::K_INT64 => (i64::MIN as i128, i64::MAX as i128),
+                s::K_UINT32 => (0, u32::MAX as i128),
+                _ => (0, u64::MAX as i128),
+            };
+            // Integral floats such as `3.0` are accepted (Go would reject them).
+            let f = n.as_f64();
+            let i = match (n.as_i64(), n.as_u64()) {
+                (Some(i), _) => i as i128,
+                (_, Some(u)) => u as i128,
+                _ if f.is_finite() && f == (f as i64) as f64 => f as i64 as i128,
+                _ => return false,
+            };
+            (lo..=hi).contains(&i)
+        }
+        _ => false,
+    }
+}
+
+fn type_err(v: &Value, root: &str, path: &str, go: &str) -> String {
+    format!("json: cannot unmarshal {} into Go struct field {root}.{path} of type {go}", json_type(v))
+}
+
+fn type_message(v: &Value, idx: u16, root: &str, path: &str, depth: usize) -> Option<String> {
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    let (ok, go) = match idx {
+        s::M_TIME => (matches!(v, Value::String(_)), "v1.Time"),
+        s::M_MICRO_TIME => (matches!(v, Value::String(_)), "v1.MicroTime"),
+        s::M_DURATION => (matches!(v, Value::String(_)), "v1.Duration"),
+        s::M_INT_OR_STRING => (matches!(v, Value::String(_)) || matches!(v, Value::Number(n) if n.is_integer()), "intstr.IntOrString"),
+        s::M_QUANTITY => (matches!(v, Value::String(_) | Value::Number(_)), "resource.Quantity"),
+        // Free-form JSON, and CRD schema unions (an object, or an array / a bool; the CRD
+        // structural checks validate their contents).
+        s::M_RAW_EXTENSION | s::M_FIELDS_V1 | s::M_EXT_JSON => return None,
+        s::M_SCHEMA_OR_ARRAY | s::M_SCHEMA_OR_BOOL | s::M_SCHEMA_OR_STRINGS => (matches!(v, Value::Object(_) | Value::Array(_) | Value::Bool(_)), "object"),
+        _ => (matches!(v, Value::Object(_)), "object"),
+    };
+    if !ok {
+        return Some(type_err(v, root, path, go));
+    }
+    if let (Value::Object(fields), false) = (v, opaque(idx)) {
+        for (k, fv) in fields {
+            if let Some(f) = lookup(idx, k, 0) {
+                if let Some(e) = type_field(fv, f, root, &join(path, k), depth) {
+                    return Some(e);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn type_item(v: &Value, kind: u8, arg: u16, root: &str, path: &str, depth: usize) -> Option<String> {
+    if matches!(v, Value::Null) {
+        return None;
+    }
+    if kind == s::K_MESSAGE {
+        return type_message(v, arg, root, path, depth + 1);
+    }
+    if scalar_ok(v, kind) { None } else { Some(type_err(v, root, path, &go_type(kind, false))) }
+}
+
+fn type_field(v: &Value, f: &s::Field, root: &str, path: &str, depth: usize) -> Option<String> {
+    if matches!(v, Value::Null) {
+        return None;
+    }
+    let kind = f.kind & s::K_MASK;
+    if kind == s::K_MAP {
+        let Value::Object(entries) = v else { return Some(type_err(v, root, path, &go_type(kind, false))) };
+        let (_, _, vk, va) = s::MAPS[f.arg as usize];
+        return entries.iter().find_map(|(k, ev)| type_item(ev, vk, va, root, &join(path, k), depth));
+    }
+    if f.kind & s::F_REPEATED != 0 {
+        let Value::Array(items) = v else { return Some(type_err(v, root, path, &go_type(kind, true))) };
+        return items.iter().find_map(|it| type_item(it, kind, f.arg, root, path, depth));
+    }
+    type_item(v, kind, f.arg, root, path, depth)
+}
+
+/// The first JSON type error of `v` as a built-in `kind` of `api_version` (what Go's decoder
+/// would reject, without the `cannot be handled` prefix); `None` when well-typed or the schema
+/// has no such kind. Unknown fields are not type errors.
+pub fn type_error(api_version: &str, kind: &str, v: &Value) -> Option<String> {
+    let idx = s::KINDS.iter().find(|k| k.0 == api_version && k.1 == kind)?.2;
+    let Value::Object(fields) = v else { return None };
+    fields.iter().find_map(|(k, fv)| lookup(idx, k, 0).and_then(|f| type_field(fv, f, kind, k, 0)))
 }
 
 /// Unknown fields of a custom resource's `metadata` (the CRD schema never describes it).
@@ -205,6 +331,38 @@ mod tests {
         assert!(u.is_empty(), "{u:?}");
         let u = unk("apps/v1", "Deployment", r#"{"spec":{"selector":{"matchLabels":{"a":"b"}},"template":{"metadata":{"labels":{"a":"b"}},"spec":{"containers":[{"name":"c","bogus":1}]}}}}"#);
         assert_eq!(u, ["spec.template.spec.containers[0].bogus"]);
+    }
+
+    fn ty(api: &str, kind: &str, body: &str) -> Option<String> {
+        type_error(api, kind, &json::parse(body.as_bytes()).unwrap())
+    }
+
+    #[test]
+    fn type_errors() {
+        let e = ty("v1", "Pod", r#"{"spec":{"containers":"x"}}"#).unwrap();
+        assert!(e.contains("cannot unmarshal string into Go struct field Pod.spec.containers of type []object"), "{e}");
+        let e = ty("v1", "Pod", r#"{"spec":{"containers":[{"name":5}]}}"#).unwrap();
+        assert!(e.contains("number into Go struct field Pod.spec.containers.name of type string"), "{e}");
+        assert!(ty("v1", "Pod", r#"{"spec":{"containers":[{"name":"c","ports":[{"containerPort":4294967296}]}]}}"#).is_some());
+        assert!(ty("v1", "Pod", r#"{"spec":{"containers":[{"name":"c","ports":[{"containerPort":80}]}]}}"#).is_none());
+        assert!(ty("v1", "Pod", r#"{"metadata":{"labels":{"a":1}}}"#).is_some());
+        assert!(ty("v1", "Pod", r#"{"spec":{"hostNetwork":"yes"}}"#).is_some());
+    }
+
+    #[test]
+    fn type_special_forms() {
+        for t in ["80", r#""http""#] {
+            assert!(ty("v1", "Service", &format!(r#"{{"spec":{{"ports":[{{"port":1,"targetPort":{t}}}]}}}}"#)).is_none());
+        }
+        assert!(ty("v1", "Service", r#"{"spec":{"ports":[{"port":1,"targetPort":true}]}}"#).is_some());
+        assert!(ty("v1", "Pod", r#"{"spec":{"containers":[{"name":"c","resources":{"limits":{"cpu":1,"memory":"1Gi"}}}]}}"#).is_none());
+        assert!(ty("v1", "Pod", r#"{"metadata":{"creationTimestamp":"2020-01-01T00:00:00Z"}}"#).is_none());
+        assert!(ty("v1", "Pod", r#"{"metadata":{"creationTimestamp":5}}"#).is_some());
+    }
+
+    #[test]
+    fn type_null_and_unknown() {
+        assert!(ty("v1", "Pod", r#"{"metadata":null,"spec":{"containers":null,"hostNetwork":null,"nodeSelector":{"a":null},"bogus":[1]}}"#).is_none());
     }
 
     #[test]
