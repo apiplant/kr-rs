@@ -117,7 +117,7 @@ Mostly addressed (KNOWN_ISSUES #106); environmental: DaemonSet rollback needs 2 
 
 ## Admission webhooks and CRDs (15)
 
-Partly addressed (KNOWN_ISSUES #105); open: CRD conversion webhooks and CRs in a non-storage version.
+Addressed (KNOWN_ISSUES #105, #110); conversion of writes and watches in progress.
 
 - [sig-api-machinery] AdmissionWebhook should be able to deny attaching pod — `unexpected 'kubectl attach' error message. expected to contain "attaching to pod 'to-be-attached-pod' is not allowed", got "timed out waiting for command /usr/l…`
 - [sig-api-machinery] AdmissionWebhook should honor timeout — `expect an HTTP/dial timeout error querying the slow webhook, got: "Internal error occurred: failed calling webhook \"allow-configmap-with-delay-webhook.k8s.io\"…`
@@ -137,7 +137,7 @@ Partly addressed (KNOWN_ISSUES #105); open: CRD conversion webhooks and CRs in a
 
 ## Networking and DNS (14)
 
-Partly addressed (KNOWN_ISSUES #107); open: hostNetwork pods, status.hostIP, DNS for musl resolvers.
+Partly addressed (KNOWN_ISSUES #107, #108); open: DNS for musl resolvers.
 
 - [sig-network] API Server should have Endpoints and EndpointSlices pointing to API Server — `Expected at least 1 EndpointSlice, got 1: []v1.EndpointSubset{v1.EndpointSubset{Addresses:[]v1.EndpointAddress{v1.EndpointAddress{IP:"172.17.0.3", Hostname:"", …`
 - [sig-network] DNS should provide /etc/hosts entries for the cluster — `Unable to read musl_hosts@dns-querier-1.dns-test-service.dns-4467.svc.cluster.local from pod dns-4467/dns-test-a34286d9-09b4-46a9-87e5-0527c227b54a: client rate…`
@@ -193,7 +193,7 @@ Addressed (KNOWN_ISSUES #105); to be confirmed by the next run.
 
 ## kubectl (5)
 
-Log timestamps fixed (KNOWN_ISSUES #105); open: describe, attach denial message, Guestbook.
+Log timestamps, --since and the describe panic fixed (KNOWN_ISSUES #105, #111); Update Demo, Guestbook and attach denial not reproducible live.
 
 - [sig-cli] Kubectl client Guestbook application should create and stop a working application — `Frontend service did not start serving content in 600 seconds.`
 - [sig-cli] Kubectl client Kubectl describe should check if kubectl describe prints relevant information for rc and pods — `error running /usr/local/bin/kubectl --kubeconfig=/tmp/kubeconfig-2164501684 --namespace=kubectl-2997 describe service agnhost-primary:`

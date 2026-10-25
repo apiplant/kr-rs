@@ -408,3 +408,10 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **Type checking is synchronous:** `status.typeChecking` is computed when the policy is written instead of by a controller (upstream sets it shortly after). Clients poll for it, so being early is indistinguishable.
 - **Apply configurations** are merged with the strategic-merge code (list keys from the same tables) rather than structured-merge-diff; the results agree for the common cases (maps, keyed lists) and differ for atomic structs and sets.
 **Status:** accepted.
+
+## ADR-029: Pod Security admission built in
+- **What:** the upstream PodSecurity admission plugin, in `psa.rs`, evaluated in the API server's create/update path for pods (deny on `enforce`, warning on `warn`) and pod-template workloads (warnings only).
+- **Defaults:** unlabelled namespaces are `privileged`, as upstream ships; kr does not change the default so that existing manifests keep working, and clusters opt namespaces in with labels. An invalid level label is evaluated as `restricted` and rejected on namespace writes (fail closed).
+- **Scope:** the baseline and restricted checks of `latest` with upstream's wording (clients and e2e tests match on it). `-version` labels are accepted and ignored; no exemption configuration; `audit` is accepted but kr has no audit log.
+- **Why built in:** hostNetwork, privileged and hostPath pods are otherwise available to anyone who can create pods. kr's user-namespaced sandboxes reduce the blast radius, but namespaces need the same declarative guardrail upstream gives.
+**Status:** accepted.
