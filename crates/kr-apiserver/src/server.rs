@@ -2,6 +2,7 @@
 //! responses (watches become chunked streams), and runs the listener.
 
 use crate::api::{ApiServer, Reply, Req, User, WatchStream};
+use crate::cluster::forward;
 use crate::webhook::Run;
 use alloc::boxed::Box;
 use alloc::format;
@@ -30,7 +31,11 @@ impl ResponseStream for Watch {
 }
 
 pub async fn handle(api: &ApiServer, req: Request) -> Response {
-    let user = user_from_certs(req.peer.client_certs.as_deref());
+    // Another server forwarding a write for one of its clients (ADR-026).
+    let peer_cert = req.peer.client_certs.as_deref().and_then(|c| c.first()).map(|c| c.as_slice());
+    let forwarded = forward::trusted_identity(peer_cert, req.header(forward::IDENTITY));
+    let is_forwarded = forwarded.is_some();
+    let user = forwarded.or_else(|| user_from_certs(req.peer.client_certs.as_deref()));
     let r = Req {
         method: &req.method,
         path: req.path(),
@@ -43,6 +48,29 @@ pub async fn handle(api: &ApiServer, req: Request) -> Response {
         bearer: req.header("authorization").and_then(|a| a.strip_prefix("Bearer ").or_else(|| a.strip_prefix("bearer "))).map(str::trim),
         authz_verb: None,
     };
+    if let Some(c) = api.cluster().filter(|_| ApiServer::mutates(&r)) {
+        match c.route(5_000).await {
+            Ok(None) => {}
+            // Forward once; a forwarded request reaching a non-leader is refused (no loops).
+            Ok(Some(leader)) if !is_forwarded => {
+                let user = match api.authenticate(&r) {
+                    Ok(u) => u,
+                    Err(e) => return respond(Reply::err(e)),
+                };
+                return match c.forward(api, leader, &user, &req.method, r.path, r.query, &req.headers, &req.body).await {
+                    Some(f) => {
+                        let mut resp = Response::new(f.status, f.body).with_header("Content-Type", &f.content_type);
+                        for w in f.warnings {
+                            resp = resp.with_header("Warning", &w);
+                        }
+                        resp
+                    }
+                    None => respond(Reply::err(crate::api::not_leader(Some(leader)))),
+                };
+            }
+            Ok(l) | Err(l) => return respond(Reply::err(crate::api::not_leader(l))),
+        }
+    }
     let before = api.revision();
     let (res, warnings) = crate::webhook::run(api, &r).await;
     let rewritten;
@@ -66,6 +94,9 @@ pub async fn handle(api: &ApiServer, req: Request) -> Response {
         return respond(Reply::err(crate::object::ApiError::new(500, "InternalError", "storage sync failed")));
     }
     let mut resp = respond(reply);
+    if is_forwarded {
+        resp = resp.with_header(forward::REVISION, &format!("{}", api.revision()));
+    }
     for w in warnings {
         resp = resp.with_header("Warning", &format!("299 - \"{}\"", w.replace('\\', "\\\\").replace('"', "\\\"").replace(['\n', '\r'], " ")));
     }
@@ -103,6 +134,11 @@ pub async fn run(api: Rc<ApiServer>, addr: [u8; 4], port: u16, tls: Rc<kr_crypto
         }
     });
     let listener = server::listen(addr, port, 512)?;
+    serve(api, listener, tls).await
+}
+
+/// Serves the API on an already bound listener (no background flushing; see [`run`]).
+pub async fn serve(api: Rc<ApiServer>, listener: kr_rt::exec::Async<kr_sys::Fd>, tls: Rc<kr_crypto::tls::ServerConfig>) -> kr_net::Result<()> {
     let cfg = Rc::new(ServerConfig { tls: Some(tls), idle_timeout_ms: 300_000, ..ServerConfig::default() });
     let handler = move |req: Request| -> HandlerFuture {
         let api = api.clone();

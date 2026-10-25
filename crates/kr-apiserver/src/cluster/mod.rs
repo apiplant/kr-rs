@@ -12,6 +12,7 @@
 //! A leader that steps down with uncommitted writes rebuilds its store from the snapshot plus
 //! the committed log; writes that did replicate are applied again when they commit.
 
+pub mod forward;
 pub mod transport;
 
 use crate::api::ApiServer;
@@ -90,6 +91,10 @@ pub struct Cluster {
     was_ready: Cell<bool>,
     /// Bumped on every leadership change (leader-only components restart on it).
     pub epoch: Cell<u64>,
+    /// HTTP client for forwarding writes to the leader (created on first use).
+    /// This server's own address, registered under [`SERVERS_PREFIX`] when it leads.
+    self_addr: RefCell<Option<ServerAddr>>,
+    forwarder: RefCell<Option<Rc<kr_net::http1::client::Client<kr_net::tls::TlsConnector>>>>,
 }
 
 impl Cluster {
@@ -118,6 +123,8 @@ impl Cluster {
             was_leader: Cell::new(false),
             was_ready: Cell::new(false),
             epoch: Cell::new(0),
+            self_addr: RefCell::new(None),
+            forwarder: RefCell::new(None),
         };
         api.store.borrow_mut().set_visible(c.committed_rev.get());
         Ok(Rc::new(c))
@@ -206,6 +213,44 @@ impl Cluster {
         .await
     }
 
+    /// Resolves once this server has applied store revision `rev` (any role).
+    pub async fn wait_applied(&self, rev: u64) {
+        poll_fn(|cx| {
+            if self.committed_rev.get() >= rev {
+                return Poll::Ready(());
+            }
+            self.waiters.borrow_mut().push(cx.waker().clone());
+            Poll::Pending
+        })
+        .await
+    }
+
+    /// Where a write should go: `Ok(None)` = handle it here (ready leader), `Ok(Some(id))` =
+    /// forward to leader `id`. Waits up to `max_ms` through an election; `Err` = no leader.
+    pub async fn route(&self, max_ms: u64) -> Result<Option<NodeId>, Option<NodeId>> {
+        let deadline = kr_rt::exec::now_ms() + max_ms;
+        loop {
+            if self.ready() {
+                return Ok(None);
+            }
+            match self.leader() {
+                Some(l) if l != self.id => return Ok(Some(l)),
+                l => {
+                    if kr_rt::exec::now_ms() >= deadline {
+                        return Err(l);
+                    }
+                }
+            }
+            kr_rt::exec::sleep(50).await;
+        }
+    }
+
+    /// A server's address: the replicated `/kr/servers/<id>` entry, else the seed.
+    pub fn addr_of(&self, api: &ApiServer, id: NodeId) -> Option<ServerAddr> {
+        let stored = api.store.borrow().get(&alloc::format!("{SERVERS_PREFIX}{id}")).and_then(|kv| ServerAddr::from_json(&kv.value));
+        stored.or_else(|| self.seeds.borrow().get(&id).cloned())
+    }
+
     fn lost_index(&self, index: u64) -> bool {
         self.lost.borrow().contains(&index)
     }
@@ -220,6 +265,32 @@ impl Cluster {
     pub fn add_seed(&self, id: NodeId, addr: ServerAddr) {
         self.seeds.borrow_mut().insert(id, addr);
         self.inbox.notify.notify();
+    }
+
+    pub fn set_self_addr(&self, addr: ServerAddr) {
+        *self.self_addr.borrow_mut() = Some(addr);
+    }
+
+    /// Addresses of all servers known to the replicated store.
+    pub fn servers(&self, api: &ApiServer) -> Vec<(NodeId, ServerAddr)> {
+        let (kvs, _) = api.store.borrow().list(SERVERS_PREFIX, None, 1000);
+        kvs.iter().filter_map(|kv| Some((kv.key.strip_prefix(SERVERS_PREFIX)?.parse().ok()?, ServerAddr::from_json(&kv.value)?))).collect()
+    }
+
+    /// Ready leader: make sure the store has this server's current address.
+    fn register_self(&self, api: &ApiServer) {
+        let Some(me) = self.self_addr.borrow().clone() else { return };
+        let key = alloc::format!("{SERVERS_PREFIX}{}", self.id);
+        let mut store = api.store.borrow_mut();
+        match store.get(&key) {
+            Some(kv) if ServerAddr::from_json(&kv.value).as_ref() == Some(&me) => {}
+            Some(_) => {
+                let _ = store.update(&key, me.to_json().into_bytes(), None);
+            }
+            None => {
+                let _ = store.create(&key, me.to_json().into_bytes());
+            }
+        }
     }
 
     /// Updates the outbound links from the current voters and their stored addresses.
@@ -396,6 +467,7 @@ impl Cluster {
         let ready = self.ready();
         if ready && !self.was_ready.get() {
             self.was_ready.set(true);
+            self.register_self(api);
             api.bootstrap_all();
             self.inbox.notify.notify(); // propose the bootstrap records
         }
@@ -443,6 +515,22 @@ impl Cluster {
         let _ = store.take_records();
         drop(store);
         api.reload_crds();
+    }
+
+    /// Runs `start()` while this server is the ready leader and aborts it when leadership is
+    /// lost (controllers and the scheduler: exactly one copy runs in the cluster).
+    pub async fn while_leader<F: core::future::Future<Output = ()> + 'static>(self: Rc<Self>, start: impl Fn() -> F) {
+        loop {
+            while !self.ready() {
+                kr_rt::exec::sleep(200).await;
+            }
+            let epoch = self.epoch.get();
+            let task = kr_rt::exec::spawn(start());
+            while self.epoch.get() == epoch && self.is_leader() {
+                kr_rt::exec::sleep(200).await;
+            }
+            task.abort();
+        }
     }
 
     /// Hands leadership to another voter (graceful shutdown or removal).

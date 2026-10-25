@@ -3,6 +3,7 @@
 //! watches on followers, and failover after the leader dies.
 
 use kr_apiserver::api::{ApiServer, Reply, Req, User};
+use kr_apiserver::client::{Client, InProcess};
 use kr_apiserver::cluster::{transport, Cluster, ServerAddr};
 use kr_crypto::tls::{ClientAuth, ClientConfig, ServerConfig};
 use kr_crypto::x509::{self, CertParams, Name, SigningKey};
@@ -101,12 +102,17 @@ fn three_servers_replicate_and_fail_over() {
         let _ = std::fs::remove_dir_all(&base);
         let ids = [1u64, 2, 3];
         let mut listeners = Vec::new();
+        let mut api_listeners = Vec::new();
         for _ in ids {
             let l = listen([127, 0, 0, 1], 0, 16).unwrap();
             let port = local_addr(&l).unwrap().1;
             listeners.push((l, port));
+            let a = listen([127, 0, 0, 1], 0, 16).unwrap();
+            let port = local_addr(&a).unwrap().1;
+            api_listeners.push(Some((a, port)));
         }
         let ports: Vec<u16> = listeners.iter().map(|x| x.1).collect();
+        let api_ports: Vec<u16> = api_listeners.iter().map(|x| x.as_ref().unwrap().1).collect();
         let mut srvs = Vec::new();
         for (i, (l, _)) in listeners.into_iter().enumerate() {
             let id = ids[i];
@@ -120,13 +126,19 @@ fn three_servers_replicate_and_fail_over() {
             let cluster = Cluster::open(&api, id, dir.to_str().unwrap(), ids.to_vec(), cli_tls, id * 7919).unwrap();
             for (j, other) in ids.iter().enumerate() {
                 if *other != id {
-                    cluster.add_seed(*other, ServerAddr { ip: [127, 0, 0, 1], raft_port: ports[j], api_port: 0 });
+                    cluster.add_seed(*other, ServerAddr { ip: [127, 0, 0, 1], raft_port: ports[j], api_port: api_ports[j] });
                 }
             }
             api.set_cluster(cluster.clone());
+            let api_tls = Rc::new(ServerConfig { cert_chain: srv_tls.cert_chain.clone(), key: key(10 + id as u8), client_auth: ClientAuth::Optional(vec![ca.clone()]), alpn: vec![b"http/1.1".to_vec()] });
             let t1 = spawn(transport::serve(l, srv_tls, id, cluster.inbox.clone()));
             let t2 = spawn(cluster.clone().run(api.clone()));
-            srvs.push(Srv { id, api, cluster, tasks: vec![t1, t2] });
+            let (al, _) = api_listeners[i].take().unwrap();
+            let a2 = api.clone();
+            let t3 = spawn(async move {
+                let _ = kr_apiserver::server::serve(a2, al, api_tls).await;
+            });
+            srvs.push(Srv { id, api, cluster, tasks: vec![t1, t2, t3] });
         }
         let leader = |srvs: &[Srv]| srvs.iter().position(|s| s.cluster.is_leader());
         let mut l = None;
@@ -161,6 +173,22 @@ fn three_servers_replicate_and_fail_over() {
         assert_eq!(code, 503, "{v:?}");
         assert!(get(&srvs[fi], "/api/v1/namespaces/default/configmaps/b").0 == 404);
 
+        // An in-process client on the follower (its kubelet) forwards the write to the leader
+        // over HTTPS with its server certificate, and then reads its own write locally.
+        let ip = InProcess::new(srvs[fi].api.clone(), "kubelet");
+        let obj = json::parse(br#"{"metadata":{"name":"fwd"},"data":{"x":"1"}}"#).unwrap();
+        let created = ip.create("/api/v1/namespaces/default/configmaps", &obj).await.expect("forwarded create");
+        let fwd_rv = rv(&created);
+        let (c, v) = get(&srvs[fi], "/api/v1/namespaces/default/configmaps/fwd");
+        assert_eq!(c, 200, "follower reads its forwarded write");
+        assert_eq!(rv(&v), fwd_rv);
+        assert_eq!(get(&srvs[li], "/api/v1/namespaces/default/configmaps/fwd").0, 200);
+        // The forwarded identity is the original user's: an unprivileged identity is refused
+        // by the leader's RBAC, not waved through as the follower server.
+        let nobody = InProcess::with_user(srvs[fi].api.clone(), User { name: "nobody".into(), groups: vec!["system:authenticated".into()] });
+        let e = nobody.create("/api/v1/namespaces/default/configmaps", &obj).await.unwrap_err();
+        assert_eq!(e.code, 403, "{e:?}");
+
         // The leader dies: the other two elect a new leader and keep accepting writes.
         let dead = srvs[li].id;
         for t in &srvs[li].tasks {
@@ -185,13 +213,12 @@ fn three_servers_replicate_and_fail_over() {
 
         // The dead server restarts from its own disk (same port), recovers its log and catches
         // up on the write it missed.
-        let (l, port) = loop {
+        let (l, _port) = loop {
             if let Ok(l) = listen([127, 0, 0, 1], ports[li], 16) {
                 break (l, ports[li]);
             }
             sleep(50).await;
         };
-        let _ = port;
         let k = key(10 + dead as u8);
         let subject = Name { common_name: transport::cert_cn(dead), organizations: vec![transport::ORG.into()] };
         let c = issue(&subject, 10 + dead as u8, &k, false, (&ca_name, &ca_key));

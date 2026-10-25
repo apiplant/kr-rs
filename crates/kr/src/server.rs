@@ -132,8 +132,43 @@ fn rng(b: &mut [u8]) {
     kr_sys::getrandom(b)
 }
 
+/// HA mode (ADR-026): this server's Raft id (`server-id`, created once) and its
+/// `system:kr-server:<id>` certificate (`pki/server.pem`), used for the Raft transport and for
+/// forwarding writes to the leader.
+fn server_identity(data: &str, advertise: [u8; 4]) -> Result<u64, String> {
+    let id_path = pki::path(data, "server-id");
+    let id = match fs::read_file(&id_path, 64).ok().and_then(|b| String::from_utf8(b).ok()).and_then(|s| s.trim().parse::<u64>().ok()) {
+        Some(id) => id,
+        None => {
+            let mut b = [0u8; 8];
+            kr_sys::getrandom(&mut b);
+            // Ids are small positive numbers in logs and certificate names.
+            let id = (u64::from_le_bytes(b) % 1_000_000_000).max(1);
+            pki::write_new(&id_path, format!("{id}\n").as_bytes(), 0o600)?;
+            id
+        }
+    };
+    let pki_dir = format!("{data}/pki");
+    if !exists(&pki::path(&pki_dir, "server.pem")) {
+        let ca = pki::load_ca(&pki_dir)?;
+        let name = Name { common_name: kr_apiserver::cluster::transport::cert_cn(id), organizations: alloc::vec![kr_apiserver::cluster::transport::ORG.into()] };
+        issue(&pki_dir, "server", &ca, name, true, true, Vec::new(), alloc::vec![alloc::vec![127, 0, 0, 1], advertise.to_vec()])?;
+    }
+    Ok(id)
+}
+
+/// TLS configurations for the Raft listener and for outbound server-to-server connections.
+fn server_tls(pki_dir: &str) -> Result<(Rc<ServerConfig>, Rc<kr_crypto::tls::ClientConfig>), String> {
+    let chain = load_pem(pki_dir, "server.pem", "CERTIFICATE")?;
+    let key = || -> Result<x509::SigningKey, String> { x509::private_key_from_pkcs8(&load_pem(pki_dir, "server.key", "PRIVATE KEY")?.pop().ok_or("server.key empty")?).map_err(|_| "server.key unsupported".into()) };
+    let ca = load_pem(pki_dir, "ca.pem", "CERTIFICATE")?;
+    let srv = Rc::new(ServerConfig { cert_chain: chain.clone(), key: key()?, client_auth: ClientAuth::Required(ca.clone()), alpn: Vec::new() });
+    let cli = Rc::new(kr_crypto::tls::ClientConfig { roots: ca, pinned_ca: None, client_cert: Some((chain, key()?)), alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
+    Ok((srv, cli))
+}
+
 pub fn main(mut args: Args) -> i32 {
-    let (mut port, mut data) = (6443u16, None);
+    let (mut port, mut data, mut cluster_init) = (6443u16, None, false);
     while let Some(a) = args.next() {
         let v = args.next().and_then(|v| core::str::from_utf8(v).ok());
         match (a, v) {
@@ -142,7 +177,13 @@ pub fn main(mut args: Args) -> i32 {
                 Err(_) => return fail("bad --port"),
             },
             (b"--data", Some(d)) => data = Some(String::from(d)),
-            _ => return fail("usage: kr server [--port 6443] [--data DIR]"),
+            (b"--cluster-init", v) => {
+                cluster_init = true;
+                if let Some(v) = v {
+                    return fail(&format!("unexpected argument {v}"));
+                }
+            }
+            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init]"),
         }
     }
     let data = data.unwrap_or_else(data_dir);
@@ -150,6 +191,16 @@ pub fn main(mut args: Args) -> i32 {
         return fail(&e);
     }
     let pki_dir = format!("{data}/pki");
+    // The address pods, agents and other servers use to reach this API server.
+    let advertise = kr_sys::ns::route_source([1, 1, 1, 1]).unwrap_or([127, 0, 0, 1]);
+    // HA once initialised (the Raft directory exists), or when asked to start a cluster.
+    let raft_dir = format!("{data}/raft");
+    let raft_fresh = !exists(&pki::path(&raft_dir, "hardstate")) && !exists(&pki::path(&raft_dir, "log"));
+    let ha = cluster_init || !raft_fresh;
+    if ha && raft_fresh && exists(&pki::path(&format!("{data}/db"), "log")) {
+        // TODO(kr-raft): import the single-server store as the initial Raft snapshot.
+        return fail("this server already has a single-server datastore; converting it to HA is not supported yet");
+    }
     let setup = || -> Result<(Rc<ServerConfig>, kr_store::Store), String> {
         // The CA travels in the chain so joining agents can pin it by hash.
         let mut chain = load_pem(&pki_dir, "apiserver.pem", "CERTIFICATE")?;
@@ -158,7 +209,11 @@ pub fn main(mut args: Args) -> i32 {
         let key = x509::private_key_from_pkcs8(&key_der).map_err(|_| "apiserver.key unsupported")?;
         let ca = load_pem(&pki_dir, "ca.pem", "CERTIFICATE")?;
         let tls = Rc::new(ServerConfig { cert_chain: chain, key, client_auth: ClientAuth::Optional(ca), alpn: alloc::vec![b"http/1.1".to_vec()] });
-        let store = kr_store::Store::open(&format!("{data}/db")).map_err(|_| String::from("cannot open the datastore"))?;
+        let store = if ha {
+            kr_store::Store::replicated()
+        } else {
+            kr_store::Store::open(&format!("{data}/db")).map_err(|_| String::from("cannot open the datastore"))?
+        };
         Ok((tls, store))
     };
     let (tls, store) = match setup() {
@@ -169,6 +224,31 @@ pub fn main(mut args: Args) -> i32 {
         Ok(a) => Rc::new(a),
         Err(e) => return fail(&e.message),
     };
+    // HA: the Raft driver must be attached before any bootstrap write (only a ready leader
+    // writes; everything else arrives through the log).
+    let mut ha_tasks = None;
+    if ha {
+        let r = (|| -> Result<_, String> {
+            let id = server_identity(&data, advertise)?;
+            let (srv_tls, cli_tls) = server_tls(&pki_dir)?;
+            mkdir_p(&raft_dir)?;
+            let voters = if raft_fresh { alloc::vec![id] } else { Vec::new() };
+            let mut seed = [0u8; 8];
+            kr_sys::getrandom(&mut seed);
+            let c = kr_apiserver::cluster::Cluster::open(&api, id, &raft_dir, voters, cli_tls, u64::from_le_bytes(seed))?;
+            c.set_self_addr(kr_apiserver::cluster::ServerAddr { ip: advertise, raft_port: kr_apiserver::cluster::transport::PORT, api_port: port });
+            api.set_cluster(c.clone());
+            let l = kr_net::http1::server::listen([0, 0, 0, 0], kr_apiserver::cluster::transport::PORT, 64).map_err(|_| format!("cannot listen on :{}", kr_apiserver::cluster::transport::PORT))?;
+            Ok((c, l, srv_tls, id))
+        })();
+        match r {
+            Ok((c, l, srv_tls, id)) => {
+                print(format!("kr server: HA server {id}, raft on :{}\n", kr_apiserver::cluster::transport::PORT).as_bytes());
+                ha_tasks = Some((c, l, srv_tls, id));
+            }
+            Err(e) => return fail(&e),
+        }
+    }
     let sa_setup = || -> Result<(), String> {
         let der = load_pem(&pki_dir, "sa.key", "PRIVATE KEY")?.pop().ok_or("sa.key empty")?;
         let x509::SigningKey::P256(key) = x509::private_key_from_pkcs8(&der).map_err(|_| "sa.key unsupported")? else {
@@ -196,8 +276,6 @@ pub fn main(mut args: Args) -> i32 {
     if let Err(e) = join_setup() {
         return fail(&e);
     }
-    // The address pods and agents use to reach this API server.
-    let advertise = kr_sys::ns::route_source([1, 1, 1, 1]).unwrap_or([127, 0, 0, 1]);
     if let Err(e) = api.ensure_builtin_services(advertise, port) {
         return fail(&e.message);
     }
@@ -224,7 +302,17 @@ pub fn main(mut args: Args) -> i32 {
     let api_for_proxy = api.clone();
     match kr_rt::exec::block_on(async move {
         let cfg = kr_controllers::Config { now: pki::now, ..kr_controllers::Config::default() };
-        kr_rt::exec::spawn(kr_controllers::run_all_with(controllers, cfg));
+        match ha_tasks {
+            Some((c, l, srv_tls, id)) => {
+                kr_rt::exec::spawn(kr_apiserver::cluster::transport::serve(l, srv_tls, id, c.inbox.clone()));
+                kr_rt::exec::spawn(c.clone().run(api.clone()));
+                // Exactly one copy of the controllers and the scheduler: on the leader.
+                kr_rt::exec::spawn(c.while_leader(move || kr_controllers::run_all_with(controllers.clone(), cfg)));
+            }
+            None => {
+                kr_rt::exec::spawn(kr_controllers::run_all_with(controllers, cfg));
+            }
+        }
         let local: Option<Rc<dyn kr_apiserver::api::NodeProxy>> = kubelet.as_ref().map(|k| Rc::new(kr_kubelet::stream::Proxy(k.clone())) as Rc<dyn kr_apiserver::api::NodeProxy>);
         api_for_proxy.set_node_proxy(Rc::new(kr_kubelet::remote::Router { local_node: local_node.clone(), local, tls: kubelet_client.clone() }));
         if let Some(k) = kubelet {

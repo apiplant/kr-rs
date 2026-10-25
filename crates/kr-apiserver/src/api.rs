@@ -647,7 +647,7 @@ impl ApiServer {
 
     /// Whether `req` may change the store (forwarded to the leader in HA mode). Review APIs,
     /// streaming subresources and dry runs only read.
-    fn mutates(req: &Req) -> bool {
+    pub(crate) fn mutates(req: &Req) -> bool {
         if !matches!(req.method, "POST" | "PUT" | "PATCH" | "DELETE") {
             return false;
         }
@@ -1845,10 +1845,17 @@ impl ApiServer {
         }
         let svc = resources::find("", "v1", "services").unwrap();
         let ep = resources::find("", "v1", "endpoints").unwrap();
-        let ip = alloc::format!("{}.{}.{}.{}", advertise[0], advertise[1], advertise[2], advertise[3]);
+        // HA: every server is an endpoint of the kubernetes Service.
+        let mut addrs: Vec<([u8; 4], u16)> = self.cluster().map(|c| c.servers(self)).unwrap_or_default().into_iter().map(|(_, a)| (a.ip, a.api_port)).collect();
+        if addrs.is_empty() {
+            addrs.push((advertise, port));
+        }
+        let port = addrs[0].1;
+        let ips: Vec<String> = addrs.iter().map(|(a, _)| alloc::format!(r#"{{"ip":"{}.{}.{}.{}"}}"#, a[0], a[1], a[2], a[3])).collect();
+        let ips = ips.join(",");
         self.bootstrap_object(svc, Some("default"), "kubernetes", "Service", r#"{"metadata":{"name":"kubernetes","labels":{"component":"apiserver","provider":"kubernetes"}},"spec":{"type":"ClusterIP","clusterIP":"10.96.0.1","clusterIPs":["10.96.0.1"],"ipFamilies":["IPv4"],"ipFamilyPolicy":"SingleStack","sessionAffinity":"None","internalTrafficPolicy":"Cluster","ports":[{"name":"https","port":443,"protocol":"TCP","targetPort":6443}]}}"#);
         // The endpoints follow the API server's current address (re-written on every start).
-        let body = alloc::format!(r#"{{"metadata":{{"name":"kubernetes","labels":{{"endpointslice.kubernetes.io/skip-mirror":"true"}}}},"subsets":[{{"addresses":[{{"ip":"{ip}"}}],"ports":[{{"name":"https","port":{port},"protocol":"TCP"}}]}}]}}"#);
+        let body = alloc::format!(r#"{{"metadata":{{"name":"kubernetes","labels":{{"endpointslice.kubernetes.io/skip-mirror":"true"}}}},"subsets":[{{"addresses":[{ips}],"ports":[{{"name":"https","port":{port},"protocol":"TCP"}}]}}]}}"#);
         let key = ep.key(Some("default"), "kubernetes");
         let _ = self.store.borrow_mut().delete(&key, None);
         self.bootstrap_object(ep, Some("default"), "kubernetes", "Endpoints", &body);

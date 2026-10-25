@@ -93,7 +93,12 @@ impl InProcess {
         InProcess { api, user: User { name: alloc::format!("system:kr:{component}"), groups: alloc::vec![String::from("system:masters")] } }
     }
 
-    fn call(&self, method: &str, path: &str, query: &str, ct: Option<&str>, body: &[u8]) -> Result<Value> {
+    /// A client acting as `user` (tests; components use [`InProcess::new`]).
+    pub fn with_user(api: Rc<ApiServer>, user: User) -> InProcess {
+        InProcess { api, user }
+    }
+
+    async fn call(&self, method: &str, path: &str, query: &str, ct: Option<&str>, body: &[u8]) -> Result<Value> {
         // Allow "path?query" for convenience (e.g. delete with gracePeriodSeconds).
         let (path, query) = match path.split_once('?') {
             Some((p, q)) if query.is_empty() => (p, q),
@@ -107,7 +112,25 @@ impl InProcess {
             &q2
         };
         let req = Req { method, path, query, content_type: ct, accept: Some("application/json"), body, user: Some(self.user.clone()), bearer: None, headers: &[], authz_verb: None };
-        match self.api.handle(&req) {
+        let reply = match self.api.cluster().filter(|_| ApiServer::mutates(&req)) {
+            // HA follower: the leader makes the change (ADR-026).
+            Some(c) => match c.route(5_000).await {
+                Ok(None) => self.api.handle(&req),
+                Ok(Some(leader)) => {
+                    let mut headers = alloc::vec![(String::from("Accept"), String::from("application/json"))];
+                    if let Some(ct) = ct {
+                        headers.push((String::from("Content-Type"), String::from(ct)));
+                    }
+                    match c.forward(&self.api, leader, &self.user, method, path, query, &headers, body).await {
+                        Some(f) => Reply::Json(f.status, String::from_utf8(f.body).unwrap_or_default()),
+                        None => Reply::err(crate::api::not_leader(Some(leader))),
+                    }
+                }
+                Err(l) => Reply::err(crate::api::not_leader(l)),
+            },
+            None => self.api.handle(&req),
+        };
+        match reply {
             Reply::Json(code, s) => {
                 let v = json::parse(s.as_bytes()).unwrap_or(Value::Null);
                 if code < 300 {
@@ -131,22 +154,22 @@ impl InProcess {
 
 impl Client for InProcess {
     async fn get(&self, path: &str) -> Result<Value> {
-        self.call("GET", path, "", None, b"")
+        self.call("GET", path, "", None, b"").await
     }
     async fn list(&self, path: &str, query: &str) -> Result<Value> {
-        self.call("GET", path, query, None, b"")
+        self.call("GET", path, query, None, b"").await
     }
     async fn create(&self, path: &str, obj: &Value) -> Result<Value> {
-        self.call("POST", path, "", Some("application/json"), json::to_string(obj).as_bytes())
+        self.call("POST", path, "", Some("application/json"), json::to_string(obj).as_bytes()).await
     }
     async fn update(&self, path: &str, obj: &Value) -> Result<Value> {
-        self.call("PUT", path, "", Some("application/json"), json::to_string(obj).as_bytes())
+        self.call("PUT", path, "", Some("application/json"), json::to_string(obj).as_bytes()).await
     }
     async fn patch(&self, path: &str, content_type: &str, patch: &Value) -> Result<Value> {
-        self.call("PATCH", path, "", Some(content_type), json::to_string(patch).as_bytes())
+        self.call("PATCH", path, "", Some(content_type), json::to_string(patch).as_bytes()).await
     }
     async fn delete(&self, path: &str) -> Result<Value> {
-        self.call("DELETE", path, "", None, b"")
+        self.call("DELETE", path, "", None, b"").await
     }
     async fn watch(&self, path: &str, query: &str) -> Result<Watch> {
         let q = if query.is_empty() { String::from("watch=1") } else { alloc::format!("{query}&watch=1") };
