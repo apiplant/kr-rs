@@ -36,4 +36,5 @@ pub mod resources;
 pub mod server;
 pub mod tokens;
 pub(crate) mod policy;
+pub mod psa;
 pub mod webhook;

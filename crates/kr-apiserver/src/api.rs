@@ -727,7 +727,7 @@ impl ApiServer {
     }
 
     /// Like [`Self::handle`], with the `fieldValidation` warnings returned apart from the reply.
-    pub(crate) fn handle_w(&self, req: &Req) -> (Reply, Vec<String>) {
+    pub fn handle_w(&self, req: &Req) -> (Reply, Vec<String>) {
         let write = matches!(req.method, "POST" | "PUT" | "PATCH");
         let mode = if write { crate::fieldval::Mode::parse(Query::parse(req.query).ok().as_ref().and_then(|q| q.get("fieldValidation"))) } else { crate::fieldval::Mode::Ignore };
         self.fv_mode.set(mode);
@@ -1597,6 +1597,7 @@ impl ApiServer {
             self.admit_priority(o, &ns)?;
             self.admit_pod_classes(o, &ns)?;
         }
+        self.admit_pod_security(rt, o, None)?;
         if rt.res.plural == "jobs" {
             admit_job(o, &name)?;
         }
@@ -1700,6 +1701,9 @@ impl ApiServer {
                     return Err(ApiError::invalid(alloc::format!("PriorityClass.scheduling.k8s.io \"{name}\" is invalid: {f}: Forbidden: may not be changed in an update.")));
                 }
             }
+        }
+        if !status {
+            self.admit_pod_security(rt, &new, Some(&old))?;
         }
         if rt.res.plural == "services" && !status {
             self.admit_service(&mut new, Some(&old))?;
@@ -2453,6 +2457,41 @@ impl ApiServer {
             }
         }
         Ok(())
+    }
+
+    /// Pod Security admission (`psa.rs`): pods are checked against their namespace's `enforce`
+    /// and `warn` levels (on update only when the spec changed, as upstream), workload pod
+    /// templates only warn, and namespaces must carry valid level labels.
+    fn admit_pod_security(&self, rt: &Route, o: &Value, old: Option<&Value>) -> R<()> {
+        let name = o.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("");
+        if rt.res.group.is_empty() && rt.res.plural == "namespaces" {
+            return crate::psa::validate_namespace(o).map_err(|e| ApiError::invalid(alloc::format!("Namespace {name:?} is invalid: {e}")));
+        }
+        let ns = rt.namespace.as_deref().unwrap_or("");
+        let pod = rt.res.group.is_empty() && rt.res.plural == "pods";
+        let tpath = if pod { None } else { crate::psa::template_path(rt.res.group, rt.res.plural) };
+        let (spec, meta) = match (pod, tpath) {
+            (true, _) => (o.get("spec"), o.get("metadata")),
+            (false, Some(p)) => {
+                let t = o.pointer(p);
+                (t.and_then(|t| t.get("spec")), t.and_then(|t| t.get("metadata")))
+            }
+            _ => return Ok(()),
+        };
+        let Some(spec) = spec else { return Ok(()) };
+        if let Some(old) = old {
+            let old_spec = if pod { old.get("spec") } else { tpath.and_then(|p| old.pointer(p)).and_then(|t| t.get("spec")) };
+            if object::same_json(&old_spec, &Some(spec)) {
+                return Ok(());
+            }
+        }
+        let nsobj = self.wh_object("", "v1", "namespaces", None, ns);
+        let d = crate::psa::check(nsobj.as_ref(), spec, meta.unwrap_or(&Value::Null), !pod);
+        self.warnings.borrow_mut().extend(d.warnings);
+        match d.deny {
+            Some(msg) => Err(ApiError::new(403, "Forbidden", alloc::format!("pods {name:?} is forbidden: {msg}"))),
+            None => Ok(()),
+        }
     }
 
     /// Whether a ResourceQuota in `ns` has a `PriorityClass In [..class..]` scope selector.
