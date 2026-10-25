@@ -3,6 +3,8 @@
 //!
 //! * **Protection**: every PVC carries the finalizer `kubernetes.io/pvc-protection`; a deleted
 //!   PVC loses it only when no non-terminal pod uses it.
+//! * **PV protection**: every PV carries `kubernetes.io/pv-protection`; a deleted PV loses it
+//!   unless it is `Bound` to a claim that still exists.
 //! * **Static binding**: an unbound PVC takes the smallest Available PV with the same
 //!   `storageClassName`, enough capacity, a superset of its access modes and no other claim (or a
 //!   `claimRef` naming this PVC).
@@ -24,6 +26,7 @@ use kr_fmt::quantity::Quantity;
 
 pub const PROVISIONER: &str = "kr.io/local-path";
 pub const PROTECTION: &str = "kubernetes.io/pvc-protection";
+const PV_PROTECTION: &str = "kubernetes.io/pv-protection";
 const PVS: &str = "/api/v1/persistentvolumes";
 const CLASSES: &str = "/apis/storage.k8s.io/v1/storageclasses";
 
@@ -88,16 +91,16 @@ async fn sync<C: Client>(c: &C) -> Result<()> {
     Ok(())
 }
 
-async fn set_finalizer<C: Client>(c: &C, path: &str, want: bool) -> Result<()> {
+async fn set_finalizer<C: Client>(c: &C, path: &str, fin_name: &str, want: bool) -> Result<()> {
     retry_conflict(|| async {
         let Some(mut o) = get_opt(c, path).await? else { return Ok(()) };
         let fin: Vec<Value> = o.pointer(&["metadata", "finalizers"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
-        if fin.iter().any(|f| f.as_str() == Some(PROTECTION)) == want {
+        if fin.iter().any(|f| f.as_str() == Some(fin_name)) == want {
             return Ok(());
         }
-        let mut fin: Vec<Value> = fin.into_iter().filter(|f| f.as_str() != Some(PROTECTION)).collect();
+        let mut fin: Vec<Value> = fin.into_iter().filter(|f| f.as_str() != Some(fin_name)).collect();
         if want {
-            fin.push(Value::from(PROTECTION));
+            fin.push(Value::from(fin_name));
         }
         o.entry_object("metadata").set("finalizers", Value::Array(fin));
         c.update(path, &o).await.map(|_| ())
@@ -121,13 +124,13 @@ async fn sync_pvc<C: Client>(c: &C, pvc: &Value, pod_list: &[Value], vols: &mut 
     let users: Vec<&Value> = pod_list.iter().filter(|p| !pod_terminal(p) && uses(p, ns, nm)).collect();
     if deleting(pvc) {
         if users.is_empty() {
-            set_finalizer(c, &path, false).await?;
+            set_finalizer(c, &path, PROTECTION, false).await?;
         }
         return Ok(());
     }
     let has_fin = pvc.pointer(&["metadata", "finalizers"]).and_then(Value::as_array).is_some_and(|a| a.iter().any(|f| f.as_str() == Some(PROTECTION)));
     if !has_fin {
-        set_finalizer(c, &path, true).await?;
+        set_finalizer(c, &path, PROTECTION, true).await?;
     }
     let bound = str_at(pvc, &["spec", "volumeName"]);
     if !bound.is_empty() {
@@ -243,11 +246,18 @@ async fn mark_bound<C: Client>(c: &C, pvc_path: &str, pv: &Value) -> Result<()> 
 }
 
 async fn sync_pv<C: Client>(c: &C, pv: &Value, claims: &[Value]) -> Result<()> {
-    if deleting(pv) {
-        return Ok(());
-    }
     let path = alloc::format!("{PVS}/{}", name(pv));
     let phase = str_at(pv, &["status", "phase"]);
+    if deleting(pv) {
+        if phase != "Bound" || !claims.iter().any(|p| claim_matches(pv, p)) {
+            set_finalizer(c, &path, PV_PROTECTION, false).await?;
+        }
+        return Ok(());
+    }
+    let has_fin = pv.pointer(&["metadata", "finalizers"]).and_then(Value::as_array).is_some_and(|a| a.iter().any(|f| f.as_str() == Some(PV_PROTECTION)));
+    if !has_fin {
+        set_finalizer(c, &path, PV_PROTECTION, true).await?;
+    }
     if str_at(pv, &["spec", "claimRef", "name"]).is_empty() {
         // New PVs start Pending (API defaulting); unclaimed ones become Available.
         if phase.is_empty() || phase == "Pending" {

@@ -72,8 +72,14 @@ fn sts(replicas: u32, image: &str, extra: &str) -> Value {
     v(&alloc::format!(
         r#"{{"metadata":{{"name":"web"}},"spec":{{"replicas":{replicas},"serviceName":"web"{extra},"selector":{{"matchLabels":{{"app":"web"}}}},
         "template":{{"metadata":{{"labels":{{"app":"web"}}}},"spec":{{"containers":[{{"name":"c","image":"{image}"}}]}}}},
-        "volumeClaimTemplates":[{{"metadata":{{"name":"data"}},"spec":{{"accessModes":["ReadWriteOnce"],"resources":{{"requests":{{"storage":"1Gi"}}}}}}}}]}}}}"#
+        "volumeClaimTemplates":[{{"metadata":{{"name":"data"}},"spec":{{"storageClassName":"wffc","accessModes":["ReadWriteOnce"],"resources":{{"requests":{{"storage":"1Gi"}}}}}}}}]}}}}"#
     ))
+}
+
+/// Claims of the StatefulSet tests use a class that binds on first consumer, so pods schedule.
+async fn wffc_class(c: &InProcess) {
+    let sc = v(r#"{"metadata":{"name":"wffc"},"provisioner":"example.com/none","volumeBindingMode":"WaitForFirstConsumer"}"#);
+    c.create("/apis/storage.k8s.io/v1/storageclasses", &sc).await.unwrap();
 }
 
 async fn set_sts_image(c: &InProcess, image: &str) {
@@ -94,6 +100,7 @@ fn statefulset_ordered_creation_identity_and_scale_down() {
     scenario(|c| async move {
         c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
         hold(&["web-0"]);
+        wffc_class(&c).await;
         let created = c.create(STS, &sts(3, "i:1", "")).await.unwrap();
         wait_until("web-0 exists", || async { pod(&c, "web-0").await.is_some() }).await;
         sleep(250).await;
@@ -157,6 +164,7 @@ fn statefulset_parallel_does_not_wait() {
     scenario(|c| async move {
         c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
         hold(&["web-0"]);
+        wffc_class(&c).await;
         c.create(STS, &sts(3, "i:1", r#","podManagementPolicy":"Parallel""#)).await.unwrap();
         wait_until("all pods created at once", || async { all_pods(&c).await.len() == 3 }).await;
         wait_until("2 ready", || async { sts_status(&c, "readyReplicas").await == 2 && sts_status(&c, "replicas").await == 3 }).await;
@@ -170,6 +178,7 @@ fn statefulset_parallel_does_not_wait() {
 fn statefulset_rolling_update_with_partition() {
     scenario(|c| async move {
         c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
+        wffc_class(&c).await;
         c.create(STS, &sts(3, "i:1", r#","updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"partition":2}}"#)).await.unwrap();
         wait_until("3 ready", || all_ready(&c, &["web-0", "web-1", "web-2"])).await;
         wait_until("rev1 current", || async {
@@ -218,6 +227,7 @@ fn statefulset_rolling_update_with_partition() {
 fn statefulset_rolling_update_deletes_highest_ordinal_first() {
     scenario(|c| async move {
         c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
+        wffc_class(&c).await;
         c.create(STS, &sts(3, "i:1", "")).await.unwrap();
         wait_until("3 ready", || all_ready(&c, &["web-0", "web-1", "web-2"])).await;
         hold_delete(&["web-2"]);
@@ -239,6 +249,7 @@ fn statefulset_rolling_update_deletes_highest_ordinal_first() {
 fn statefulset_on_delete_only_replaces_deleted_pods() {
     scenario(|c| async move {
         c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
+        wffc_class(&c).await;
         c.create(STS, &sts(3, "i:1", r#","updateStrategy":{"type":"OnDelete"}"#)).await.unwrap();
         wait_until("3 ready", || all_ready(&c, &["web-0", "web-1", "web-2"])).await;
         set_sts_image(&c, "i:2").await;

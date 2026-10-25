@@ -77,6 +77,11 @@ async fn schedule_one<C: Client>(c: &C, cfg: &Config, ns: &str, name: &str) -> R
     }
     let nodes = items(&c.list("/api/v1/nodes", "").await?);
     let all_pods = items(&c.list(&pods(None), "").await?);
+    if let Some(why) = unbound_claim(c, ns, &pod).await? {
+        let msg = alloc::format!("0/{} nodes are available: {why}.", nodes.len());
+        mark_unschedulable(c, cfg, &path, &pod, &msg).await?;
+        return Ok(Some(cfg.retry_ms));
+    }
     let pinned = volume_affinity(c, ns, &pod).await?;
     match pick(&pod, &nodes, &all_pods, &pinned) {
         Ok(node) => {
@@ -97,6 +102,29 @@ async fn schedule_one<C: Client>(c: &C, cfg: &Config, ns: &str, name: &str) -> R
             Ok(Some(cfg.retry_ms))
         }
     }
+}
+
+/// Why the pod's claims block scheduling: a missing PVC, or an unbound one whose class is not
+/// `WaitForFirstConsumer` (those are bound by the PV controller regardless of any pod).
+async fn unbound_claim<C: Client>(c: &C, ns: &str, pod: &Value) -> Result<Option<String>> {
+    for vol in pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]) {
+        let claim = str_at(vol, &["persistentVolumeClaim", "claimName"]);
+        if claim.is_empty() {
+            continue;
+        }
+        let Some(pvc) = get_opt(c, &alloc::format!("{}/{claim}", pvcs(Some(ns)))).await? else {
+            return Ok(Some(alloc::format!("persistentvolumeclaim \"{claim}\" not found")));
+        };
+        if str_at(&pvc, &["status", "phase"]) == "Bound" {
+            continue;
+        }
+        let class = str_at(&pvc, &["spec", "storageClassName"]);
+        let sc = if class.is_empty() { None } else { get_opt(c, &alloc::format!("/apis/storage.k8s.io/v1/storageclasses/{class}")).await? };
+        if sc.is_none_or(|k| str_at(&k, &["volumeBindingMode"]) != "WaitForFirstConsumer") {
+            return Ok(Some("pod has unbound immediate PersistentVolumeClaims".to_string()));
+        }
+    }
+    Ok(None)
 }
 
 /// Node affinities (as pod-spec style `affinity` holders) of the PVs bound to the pod's PVCs. An
