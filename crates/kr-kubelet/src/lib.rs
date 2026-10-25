@@ -1066,6 +1066,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             self.kill_now(uid);
         }
         if self.all_stopped(uid) {
+            // A pod kept by finalizers stays visible: record that nothing runs any more
+            // (terminal phase, terminated containers), as upstream's kubelet does.
+            self.report_final_status(uid, pod).await;
             self.cleanup(uid);
             // Finish the deletion: the API object is removed once nothing runs.
             let path = alloc::format!("/api/v1/namespaces/{}/pods/{}", meta(pod, "namespace"), meta(pod, "name"));
@@ -1126,6 +1129,36 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     }
 }
 
+
+impl<C: Client + Clone + 'static> Kubelet<C> {
+    /// Status for a pod whose containers have all stopped after deletion: `Succeeded` if every
+    /// regular container exited 0, else `Failed`; not ready.
+    async fn report_final_status(&self, uid: &str, pod: &Value) {
+        let (mut status, path) = {
+            let pods = self.pods.borrow();
+            let Some(p) = pods.get(uid) else { return };
+            let policy = pod.pointer(&["spec", "restartPolicy"]).and_then(Value::as_str).unwrap_or("Always");
+            (status_json(p, policy), alloc::format!("/api/v1/namespaces/{}/pods/{}/status", p.ns, p.name))
+        };
+        let ok = self.pods.borrow().get(uid).is_some_and(|p| p.ctrs.iter().filter(|c| !c.init).all(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code == 0)));
+        if let Value::Object(f) = &mut status {
+            f.retain(|(k, _)| k != "phase");
+            f.push((String::from("phase"), Value::from(if ok { "Succeeded" } else { "Failed" })));
+            f.push((String::from("qosClass"), Value::from(spec::qos_class(pod))));
+            for (k, v) in f.iter_mut() {
+                if k == "conditions" {
+                    for c in v.as_array_mut().into_iter().flatten() {
+                        if matches!(c.get("type").and_then(Value::as_str), Some("Ready" | "ContainersReady")) {
+                            c.set("status", Value::from("False"));
+                        }
+                    }
+                }
+            }
+        }
+        let patch = Value::Object(alloc::vec![(String::from("status"), status)]);
+        let _ = self.c.patch(&path, "application/merge-patch+json", &patch).await;
+    }
+}
 
 fn status_json(p: &PodRt, policy: &str) -> Value {
     let t = |s: i64| Value::String(rfc3339(s));
