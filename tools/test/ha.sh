@@ -99,6 +99,21 @@ test_() {
   for n in krs2 krs3; do
     [ "$(k "$n" get configmaps -A -o jsonpath='{range .items[*]}{.metadata.uid}{.metadata.resourceVersion}{end}')" = "$A" ] || fail "$n diverged"
   done
+  # The agent's server (krs2) dies: the agent fails over to another server from the
+  # kubernetes endpoints and keeps renewing its node lease.
+  R0=$(k krs1 get lease -n kube-node-lease kra1 -o jsonpath='{.spec.renewTime}')
+  docker exec krs2 pkill -9 -x kr
+  sleep 25
+  R1=$(k krs1 get lease -n kube-node-lease kra1 -o jsonpath='{.spec.renewTime}')
+  [ "$R0" != "$R1" ] || fail "agent did not fail over (lease $R0 not renewed)"
+  echo "agent failed over: lease $R0 -> $R1"
+  # ...and restarts while its --server is still down (saved server list).
+  docker exec kra1 pkill -9 -x kr; sleep 1
+  docker exec -d kra1 sh -c "KR_ROOT=/store /krbin/kr agent --server https://$(ip krs2):6443 >> /tmp/agent.log 2>&1"
+  sleep 40
+  R2=$(k krs1 get lease -n kube-node-lease kra1 -o jsonpath='{.spec.renewTime}')
+  [ "$R2" != "$R1" ] || fail "restarted agent did not reach another server"
+  start krs2; wait_api krs2
   # Remove a server (retried: removing the leader first hands leadership over).
   ID3=$(docker exec krs3 cat /var/tmp/srv/server-id)
   docker exec $KC krs1 sh -c "echo '{\"id\":$ID3}' > /tmp/rm.json"

@@ -157,6 +157,36 @@ async fn renew(remote: &Remote, pki_dir: &str, name: &str, ip: [u8; 4]) -> Resul
 }
 
 /// Reads the join token from a file that only its owner can read.
+/// Follows the `kubernetes` endpoints (one per API server in HA) so that requests can fail
+/// over to any server, and saves the list for the next start.
+async fn track_servers(remote: Remote, file: String) {
+    let mut saved = String::new();
+    loop {
+        if let Ok(ep) = remote.get("/api/v1/namespaces/default/endpoints/kubernetes").await {
+            let mut urls = Vec::new();
+            for sub in ep.get("subsets").and_then(kr_fmt::json::Value::as_array).map(|a| a.to_vec()).unwrap_or_default() {
+                let port = sub.pointer(&["ports"]).and_then(kr_fmt::json::Value::as_array).and_then(|p| p.first()).and_then(|p| p.get("port")).and_then(kr_fmt::json::Value::as_u64).unwrap_or(6443);
+                for a in sub.get("addresses").and_then(kr_fmt::json::Value::as_array).map(|a| a.to_vec()).unwrap_or_default() {
+                    if let Some(ip) = a.get("ip").and_then(kr_fmt::json::Value::as_str).and_then(kr_apiserver::object::parse_ipv4) {
+                        urls.push(format!("https://{}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]));
+                    }
+                }
+            }
+            let text = urls.join("\n");
+            if !urls.is_empty() && text != saved {
+                remote.set_servers(&urls);
+                let tmp = format!("{file}.tmp\0");
+                let _ = fs::unlinkat(fs::AT_FDCWD, tmp.as_bytes(), 0);
+                let dst = format!("{file}\0");
+                if pki::write_new(tmp.as_bytes(), text.as_bytes(), 0o644).is_ok() && fs::renameat2(fs::AT_FDCWD, tmp.as_bytes(), fs::AT_FDCWD, dst.as_bytes(), 0).is_ok() {
+                    saved = text;
+                }
+            }
+        }
+        kr_rt::exec::sleep(30_000).await;
+    }
+}
+
 pub(crate) fn read_token_file(path: &str) -> Result<String, String> {
     let c = format!("{path}\0");
     let st = fs::newfstatat(fs::AT_FDCWD, c.as_bytes(), 0).map_err(|e| format!("token file {path}: errno {}", e.0))?;
@@ -214,6 +244,13 @@ pub fn main(mut args: Args) -> i32 {
         Ok(r) => r,
         Err(e) => return fail(&e.message),
     };
+    // HA: every API server, as last seen; lets the agent start while --server is down.
+    let servers_file = format!("{data}/servers");
+    if let Some(list) = fs::read_file(&pki::path(&data, "servers"), 64 << 10).ok().and_then(|b| String::from_utf8(b).ok()) {
+        let mut urls = alloc::vec![server.clone()];
+        urls.extend(list.lines().map(String::from).filter(|u| *u != server));
+        remote.set_servers(&urls);
+    }
     let tls = match serving_config(&pki_dir) {
         Ok(t) => Rc::new(core::cell::RefCell::new(t)),
         Err(e) => return fail(&e),
@@ -224,6 +261,7 @@ pub fn main(mut args: Args) -> i32 {
     };
     let cfg = kr_kubelet::Config { node_name: name.clone(), root: String::from(store.root()), network: ns::getuid() == 0, cgroups: cgroups_available(), node_ip: ip, vxlan: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() != Some("host-gw"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env() };
     let rotation = (remote.clone(), pki_dir.clone(), name.clone(), ip, tls.clone());
+    let tracker = remote.clone();
     let kubelet = kr_kubelet::Kubelet::new(remote, cfg, store);
     print(format!("kr agent: node {name} ({}.{}.{}.{}) -> {server}\n", ip[0], ip[1], ip[2], ip[3]).as_bytes());
     kr_rt::exec::block_on(async move {
@@ -231,6 +269,7 @@ pub fn main(mut args: Args) -> i32 {
         kr_rt::exec::spawn(kr_kubelet::remote::serve(proxy, name, tls));
         let (r, d, n, ip, s) = rotation;
         kr_rt::exec::spawn(rotate(r, d, n, ip, s));
+        kr_rt::exec::spawn(track_servers(tracker, servers_file));
         kubelet.run().await;
     });
     0

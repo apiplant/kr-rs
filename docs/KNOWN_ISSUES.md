@@ -40,7 +40,7 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     Remaining:
     - Fixed: an existing single-server datastore is converted by `kr server --cluster-init` (its image becomes the Raft snapshot at index 1, the old dir is kept as `db.imported`; `tools/test/ha.sh import`). Joining with an existing datastore is refused.
     - Fixed: a restarted server could not reach its peers when they were needed for quorum (their addresses are in the replicated store, which is behind on restart); known addresses are now kept in `raft/peers`.
-    - Agents talk to the one server in `--server`; no client-side failover or load-balanced address yet (plan: agents learn the `kubernetes` endpoints and rotate on failure).
+    - Fixed: agents fail over. They follow the `kubernetes` endpoints (every 30 s, saved to `<agent data>/servers` for restarts) and switch to the next server when a request gets no HTTP response; `tools/test/ha.sh` kills the agent's server and restarts the agent while it is down. A write that failed mid-flight is retried on the next server, so it can be applied twice (kubelet writes are idempotent or precondition-guarded). Pods using the `kubernetes` Service already get every server.
     - A removed server never sees its own removal and keeps pre-campaigning until it is stopped (harmless: pre-vote, and its log is behind). Stop and wipe removed servers.
     - No learners: a joining server is a voter as soon as its add commits, so a 1→2 cluster stalls if the newcomer dies before catching up. Join one server at a time.
     - A server's address is re-registered only when it becomes leader or rejoins; an IP change of a follower needs a restart with `--server`.

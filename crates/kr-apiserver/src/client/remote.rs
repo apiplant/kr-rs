@@ -32,7 +32,10 @@ pub enum RemoteAuth {
 }
 
 struct Inner {
-    base: String,
+    /// API servers (HA: every server works); `cur` is the one in use. A transport error moves
+    /// to the next.
+    servers: core::cell::RefCell<Vec<String>>,
+    cur: core::cell::Cell<usize>,
     roots: Vec<Vec<u8>>,
     bearer: Option<String>,
     unary: Http<TlsConnector>,
@@ -94,7 +97,7 @@ impl Remote {
             TlsConnector::new(SystemResolver::system(), cfg),
             HttpConfig { read_timeout_ms: WATCH_IDLE_MS, max_redirects: 0, max_idle: 0, user_agent: "kr-node/0.0.1".to_string(), ..HttpConfig::default() },
         );
-        Ok(Remote { inner: Rc::new(Inner { base: base.to_string(), roots, bearer, unary, watch }) })
+        Ok(Remote { inner: Rc::new(Inner { servers: core::cell::RefCell::new(alloc::vec![base.to_string()]), cur: core::cell::Cell::new(0), roots, bearer, unary, watch }) })
     }
 
     /// Switches to a new client certificate (rotation). New connections use it; pooled and
@@ -107,8 +110,37 @@ impl Remote {
         Ok(())
     }
 
+    /// Replaces the server list (e.g. from the `kubernetes` endpoints), keeping the server in
+    /// use if it is still listed. Invalid URLs are skipped; an empty list changes nothing.
+    pub fn set_servers(&self, urls: &[String]) {
+        let urls: Vec<String> = urls.iter().map(|u| u.trim_end_matches('/').to_string()).filter(|u| Url::parse(u).is_ok()).collect();
+        if urls.is_empty() {
+            return;
+        }
+        let current = self.server();
+        let mut list = self.inner.servers.borrow_mut();
+        *list = urls;
+        let i = list.iter().position(|u| *u == current).unwrap_or(0);
+        self.inner.cur.set(i);
+    }
+
+    pub fn servers(&self) -> Vec<String> {
+        self.inner.servers.borrow().clone()
+    }
+
+    /// The server in use.
+    pub fn server(&self) -> String {
+        let l = self.inner.servers.borrow();
+        l[self.inner.cur.get() % l.len()].clone()
+    }
+
+    fn rotate(&self) {
+        let n = self.inner.servers.borrow().len();
+        self.inner.cur.set((self.inner.cur.get() + 1) % n);
+    }
+
     fn url(&self, path: &str, query: &str) -> String {
-        let mut u = alloc::format!("{}{}", self.inner.base, path);
+        let mut u = alloc::format!("{}{}", self.server(), path);
         if !query.is_empty() {
             u.push('?');
             u.push_str(query);
@@ -127,7 +159,25 @@ impl Remote {
         h
     }
 
+    /// One call, trying each server once on transport errors (refused, reset, timeout). A
+    /// write may then reach the cluster twice; the kubelet's writes are idempotent or
+    /// precondition-guarded (resourceVersion, AlreadyExists).
     async fn unary(&self, method: &str, path: &str, query: &str, ct: Option<&str>, body: &[u8]) -> Result<Value> {
+        let n = self.inner.servers.borrow().len();
+        let mut last = None;
+        for _ in 0..n {
+            match self.unary_once(method, path, query, ct, body).await {
+                Err(e) if e.code == 503 && e.message.starts_with(TRANSPORT) => {
+                    self.rotate();
+                    last = Some(e);
+                }
+                r => return r,
+            }
+        }
+        Err(last.unwrap_or_else(|| ApiError::new(503, "ServiceUnavailable", "no API server")))
+    }
+
+    async fn unary_once(&self, method: &str, path: &str, query: &str, ct: Option<&str>, body: &[u8]) -> Result<Value> {
         let (path, query) = split_path(path, query);
         let url = self.url(path, &query);
         let auth = self.inner.bearer.as_deref().map(|t| alloc::format!("Bearer {t}")).unwrap_or_default();
@@ -143,7 +193,7 @@ impl Remote {
         };
         match timeout(UNARY_TIMEOUT_MS, call).await {
             Ok(r) => r,
-            Err(_) => Err(ApiError::new(503, "ServiceUnavailable", "request timed out")),
+            Err(_) => Err(ApiError::new(503, "ServiceUnavailable", alloc::format!("{TRANSPORT}timeout"))),
         }
     }
 }
@@ -169,8 +219,11 @@ fn describe(e: NetError) -> &'static str {
     }
 }
 
+/// Message prefix of errors where no HTTP response arrived (another server may answer).
+const TRANSPORT: &str = "transport error: ";
+
 fn net_err(e: NetError) -> ApiError {
-    ApiError::new(503, "ServiceUnavailable", alloc::format!("transport error: {}", describe(e)))
+    ApiError::new(503, "ServiceUnavailable", alloc::format!("{TRANSPORT}{}", describe(e)))
 }
 
 fn status_error(code: u16, http_reason: &str, body: &[u8]) -> ApiError {
@@ -266,9 +319,17 @@ impl Client for Remote {
         let auth = self.inner.bearer.as_deref().map(|t| alloc::format!("Bearer {t}")).unwrap_or_default();
         let headers = self.headers(None, &auth);
         // Only connecting and the response head are bounded; the body has the idle limit.
+        // On failure the next attempt (the caller re-watches) goes to the next server.
         let mut resp = match timeout(UNARY_TIMEOUT_MS, self.inner.watch.request("GET", &url, &headers, b"")).await {
-            Ok(r) => r.map_err(net_err)?,
-            Err(_) => return Err(ApiError::new(503, "ServiceUnavailable", "request timed out")),
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                self.rotate();
+                return Err(net_err(e));
+            }
+            Err(_) => {
+                self.rotate();
+                return Err(ApiError::new(503, "ServiceUnavailable", alloc::format!("{TRANSPORT}timeout")));
+            }
         };
         if !(200..300).contains(&resp.status) {
             let data = resp.read_to_end(1024 * 1024).await.unwrap_or_default();
