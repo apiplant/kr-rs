@@ -137,6 +137,9 @@ where
                 Ok(Some(ms)) => q.add_after(&key, ms),
                 Err(_) => q.add_after(&key, cfg.backoff_ms),
             }
+            // In-process calls never suspend: without this, a long queue (1000 pods to
+            // schedule) would hold the executor and stall the API server.
+            exec::yield_now().await;
         }
         if q.has_dirty() {
             continue;
