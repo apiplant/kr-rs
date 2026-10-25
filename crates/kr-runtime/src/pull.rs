@@ -40,6 +40,28 @@ fn registry() -> Result<Registry<TlsConnector>> {
     Ok(reg)
 }
 
+/// The mirror for `registry` from `$KR_REGISTRY_MIRRORS` (`registry.k8s.io=http://10.0.0.1:5001,
+/// docker.io=https://cache:5000`): its `host[:port]` and whether it is plain http. Blobs are
+/// still verified against the digests in the manifest; the mirror is trusted for tag resolution
+/// only, like docker's `registry-mirrors`.
+fn mirror_for(registry: &str) -> Option<(String, bool)> {
+    let v = crate::store::env_var("KR_REGISTRY_MIRRORS")?;
+    v.split(',').find_map(|e| {
+        let (from, to) = e.trim().split_once('=')?;
+        if from != registry {
+            return None;
+        }
+        let (plain, host) = match to.split_once("://") {
+            Some(("http", h)) => (true, h),
+            Some(("https", h)) => (false, h),
+            Some(_) => return None,
+            None => (false, to),
+        };
+        let host = host.trim_end_matches('/');
+        (!host.is_empty()).then(|| (host.to_string(), plain))
+    })
+}
+
 pub async fn pull(store: &Store, image_ref: &str) -> Result<ImageId> {
     pull_full(store, image_ref, &[], &Limits::default()).await
 }
@@ -61,10 +83,27 @@ async fn pull_full(store: &Store, image_ref: &str, creds: &[Cred], limits: &Limi
             return Ok(id);
         }
     }
-    let r = Reference::parse(image_ref)?;
+    let upstream = Reference::parse(image_ref)?;
     let mut reg = registry()?;
-    reg.set_credential(lookup(creds, &r.registry, &r.repository).cloned());
-    let image = reg.resolve(&r).await?;
+    // A configured mirror is tried first, anonymously; any failure falls back to upstream.
+    let mut resolved = None;
+    if let Some((host, plain)) = mirror_for(&upstream.registry) {
+        if plain {
+            reg.allow_plain_http(&host);
+        }
+        let m = Reference { registry: host, ..upstream.clone() };
+        if let Ok(image) = reg.resolve(&m).await {
+            resolved = Some((m, image));
+        }
+    }
+    let (r, image) = match resolved {
+        Some(x) => x,
+        None => {
+            reg.set_credential(lookup(creds, &upstream.registry, &upstream.repository).cloned());
+            let image = reg.resolve(&upstream).await?;
+            (upstream, image)
+        }
+    };
     if image.manifest.layers.len() > MAX_LAYERS {
         return Err(Error::Image("too many layers"));
     }
@@ -105,27 +144,60 @@ async fn pull_full(store: &Store, image_ref: &str, creds: &[Cred], limits: &Limi
     crate::store::write_file_atomic(&format!("{dir}/manifest.json"), &image.raw)?;
     crate::store::write_file_atomic(&format!("{dir}/config.json"), &cfg_json)?;
 
+    // Concurrent pulls of one image (other namespaces, other `kr ctr` processes) each unpack
+    // into their own directory; the first rename wins.
+    clear_stale_tmp(&dir);
+    let pid = kr_sys::fs::getpid();
+    let mut nonce = [0u8; 4];
+    kr_sys::getrandom(&mut nonce);
+    let tmp = format!("rootfs.tmp-{pid}-{}-{:08x}", crate::network::proc_start(pid).unwrap_or(0), u32::from_le_bytes(nonce));
+    let ctmp = cpath(&tmp)?;
     let dirfd = fs::openat(AT_FDCWD, &cpath(&dir)?, fs::O_PATH | fs::O_DIRECTORY | fs::O_CLOEXEC, 0).ctx("open image dir")?;
-    fs::remove_all(dirfd.raw(), b"rootfs.tmp\0").ctx("clear rootfs.tmp")?;
-    fs::mkdirat(dirfd.raw(), b"rootfs.tmp\0", 0o755).ctx("mkdir rootfs.tmp")?;
-    let built = build_rootfs(store, &image.manifest.layers, &gz, &icfg.diff_ids, &format!("{dir}/rootfs.tmp"), limits);
+    fs::mkdirat(dirfd.raw(), &ctmp, 0o755).ctx("mkdir rootfs.tmp")?;
+    let built = build_rootfs(store, &image.manifest.layers, &gz, &icfg.diff_ids, &format!("{dir}/{tmp}"), limits);
     if let Err(e) = built {
-        let _ = fs::remove_all(dirfd.raw(), b"rootfs.tmp\0");
+        let _ = fs::remove_all(dirfd.raw(), &ctmp);
         return Err(e);
     }
-    match fs::renameat2(dirfd.raw(), b"rootfs.tmp\0", dirfd.raw(), b"rootfs\0", fs::RENAME_NOREPLACE) {
+    match fs::renameat2(dirfd.raw(), &ctmp, dirfd.raw(), b"rootfs\0", fs::RENAME_NOREPLACE) {
         Ok(()) => {}
         Err(Errno(fs::EEXIST)) | Err(Errno(fs::ENOTEMPTY)) => {
             // a concurrent pull finished first
-            let _ = fs::remove_all(dirfd.raw(), b"rootfs.tmp\0");
+            let _ = fs::remove_all(dirfd.raw(), &ctmp);
         }
         Err(e) => {
-            let _ = fs::remove_all(dirfd.raw(), b"rootfs.tmp\0");
+            let _ = fs::remove_all(dirfd.raw(), &ctmp);
             return Err(Error::Io("rename rootfs", e));
         }
     }
     store.set_ref(image_ref, &id)?;
     Ok(id)
+}
+
+/// Removes unpack directories of pulls whose process is gone (`rootfs.tmp-<pid>-<start>-<n>`,
+/// and the pre-per-pull `rootfs.tmp`). Directories of live pulls are left alone.
+fn clear_stale_tmp(dir: &str) {
+    let Ok(c) = cpath(dir) else { return };
+    let Ok(fd) = fs::openat(AT_FDCWD, &c, fs::O_RDONLY | fs::O_DIRECTORY | fs::O_CLOEXEC, 0) else { return };
+    let names: Vec<Vec<u8>> = fs::read_dir(&fd).filter_map(|e| e.ok()).map(|e| e.name).collect();
+    for name in names {
+        let Some(rest) = name.strip_prefix(b"rootfs.tmp") else { continue };
+        let stale = match core::str::from_utf8(rest).ok().and_then(|r| r.strip_prefix('-')) {
+            None => rest.is_empty(),
+            Some(r) => {
+                let mut f = r.split('-');
+                match (f.next().and_then(|p| p.parse::<u32>().ok()), f.next().and_then(|s| s.parse::<u64>().ok())) {
+                    (Some(pid), Some(start)) => crate::network::proc_start(pid) != Some(start),
+                    _ => false,
+                }
+            }
+        };
+        if stale {
+            let mut n = name.clone();
+            n.push(0);
+            let _ = fs::remove_all(fd.raw(), &n);
+        }
+    }
 }
 
 fn build_rootfs(store: &Store, layers: &[Descriptor], gz: &[bool], diff_ids: &[String], tmp: &str, limits: &Limits) -> Result<Vec<Stats>> {

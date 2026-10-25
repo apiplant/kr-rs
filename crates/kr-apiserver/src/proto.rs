@@ -72,7 +72,9 @@ pub fn decode_body_as(body: &[u8], fallback: Option<(&'static str, &'static str)
     if let (true, Some((av, k))) = (kind.is_empty(), fallback) {
         (api_version, kind) = (av, k);
     }
-    let idx = s::KINDS.iter().find(|k| (k.0 == api_version || (api_version == "meta.k8s.io/v1" && k.0 == "v1" && kind == "DeleteOptions")) && k.1 == kind).map(|k| k.2).ok_or("protobuf: unsupported kind")?;
+    // DeleteOptions is registered in every group version (client-go stamps it with the
+    // resource's, e.g. `apps/v1`); all of them are the one meta/v1 message.
+    let idx = s::KINDS.iter().find(|k| (k.0 == api_version || (kind == "DeleteOptions" && k.0 == "v1")) && k.1 == kind).map(|k| k.2).ok_or("protobuf: unsupported kind")?;
     let mut v = message(raw, idx, 0)?;
     if let Value::Object(o) = &mut v {
         o.retain(|e| e.0 != "kind" && e.0 != "apiVersion");

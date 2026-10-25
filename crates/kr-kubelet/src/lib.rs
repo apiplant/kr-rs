@@ -872,6 +872,12 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         if self.store.image(image).is_some() && !pulls.contains_key(key) && self.pulled_once(key) {
             return PullGate::Ready;
         }
+        // Another identity is pulling the same image (every e2e namespace is its own key): wait
+        // for it rather than download it again; if it fails, this key then pulls on its own.
+        let prefix = alloc::format!("{image}\0");
+        if pulls.iter().any(|(k, p)| k.starts_with(&prefix) && matches!(p, Pull::InProgress)) {
+            return PullGate::Wait;
+        }
         pulls.insert(key.to_string(), Pull::InProgress);
         PullGate::Start
     }

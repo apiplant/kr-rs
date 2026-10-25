@@ -236,8 +236,9 @@ pub fn prepare_create(o: &mut Value, t: &Target, clock: &Clock, rev: u64) -> Res
             meta.set("name", Value::from(name.as_str()));
         }
     }
-    // RBAC objects only need to be valid path segments (upstream allows "system:..." names).
-    let path_segment = matches!(t.kind, "Role" | "ClusterRole" | "RoleBinding" | "ClusterRoleBinding");
+    // RBAC objects only need to be valid path segments (upstream allows "system:..." names);
+    // so do ClusterTrustBundles ("<signer>:<x>") and IPAddresses (named by the IP, ":" in v6).
+    let path_segment = matches!(t.kind, "Role" | "ClusterRole" | "RoleBinding" | "ClusterRoleBinding" | "ClusterTrustBundle" | "IPAddress");
     let ok = if path_segment {
         is_path_segment(&name)
     } else if t.name_is_label {

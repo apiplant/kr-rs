@@ -37,6 +37,7 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 70. **Conformance gaps** — *open; tracked as C1–C9 in PLAN.md*
     Done since: CRDs (#87), admission webhooks (#88), aggregated discovery, ResourceQuota, hostPort, lifecycle hooks, ephemeral containers, storage (PVC/SC/PV #73).
     Since: protobuf responses (objects, lists, Status; encoded from the same tables, checked against upstream `protoc` decoding of live responses; watches and Tables stay JSON, which client-go accepts by Content-Type), built-in type checks (#63).
+    Round 4 (2026-10-25, in progress when triaged): ~320 failures, almost all from #98 (pull race) and #99 (DeleteOptions groups, names); both fixed, a rerun is needed for the real remainder.
     Remaining: protobuf watch streams, value validation (#63), and whatever the current Sonobuoy run reports (`tools/test/conformance.sh results`).
 97. **HA (kr-raft, ADR-026) gaps** — *partly fixed*
     `kr server --cluster-init` starts a Raft-replicated control plane; `kr server --server https://<any server>:6443 --token-file <server-token>` joins one (2-phase: key material, then `POST /kr/add-server` with its own server certificate); `POST /kr/remove-server {"id":N}` (system:masters) removes one. Followers serve reads and watches locally and forward writes (HTTP and in-process) to the leader; controllers and the scheduler run on the leader only. `tools/test/ha.sh` (3 servers + agent: join, forwarding, kill -9 of the leader, controller hand-over, catch-up, identical stores, removal) passes; Raft itself is checked by a chaos simulation (`crates/kr-raft/src/tests.rs`).
@@ -234,6 +235,10 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     DELETE now sets `Terminating`; the namespace controller empties it (built-in and CRD resources, honouring finalizers and graceful pod deletion) and finalizes it.
 69. **No garbage collection by ownerReferences** — *fixed*
     `kr-controllers/src/gc.rs` deletes dependents whose owners are gone (background propagation) and honours orphan/foreground deletion.
+98. **Concurrent pulls of one image destroyed each other's rootfs** — *fixed*
+    Found in conformance round 4 (2026-10-25): most of ~320 failures were pods stuck `ContainerCreating: pulling image agnhost:2.66.1` for 40+ minutes. Pull keys include the credential identity (namespace/SA/secrets), so every e2e namespace started its own pull of the same image, and all of them unpacked into the same `<image>/rootfs.tmp`, removing each other's tree (`fchownat`/`mkdirat` ENOENT, `ENOTEMPTY`); each failure backed off 10 s and retried. Reproduced outside k8s: 20 concurrent `kr ctr pull` of agnhost took 792 s and 18 failed. Fix: each pull unpacks into `rootfs.tmp-<pid>-<start>-<nonce>` (first rename wins; leftovers of dead processes are removed), and the kubelet waits for an in-flight pull of the same image under another identity instead of starting another. After: 20 concurrent pulls, 3 s, 20 succeed.
+99. **Protobuf DeleteOptions stamped with the resource's group; `:` in ClusterTrustBundle/IPAddress names** — *fixed*
+    Conformance round 4: client-go stamps DeleteOptions with the deleted resource's group version (`apps/v1`, `apiextensions.k8s.io/v1`, `storage.k8s.io/v1`, `node.k8s.io/v1`), which kr answered 415 (~25 failures); any group's DeleteOptions now decodes as meta/v1 (`tests/proto_delete.rs`). ClusterTrustBundle (`<signer>:<name>`) and IPAddress (the IP, `:` in v6) names were checked as DNS subdomains (11 failures); they are path segments now (`tests/names.rs`). Not done: IPAddress names are not checked to be canonical IPs, CTB names not checked against `spec.signerName`.
 
 ## Node agent and controllers (phase 4)
 71. **No probes** — *fixed*
