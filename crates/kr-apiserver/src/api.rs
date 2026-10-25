@@ -309,7 +309,7 @@ impl ApiServer {
                     }
                     v
                 };
-                let g = gen_of(old) + u64::from(strip(old) != strip(o));
+                let g = gen_of(old) + u64::from(!object::same_json(&Some(&strip(old)), &Some(&strip(o))));
                 o.entry_object("metadata").set("generation", Value::Number(Number::from_u64(g)));
             }
             Some(_) => {}
@@ -1600,7 +1600,12 @@ impl ApiServer {
             if v.pointer(&["metadata", "deletionTimestamp"]).is_none() {
                 let g = grace.or_else(|| v.pointer(&["spec", "terminationGracePeriodSeconds"]).and_then(Value::as_i64)).unwrap_or(30).max(1);
                 let rev = self.store.borrow().revision() + 1;
+                let gen = v.pointer(&["metadata", "generation"]).and_then(Value::as_u64);
                 let m = v.entry_object("metadata");
+                // Starting a graceful deletion is a (spec-relevant) change: the generation moves.
+                if let Some(gen) = gen {
+                    m.set("generation", Value::Number(Number::from_u64(gen + 1)));
+                }
                 m.set("deletionTimestamp", Value::String(object::rfc3339((self.now)() + g)));
                 m.set("deletionGracePeriodSeconds", Value::Number(Number::from_i64(g)));
                 m.set("resourceVersion", Value::String(rev.to_string()));

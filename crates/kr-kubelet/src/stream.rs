@@ -374,7 +374,10 @@ async fn exec_session(conn: Box<dyn Conn>, proto: Protocol, target: ExecTarget, 
         if exit.is_some() && out_fut.is_none() && err_fut.is_none() {
             let code = exit.unwrap();
             let status = if code == 0 { channel::status_success() } else { channel::status_exit(code) };
-            let _ = ws.send_binary(&channel::error_frame(&status)).await;
+            // v1 has no success status message (clients treat every non-stdout frame as an error).
+            if code != 0 || proto != Protocol::V1 {
+                let _ = ws.send_binary(&channel::error_frame(&status)).await;
+            }
             let _ = ws.close(1000, "").await;
             return;
         }

@@ -764,7 +764,7 @@ async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str
     }
 }
 
-pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig, pod_dir: &str, ip: Option<[u8; 4]>, node: &str) -> Result<Built, String> {
+pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig, pod_dir: &str, ip: Option<[u8; 4]>, node: &str, store: &kr_runtime::store::Store) -> Result<Built, String> {
     let ns = meta(pod, "namespace");
     // env: image env, then container env (later wins), with $(VAR) expansion.
     let mut env: Vec<(String, String)> = img.env.iter().filter_map(|e| e.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect();
@@ -869,7 +869,16 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         let name = vm.get("name").and_then(Value::as_str).unwrap_or("");
         let target = vm.get("mountPath").and_then(Value::as_str).unwrap_or("");
         let vol = vols.iter().find(|v| v.get("name").and_then(Value::as_str) == Some(name)).ok_or_else(|| alloc::format!("volume {name} not found"))?;
-        let Some(src) = volume_source(c, pod, vol, pod_dir).await? else { continue };
+        let src = if let Some(iv) = vol.get("image") {
+            // OCI image volume: the pulled image's unpacked rootfs, mounted read-only.
+            let r = iv.get("reference").and_then(Value::as_str).unwrap_or("");
+            let (_, _, mut root) = store.image(r).ok_or_else(|| alloc::format!("image {r} not present"))?;
+            root.pop();
+            Some(String::from_utf8(root).map_err(|_| String::from("bad image path"))?)
+        } else {
+            volume_source(c, pod, vol, pod_dir).await?
+        };
+        let Some(src) = src else { continue };
         let mut sub_path = None;
         let sub_expr = vm.get("subPathExpr").and_then(Value::as_str).filter(|s| !s.is_empty());
         let sub_plain = vm.get("subPath").and_then(Value::as_str).filter(|s| !s.is_empty());
@@ -896,7 +905,7 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
             drop(fd);
             sub_path = Some(sub.as_bytes().to_vec());
         }
-        let ro = vm.get("readOnly").and_then(Value::as_bool).unwrap_or(false) || ["configMap", "secret", "projected", "downwardAPI"].iter().any(|k| vol.get(k).is_some());
+        let ro = vm.get("readOnly").and_then(Value::as_bool).unwrap_or(false) || ["configMap", "secret", "projected", "downwardAPI", "image"].iter().any(|k| vol.get(k).is_some());
         mounts.push(Mount { source: src.into_bytes(), sub_path, target: target.as_bytes().to_vec(), readonly: ro });
     }
     // terminationMessagePath: a fresh world-writable file per start (any runAsUser must be able to
