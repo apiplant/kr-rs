@@ -113,7 +113,7 @@ pub struct ApiServer {
     /// Warnings for the response of the request being handled.
     warnings: RefCell<Vec<String>>,
     /// Parsed webhook configurations, valid for the stamp they were built at.
-    pub(crate) wh_cache: RefCell<Option<([u64; 4], alloc::rc::Rc<crate::webhook::Configs>)>>,
+    pub(crate) wh_cache: RefCell<Option<([u64; 12], alloc::rc::Rc<crate::webhook::Configs>)>>,
 }
 
 /// Default namespaces created on first start.
@@ -729,10 +729,30 @@ impl ApiServer {
         items.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect()
     }
 
-    /// (count, newest mod revision) of the mutating and validating webhook configurations.
-    pub(crate) fn wh_stamp(&self) -> [u64; 4] {
-        let mut s = [0; 4];
-        for (i, p) in ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"].iter().enumerate() {
+    /// Built-in and custom resources.
+    pub(crate) fn all_resources(&self) -> Vec<&'static Resource> {
+        resources::RESOURCES.iter().chain(self.extra()).collect()
+    }
+
+    /// Stored objects of `r`, in one namespace or all.
+    pub(crate) fn list_values(&self, r: &Resource, ns: Option<&str>) -> Vec<Value> {
+        let prefix = match ns {
+            Some(n) if r.namespaced => alloc::format!("{}{n}/", r.prefix()),
+            _ => r.prefix(),
+        };
+        let (items, _) = self.store.borrow().list(&prefix, None, 0);
+        items.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect()
+    }
+
+    /// The openAPIV3Schema of a served custom resource version.
+    pub(crate) fn custom_schema(&self, group: &str, version: &str, kind: &str) -> Option<Value> {
+        self.custom.borrow().iter().find(|c| c.res.group == group && c.res.version == version && c.res.kind == kind).and_then(|c| c.schema.clone())
+    }
+
+    /// (count, newest mod revision) of the webhook configurations and admission policies.
+    pub(crate) fn wh_stamp(&self) -> [u64; 12] {
+        let mut s = [0; 12];
+        for (i, p) in crate::webhook::CONFIG_PLURALS.iter().enumerate() {
             if let Some(r) = resources::find("admissionregistration.k8s.io", "v1", p) {
                 let (items, _) = self.store.borrow().list(&r.prefix(), None, 0);
                 s[i * 2] = items.len() as u64;
@@ -1287,6 +1307,11 @@ impl ApiServer {
         if is_crd {
             crate::crd::admit(o, None, (self.now)())?;
         }
+        if rt.res.plural == "validatingadmissionpolicies" {
+            // Type checking runs synchronously (upstream: a controller, shortly after).
+            let st = crate::policy::type_check_status(self, o);
+            o.set("status", st);
+        }
         self.admit_custom(rt, o, None, false)?;
         if rt.res.plural == "pods" {
             let ns = rt.namespace.clone().unwrap_or_default();
@@ -1381,6 +1406,10 @@ impl ApiServer {
         }
         if crate::crd::is_crd(rt.res) {
             crate::crd::admit(&mut new, Some(&old), (self.now)())?;
+        }
+        if rt.res.plural == "validatingadmissionpolicies" && !status && new.get("spec") != old.get("spec") {
+            let st = crate::policy::type_check_status(self, &new);
+            new.set("status", st);
         }
         self.admit_custom(rt, &mut new, Some(&old), status)?;
         if rt.res.plural == "services" && !status {
