@@ -13,7 +13,7 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 50. **Container networking gaps** — *partly fixed* (ADR-019, ADR-022)
     Pods get a bridge network as root and rootless (an infra user+net namespace holds the bridge), and ports are published through hostPort/NodePort (userspace proxy).
     Remaining:
-    - Kubelet pod leases are garbage-collected at startup (`network::gc`; leases owned by pod uids are stale after a kr crash). Leases of standalone `kr ctr run` containers are not collected if that process is SIGKILLed.
+    - Kubelet pod leases are garbage-collected at startup (`network::gc`; leases owned by pod uids are stale after a kr crash). Fixed: leases of standalone `kr ctr run` containers record the owning process (pid + start time, so reused pids don't count; zombies count as dead) and are collected by the next `kr ctr run` or kubelet start once that process is gone (verified with SIGKILL in a container).
     - IPv4 only.
     - Standalone `kr ctr run` containers are still loopback-only when rootless.
 

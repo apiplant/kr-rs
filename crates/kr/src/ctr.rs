@@ -208,7 +208,9 @@ fn bridge_network(store: &Store, id: &str) -> Result<Option<network::Lease>, i32
         Ok(()) | Err(kr_sys::Errno(17)) => {}
         Err(e) => return Err(fail(&format!("mkdir ipam: errno {}", e.0))),
     }
-    network::allocate(dir.as_bytes(), id.as_bytes()).map(Some).map_err(|e| fail(&format!("ipam: errno {}", e.0)))
+    // Leases of `kr ctr run` processes that died without cleaning up (SIGKILL).
+    network::gc(dir.as_bytes(), |owner| network::owner_alive(owner) != Some(false));
+    network::allocate(dir.as_bytes(), &network::process_owner(id.as_bytes())).map(Some).map_err(|e| fail(&format!("ipam: errno {}", e.0)))
 }
 
 /// Starts the container and waits for it, forwarding SIGINT/SIGTERM to its pid 1. A second

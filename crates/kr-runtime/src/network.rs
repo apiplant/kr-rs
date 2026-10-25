@@ -193,6 +193,39 @@ pub fn allocate_in(dir: &[u8], owner: &[u8], pn: &PodNet) -> Result<Lease, Errno
     Err(Errno(28)) // ENOSPC: subnet exhausted
 }
 
+/// Start time (clock ticks since boot, field 22 of `/proc/<pid>/stat`) of a live process.
+fn proc_start(pid: u32) -> Option<u64> {
+    let mut p = alloc::format!("/proc/{pid}/stat").into_bytes();
+    p.push(0);
+    let b = kr_sys::fs::read_file(&p, 4096).ok()?;
+    // comm (field 2) may contain spaces and parentheses: fields resume after the last ')'.
+    let rest = &b[b.iter().rposition(|c| *c == b')')? + 2..];
+    let mut f = core::str::from_utf8(rest).ok()?.split(' ');
+    // A zombie (killed, not yet reaped by its parent) no longer runs.
+    if matches!(f.next()?, "Z" | "X") {
+        return None;
+    }
+    f.nth(18)?.parse().ok()
+}
+
+/// Lease owner for a standalone container: `<id> pid=<pid>:<start>` of this process, so that a
+/// lease left by a SIGKILLed `kr ctr run` can be recognised ([`owner_alive`]).
+pub fn process_owner(id: &[u8]) -> Vec<u8> {
+    let pid = kr_sys::fs::getpid();
+    let mut o = id.to_vec();
+    o.extend_from_slice(alloc::format!(" pid={pid}:{}", proc_start(pid).unwrap_or(0)).as_bytes());
+    o
+}
+
+/// For an owner written by [`process_owner`]: whether that process still runs (same pid and
+/// start time, so a reused pid does not count). `None` for other owners (pod uids).
+pub fn owner_alive(owner: &[u8]) -> Option<bool> {
+    let s = core::str::from_utf8(owner).ok()?;
+    let (pid, start) = s.rsplit_once(" pid=")?.1.split_once(':')?;
+    let (pid, start): (u32, u64) = (pid.parse().ok()?, start.parse().ok()?);
+    Some(proc_start(pid) == Some(start))
+}
+
 /// Garbage-collects leases whose owner (the id recorded in the file) fails `keep`, e.g. leases
 /// of sandboxes that died with a SIGKILLed kr. Returns how many were removed. Non-lease names
 /// (anything not a dotted quad) are left alone.
@@ -240,6 +273,18 @@ mod tests {
         assert_eq!(gc(&dir, |_| false), 2);
         let _ = (c2, a);
         let _ = ns::rmdir(&c);
+    }
+
+    #[test]
+    fn process_owners_are_alive_only_while_their_process_runs() {
+        let me = process_owner(b"ctr-1");
+        assert_eq!(owner_alive(&me), Some(true));
+        assert_eq!(owner_alive(b"0b7d6f0e-pod-uid"), None);
+        // Same pid, different start time: a reused pid.
+        let s = core::str::from_utf8(&me).unwrap();
+        let (head, _) = s.rsplit_once(':').unwrap();
+        assert_eq!(owner_alive(alloc::format!("{head}:1").as_bytes()), Some(false));
+        assert_eq!(owner_alive(b"ctr-2 pid=999999999:5"), Some(false));
     }
 
     fn dec_pid() -> Vec<u8> {

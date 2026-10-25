@@ -224,12 +224,12 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             network::set_pod_mtu(uplink_mtu().saturating_sub(50));
         }
         // Sandboxes die with the previous kr process (even after SIGKILL), so every pod lease is
-        // stale. Leases owned by anything but a pod uid (`kr ctr run` ids) are left alone.
+        // stale. Leases of `kr ctr run` processes are kept while that process runs.
         // Containers of a killed kr survive as orphans: kill whatever is left in the pod cgroups.
         if self.cfg.cgroups {
             kr_runtime::cgroup::kill_stale_pods();
         }
-        network::gc(alloc::format!("{}/ipam", self.cfg.root).as_bytes(), |owner| !is_pod_uid(owner));
+        network::gc(alloc::format!("{}/ipam", self.cfg.root).as_bytes(), |owner| !is_pod_uid(owner) && network::owner_alive(owner) != Some(false));
         node::register(&self.c, &self.cfg).await;
         // The API server assigns the pod subnet at registration.
         for _ in 0..30 {
