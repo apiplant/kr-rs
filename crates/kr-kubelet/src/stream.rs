@@ -198,25 +198,42 @@ impl<C: Client + Clone + 'static> Proxy<C> {
     fn logs(&self, ns: &str, pod: &str, v: &PodView, q: &Query) -> Result<Response, ApiError> {
         let path = alloc::format!("{}/{}.log\0", v.dir, v.container);
         let data = kr_sys::fs::read_file(path.as_bytes(), 64 << 20).unwrap_or_default();
+        let marks = self.0.log_marks.borrow().get(path.trim_end_matches('\0')).cloned().unwrap_or_default();
+        // The file's last write bounds the time of bytes no sample covers yet.
+        let tail_at = kr_sys::fs::newfstatat(kr_sys::ns::AT_FDCWD, path.as_bytes(), 0).map(|s| (s.mtime_sec, s.mtime_nsec)).unwrap_or_else(|_| now_ts());
         let mut start = 0;
+        let since = q.get("sinceSeconds").and_then(|s| s.parse::<i64>().ok()).map(|s| now_ts().0 - s).or_else(|| q.get("sinceTime").and_then(|t| kr_apiserver::printers::parse_rfc3339(t)));
+        if let Some(cut) = since {
+            // First line written in a sampling interval that ended at or after the cut.
+            let mut off = 0;
+            start = data.len();
+            for line in data.split_inclusive(|b| *b == b'\n') {
+                if time_at(&marks, off, tail_at).0 >= cut {
+                    start = off;
+                    break;
+                }
+                off += line.len();
+            }
+        }
         if let Some(n) = q.get("tailLines").and_then(|t| t.parse::<usize>().ok()) {
             // Last n lines (a trailing newline does not start a new line).
             let body = if data.ends_with(b"\n") { &data[..data.len() - 1] } else { &data[..] };
             let mut lines = 0;
-            start = body.len();
-            while start > 0 && lines < n {
-                start -= 1;
-                if body[start] == b'\n' {
+            let mut from = body.len();
+            while from > 0 && lines < n {
+                from -= 1;
+                if body[from] == b'\n' {
                     lines += 1;
                     if lines == n {
-                        start += 1;
+                        from += 1;
                         break;
                     }
                 }
             }
             if lines < n {
-                start = 0;
+                from = 0;
             }
+            start = start.max(from);
         }
         let mut out = data[start..].to_vec();
         if let Some(l) = q.get("limitBytes").and_then(|l| l.parse::<usize>().ok()) {
@@ -224,9 +241,7 @@ impl<C: Client + Clone + 'static> Proxy<C> {
         }
         let stamp = q.flag("timestamps");
         if stamp {
-            // The log file keeps no per-line times: lines are stamped with the file's last write.
-            let at = kr_sys::fs::newfstatat(kr_sys::ns::AT_FDCWD, path.as_bytes(), 0).map(|s| (s.mtime_sec, s.mtime_nsec)).unwrap_or_else(|_| now_ts());
-            out = stamp_lines(&out, at);
+            out = stamp_lines(&out, start, &marks, tail_at);
         }
         if !q.flag("follow") {
             return Ok(Response::new(200, out).with_header("Content-Type", "text/plain"));
@@ -243,13 +258,23 @@ fn now_ts() -> (i64, i64) {
     kr_sys::clock_gettime(0).map(|t| (t.tv_sec, t.tv_nsec)).unwrap_or((0, 0))
 }
 
-/// Prefixes every line of `data` with an RFC 3339 nano timestamp and a space.
-fn stamp_lines(data: &[u8], (sec, nsec): (i64, i64)) -> Vec<u8> {
-    let t = alloc::format!("{}.{nsec:09}Z ", kr_apiserver::object::rfc3339(sec).trim_end_matches('Z'));
-    let mut out = Vec::with_capacity(data.len() + t.len() * 8);
+/// The time (seconds, nanoseconds) of the log byte at `off`: the first sample whose size lies
+/// beyond it, else `fallback`.
+fn time_at(marks: &[(u64, i64, i64)], off: usize, fallback: (i64, i64)) -> (i64, i64) {
+    let i = marks.partition_point(|m| m.0 as usize <= off);
+    marks.get(i).map_or(fallback, |m| (m.1, m.2))
+}
+
+/// Prefixes every line of `data` (which starts at file offset `base`) with an RFC 3339 nano
+/// timestamp and a space.
+fn stamp_lines(data: &[u8], base: usize, marks: &[(u64, i64, i64)], fallback: (i64, i64)) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 32 * 8);
+    let mut off = base;
     for line in data.split_inclusive(|b| *b == b'\n') {
-        out.extend_from_slice(t.as_bytes());
+        let (sec, nsec) = time_at(marks, off, fallback);
+        out.extend_from_slice(alloc::format!("{}.{nsec:09}Z ", kr_apiserver::object::rfc3339(sec).trim_end_matches('Z')).as_bytes());
         out.extend_from_slice(line);
+        off += line.len();
     }
     out
 }
@@ -312,7 +337,7 @@ impl ResponseStream for Follow {
             let mut data = self.read_new();
             if !data.is_empty() {
                 if self.stamp {
-                    data = stamp_lines(&data, now_ts());
+                    data = stamp_lines(&data, 0, &[], now_ts());
                 }
                 return Poll::Ready(Some(data));
             }

@@ -1299,3 +1299,17 @@ fn crd_deletion_removes_instances_then_the_crd() {
         assert_eq!(c.list(g, "").await.unwrap_err().code, 404);
     });
 }
+
+#[test]
+fn slice_ports_always_carry_a_name() {
+    scenario(|c| async move {
+        c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
+        // kubectl describe dereferences the port name of every slice port.
+        c.create(SVCS, &v(r#"{"metadata":{"name":"web"},"spec":{"selector":{"app":"web"},"ports":[{"port":80,"targetPort":8080}]}}"#)).await.unwrap();
+        c.create(PODS, &web_pod("a", 8080)).await.unwrap();
+        wait_until("slice published", || async { slice_eps(&c).await.len() == 1 }).await;
+        let s = &slices(&c).await[0];
+        let p = &s.get("ports").and_then(Value::as_array).unwrap()[0];
+        assert_eq!(p.get("name").and_then(Value::as_str), Some(""));
+    });
+}
