@@ -137,7 +137,7 @@ Addressed (KNOWN_ISSUES #105, #110), including conversion webhooks verified live
 
 ## Networking and DNS (14)
 
-Partly addressed (KNOWN_ISSUES #107, #108); open: DNS for musl resolvers.
+Addressed (KNOWN_ISSUES #107, #108), including DNS behaviour for musl clients checked live with the e2e probe commands.
 
 - [sig-network] API Server should have Endpoints and EndpointSlices pointing to API Server — `Expected at least 1 EndpointSlice, got 1: []v1.EndpointSubset{v1.EndpointSubset{Addresses:[]v1.EndpointAddress{v1.EndpointAddress{IP:"172.17.0.3", Hostname:"", …`
 - [sig-network] DNS should provide /etc/hosts entries for the cluster — `Unable to read musl_hosts@dns-querier-1.dns-test-service.dns-4467.svc.cluster.local from pod dns-4467/dns-test-a34286d9-09b4-46a9-87e5-0527c227b54a: client rate…`

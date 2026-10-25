@@ -31,7 +31,7 @@ impl Zone for Fake {
         match (ns, name) {
             ("default", "web") => Some(ServiceRecord { cluster_ip: Some([10, 96, 0, 10]), ports: vec![port("http", "tcp", 80)] }),
             ("default", "db") | ("default", "big") => Some(ServiceRecord { cluster_ip: None, ports: vec![port("sql", "tcp", 5432)] }),
-            ("default", "ext") => Some(ServiceRecord { cluster_ip: None, ports: vec![] }),
+            ("default", "ext" | "alias" | "alias2" | "loop") => Some(ServiceRecord { cluster_ip: None, ports: vec![] }),
             _ => None,
         }
     }
@@ -47,7 +47,13 @@ impl Zone for Fake {
         }
     }
     fn external_name(&self, ns: &str, name: &str) -> Option<String> {
-        (ns == "default" && name == "ext").then(|| "example.com.".to_string())
+        match (ns, name) {
+            ("default", "ext") => Some("example.com.".to_string()),
+            ("default", "alias") => Some("web.default.svc.cluster.local.".to_string()),
+            ("default", "alias2") => Some("alias.default.svc.cluster.local.".to_string()),
+            ("default", "loop") => Some("loop.default.svc.cluster.local.".to_string()),
+            _ => None,
+        }
     }
     fn namespace_exists(&self, ns: &str) -> bool {
         ns == "default" || ns == "kube-system"
@@ -229,6 +235,25 @@ fn externalname_cname() {
         assert_eq!((m.rcode(), m.an.len(), m.an[0].ty), (0, 1, 5), "type {ty}");
         assert_eq!(m.rdname(&m.an[0], 0), "example.com");
     }
+}
+
+/// In-cluster ExternalName targets are resolved in the same answer (musl does not chase a
+/// CNAME); chains are followed, loops end.
+#[test]
+fn externalname_in_cluster_target_is_chased() {
+    let m = ask("alias.default.svc.cluster.local", 1);
+    assert_eq!(m.rcode(), 0);
+    assert_eq!(m.an.iter().map(|r| r.ty).collect::<Vec<_>>(), [5, 1]);
+    assert_eq!(m.an[1].name, "web.default.svc.cluster.local");
+    assert_eq!(ips(&m.an), [[10, 96, 0, 10]]);
+    let m = ask("alias2.default.svc.cluster.local", 1);
+    assert_eq!(m.an.iter().map(|r| r.ty).collect::<Vec<_>>(), [5, 5, 1]);
+    assert_eq!(ips(&m.an), [[10, 96, 0, 10]]);
+    // Only the alias when the CNAME itself is asked for; AAAA gets the chain and no address.
+    assert_eq!(ask("alias.default.svc.cluster.local", 5).an.len(), 1);
+    assert_eq!(ask("alias.default.svc.cluster.local", 28).an.iter().map(|r| r.ty).collect::<Vec<_>>(), [5]);
+    let m = ask("loop.default.svc.cluster.local", 1);
+    assert!(m.an.len() <= 9 && m.an.iter().all(|r| r.ty == 5));
 }
 
 #[test]

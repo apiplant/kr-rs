@@ -595,8 +595,12 @@ mod imp {
             }
             [name, ns] => {
                 if let Some(target) = zone.external_name(ns, name) {
+                    let target = target.trim_end_matches('.').to_ascii_lowercase();
                     let mut r = Reply::new(0);
-                    r.answers.push(Rr { owner: None, rtype: TYPE_CNAME, data: Data::Name(target.trim_end_matches('.').to_string()) });
+                    r.answers.push(Rr { owner: None, rtype: TYPE_CNAME, data: Data::Name(target.clone()) });
+                    if q.qtype != TYPE_CNAME {
+                        chase(q, zone, target, &mut r);
+                    }
                     return r;
                 }
                 let Some(s) = zone.service(ns, name) else { return nxdomain(dom) };
@@ -631,6 +635,34 @@ mod imp {
             }
             [port, proto, name, ns] if port.starts_with('_') && proto.starts_with('_') => srv(q, zone, dom, &port[1..], &proto[1..], name, ns),
             _ => nxdomain(dom),
+        }
+    }
+
+    /// Appends the records of an in-cluster CNAME target to `r`, as CoreDNS does: stub resolvers
+    /// such as musl's do not chase a CNAME by querying again. ExternalName hops are followed
+    /// here (at most 8, so loops end) and only the final, non-alias target is looked up.
+    /// Targets outside the cluster domain are left to the client.
+    fn chase(q: &Query, zone: &dyn Zone, mut target: String, r: &mut Reply) {
+        let dom = zone.domain().trim_matches('.').to_ascii_lowercase();
+        for _ in 0..8 {
+            let Some(rel) = target.strip_suffix(dom.as_str()).and_then(|t| t.strip_suffix('.')) else { return };
+            let labels: Vec<&str> = rel.split('.').collect();
+            if let [name, ns, "svc"] = labels.as_slice() {
+                if let Some(next) = zone.external_name(ns, name) {
+                    let next = next.trim_end_matches('.').to_ascii_lowercase();
+                    r.answers.push(Rr { owner: Some(target.clone()), rtype: TYPE_CNAME, data: Data::Name(next.clone()) });
+                    target = next;
+                    continue;
+                }
+            }
+            let sub = Query { id: q.id, flags: q.flags, qname: target.clone(), qtype: q.qtype, qclass: q.qclass, qend: q.qend, edns: None };
+            if let Some(rep) = lookup(&sub, zone) {
+                for mut rr in rep.answers {
+                    rr.owner.get_or_insert_with(|| target.clone());
+                    r.answers.push(rr);
+                }
+            }
+            return;
         }
     }
 

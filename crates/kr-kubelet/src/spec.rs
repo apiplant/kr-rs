@@ -165,7 +165,14 @@ pub fn write_etc_hosts(pod_dir: &str, pod: &Value, hostname: &str, ip: Option<[u
     } else {
         let mut s = String::from("# Kubernetes-managed hosts file (kr).\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
         if let Some(a) = ip {
-            s.push_str(&alloc::format!("{}.{}.{}.{}\t{hostname}\n", a[0], a[1], a[2], a[3]));
+            // With a subdomain the pod is also `<hostname>.<subdomain>.<ns>.svc.<domain>`,
+            // listed first as upstream's kubelet does (getent / `hostname -f` read it).
+            let sub = pod.pointer(&["spec", "subdomain"]).and_then(Value::as_str).filter(|s| !s.is_empty());
+            let names = match sub {
+                Some(sub) => alloc::format!("{hostname}.{sub}.{}.svc.cluster.local\t{hostname}", meta(pod, "namespace")),
+                None => String::from(hostname),
+            };
+            s.push_str(&alloc::format!("{}.{}.{}.{}\t{names}\n", a[0], a[1], a[2], a[3]));
         }
         s
     };
