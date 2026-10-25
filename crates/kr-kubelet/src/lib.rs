@@ -699,7 +699,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         } else {
             None
         };
-        spec::write_etc_hosts(&dir, &hostname, ip).map_err(|_| String::from("cannot write /etc/hosts"))?;
+        spec::write_etc_hosts(&dir, pod, &hostname, ip).map_err(|_| String::from("cannot write /etc/hosts"))?;
         spec::write_resolv_conf(&dir, pod).map_err(|_| String::from("cannot write /etc/resolv.conf"))?;
         let mut pods = self.pods.borrow_mut();
         let p = pods.get_mut(uid).unwrap();

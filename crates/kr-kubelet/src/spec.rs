@@ -107,10 +107,28 @@ async fn service_env<C: Client>(c: &C, pod: &Value) -> Vec<(String, String)> {
     out
 }
 
-pub fn write_etc_hosts(pod_dir: &str, hostname: &str, ip: Option<[u8; 4]>) -> Result<(), ()> {
-    let mut s = String::from("# Kubernetes-managed hosts file (kr).\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
-    if let Some(a) = ip {
-        s.push_str(&alloc::format!("{}.{}.{}.{}\t{hostname}\n", a[0], a[1], a[2], a[3]));
+/// The pod's /etc/hosts: kubelet-managed (localhost, the pod's own name, `hostAliases`), or for
+/// hostNetwork pods a copy of the node's file, which upstream does not manage either.
+pub fn write_etc_hosts(pod_dir: &str, pod: &Value, hostname: &str, ip: Option<[u8; 4]>) -> Result<(), ()> {
+    let host_net = pod.pointer(&["spec", "hostNetwork"]).and_then(Value::as_bool) == Some(true);
+    let mut s = if host_net {
+        String::from_utf8(kr_sys::fs::read_file(b"/etc/hosts\0", 1024 * 1024).unwrap_or_default()).unwrap_or_default()
+    } else {
+        let mut s = String::from("# Kubernetes-managed hosts file (kr).\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
+        if let Some(a) = ip {
+            s.push_str(&alloc::format!("{}.{}.{}.{}\t{hostname}\n", a[0], a[1], a[2], a[3]));
+        }
+        s
+    };
+    let aliases = pod.pointer(&["spec", "hostAliases"]).and_then(Value::as_array).unwrap_or(&[]);
+    if !aliases.is_empty() {
+        s.push_str("\n# Entries added by HostAliases.\n");
+        for a in aliases {
+            let names: Vec<&str> = a.get("hostnames").and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_str).collect();
+            if let Some(ip) = a.get("ip").and_then(Value::as_str).filter(|_| !names.is_empty()) {
+                s.push_str(&alloc::format!("{ip}\t{}\n", names.join("\t")));
+            }
+        }
     }
     kr_runtime::store::write_file_atomic(&alloc::format!("{pod_dir}/etc-hosts"), s.as_bytes()).map_err(|_| ())
 }
@@ -804,8 +822,14 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         let vol = vols.iter().find(|v| v.get("name").and_then(Value::as_str) == Some(name)).ok_or_else(|| alloc::format!("volume {name} not found"))?;
         let Some(src) = volume_source(c, pod, vol, pod_dir).await? else { continue };
         let mut sub_path = None;
-        if let Some(sub) = vm.get("subPath").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-            if sub.starts_with('/') || sub.split('/').any(|c| c == "..") {
+        let sub_expr = vm.get("subPathExpr").and_then(Value::as_str).filter(|s| !s.is_empty());
+        let sub_plain = vm.get("subPath").and_then(Value::as_str).filter(|s| !s.is_empty());
+        if sub_expr.is_some() && sub_plain.is_some() {
+            return Err(String::from("subPath and subPathExpr are mutually exclusive"));
+        }
+        let sub_expanded = sub_expr.map(|e| expand(e, &env));
+        if let Some(sub) = sub_plain.or(sub_expanded.as_deref()) {
+            if sub.contains('`') || sub.starts_with('/') || sub.split('/').any(|c| c == "..") {
                 return Err(alloc::format!("invalid subPath {sub}"));
             }
             // Resolve inside the volume (RESOLVE_IN_ROOT): a symlink the container created in
