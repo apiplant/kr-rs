@@ -108,6 +108,10 @@ pub async fn pre(api: &ApiServer, req: &Req<'_>) -> Option<Reply> {
         return None;
     }
     let user = api.authenticate(req).ok()?;
+    // Only callers allowed to patch the object get a webhook call made on their behalf.
+    if let Err(e) = api.authorize_request(req, &user) {
+        return Some(Reply::err(e));
+    }
     if let Err(e) = convert_items(api, &cc, &gv, &mut [&mut old]).await {
         return Some(Reply::err(e));
     }
