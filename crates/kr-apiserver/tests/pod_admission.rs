@@ -68,3 +68,24 @@ fn pod_admission_plugins() {
     let big = r#"{"metadata":{"name":"b"},"spec":{"containers":[{"name":"c","image":"i","resources":{"limits":{"cpu":"600m"}}}]}}"#;
     assert_eq!(call(&api, "POST", &pods, "application/json", big).0, 403);
 }
+
+/// Critical priority classes outrank every workload: outside kube-system they need a quota that
+/// explicitly covers them (upstream's default limitedResources).
+#[test]
+fn critical_priority_is_limited() {
+    let api = server();
+    // Created by the bootstrap policy in a real server (not enabled in this harness).
+    let pc = r#"{"apiVersion":"scheduling.k8s.io/v1","kind":"PriorityClass","metadata":{"name":"system-node-critical"},"value":2000001000}"#;
+    assert_eq!(call(&api, "POST", "/apis/scheduling.k8s.io/v1/priorityclasses", "application/json", pc).0, 201);
+    let pod = |ns: &str| format!(r#"{{"metadata":{{"name":"p","namespace":"{ns}"}},"spec":{{"priorityClassName":"system-node-critical","containers":[{{"name":"c","image":"i"}}]}}}}"#);
+    let (c, v) = call(&api, "POST", "/api/v1/namespaces/default/pods", "application/json", &pod("default"));
+    assert_eq!(c, 403, "{v:?}");
+    assert!(v.get("message").and_then(Value::as_str).unwrap().contains("insufficient quota"), "{v:?}");
+    let (c, v) = call(&api, "POST", "/api/v1/namespaces/kube-system/pods", "application/json", &pod("kube-system"));
+    assert_eq!(c, 201, "{v:?}");
+    let q = r#"{"metadata":{"name":"crit"},"spec":{"hard":{"pods":"10"},"scopeSelector":{"matchExpressions":[{"scopeName":"PriorityClass","operator":"In","values":["system-node-critical"]}]}}}"#;
+    assert_eq!(call(&api, "POST", "/api/v1/namespaces/default/resourcequotas", "application/json", q).0, 201);
+    let (c, v) = call(&api, "POST", "/api/v1/namespaces/default/pods", "application/json", &pod("default"));
+    assert_eq!(c, 201, "{v:?}");
+    assert_eq!(v.pointer(&["spec", "priority"]).and_then(Value::as_i64), Some(2_000_001_000));
+}
