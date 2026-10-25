@@ -1008,6 +1008,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     /// Graceful termination for a pod with a deletionTimestamp.
     async fn terminate(&self, uid: &str, pod: &Value) {
         if !self.pods.borrow().contains_key(uid) {
+            // Nothing runs here for this pod (never admitted, or already cleaned up):
+            // upstream kubelet force-deletes unknown terminating pods, so the object
+            // does not linger after the grace period.
+            let path = alloc::format!("/api/v1/namespaces/{}/pods/{}?gracePeriodSeconds=0", meta(pod, "namespace"), meta(pod, "name"));
+            let _ = self.c.delete(&path).await;
             return;
         }
         let grace = pod.pointer(&["metadata", "deletionGracePeriodSeconds"]).and_then(Value::as_u64).or_else(|| pod.pointer(&["spec", "terminationGracePeriodSeconds"]).and_then(Value::as_u64)).unwrap_or(30);

@@ -42,6 +42,8 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     - They are republished every 20 s through an atomic `..data` symlink swap; the SA token is renewed at 80% of its lifetime.
     - subPath is resolved with RESOLVE_IN_ROOT inside the container mount namespace.
     - PersistentVolumeClaims work with a built-in local-path provisioner (default StorageClass `local-path`, `WaitForFirstConsumer`, hostPath PVs under `/var/lib/kr/storage` pinned to a node, pvc-protection, static binding, Delete/Retain reclaim, kubelet GC of deleted PV directories; verified live on two nodes). Remaining: other volume types, volume expansion, snapshots, PV protection finalizer, storage capacity limits (no quota on the directories), and unbound Immediate claims do not block scheduling.
+96. **Protobuf request bodies are only handled for DeleteOptions** — *partly fixed*
+    Found in conformance round 3 (2026-10-25): about 60 e2e failures were one root cause — client-go sends DELETE bodies as protobuf DeleteOptions, and the run's binary rejected some framings with `invalid DeleteOptions: protobuf ...` (also `cannot create crd protobuf is not supported...`). The committed code decodes typed (`meta.k8s.io/v1`/`v1`) and typeless-with-fallback DeleteOptions correctly — regression-tested in `crates/kr-apiserver/tests/proto_delete.rs`; the failing run predated that binary. Remaining: CREATE/UPDATE bodies for other kinds (e.g. CRD creates from client-go clients) still answer 415, and protobuf *responses* are not implemented (#70).
 
 ## Services, DNS, multi-node (phase 5, ADR-022)
 80. **Overlay networking is VXLAN or host-gw only** — *partly fixed*
@@ -238,6 +240,14 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     Remaining gaps: no proportional scaling during a rollout, no adoption of orphan ReplicaSets, namespace deletion conditions are limited to `NamespaceContentRemaining`.
 77. **Image pulls block the kubelet sync loop** — *fixed*
     Pulls run as background tasks; failures back off and are reported as `ImagePullBackOff`.
+94. **Graceful pod deletion never completes** — *fixed*
+    Found in conformance round 3: pods that got a `deletionTimestamp` before the kubelet ever admitted them (tests create + delete faster than the sync loop) stayed `Terminating` forever — `terminate()` returned early when the pod was not in the kubelet's runtime map, so the API object was never removed (49 marker pods stuck on one node for 45+ min; pods with client-set finalizers lingering is upstream-correct behaviour, a different case).
+    Fix: the kubelet force-deletes (`gracePeriodSeconds=0`) terminating pods it has no runtime state for, matching upstream `kubelet.deletePod`. Verified live: three create+delete races all removed within one sync cycle.
+    Not covered: apiserver-side eviction of pods on a dead node (upstream uses the taint manager; kr has no node-lifecycle controller yet).
+95. **Sonobuoy aggregator gets `Unauthorized` from kr's apiserver** — *fixed*
+    Found in conformance round 3: about an hour after pod start, every request from a pod's service account returned 401 (sonobuoy spammed `unable to list pods ... Unauthorized` every few seconds, the aggregator never discovered the e2e job pods, and sonobuoy never completed), so the run stayed `running` in the API even though the suite had finished and written its log — `conformance.sh wait` hangs on this.
+    Cause: the kubelet's projected-volume refresh decided a mounted token was fresh by file mtime, and every 20 s republish rewrote the file — so an expired token was republished forever.
+    Fix: `spec.rs` `stage_volume` reads the token's own `iat`/`exp` claims (`token_lifetime`) and renews at 80% of the real lifetime. Verified live: a pod with `expirationSeconds: 600` rotated its token exactly at 480 s, and the rotated token authenticated (403 on a forbidden list, not 401).
 
 ## Services, DNS, multi-node (phase 5, ADR-022)
 81. **No Node authorizer** — *fixed* (ADR-023)

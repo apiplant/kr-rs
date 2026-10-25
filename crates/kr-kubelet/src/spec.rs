@@ -356,12 +356,13 @@ async fn stage_volume<C: Client>(c: &C, pod: &Value, vol: &Value, dir: &str, sta
         for src in pj.get("sources").and_then(Value::as_array).unwrap_or(&[]) {
             if let Some(t) = src.get("serviceAccountToken") {
                 let path = t.get("path").and_then(Value::as_str).unwrap_or("token");
-                // Reuse the current token until 80% of its lifetime.
-                let exp = t.get("expirationSeconds").and_then(Value::as_i64).unwrap_or(3600);
+                // Reuse the current token until 80% of its lifetime. Freshness comes
+                // from the token's own `iat`/`exp` claims: the file's mtime is rewritten
+                // by every republish, so it cannot tell an expired token from a new one.
                 let cur = alloc::format!("{dir}/..data/{path}\0");
-                let fresh = kr_sys::fs::newfstatat(kr_sys::fs::AT_FDCWD, cur.as_bytes(), 0).ok().filter(|st| now_secs() - st.mtime_sec < exp * 8 / 10);
-                let token = match fresh.and_then(|_| kr_sys::fs::read_file(cur.as_bytes(), 1 << 16).ok()) {
-                    Some(t) => t,
+                let fresh = kr_sys::fs::read_file(cur.as_bytes(), 1 << 16).ok().and_then(|tok| token_lifetime(&tok)).filter(|(iat, lifetime)| iat + lifetime * 8 / 10 > now_secs());
+                let token = match fresh {
+                    Some(_) => kr_sys::fs::read_file(cur.as_bytes(), 1 << 16).unwrap_or_default(),
                     None => request_token(c, pod, t).await?.into_bytes(),
                 };
                 write_item(stage, path, &token, mode)?;
@@ -383,6 +384,18 @@ async fn stage_volume<C: Client>(c: &C, pod: &Value, vol: &Value, dir: &str, sta
 
 fn now_secs() -> i64 {
     kr_sys::clock_gettime(0).map(|t| t.tv_sec).unwrap_or(0)
+}
+
+/// `(iat, lifetime)` of a JWT bearer token, from its payload claims; `None` when the token
+/// is not a JWT with an `exp`, so it is renewed.
+fn token_lifetime(tok: &[u8]) -> Option<(i64, i64)> {
+    let s = core::str::from_utf8(tok).ok()?;
+    let (_, rest) = s.split_once('.')?;
+    let (payload, _) = rest.split_once('.')?;
+    let json = kr_fmt::json::parse(&kr_fmt::base64::decode(payload).ok()?).ok()?;
+    let exp = json.get("exp")?.as_i64()?;
+    let iat = json.get("iat").and_then(Value::as_i64).unwrap_or(exp);
+    Some((iat, exp.saturating_sub(iat).max(1)))
 }
 
 /// Points `dir/..data` at `stage_name`, links each top-level entry through it, and removes
