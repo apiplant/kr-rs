@@ -201,40 +201,8 @@ impl Ctx<'_> {
     }
 
     async fn call(&self, wh: &Value, review: &str) -> Result<Value, String> {
-        let cc = wh.get("clientConfig").ok_or("no clientConfig")?;
-        let (url, hosts) = if let Some(u) = cc.get("url").and_then(Value::as_str) {
-            (u.to_string(), String::new())
-        } else {
-            let svc = cc.get("service").ok_or("clientConfig has neither url nor service")?;
-            let (sn, sns) = (svc.get("name").and_then(Value::as_str).unwrap_or(""), svc.get("namespace").and_then(Value::as_str).unwrap_or(""));
-            let port = svc.get("port").and_then(Value::as_u64).unwrap_or(443);
-            let path = svc.get("path").and_then(Value::as_str).unwrap_or("/");
-            let s = self.api.wh_object("", "v1", "services", Some(sns), sn).ok_or_else(|| format!("service \"{sn}\" not found"))?;
-            let ip = s.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).filter(|i| i.contains('.')).ok_or("service has no cluster IP")?;
-            let host = format!("{sn}.{sns}.svc");
-            (format!("https://{host}:{port}{path}"), format!("{ip} {host}\n"))
-        };
-        // Like upstream, the request carries its timeout: `?timeout=1s`.
-        let secs = wh.get("timeoutSeconds").and_then(Value::as_u64).unwrap_or(10).clamp(1, 30);
-        let url = format!("{url}{}timeout={secs}s", if url.contains('?') { '&' } else { '?' });
-        let roots = match cc.get("caBundle").and_then(Value::as_str) {
-            Some(b) => x509::pem_decode_all(core::str::from_utf8(&kr_fmt::base64::decode(b).map_err(|_| "invalid caBundle")?).map_err(|_| "invalid caBundle")?, "CERTIFICATE").map_err(|_| "invalid caBundle")?,
-            None => Vec::new(),
-        };
-        let cfg = Rc::new(ClientConfig { pinned_ca: None, roots, client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
-        let http = Http::with_connector(
-            TlsConnector::new(WhResolver(HostsResolver::from_contents(&hosts)), cfg),
-            HttpConfig { max_redirects: 0, max_idle: 0, connect_timeout_ms: secs * 1000, head_timeout_ms: secs * 1000, read_timeout_ms: secs * 1000, user_agent: "kr-apiserver".to_string(), ..HttpConfig::default() },
-        );
-        let fut = async {
-            let mut resp = http.request("POST", &url, &[("Content-Type", "application/json"), ("Accept", "application/json")], review.as_bytes()).await.map_err(|e| if format!("{e:?}").contains("Timeout") { format!("Post \"{url}\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)") } else { format!("Post \"{url}\": {e:?}") })?;
-            if resp.status != 200 {
-                return Err(format!("Post \"{url}\": webhook returned status {}", resp.status));
-            }
-            resp.read_to_end(8 << 20).await.map_err(|e| format!("reading response: {e:?}"))
-        };
-        let body = kr_rt::exec::timeout(secs * 1000, fut).await.map_err(|_| format!("Post \"{url}\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)"))??;
-        json::parse(&body).map_err(|_| "webhook response is not valid JSON".to_string())
+        let secs = wh.get("timeoutSeconds").and_then(Value::as_u64).unwrap_or(10);
+        post_review(self.api, wh.get("clientConfig").ok_or("no clientConfig")?, secs, review).await
     }
 
     /// Calls `wh` if it applies. `Ok(Skipped)` also covers errors ignored by `failurePolicy: Ignore`.
@@ -287,6 +255,44 @@ impl Ctx<'_> {
     }
 }
 
+
+/// POSTs `review` to a webhook `clientConfig` (url, or service plus caBundle) and parses the JSON
+/// answer. Shared by admission and CRD conversion webhooks.
+pub(crate) async fn post_review(api: &ApiServer, cc: &Value, secs: u64, review: &str) -> Result<Value, String> {
+    let (url, hosts) = if let Some(u) = cc.get("url").and_then(Value::as_str) {
+        (u.to_string(), String::new())
+    } else {
+        let svc = cc.get("service").ok_or("clientConfig has neither url nor service")?;
+        let (sn, sns) = (svc.get("name").and_then(Value::as_str).unwrap_or(""), svc.get("namespace").and_then(Value::as_str).unwrap_or(""));
+        let port = svc.get("port").and_then(Value::as_u64).unwrap_or(443);
+        let path = svc.get("path").and_then(Value::as_str).unwrap_or("/");
+        let s = api.wh_object("", "v1", "services", Some(sns), sn).ok_or_else(|| format!("service \"{sn}\" not found"))?;
+        let ip = s.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).filter(|i| i.contains('.')).ok_or("service has no cluster IP")?;
+        let host = format!("{sn}.{sns}.svc");
+        (format!("https://{host}:{port}{path}"), format!("{ip} {host}\n"))
+    };
+    // Like upstream, the request carries its timeout: `?timeout=1s`.
+    let secs = secs.clamp(1, 30);
+    let url = format!("{url}{}timeout={secs}s", if url.contains('?') { '&' } else { '?' });
+    let roots = match cc.get("caBundle").and_then(Value::as_str) {
+        Some(b) => x509::pem_decode_all(core::str::from_utf8(&kr_fmt::base64::decode(b).map_err(|_| "invalid caBundle")?).map_err(|_| "invalid caBundle")?, "CERTIFICATE").map_err(|_| "invalid caBundle")?,
+        None => Vec::new(),
+    };
+    let cfg = Rc::new(ClientConfig { pinned_ca: None, roots, client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
+    let http = Http::with_connector(
+        TlsConnector::new(WhResolver(HostsResolver::from_contents(&hosts)), cfg),
+        HttpConfig { max_redirects: 0, max_idle: 0, connect_timeout_ms: secs * 1000, head_timeout_ms: secs * 1000, read_timeout_ms: secs * 1000, user_agent: "kr-apiserver".to_string(), ..HttpConfig::default() },
+    );
+    let fut = async {
+        let mut resp = http.request("POST", &url, &[("Content-Type", "application/json"), ("Accept", "application/json")], review.as_bytes()).await.map_err(|e| if format!("{e:?}").contains("Timeout") { format!("Post \"{url}\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)") } else { format!("Post \"{url}\": {e:?}") })?;
+        if resp.status != 200 {
+            return Err(format!("Post \"{url}\": webhook returned status {}", resp.status));
+        }
+        resp.read_to_end(8 << 20).await.map_err(|e| format!("reading response: {e:?}"))
+    };
+    let body = kr_rt::exec::timeout(secs * 1000, fut).await.map_err(|_| format!("Post \"{url}\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)"))??;
+    json::parse(&body).map_err(|_| "webhook response is not valid JSON".to_string())
+}
 
 /// Kinds whose changes invalidate [`Configs`] (see `ApiServer::wh_stamp`).
 pub(crate) const CONFIG_PLURALS: [&str; 6] = ["mutatingwebhookconfigurations", "validatingwebhookconfigurations", "validatingadmissionpolicies", "validatingadmissionpolicybindings", "mutatingadmissionpolicies", "mutatingadmissionpolicybindings"];
