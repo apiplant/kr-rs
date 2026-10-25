@@ -117,7 +117,7 @@ Mostly addressed (KNOWN_ISSUES #106); environmental: DaemonSet rollback needs 2 
 
 ## Admission webhooks and CRDs (15)
 
-Addressed (KNOWN_ISSUES #105, #110); conversion of writes and watches in progress.
+Addressed (KNOWN_ISSUES #105, #110), including conversion webhooks verified live with upstream's webhook image.
 
 - [sig-api-machinery] AdmissionWebhook should be able to deny attaching pod — `unexpected 'kubectl attach' error message. expected to contain "attaching to pod 'to-be-attached-pod' is not allowed", got "timed out waiting for command /usr/l…`
 - [sig-api-machinery] AdmissionWebhook should honor timeout — `expect an HTTP/dial timeout error querying the slow webhook, got: "Internal error occurred: failed calling webhook \"allow-configmap-with-delay-webhook.k8s.io\"…`
