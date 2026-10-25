@@ -889,6 +889,25 @@ impl ApiServer {
         Ok(self.convert_reply(&route, reply))
     }
 
+    /// `pods/<name>[:port]/proxy[/path]`: relays the request to the pod's IP (default port: the
+    /// first container port, else 80).
+    fn pod_proxy(&self, req: &Req, rt: &Route, name: &str) -> R<Reply> {
+        let (pod_name, port) = match name.split_once(':') {
+            Some((n, p)) => (n, Some(p)),
+            None => (name, None),
+        };
+        let (_, pod) = self.get_value(rt, pod_name)?;
+        let ip = pod.pointer(&["status", "podIP"]).and_then(Value::as_str).and_then(object::parse_ipv4).ok_or_else(|| ApiError::bad_request(alloc::format!("pod {pod_name} does not have an IP yet")))?;
+        let port = match port {
+            Some(p) => p.parse::<u16>().ok(),
+            None => pod.pointer(&["spec", "containers"]).and_then(Value::as_array).and_then(|cs| cs.iter().find_map(|c| c.get("ports")?.as_array()?.first()?.get("containerPort")?.as_u64())).map(|p| p as u16).or(Some(80)),
+        }
+        .ok_or_else(|| ApiError::bad_request("invalid port"))?;
+        let path = req.path.split_once("/proxy").map_or("/", |(_, t)| t);
+        let path = if path.is_empty() { "/" } else { path };
+        Ok(Reply::Http(crate::podproxy::forward(req.method, ip, port, path, req.query, req.content_type, req.accept, req.body)))
+    }
+
     fn dispatch(&self, req: &Req, rt: &Route, q: &Query) -> R<Reply> {
         let sub = rt.sub.as_deref();
         if let Some(s) = sub {
@@ -897,6 +916,7 @@ impl ApiServer {
             }
         }
         match (req.method, &rt.name, sub) {
+            (_, Some(n), Some("proxy")) => self.pod_proxy(req, rt, n),
             ("GET" | "POST", Some(n), Some(sub @ ("log" | "exec" | "attach" | "portforward"))) => {
                 let (_, pod) = self.get_value(rt, n)?;
                 let node = pod.pointer(&["spec", "nodeName"]).and_then(Value::as_str).unwrap_or("").to_string();
@@ -2385,6 +2405,8 @@ fn parse_route(extra: &[&'static Resource], group: &str, version: &str, rest: &[
         [p] => (*p, None, None),
         [p, n] => (*p, Some(n.to_string()), None),
         [p, n, s] => (*p, Some(n.to_string()), Some(s.to_string())),
+        // pods/<name>[:port]/proxy/<path...>: the path is re-read from the request.
+        [p @ "pods", n, "proxy", ..] => (*p, Some(n.to_string()), Some(String::from("proxy"))),
         _ => return None,
     };
     let res = resources::find_in(extra, group, version, plural)?;

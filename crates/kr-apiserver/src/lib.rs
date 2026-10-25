@@ -23,6 +23,7 @@ pub mod node_authz;
 pub mod object;
 pub mod openapi;
 pub mod patch;
+pub mod podproxy;
 pub mod ssa;
 pub mod printers;
 pub mod rbac;

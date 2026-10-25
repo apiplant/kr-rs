@@ -22,6 +22,55 @@ pub struct Built {
     pub extra_groups: Vec<u32>,
 }
 
+/// Host file backing a container's terminationMessagePath.
+pub fn term_file(pod_dir: &str, name: &str) -> String {
+    alloc::format!("{pod_dir}/{name}.term")
+}
+
+/// The termination message: the file's first 4096 bytes; with `FallbackToLogsOnError`, a failed
+/// container with an empty file reports the tail of its log (80 lines, 2048 bytes) instead.
+pub fn termination_message(pod_dir: &str, name: &str, fallback: bool, failed: bool) -> String {
+    let read = |path: String, limit: usize| kr_sys::fs::read_file(alloc::format!("{path}\0").as_bytes(), limit).unwrap_or_default();
+    let mut msg = read(term_file(pod_dir, name), 4096);
+    msg.truncate(4096);
+    if msg.is_empty() && fallback && failed {
+        let log = read(alloc::format!("{pod_dir}/{name}.log"), 64 << 20);
+        msg = tail_log(&log, 80, 2048).to_vec();
+    }
+    String::from_utf8_lossy(&msg).into_owned()
+}
+
+/// Last `lines` lines of `log`, then at most the last `bytes` bytes of those.
+fn tail_log(log: &[u8], lines: usize, bytes: usize) -> &[u8] {
+    let body = log.strip_suffix(b"\n").unwrap_or(log);
+    let mut start = 0;
+    let mut seen = 0;
+    for (i, b) in body.iter().enumerate().rev() {
+        if *b == b'\n' {
+            seen += 1;
+            if seen == lines {
+                start = i + 1;
+                break;
+            }
+        }
+    }
+    let t = &body[start..];
+    &t[t.len().saturating_sub(bytes)..]
+}
+
+#[cfg(test)]
+mod term_tests {
+    use super::*;
+
+    #[test]
+    fn tail() {
+        assert_eq!(tail_log(b"a\nb\nc\n", 2, 100), b"b\nc");
+        assert_eq!(tail_log(b"a\nb", 5, 100), b"a\nb");
+        assert_eq!(tail_log(b"abcdef", 5, 3), b"def");
+        assert_eq!(tail_log(b"", 5, 3), b"");
+    }
+}
+
 pub fn find_container<'a>(pod: &'a Value, name: &str) -> Option<&'a Value> {
     ["initContainers", "containers", "ephemeralContainers"]
         .iter()
@@ -849,6 +898,16 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         }
         let ro = vm.get("readOnly").and_then(Value::as_bool).unwrap_or(false) || ["configMap", "secret", "projected", "downwardAPI"].iter().any(|k| vol.get(k).is_some());
         mounts.push(Mount { source: src.into_bytes(), sub_path, target: target.as_bytes().to_vec(), readonly: ro });
+    }
+    // terminationMessagePath: a fresh world-writable file per start (any runAsUser must be able to
+    // write it), read back by the kubelet once the container exits.
+    let tpath = ctr.get("terminationMessagePath").and_then(Value::as_str).filter(|p| !p.is_empty()).unwrap_or("/dev/termination-log");
+    if !mounts.iter().any(|m| m.target == tpath.as_bytes()) {
+        let host = term_file(pod_dir, ctr.get("name").and_then(Value::as_str).unwrap_or(""));
+        if let Ok(fd) = kr_sys::ns::open(alloc::format!("{host}\0").as_bytes(), kr_sys::ns::O_WRONLY | kr_sys::ns::O_CREAT | kr_sys::fs::O_TRUNC, 0o666) {
+            let _ = kr_sys::fs::fchmod(fd.raw(), 0o666);
+            mounts.push(Mount { source: host.into_bytes(), sub_path: None, target: tpath.as_bytes().to_vec(), readonly: false });
+        }
     }
     let mut extra_groups: Vec<u32> = pod.pointer(&["spec", "securityContext", "supplementalGroups"]).and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_u64).map(|g| g as u32).collect();
     if let Some(fg) = pod.pointer(&["spec", "securityContext", "fsGroup"]).and_then(Value::as_u64) {
