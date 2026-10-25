@@ -131,27 +131,47 @@ async fn reconcile_kind<C: Client>(c: &C, cfg: &Config, k: Kind, ns: &str, name:
     } else {
         rs.get("spec").and_then(|s| s.get("selector")).and_then(parse_selector)
     };
-    let Some((sel_str, sel)) = parsed else { return Ok(None) };
-    let list = c.list(&pods(Some(ns)), &alloc::format!("labelSelector={}", enc(&sel_str))).await?;
+    let Some((_, sel)) = parsed else { return Ok(None) };
+    // All of the namespace's pods: matching ones are claimed, controlled ones that no longer
+    // match are released.
+    let list = c.list(&pods(Some(ns)), "").await?;
     let rs_uid = uid(&rs);
 
     let mut owned: Vec<Value> = Vec::new();
-    for p in items(&list).into_iter().filter(|p| sel.matches(p) && !deleting(p) && !pod_terminal(p)) {
+    for p in items(&list) {
+        let matches = sel.matches(&p);
+        let live = !deleting(&p) && !pod_terminal(&p);
         match controller_ref(&p) {
-            Some(r) if str_at(r, &["uid"]) == rs_uid => owned.push(p),
+            Some(r) if str_at(r, &["uid"]) == rs_uid && live => {
+                if matches {
+                    owned.push(p);
+                } else {
+                    release_owner(c, &pods(Some(ns)), rs_uid, &p).await?;
+                }
+            }
             Some(_) => {}
-            None => {
+            None if matches && live => {
                 if let Some(p) = adopt(c, k, &rs, &p).await? {
                     owned.push(p);
                 }
             }
+            None => {}
         }
     }
 
+    let mut failure: Option<String> = None;
     if owned.len() < desired {
         let tpl = rs.pointer(&["spec", "template"]).cloned().unwrap_or(Value::Null);
         for _ in 0..(desired - owned.len()).min(MAX_BURST) {
-            c.create(&pods(Some(ns)), &pod_from_template(k, &rs, &tpl)).await?;
+            match c.create(&pods(Some(ns)), &pod_from_template(k, &rs, &tpl)).await {
+                Ok(_) => {}
+                // Refused (quota, admission): surfaced as the ReplicaFailure condition.
+                Err(e) if e.code == 403 => {
+                    failure = Some(e.message);
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
         }
     } else if owned.len() > desired {
         owned.sort_by_key(deletion_rank);
@@ -169,8 +189,9 @@ async fn reconcile_kind<C: Client>(c: &C, cfg: &Config, k: Kind, ns: &str, name:
     let (now, min_ready) = ((cfg.now)(), int_at(&rs, &["spec", "minReadySeconds"], 0));
     let available = owned.iter().filter(|p| pod_available(p, min_ready, now)).count();
     let soonest = owned.iter().filter_map(|p| available_in(p, min_ready, now)).min();
-    write_status(c, k, ns, name, [owned.len(), ready, available, labeled]).await?;
-    Ok(soonest.map(|s| s as u64 * 1000 + 50))
+    write_status(c, k, ns, name, [owned.len(), ready, available, labeled], failure.as_deref(), now).await?;
+    let retry = failure.map(|_| 5000);
+    Ok([soonest.map(|s| s as u64 * 1000 + 50), retry].into_iter().flatten().min())
 }
 
 fn name_of(p: &Value) -> &str {
@@ -202,7 +223,7 @@ async fn adopt<C: Client>(c: &C, k: Kind, rs: &Value, p: &Value) -> Result<Optio
     }
 }
 
-async fn write_status<C: Client>(c: &C, k: Kind, ns: &str, name: &str, [replicas, ready, available, labeled]: [usize; 4]) -> Result<()> {
+async fn write_status<C: Client>(c: &C, k: Kind, ns: &str, name: &str, [replicas, ready, available, labeled]: [usize; 4], failure: Option<&str>, now: i64) -> Result<()> {
     let path = alloc::format!("{}/{name}", (k.path)(Some(ns)));
     retry_conflict(|| async {
         let mut rs = match c.get(&path).await {
@@ -218,10 +239,29 @@ async fn write_status<C: Client>(c: &C, k: Kind, ns: &str, name: &str, [replicas
             ("availableReplicas", num(available as i64)),
             ("observedGeneration", num(gen)),
         ]);
-        if let Some(conds) = rs.pointer(&["status", "conditions"]) {
-            want.set("conditions", conds.clone());
+        // ReplicaFailure follows the last pod creation: set with its error, cleared on success.
+        let mut conds: Vec<Value> = rs.pointer(&["status", "conditions"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+        let old = conds.iter().position(|x| str_at(x, &["type"]) == "ReplicaFailure");
+        match (failure, old) {
+            (Some(msg), o) if o.is_none_or(|i| str_at(&conds[i], &["message"]) != msg) => {
+                let cond = obj(alloc::vec![
+                    ("type", Value::from("ReplicaFailure")),
+                    ("status", Value::from("True")),
+                    ("lastTransitionTime", Value::String(rfc3339(now))),
+                    ("reason", Value::from("FailedCreate")),
+                    ("message", Value::from(msg)),
+                ]);
+                set_condition(&mut conds, cond);
+            }
+            (None, Some(i)) => {
+                conds.remove(i);
+            }
+            _ => {}
         }
-        let same = ["replicas", "fullyLabeledReplicas", "readyReplicas", "availableReplicas", "observedGeneration"].iter().all(|f| rs.pointer(&["status", f]).and_then(Value::as_i64) == want.get(f).and_then(Value::as_i64));
+        if !conds.is_empty() {
+            want.set("conditions", Value::Array(conds));
+        }
+        let same = rs.get("status").map(canonical) == Some(canonical(&want));
         if same {
             return Ok(());
         }

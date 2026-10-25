@@ -34,7 +34,10 @@ fn obj<'a>(o: &'a mut Value, key: &str) -> Option<&'a mut Value> {
 /// Applies the defaults for `kind` (identified by its resource plural and group).
 pub fn apply(group: &str, plural: &str, o: &mut Value) {
     match (group, plural) {
-        ("", "pods") => pod_spec(o.entry_object("spec")),
+        ("", "pods") => {
+            pod_spec(o.entry_object("spec"));
+            def(o.entry_object("status"), "phase", s("Pending"));
+        }
         ("", "podtemplates") => template(o),
         ("", "replicationcontrollers") => {
             let sp = o.entry_object("spec");

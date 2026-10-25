@@ -233,25 +233,47 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     it.next().is_none().then_some(out)
 }
 
+/// The environment of an exec probe or hook: PATH plus the container's literal and
+/// `fieldRef` (`metadata.labels`/`annotations`) variables, so commands see what the container sees.
+fn exec_env(pod: &Value, ctr: &Value) -> Vec<Vec<u8>> {
+    let mut env = alloc::vec![b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_vec()];
+    for e in ctr.get("env").and_then(Value::as_array).unwrap_or(&[]) {
+        let name = e.get("name").and_then(Value::as_str).unwrap_or("");
+        let value = match e.get("value").and_then(Value::as_str) {
+            Some(v) => Some(String::from(v)),
+            None => e.pointer(&["valueFrom", "fieldRef", "fieldPath"]).and_then(Value::as_str).and_then(|p| {
+                let (field, rest) = p.split_once("['")?;
+                let key = rest.strip_suffix("']")?;
+                let kind = field.strip_prefix("metadata.").filter(|k| matches!(*k, "labels" | "annotations"))?;
+                Some(pod.pointer(&["metadata", kind, key]).and_then(Value::as_str).map(String::from).unwrap_or_default())
+            }),
+        };
+        if let Some(v) = value.filter(|_| !name.is_empty()) {
+            env.push(alloc::format!("{name}={v}").into_bytes());
+        }
+    }
+    env
+}
+
 /// Runs a lifecycle hook handler (`exec`, `httpGet`, `tcpSocket` or `sleep`); true = success.
-pub async fn run_handler(spec: &Value, ctr: &Value, ctr_target: &ExecTarget, pod_target: Option<&ExecTarget>, maps: &IdMaps, timeout_ms: u64) -> bool {
+pub async fn run_handler(spec: &Value, pod: &Value, ctr: &Value, ctr_target: &ExecTarget, pod_target: Option<&ExecTarget>, maps: &IdMaps, timeout_ms: u64) -> bool {
     if let Some(s) = spec.get("sleep") {
         let secs = s.get("seconds").and_then(Value::as_u64).unwrap_or(0);
         kr_rt::exec::sleep((secs * 1000).min(timeout_ms)).await;
         return true;
     }
-    run(spec, ctr, ctr_target, pod_target, maps, timeout_ms).await
+    run(spec, pod, ctr, ctr_target, pod_target, maps, timeout_ms).await
 }
 
 /// Runs one probe; true = success. `ctr_target` enters the container (exec probes),
 /// `pod_target` the pod network (tcp/http probes).
-pub async fn run(spec: &Value, ctr: &Value, ctr_target: &ExecTarget, pod_target: Option<&ExecTarget>, maps: &IdMaps, timeout_ms: u64) -> bool {
+pub async fn run(spec: &Value, pod: &Value, ctr: &Value, ctr_target: &ExecTarget, pod_target: Option<&ExecTarget>, maps: &IdMaps, timeout_ms: u64) -> bool {
     let started = if let Some(e) = spec.get("exec") {
         let argv: Vec<Vec<u8>> = e.get("command").and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_str).map(|s| s.as_bytes().to_vec()).collect();
         if argv.is_empty() {
             return false;
         }
-        let env = [b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_vec()];
+        let env = exec_env(pod, ctr);
         let user = ctr.pointer(&["securityContext", "runAsUser"]).and_then(Value::as_i64).map(|u| alloc::format!("{u}")).unwrap_or_default();
         container::exec_in(ctr_target, &ExecSpec { argv: &argv, env: &env, cwd: b"/", user: user.as_bytes(), stdin: None, stdout: None, stderr: None, maps, extra_groups: &[] })
     } else if let Some(g) = spec.get("grpc") {

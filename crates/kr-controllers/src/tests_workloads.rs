@@ -160,6 +160,30 @@ fn statefulset_ordered_creation_identity_and_scale_down() {
 }
 
 #[test]
+fn statefulset_scale_down_halts_on_unhealthy_pod() {
+    scenario(|c| async move {
+        c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
+        wffc_class(&c).await;
+        c.create(STS, &sts(3, "i:1", "")).await.unwrap();
+        wait_until("3 ready pods", || all_ready(&c, &["web-0", "web-1", "web-2"])).await;
+        // web-2 and web-0 become unhealthy; web-0 is the lowest unhealthy ordinal.
+        for n in ["web-0", "web-2"] {
+            merge(&c, &alloc::format!("{PODS}/{n}/status"), r#"{"status":{"conditions":[{"type":"Ready","status":"False"}]}}"#).await;
+        }
+        hold_delete(&["web-0", "web-1", "web-2"]);
+        merge(&c, &alloc::format!("{STS}/web/scale"), r#"{"spec":{"replicas":0}}"#).await;
+        sleep(400).await;
+        for n in ["web-0", "web-1", "web-2"] {
+            assert!(!pod_is_deleting(&c, n).await, "{n}: an unhealthy web-2 that is not the first unhealthy pod halts the scale down");
+        }
+        // Once web-2 is the only unhealthy pod it is deleted.
+        merge(&c, &alloc::format!("{PODS}/web-0/status"), r#"{"status":{"conditions":[{"type":"Ready","status":"True"}]}}"#).await;
+        wait_until("web-2 terminating", || pod_is_deleting(&c, "web-2")).await;
+        release_delete(&["web-0", "web-1", "web-2"]);
+    });
+}
+
+#[test]
 fn statefulset_parallel_does_not_wait() {
     scenario(|c| async move {
         c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
@@ -604,6 +628,118 @@ fn job_indexed_completion() {
         let mut idx: Vec<&str> = pods.iter().map(|p| str_at(p, &["metadata", "annotations", "batch.kubernetes.io/job-completion-index"])).collect();
         idx.sort();
         assert_eq!(idx, ["0", "1", "2", "3"], "each index ran exactly once");
+    });
+}
+
+#[test]
+fn job_success_policy_succeeded_count() {
+    scenario(|c| async move {
+        c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
+        FINISH.store(true, Ordering::SeqCst);
+        c.create(JOBS, &job("sp", r#""completions":5,"parallelism":2,"completionMode":"Indexed","successPolicy":{"rules":[{"succeededCount":2}]},"#, "Never", "succeed")).await.unwrap();
+        wait_until("complete", || jcond(&c, "sp", "Complete")).await;
+        let j = get(&c, &alloc::format!("{JOBS}/sp")).await;
+        for ty in ["SuccessCriteriaMet", "Complete"] {
+            assert_eq!(str_at(cond(&j, ty).unwrap(), &["reason"]), "SuccessPolicy", "{ty}");
+        }
+        assert_eq!((int_at(&j, &["status", "active"], -1), int_at(&j, &["status", "terminating"], -1)), (0, 0));
+        assert!(int_at(&j, &["status", "succeeded"], 0) >= 2);
+    });
+}
+
+#[test]
+fn job_success_policy_succeeded_indexes() {
+    scenario(|c| async move {
+        c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
+        FINISH.store(true, Ordering::SeqCst);
+        c.create(JOBS, &job("spi", r#""completions":3,"parallelism":3,"completionMode":"Indexed","successPolicy":{"rules":[{"succeededIndexes":"0-1"}]},"#, "Never", "succeed")).await.unwrap();
+        wait_until("complete", || jcond(&c, "spi", "Complete")).await;
+        let j = get(&c, &alloc::format!("{JOBS}/spi")).await;
+        assert_eq!(str_at(cond(&j, "SuccessCriteriaMet").unwrap(), &["reason"]), "SuccessPolicy");
+    });
+}
+
+#[test]
+fn job_completions_reached_reason() {
+    scenario(|c| async move {
+        c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
+        FINISH.store(true, Ordering::SeqCst);
+        c.create(JOBS, &job("done", r#""completions":1,"#, "Never", "succeed")).await.unwrap();
+        wait_until("complete", || jcond(&c, "done", "Complete")).await;
+        let j = get(&c, &alloc::format!("{JOBS}/done")).await;
+        assert_eq!(str_at(cond(&j, "Complete").unwrap(), &["reason"]), "CompletionsReached");
+    });
+}
+
+#[test]
+fn job_backoff_limit_per_index() {
+    scenario(|c| async move {
+        c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
+        FINISH.store(true, Ordering::SeqCst);
+        c.create(JOBS, &job("bpi", r#""completions":2,"parallelism":2,"completionMode":"Indexed","backoffLimitPerIndex":1,"#, "Never", "fail")).await.unwrap();
+        wait_until("failed", || jcond(&c, "bpi", "Failed")).await;
+        let j = get(&c, &alloc::format!("{JOBS}/bpi")).await;
+        assert_eq!(str_at(cond(&j, "Failed").unwrap(), &["reason"]), "FailedIndexes");
+        assert_eq!((str_at(&j, &["status", "failedIndexes"]), int_at(&j, &["status", "failed"], -1)), ("0-1", 4), "two pods per index");
+    });
+}
+
+#[test]
+fn job_max_failed_indexes() {
+    scenario(|c| async move {
+        c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
+        FINISH.store(true, Ordering::SeqCst);
+        c.create(JOBS, &job("mfi", r#""completions":4,"parallelism":1,"completionMode":"Indexed","backoffLimitPerIndex":0,"maxFailedIndexes":0,"#, "Never", "fail")).await.unwrap();
+        wait_until("failed", || jcond(&c, "mfi", "Failed")).await;
+        let j = get(&c, &alloc::format!("{JOBS}/mfi")).await;
+        assert_eq!(str_at(cond(&j, "Failed").unwrap(), &["reason"]), "MaxFailedIndexesExceeded");
+        assert_eq!((str_at(&j, &["status", "failedIndexes"]), int_at(&j, &["status", "failed"], -1)), ("0", 1));
+    });
+}
+
+#[test]
+fn job_pod_failure_policy() {
+    scenario(|c| async move {
+        c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
+        FINISH.store(true, Ordering::SeqCst);
+        // The fake kubelet fails pods with exit code 1.
+        let rules = |action: &str, codes: &str| alloc::format!(r#""backoffLimit":6,"podFailurePolicy":{{"rules":[{{"action":"{action}","onExitCodes":{{"operator":"In","values":[{codes}]}}}}]}},"#);
+        c.create(JOBS, &job("pfp", &rules("FailJob", "1"), "Never", "fail")).await.unwrap();
+        wait_until("failed", || jcond(&c, "pfp", "Failed")).await;
+        let j = get(&c, &alloc::format!("{JOBS}/pfp")).await;
+        assert_eq!(str_at(cond(&j, "Failed").unwrap(), &["reason"]), "PodFailurePolicy");
+        assert_eq!(int_at(&j, &["status", "failed"], -1), 1, "failed on the first failure");
+
+        // An Ignore match is not counted and not retried with a backoff.
+        c.create(JOBS, &job("pfp-ignore", &rules("Ignore", "1"), "Never", "fail")).await.unwrap();
+        sleep(400).await;
+        let j = get(&c, &alloc::format!("{JOBS}/pfp-ignore")).await;
+        assert_eq!(int_at(&j, &["status", "failed"], -1), 0);
+        assert!(!has_condition(&j, "Failed"));
+        assert!(job_pods(&c, "pfp-ignore").await.len() > 1, "ignored failures are replaced");
+
+        // No rule matches exit code 1: counted as usual.
+        c.create(JOBS, &job("pfp-count", &rules("FailJob", "42").replace("\"backoffLimit\":6", "\"backoffLimit\":1"), "Never", "fail")).await.unwrap();
+        wait_until("failed", || jcond(&c, "pfp-count", "Failed")).await;
+        let j = get(&c, &alloc::format!("{JOBS}/pfp-count")).await;
+        assert_eq!(str_at(cond(&j, "Failed").unwrap(), &["reason"]), "BackoffLimitExceeded");
+    });
+}
+
+#[test]
+fn job_adopts_and_releases_pods() {
+    scenario(|c| async move {
+        c.create(NODES, &node("n1", "{}", "[]", "8")).await.unwrap();
+        let created = c.create(JOBS, &job("ar", r#""completions":2,"parallelism":2,"#, "Never", "none")).await.unwrap();
+        wait_until("2 active", || async { jstat(&c, "ar", "active").await == 2 }).await;
+        let victim = name(&job_pods(&c, "ar").await[0]).to_string();
+        let path = alloc::format!("{PODS}/{victim}");
+        merge(&c, &path, r#"{"metadata":{"ownerReferences":null}}"#).await;
+        wait_until("readopted", || async { controller_ref(&get(&c, &path).await).is_some_and(|r| str_at(r, &["uid"]) == uid(&created)) }).await;
+        merge(&c, &path, r#"{"metadata":{"labels":null}}"#).await;
+        wait_until("released", || async { controller_ref(&get(&c, &path).await).is_none() }).await;
+        // The job starts a replacement for the released pod.
+        wait_until("replaced", || async { jstat(&c, "ar", "active").await == 2 }).await;
     });
 }
 

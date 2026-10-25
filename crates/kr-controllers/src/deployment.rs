@@ -51,18 +51,27 @@ pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config) {
     g.0.push(kr_rt::exec::spawn(watch_loop(c.clone(), deployments(None), String::new(), cfg, move |_, o| q2.add(&key_of(o)))));
     let q2 = q.clone();
     g.0.push(kr_rt::exec::spawn(watch_loop(c.clone(), replicasets(None), String::new(), cfg, move |_, rs| {
-        if let Some(r) = controller_ref(rs).filter(|r| str_at(r, &["kind"]) == "Deployment") {
-            q2.add(&alloc::format!("{}/{}", namespace(rs), str_at(r, &["name"])));
+        match controller_ref(rs) {
+            Some(r) if str_at(r, &["kind"]) == "Deployment" => q2.add(&alloc::format!("{}/{}", namespace(rs), str_at(r, &["name"]))),
+            Some(_) => {}
+            // An orphan may be adopted by any Deployment of the namespace.
+            None => q2.add(&alloc::format!("{}/*", namespace(rs))),
         }
     })));
-    let (c2, c3, q3) = (c.clone(), c.clone(), q.clone());
+    let (c2, q2, c3, q3) = (c.clone(), q.clone(), c.clone(), q.clone());
     drive(
         &cfg,
         &q,
         move |key| {
-            let c = c2.clone();
+            let (c, q) = (c2.clone(), q2.clone());
             async move {
                 let (ns, n) = split_key(&key);
+                if n == "*" {
+                    for d in items(&c.list(&deployments(Some(ns)), "").await?) {
+                        q.add(&key_of(&d));
+                    }
+                    return Ok(None);
+                }
                 reconcile(&c, &cfg, ns, n).await
             }
         },
@@ -178,8 +187,20 @@ pub async fn reconcile<C: Client>(c: &C, cfg: &Config, ns: &str, dname: &str) ->
 
     let mut olds: Vec<Value> = Vec::new();
     let mut new_rs: Option<Value> = None;
+    let sel = d.pointer(&["spec", "selector"]).and_then(parse_selector).map(|(_, s)| s);
     for rs in items(&c.list(&replicasets(Some(ns)), "").await?) {
-        if controller_ref(&rs).is_none_or(|r| str_at(r, &["uid"]) != d_uid) || deleting(&rs) {
+        if deleting(&rs) {
+            continue;
+        }
+        // Orphan ReplicaSets that match the selector become old ReplicaSets of this Deployment.
+        let rs = match controller_ref(&rs) {
+            None if sel.as_ref().is_some_and(|s| s.matches(&rs)) => match adopt(c, &replicasets(Some(ns)), &d, "apps/v1", "Deployment", &rs).await? {
+                Some(rs) => rs,
+                None => continue,
+            },
+            _ => rs,
+        };
+        if controller_ref(&rs).is_none_or(|r| str_at(r, &["uid"]) != d_uid) {
             continue;
         }
         if str_at(&rs, &["metadata", "labels", HASH_LABEL]) == hash {

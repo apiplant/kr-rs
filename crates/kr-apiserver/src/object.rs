@@ -316,7 +316,8 @@ pub fn prepare_update(old: &Value, new: &mut Value, t: &Target, rev: u64, has_st
         }
     }
     if status_only {
-        // Everything but status comes from the stored object.
+        // Everything but status (and the metadata maps, which the status endpoints let a
+        // client change too) comes from the stored object.
         let status = new.remove("status");
         // Labels and annotations stay writable through /status, as in upstream's status strategies.
         let maps: Vec<(&str, Value)> = ["labels", "annotations"].into_iter().filter_map(|f| Some((f, new.pointer(&["metadata", f])?.clone()))).collect();

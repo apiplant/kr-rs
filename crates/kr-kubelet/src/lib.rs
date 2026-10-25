@@ -172,6 +172,8 @@ struct PodRt {
     critical: bool,
     /// Set once evicted for memory pressure: containers are killed and never restarted.
     evicted: Option<String>,
+    /// (hostIP, protocol, hostPort) of the containers' host ports.
+    host_ports: Vec<(String, String, u64)>,
     /// Set once `activeDeadlineSeconds` passed: containers are killed and the pod is Failed.
     deadline_exceeded: bool,
     /// Last reported status and transition time (s) of each pod condition.
@@ -579,6 +581,26 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         if self.pods.borrow()[uid].failed_setup.is_some() {
             return;
         }
+        // Admission: a host port already taken by a pod that was admitted first rejects the pod
+        // (the scheduler keeps this from happening unless the pod was bound by hand).
+        if self.pods.borrow()[uid].sandbox.is_none() && self.pods.borrow()[uid].ctrs.iter().all(|c| matches!(c.state, CState::Waiting(..))) {
+            let pods = self.pods.borrow();
+            let mine = &pods[uid].host_ports;
+            let clash = !mine.is_empty()
+                && pods.iter().any(|(u, p)| {
+                    u != uid
+                        && p.sandbox.is_some()
+                        && p.failed_setup.is_none()
+                        && p.evicted.is_none()
+                        && p.ctrs.iter().any(|c| !matches!(c.state, CState::Terminated(_)))
+                        && p.host_ports.iter().any(|(ip, proto, port)| mine.iter().any(|(i2, p2, port2)| proto == p2 && port == port2 && (ip == i2 || ip.is_empty() || i2.is_empty() || ip == "0.0.0.0" || i2 == "0.0.0.0")))
+                });
+            drop(pods);
+            if clash {
+                self.pods.borrow_mut().get_mut(uid).unwrap().failed_setup = Some("Pod was rejected: node(s) didn't have free ports for the requested pod ports".into());
+                return;
+            }
+        }
         if self.pods.borrow()[uid].evicted.is_some() {
             self.kill_now(uid);
             return;
@@ -689,7 +711,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         let prio = pod.pointer(&["spec", "priorityClassName"]).and_then(Value::as_str).unwrap_or("");
         let critical = prio.starts_with("system-") && prio.ends_with("-critical") || pod.pointer(&["metadata", "annotations", "kubernetes.io/config.mirror"]).is_some();
-        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ctrs, start_time: now(), kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, critical, evicted: None, deadline_exceeded: false, conds: Vec::new() }
+        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ctrs, start_time: now(), kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod) }
     }
 
     fn start_sandbox(&self, uid: &str, pod: &Value) -> Result<(), String> {
@@ -895,8 +917,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     let (sig, target, ctr) = (running.signaller(), running.target(), cspec.cloned().unwrap_or(Value::Null));
                     let pod_target = self.pods.borrow().get(uid).and_then(|p| p.sandbox.as_ref().and_then(|s| s.target().ok()));
                     let me = self.clone();
+                    let pod_v = pod.clone();
                     kr_rt::exec::spawn(async move {
-                        if !probe::run_handler(&hook, &ctr, &target, pod_target.as_ref(), &me.maps, 120_000).await {
+                        if !probe::run_handler(&hook, &pod_v, &ctr, &target, pod_target.as_ref(), &me.maps, 120_000).await {
                             let _ = sig.send(kr_sys::ns::SIGKILL);
                         }
                     });
@@ -1041,8 +1064,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let me = self.clone();
             let uid = uid.to_string();
             let ctr = spec::find_container(pod, &name).cloned().unwrap_or(Value::Null);
+            let pod_v = pod.clone();
             kr_rt::exec::spawn(async move {
-                let ok = probe::run(&spec, &ctr, &target, pod_target.as_ref(), &me.maps, timeout).await;
+                let ok = probe::run(&spec, &pod_v, &ctr, &target, pod_target.as_ref(), &me.maps, timeout).await;
                 me.probe_done(&uid, ci, pi, ok);
                 me.notify.notify();
             });
@@ -1110,9 +1134,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     match (hook, c.target.clone()) {
                         // preStop runs first (bounded by the grace period), then SIGTERM.
                         (Some(hook), Some(target)) => {
-                            let (ctr, pod_target, maps) = (cspec.unwrap_or(Value::Null), pod_target.clone(), self.maps.clone());
+                            let (ctr, pod_target, maps, pod_v) = (cspec.unwrap_or(Value::Null), pod_target.clone(), self.maps.clone(), pod.clone());
                             kr_rt::exec::spawn(async move {
-                                let _ = probe::run_handler(&hook, &ctr, &target, pod_target.as_ref(), &maps, grace * 1000).await;
+                                let _ = probe::run_handler(&hook, &pod_v, &ctr, &target, pod_target.as_ref(), &maps, grace * 1000).await;
                                 let _ = s.send(kr_sys::ns::SIGTERM);
                             });
                         }
@@ -1364,10 +1388,27 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
     }
     if let Some(msg) = &p.failed_setup {
         f.push(("message", Value::from(msg.as_str())));
-        f.push(("reason", Value::from("SandboxFailed")));
+        f.push(("reason", Value::from(if msg.starts_with("Pod was rejected") { "HostPortConflict" } else { "SandboxFailed" })));
     }
     o(f)
 }
+/// (hostIP, protocol, hostPort) of every container port that asks for a host port.
+fn host_ports(pod: &Value) -> Vec<(String, String, u64)> {
+    let mut out = Vec::new();
+    for key in ["initContainers", "containers"] {
+        for c in pod.pointer(&["spec", key]).and_then(Value::as_array).unwrap_or(&[]) {
+            for p in c.get("ports").and_then(Value::as_array).unwrap_or(&[]) {
+                let hp = p.get("hostPort").and_then(Value::as_u64).unwrap_or(0);
+                if hp > 0 {
+                    let proto = p.get("protocol").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or("TCP");
+                    out.push((p.get("hostIP").and_then(Value::as_str).unwrap_or("").to_string(), proto.to_string(), hp));
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod status_tests {
     use super::*;
@@ -1386,7 +1427,7 @@ mod status_tests {
         CState::Waiting("ContainerCreating", String::new())
     }
     fn pod(ctrs: Vec<Ctr>) -> PodRt {
-        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ctrs, start_time: 0, kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new() }
+        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ctrs, start_time: 0, kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new() }
     }
     fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
         path.iter().try_fold(v, |v, k| match k.parse::<usize>() {
