@@ -449,3 +449,39 @@ fn crd_schema_passes_strict_field_validation() {
     let bad = crd.replace(r#""scope":"Namespaced""#, r#""scope":7"#).replace("gadgets.example.com", "g2.example.com").replace(r#""plural":"gadgets""#, r#""plural":"g2""#);
     assert_eq!(j(&api, "POST", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions", &bad).0, 400);
 }
+
+#[test]
+fn webhook_config_match_conditions_must_compile() {
+    let api = server();
+    let wh = |ex: &str| format!(r#"{{"apiVersion":"admissionregistration.k8s.io/v1","kind":"ValidatingWebhookConfiguration","metadata":{{"name":"w"}},"webhooks":[{{"name":"a.example.com","clientConfig":{{"url":"https://x/"}},"sideEffects":"None","admissionReviewVersions":["v1"],"matchConditions":[{{"name":"c","expression":{ex:?}}}]}}]}}"#);
+    let (c, v) = j(&api, "POST", "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations", &wh("... [] bad expression"));
+    assert_eq!(c, 422, "{v:?}");
+    assert!(v.get("message").and_then(Value::as_str).unwrap().contains("compilation failed"));
+    let (c, v) = j(&api, "POST", "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations", &wh("object.metadata.name == 'x'"));
+    assert_eq!(c, 201, "{v:?}");
+}
+
+#[test]
+fn custom_resources_get_defaults_added_after_storing() {
+    let api = server();
+    assert_eq!(j(&api, "POST", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions", CRD).0, 201);
+    let cr = r#"{"apiVersion":"example.com/v1","kind":"Widget","metadata":{"name":"w1"},"spec":{"size":1}}"#;
+    assert_eq!(j(&api, "POST", "/apis/example.com/v1/namespaces/default/widgets", cr).0, 201);
+    let patch = r#"[{"op":"add","path":"/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/color/default","value":"red"}]"#;
+    assert_eq!(call(&api, "PATCH", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.com", "application/json-patch+json", patch).0, 200);
+    let (_, v) = j(&api, "GET", "/apis/example.com/v1/namespaces/default/widgets/w1", "");
+    assert_eq!(v.pointer(&["spec", "color"]).and_then(Value::as_str), Some("red"));
+    let (_, v) = j(&api, "GET", "/apis/example.com/v1/namespaces/default/widgets", "");
+    assert_eq!(v.pointer(&["items"]).and_then(Value::as_array).unwrap()[0].pointer(&["spec", "color"]).and_then(Value::as_str), Some("red"));
+}
+
+#[test]
+fn crd_status_update_keeps_extra_conditions() {
+    let api = server();
+    assert_eq!(j(&api, "POST", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions", CRD).0, 201);
+    let p = r#"[{"op":"add","path":"/status/conditions/-","value":{"message":"patched"}}]"#;
+    let (c, v) = call(&api, "PATCH", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.com/status", "application/json-patch+json", p);
+    assert_eq!(c, 200, "{v:?}");
+    let conds = v.pointer(&["status", "conditions"]).and_then(Value::as_array).unwrap();
+    assert!(conds.iter().any(|c| c.get("message").and_then(Value::as_str) == Some("patched")), "{conds:?}");
+}

@@ -1117,11 +1117,15 @@ fn namespace_deletion_is_asynchronous_and_empties_everything() {
         assert_eq!(e.code, 403);
         assert!(e.message.contains("unable to create new content in namespace doomed because it is being terminated"), "{}", e.message);
 
-        wait_until("content deleted except terminating pods", || async {
-            c.get("/apis/x.io/v1/namespaces/doomed/widgets/w1").await.is_err() && c.get("/api/v1/namespaces/doomed/configmaps/cm").await.is_err() && c.get("/apis/apps/v1/namespaces/doomed/deployments/web").await.is_err()
+        // Pods are deleted first: the rest of the content waits for them.
+        wait_until("pods terminating and failure condition set", || async {
+            let ns = c.get(NS_DOOMED).await.unwrap();
+            let failed = ns.pointer(&["status", "conditions"]).and_then(Value::as_array).is_some_and(|cs| cs.iter().any(|x| str_at(x, &["type"]) == "NamespaceDeletionContentFailure"));
+            failed && items(&c.list(pods_path, "").await.unwrap()).iter().all(|p| p.pointer(&["metadata", "deletionTimestamp"]).is_some())
         })
         .await;
         sleep(400).await;
+        assert!(c.get("/api/v1/namespaces/doomed/configmaps/cm").await.is_ok(), "other content waits for the pods");
         let ns = c.get(NS_DOOMED).await.unwrap();
         assert_eq!(str_at(&ns, &["status", "phase"]), "Terminating", "waits for the pods");
         assert!(!items(&c.list(pods_path, "").await.unwrap()).is_empty());
