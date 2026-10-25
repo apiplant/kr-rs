@@ -93,3 +93,54 @@ fn extra_kinds_crud() {
     let (_, g) = call(&api, "GET", "/apis/apiregistration.k8s.io/v1", "");
     assert!(json::to_string(&g).contains("apiservices"));
 }
+
+#[test]
+fn immutable_and_status_metadata() {
+    let api = server();
+    let cms = "/api/v1/namespaces/default/configmaps";
+    assert_eq!(call(&api, "POST", cms, r#"{"metadata":{"name":"c"},"data":{"a":"1"},"immutable":true}"#).0, 201);
+    assert_eq!(call(&api, "PUT", &format!("{cms}/c"), r#"{"metadata":{"name":"c"},"data":{"a":"2"},"immutable":true}"#).0, 422);
+    assert_eq!(call(&api, "PUT", &format!("{cms}/c"), r#"{"metadata":{"name":"c"},"data":{"a":"1"}}"#).0, 422);
+    assert_eq!(call(&api, "POST", "/api/v1/namespaces/default/secrets", r#"{"metadata":{"name":"s"},"data":{"":"dg=="}}"#).0, 422);
+    let pc = "/apis/scheduling.k8s.io/v1/priorityclasses";
+    assert_eq!(call(&api, "POST", pc, r#"{"metadata":{"name":"p"},"value":10}"#).0, 201);
+    assert_eq!(call(&api, "PUT", &format!("{pc}/p"), r#"{"metadata":{"name":"p"},"value":11}"#).0, 422);
+    // Annotations travel through /status.
+    assert_eq!(call(&api, "POST", "/api/v1/namespaces", r#"{"metadata":{"name":"nsx"}}"#).0, 201);
+    let (c, o) = call(&api, "PUT", "/api/v1/namespaces/nsx/status", r#"{"metadata":{"name":"nsx","annotations":{"k":"v"}},"status":{"phase":"Active"}}"#);
+    assert_eq!(c, 200);
+    assert_eq!(o.pointer(&["metadata", "annotations", "k"]).and_then(Value::as_str), Some("v"));
+}
+
+#[test]
+fn root_ca_republished_and_chunking() {
+    let api = server();
+    assert_eq!(call(&api, "POST", "/api/v1/namespaces", r#"{"metadata":{"name":"nsy"}}"#).0, 201);
+    let cm = "/api/v1/namespaces/nsy/configmaps/kube-root-ca.crt";
+    assert_eq!(call(&api, "DELETE", cm, "").0, 200);
+    assert_eq!(call(&api, "GET", cm, "").0, 200);
+    assert_eq!(call(&api, "PUT", cm, r#"{"metadata":{"name":"kube-root-ca.crt"},"data":{"ca.crt":""}}"#).0, 200);
+    let (_, o) = call(&api, "GET", cm, "");
+    assert_eq!(o.pointer(&["data", "ca.crt"]).and_then(Value::as_str), Some("CA"));
+    // Paging keeps the first page's resourceVersion and reports what remains.
+    for i in 0..5 {
+        assert_eq!(call(&api, "POST", "/api/v1/namespaces/nsy/configmaps", &format!(r#"{{"metadata":{{"name":"c{i}"}}}}"#)).0, 201);
+    }
+    let (_, p1) = call(&api, "GET", "/api/v1/namespaces/nsy/configmaps?limit=2", "");
+    let rv = p1.pointer(&["metadata", "resourceVersion"]).and_then(Value::as_str).unwrap().to_string();
+    assert_eq!(p1.pointer(&["metadata", "remainingItemCount"]).and_then(Value::as_u64), Some(4));
+    assert_eq!(call(&api, "POST", "/api/v1/namespaces/nsy/configmaps", r#"{"metadata":{"name":"zz"}}"#).0, 201);
+    let tok = p1.pointer(&["metadata", "continue"]).and_then(Value::as_str).unwrap().to_string();
+    let (_, p2) = call(&api, "GET", &format!("/api/v1/namespaces/nsy/configmaps?limit=2&continue={tok}"), "");
+    assert_eq!(p2.pointer(&["metadata", "resourceVersion"]).and_then(Value::as_str), Some(rv.as_str()));
+}
+
+#[test]
+fn review_has_no_table() {
+    let api = server();
+    let req = Req { method: "POST", path: "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", query: "", content_type: Some("application/json"), accept: Some("application/json;as=Table;v=v1;g=meta.k8s.io"), body: br#"{"spec":{"nonResourceAttributes":{"path":"/","verb":"get"}}}"#, user: admin(), bearer: None, headers: &[], authz_verb: None };
+    match api.handle(&req) {
+        Reply::Json(c, _) => assert_eq!(c, 406),
+        _ => panic!(),
+    }
+}

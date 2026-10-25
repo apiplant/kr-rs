@@ -11,11 +11,13 @@ pub struct ApiError {
     pub code: u16,
     pub reason: &'static str,
     pub message: String,
+    /// `metadata.continue` of the Status (an expired list continuation: restart token).
+    pub cont: Option<String>,
 }
 
 impl ApiError {
     pub fn new(code: u16, reason: &'static str, message: impl Into<String>) -> Self {
-        ApiError { code, reason, message: message.into() }
+        ApiError { code, reason, message: message.into(), cont: None }
     }
     pub fn bad_request(m: impl Into<String>) -> Self {
         Self::new(400, "BadRequest", m)
@@ -33,7 +35,11 @@ impl ApiError {
         Self::new(409, "Conflict", alloc::format!("Operation cannot be fulfilled on {kind} \"{name}\": the object has been modified; please apply your changes to the latest version and try again"))
     }
     pub fn to_status_json(&self) -> String {
-        json::to_string(&status_value(self.code, self.reason, &self.message))
+        let mut st = status_value(self.code, self.reason, &self.message);
+        if let Some(c) = &self.cont {
+            st.entry_object("metadata").set("continue", Value::String(c.clone()));
+        }
+        json::to_string(&st)
     }
 }
 
@@ -295,7 +301,12 @@ pub fn prepare_update(old: &Value, new: &mut Value, t: &Target, rev: u64, has_st
     if status_only {
         // Everything but status comes from the stored object.
         let status = new.remove("status");
+        // Labels and annotations stay writable through /status, as in upstream's status strategies.
+        let maps: Vec<(&str, Value)> = ["labels", "annotations"].into_iter().filter_map(|f| Some((f, new.pointer(&["metadata", f])?.clone()))).collect();
         *new = old.clone();
+        for (f, v) in maps {
+            new.entry_object("metadata").set(f, v);
+        }
         match status {
             Some(s) => new.set("status", s),
             None => {

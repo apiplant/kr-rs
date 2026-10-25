@@ -117,6 +117,9 @@ pub struct ApiServer {
 }
 
 /// Default namespaces created on first start.
+/// How long a list continuation stays consistent (upstream: the 5 minute compaction interval).
+const CONTINUE_TTL_SECS: i64 = 300;
+
 const SYSTEM_NAMESPACES: &[&str] = &["default", "kube-system", "kube-public", "kube-node-lease"];
 
 type R<T> = Result<T, ApiError>;
@@ -525,6 +528,25 @@ impl ApiServer {
         json::write_str(&pem, &mut body);
         body.push_str("}}");
         self.bootstrap_object(cm, Some(ns), "kube-root-ca.crt", "ConfigMap", &body);
+        // Root CA publisher: a changed or emptied ca.crt is reset.
+        let key = cm.key(Some(ns), "kube-root-ca.crt");
+        let Some(kv) = self.store.borrow().get(&key) else { return };
+        let Ok(mut o) = json::parse(&kv.value) else { return };
+        if o.pointer(&["data", "ca.crt"]).and_then(Value::as_str) != Some(pem.as_str()) && self.writable() {
+            o.entry_object("data").set("ca.crt", Value::String(pem));
+            o.entry_object("metadata").set("resourceVersion", Value::String((self.store.borrow().revision() + 1).to_string()));
+            let _ = self.store.borrow_mut().update(&key, json::to_string(&o).into_bytes(), Some(kv.mod_rev));
+        }
+    }
+
+    /// Re-publishes `kube-root-ca.crt` after a write to the namespace's ConfigMaps (unless the
+    /// namespace is going away).
+    fn republish_root_ca(&self, ns: &str) {
+        let nsr = resources::find("", "v1", "namespaces").unwrap();
+        let live = self.store.borrow().get(&nsr.key(None, ns)).and_then(|kv| json::parse(&kv.value).ok()).is_some_and(|v| v.pointer(&["metadata", "deletionTimestamp"]).is_none());
+        if live {
+            self.ensure_root_ca(ns);
+        }
     }
 
     /// Client certificate user, else a valid ServiceAccount token, else anonymous.
@@ -899,6 +921,10 @@ impl ApiServer {
             ["openid", "v1", "jwks"] => {
                 return self.sa.borrow().as_ref().map(|(s, _)| Reply::Json(200, s.jwks())).ok_or_else(|| ApiError::not_found("jwks", "jwks"));
             }
+            // Review kinds have no metadata to tabulate.
+            ["apis", "authorization.k8s.io" | "authentication.k8s.io", "v1", ..] if wants_table(req.accept) => {
+                return Err(ApiError::new(406, "NotAcceptable", "the resource does not support conversion to a Table"));
+            }
             ["apis", "authorization.k8s.io", "v1", "selfsubjectaccessreviews"] if req.method == "POST" => return self.self_subject_access_review(req, &user),
             ["apis", "authorization.k8s.io", "v1", "subjectaccessreviews"] if req.method == "POST" => return self.subject_access_review(req, None),
             ["apis", "authorization.k8s.io", "v1", "namespaces", ns, "localsubjectaccessreviews"] if req.method == "POST" => return self.subject_access_review(req, Some(ns)),
@@ -924,6 +950,11 @@ impl ApiServer {
         let _ = (group, version, rest);
         let route = resource.ok_or_else(|| ApiError::not_found("path", path))?;
         let reply = self.dispatch(req, &route, &q)?;
+        if route.res.plural == "configmaps" && route.res.group.is_empty() && Self::mutates(req) {
+            if let Some(ns) = &route.namespace {
+                self.republish_root_ca(ns);
+            }
+        }
         Ok(self.convert_reply(&route, reply))
     }
 
@@ -1008,18 +1039,33 @@ impl ApiServer {
         let fs = FieldSelector::parse(q.get("fieldSelector").unwrap_or(""))?;
         let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(0);
         let prefix = self.list_prefix(rt);
+        // Continue token: base64url("<rev>:<issued>:<last key>"). Pages report the first page's
+        // resourceVersion; a token older than the history window (the compaction interval) is
+        // expired with a fresh "inconsistent" token that continues from the same key.
+        let now = (self.now)();
+        let mut list_rev = None;
         let start_after = match q.get("continue").filter(|c| !c.is_empty()) {
             Some(c) => {
-                let k = kr_fmt::base64::decode_url(c).ok().and_then(|b| String::from_utf8(b).ok()).ok_or_else(|| ApiError::bad_request("invalid continue token"))?;
+                let bad = || ApiError::bad_request("invalid continue token");
+                let t = kr_fmt::base64::decode_url(c).ok().and_then(|b| String::from_utf8(b).ok()).ok_or_else(bad)?;
+                let mut parts = t.splitn(3, ':');
+                let (r, issued, k) = (parts.next().and_then(|r| r.parse::<u64>().ok()), parts.next().and_then(|r| r.parse::<i64>().ok()), parts.next());
+                let (Some(r), Some(issued), Some(k)) = (r, issued, k) else { return Err(bad()) };
                 if !k.starts_with(&prefix) {
                     return Err(ApiError::bad_request("continue token does not match this list"));
                 }
-                Some(k)
+                if now - issued > CONTINUE_TTL_SECS {
+                    let mut e = ApiError::new(410, "Expired", "The provided continue parameter is too old to display a consistent list result. You can start a new list without the continue parameter, or use the continue token in this response to retrieve the remainder of the results. Continuing with the provided token results in an inconsistent list - objects that were created, modified, or deleted between the time the first chunk was returned and now may show up in the list.");
+                    e.cont = Some(kr_fmt::base64::encode_url(alloc::format!("{}:{now}:{k}", self.store.borrow().revision()).as_bytes()));
+                    return Err(e);
+                }
+                list_rev = Some(r);
+                Some(k.to_string())
             }
             None => None,
         };
         let store = self.store.borrow();
-        let rev = store.revision();
+        let rev = list_rev.unwrap_or_else(|| store.revision());
         let mut items: Vec<Kv> = Vec::new();
         let mut cursor = start_after;
         let mut more = false;
@@ -1050,7 +1096,12 @@ impl ApiServer {
             }
         }
         drop(store);
-        let cont = if more { cursor.map(|c| kr_fmt::base64::encode_url(c.as_bytes())) } else { None };
+        let cont = if more { cursor.as_ref().map(|c| kr_fmt::base64::encode_url(alloc::format!("{rev}:{now}:{c}").as_bytes())) } else { None };
+        // Without selectors the number of items after this page is known.
+        let remaining = match (&cont, &cursor) {
+            (Some(_), Some(c)) if ls.is_empty() && fs.is_empty() => Some(self.store.borrow().list(&prefix, Some(c), 0).0.len()),
+            _ => None,
+        };
         if wants_table(req.accept) {
             return Ok(Reply::Json(200, self.table(rt.res, &items, rev, cont.as_deref())));
         }
@@ -1066,6 +1117,9 @@ impl ApiServer {
         if let Some(c) = &cont {
             out.push_str(",\"continue\":");
             json::write_str(c, &mut out);
+        }
+        if let Some(n) = remaining {
+            out.push_str(&alloc::format!(",\"remainingItemCount\":{n}"));
         }
         out.push_str("},\"items\":[");
         for (i, kv) in items.iter().enumerate() {
@@ -1369,6 +1423,7 @@ impl ApiServer {
         if rt.res.plural == "resourcequotas" {
             crate::quota::validate(o).map_err(ApiError::invalid)?;
         }
+        admit_immutable(rt.res, o, None)?;
         self.admit_quota(rt, o, None)?;
         {
             use crate::ssa;
@@ -1446,6 +1501,9 @@ impl ApiServer {
         }
         if rt.res.plural == "resourcequotas" && !status {
             crate::quota::validate(&new).map_err(ApiError::invalid)?;
+        }
+        if !status {
+            admit_immutable(rt.res, &new, Some(&old))?;
         }
         // Usage can change on update only for these kinds (a Service type/port change moves
         // nodeports/loadbalancers, a PVC may grow); pods fix their resources at create.
@@ -2362,6 +2420,45 @@ impl ApiServer {
         let timeout_s: u64 = q.get("timeoutSeconds").and_then(|t| t.parse().ok()).unwrap_or(1800).min(3600);
         Ok(Reply::Watch(WatchStream { watcher, initial, ls, fs, deadline: Some(Box::pin(kr_rt::exec::sleep(timeout_s * 1000))), gv: None }))
     }
+}
+
+/// Key validation and immutability of ConfigMaps and Secrets (`immutable: true` freezes the data
+/// and cannot be unset) and PriorityClass `value`.
+fn admit_immutable(res: &Resource, new: &Value, old: Option<&Value>) -> R<()> {
+    let core = res.group.is_empty() && matches!(res.plural, "configmaps" | "secrets");
+    if core {
+        let kind = if res.plural == "secrets" { "Secret" } else { "ConfigMap" };
+        for f in ["data", "binaryData", "stringData"] {
+            if let Some(Value::Object(m)) = new.get(f) {
+                for (k, _) in m.iter() {
+                    let ok = !k.is_empty() && k != "." && k != ".." && k.len() <= 253 && k.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+                    if !ok {
+                        return Err(ApiError::invalid(alloc::format!("{kind} is invalid: {f}[{k}]: Invalid value: \"{k}\": a valid config key must consist of alphanumeric characters, '-', '_' or '.'")));
+                    }
+                }
+            }
+        }
+        if let Some(old) = old {
+            if old.get("immutable").and_then(Value::as_bool) == Some(true) {
+                if new.get("immutable").and_then(Value::as_bool) != Some(true) {
+                    return Err(ApiError::invalid(alloc::format!("{kind} is invalid: immutable: Forbidden: field is immutable when `immutable` is set")));
+                }
+                for f in ["data", "binaryData", "stringData"] {
+                    if new.get(f) != old.get(f) && !(f == "stringData" && new.get(f).is_none()) {
+                        return Err(ApiError::invalid(alloc::format!("{kind} is invalid: {f}: Forbidden: field is immutable when `immutable` is set")));
+                    }
+                }
+            }
+        }
+    }
+    if res.plural == "priorityclasses" {
+        if let Some(old) = old {
+            if new.get("value") != old.get("value") {
+                return Err(ApiError::invalid("PriorityClass.scheduling.k8s.io is invalid: value: Forbidden: may not be changed in an update."));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Job defaulting and validation (upstream batch/v1 defaults + generated selector).
