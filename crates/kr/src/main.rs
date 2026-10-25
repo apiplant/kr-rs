@@ -60,8 +60,14 @@ fn kr_main(mut args: Args) -> i32 {
         }
         Some(b"ctr") => ctr::main(args),
         Some(b"pki") => pki::main(args),
-        Some(b"server") => server::main(args),
-        Some(b"agent") => agent::main(args),
+        Some(b"server") => {
+            sys::raise_nofile_limit();
+            server::main(args)
+        }
+        Some(b"agent") => {
+            sys::raise_nofile_limit();
+            agent::main(args)
+        }
         Some(b"token") => token::main(args),
         Some(b"sleep-test") => {
             exec::block_on(sleep_test());

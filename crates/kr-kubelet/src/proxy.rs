@@ -197,6 +197,11 @@ pub struct Proxy<C: Client> {
     listeners: RefCell<BTreeMap<Key, Listener>>,
 }
 
+/// `(namespace, name)` of an object.
+fn by_name(o: &Value) -> (&str, &str) {
+    (kr_apiserver::client::meta(o, "namespace"), kr_apiserver::client::meta(o, "name"))
+}
+
 fn ip4(s: &str) -> Option<[u8; 4]> {
     kr_apiserver::object::parse_ipv4(s)
 }
@@ -212,8 +217,12 @@ impl<C: Client + Clone + 'static> Proxy<C> {
             return;
         }
         loop {
+            let started = kr_rt::exec::now_ms();
             self.reconcile().await;
-            kr_rt::exec::sleep(1000).await;
+            // Listing and diffing every Service costs CPU on the shared executor: with many of
+            // them, leave at least three times as long to everything else.
+            let took = kr_rt::exec::now_ms().saturating_sub(started);
+            kr_rt::exec::sleep(1000.max(took * 3)).await;
         }
     }
 
@@ -225,13 +234,23 @@ impl<C: Client + Clone + 'static> Proxy<C> {
         let eps = eps.get("items").and_then(Value::as_array).unwrap_or(&empty);
         let slices = slices.get("items").and_then(Value::as_array).unwrap_or(&empty);
         let mut desired: BTreeMap<Key, Backends> = BTreeMap::new();
-        for s in svcs {
+        let ep_of: BTreeMap<(&str, &str), &Value> = eps.iter().map(|e| (by_name(e), e)).collect();
+        let mut slices_of: BTreeMap<(&str, &str), Vec<&Value>> = BTreeMap::new();
+        for sl in slices {
+            if let Some(svc) = sl.pointer(&["metadata", "labels", "kubernetes.io/service-name"]).and_then(Value::as_str) {
+                slices_of.entry((kr_apiserver::client::meta(sl, "namespace"), svc)).or_default().push(sl);
+            }
+        }
+        for (n, s) in svcs.iter().enumerate() {
+            if n % 100 == 99 {
+                kr_rt::exec::yield_now().await;
+            }
             if s.pointer(&["metadata", "annotations", "kr.io/builtin"]).is_some() {
                 continue; // served by kr itself (cluster DNS)
             }
             let Some(cip) = s.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).and_then(ip4) else { continue };
-            let (ns_, name) = (kr_apiserver::client::meta(s, "namespace"), kr_apiserver::client::meta(s, "name"));
-            let ep = eps.iter().find(|e| kr_apiserver::client::meta(e, "namespace") == ns_ && kr_apiserver::client::meta(e, "name") == name);
+            let ep = ep_of.get(&by_name(s)).copied();
+            let own: &[&Value] = slices_of.get(&by_name(s)).map_or(&[], |v| v.as_slice());
             let affinity = s.pointer(&["spec", "sessionAffinity"]).and_then(Value::as_str) == Some("ClientIP");
             for p in s.pointer(&["spec", "ports"]).and_then(Value::as_array).unwrap_or(&[]) {
                 let proto = match p.get("protocol").and_then(Value::as_str) {
@@ -243,8 +262,7 @@ impl<C: Client + Clone + 'static> Proxy<C> {
                 let pname = p.get("name").and_then(Value::as_str).unwrap_or("");
                 let mut list = Vec::new();
                 // EndpointSlices win: Services without a selector may have only hand-written ones.
-                let own: Vec<&Value> = slices.iter().filter(|sl| kr_apiserver::client::meta(sl, "namespace") == ns_ && sl.pointer(&["metadata", "labels", "kubernetes.io/service-name"]).and_then(Value::as_str) == Some(name)).collect();
-                for sl in &own {
+                for sl in own {
                     let target = sl.get("ports").and_then(Value::as_array).and_then(|ps| ps.iter().find(|sp| sp.get("name").and_then(Value::as_str).unwrap_or("") == pname)).and_then(|sp| sp.get("port")).and_then(Value::as_u64);
                     let Some(tp) = target else { continue };
                     for e in sl.get("endpoints").and_then(Value::as_array).unwrap_or(&[]) {

@@ -62,6 +62,7 @@ mod nr {
     pub const GETSOCKOPT: usize = 55;
     pub const OPENAT: usize = 257;
     pub const GETRANDOM: usize = 318;
+    pub const PRLIMIT64: usize = 302;
     pub const BIND: usize = 49;
     pub const SHUTDOWN: usize = 48;
     pub const PIPE2: usize = 293;
@@ -88,6 +89,7 @@ mod nr {
     pub const GETSOCKOPT: usize = 209;
     pub const OPENAT: usize = 56;
     pub const GETRANDOM: usize = 278;
+    pub const PRLIMIT64: usize = 261;
     pub const BIND: usize = 200;
     pub const SHUTDOWN: usize = 210;
     pub const PIPE2: usize = 59;
@@ -379,6 +381,20 @@ pub fn getrandom(buf: &mut [u8]) {
             // No usable randomness means no safe keys: stop rather than continue weakly.
             Err(_) => exit_group(134),
         }
+    }
+}
+
+/// Raises the soft RLIMIT_NOFILE to the hard limit. Every connection, service listener and pod
+/// holds descriptors of this process; at the usual soft limit of 1024 `accept` starts failing
+/// with EMFILE and clients time out.
+pub fn raise_nofile_limit() {
+    const RLIMIT_NOFILE: usize = 7;
+    let mut lim = [0u64; 2]; // rlim_cur, rlim_max
+    // SAFETY: `lim` is a valid rlimit64 for the kernel to fill (pid 0 = this process, no new limit).
+    if check(unsafe { syscall4(nr::PRLIMIT64, 0, RLIMIT_NOFILE, 0, lim.as_mut_ptr() as usize) }).is_ok() && lim[0] < lim[1] {
+        lim[0] = lim[1];
+        // SAFETY: as above, reading the new limit.
+        let _ = check(unsafe { syscall4(nr::PRLIMIT64, 0, RLIMIT_NOFILE, lim.as_ptr() as usize, 0) });
     }
 }
 
