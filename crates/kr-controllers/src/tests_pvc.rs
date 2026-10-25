@@ -132,3 +132,47 @@ fn pod_follows_its_volume_to_the_node() {
         assert_eq!(str_at(&c.get(&alloc::format!("{PODS}/second")).await.unwrap(), &["spec", "nodeName"]), "n1");
     });
 }
+
+#[test]
+fn pv_protection_finalizer_blocks_delete_while_bound() {
+    scenario(|c| async move {
+        class(&c, "Retain").await;
+        c.create("/api/v1/nodes", &node("n1", r#"{"kubernetes.io/hostname":"n1"}"#, "[]", "4")).await.unwrap();
+        let pvc = c.create(CLAIMS, &claim("data", "local-path")).await.unwrap();
+        let pv_name = alloc::format!("pvc-{}", uid(&pvc));
+        c.create(PODS, &pod_with("app", "data")).await.unwrap();
+        wait_until("pv bound", || async { phase(&c, &alloc::format!("{PVS}/{pv_name}")).await == "Bound" }).await;
+        let pv = c.get(&alloc::format!("{PVS}/{pv_name}")).await.unwrap();
+        assert!(kr_fmt::json::to_string(pv.pointer(&["metadata", "finalizers"]).unwrap()).contains("kubernetes.io/pv-protection"));
+        // Deleting a bound PV waits; once the claim is gone it is released.
+        c.delete(&alloc::format!("{PVS}/{pv_name}")).await.unwrap();
+        sleep(300).await;
+        assert!(get_opt(&c, &alloc::format!("{PVS}/{pv_name}")).await.unwrap().is_some());
+        c.delete(&alloc::format!("{PODS}/app?gracePeriodSeconds=0")).await.unwrap();
+        c.delete(&alloc::format!("{CLAIMS}/data")).await.unwrap();
+        wait_until("pv gone", || async { get_opt(&c, &alloc::format!("{PVS}/{pv_name}")).await.unwrap().is_none() }).await;
+    });
+}
+
+#[test]
+fn immediate_or_missing_claim_blocks_scheduling() {
+    scenario(|c| async move {
+        c.create("/api/v1/nodes", &node("n1", "{}", "[]", "4")).await.unwrap();
+        // Missing claim.
+        c.create(PODS, &pod_with("app", "later")).await.unwrap();
+        wait_until("not found", || async { sched_msg(&c.get(&alloc::format!("{PODS}/app")).await.unwrap()).contains("persistentvolumeclaim \"later\" not found") }).await;
+        // Unbound claim of a class with no provisioner and Immediate binding.
+        let sc = v(r#"{"metadata":{"name":"slow"},"provisioner":"example.com/none","volumeBindingMode":"Immediate"}"#);
+        c.create(CLASSES, &sc).await.unwrap();
+        c.create(CLAIMS, &claim("later", "slow")).await.unwrap();
+        wait_until("unbound immediate", || async { sched_msg(&c.get(&alloc::format!("{PODS}/app")).await.unwrap()).contains("0/1 nodes are available: pod has unbound immediate PersistentVolumeClaims.") }).await;
+        // A matching PV binds the claim and the pod schedules.
+        let pv = v(r#"{"metadata":{"name":"pv1"},"spec":{"storageClassName":"slow","accessModes":["ReadWriteOnce"],"capacity":{"storage":"1Gi"},"hostPath":{"path":"/x"}}}"#);
+        c.create(PVS, &pv).await.unwrap();
+        wait_until("scheduled", || async { str_at(&c.get(&alloc::format!("{PODS}/app")).await.unwrap(), &["spec", "nodeName"]) == "n1" }).await;
+    });
+}
+
+fn sched_msg(p: &Value) -> String {
+    p.pointer(&["status", "conditions"]).and_then(Value::as_array).and_then(|a| a.iter().find(|k| str_at(k, &["type"]) == "PodScheduled")).map(|k| str_at(k, &["message"]).to_string()).unwrap_or_default()
+}
