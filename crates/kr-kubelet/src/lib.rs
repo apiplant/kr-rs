@@ -196,6 +196,8 @@ pub struct Kubelet<C: Client> {
     infra: RefCell<Option<Sandbox>>,
     /// This node's pod subnet (from `spec.podCIDR`).
     podnet: Cell<network::PodNet>,
+    /// Peer/backend pairs already reported as a backend mismatch.
+    warned_backend: RefCell<alloc::collections::BTreeSet<String>>,
 }
 
 enum PullGate {
@@ -214,7 +216,7 @@ const BACKOFF_MAX_MS: u64 = 300_000;
 
 impl<C: Client + Clone + 'static> Kubelet<C> {
     pub fn new(c: C, cfg: Config, store: Store) -> Rc<Self> {
-        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()) })
+        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()) })
     }
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
@@ -380,18 +382,22 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     let Some(pn) = n.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).and_then(network::PodNet::parse) else { continue };
                     if meta(n, "name") == self.cfg.node_name {
                         let ann = |k| n.pointer(&["metadata", "annotations", k]).and_then(Value::as_str);
-                        annotated = ann(VTEP_MAC_KEY) == Some(my_mac.as_str()) && ann(VTEP_IP_KEY) == Some(my_ip.as_str());
+                        annotated = ann(VTEP_MAC_KEY) == Some(my_mac.as_str()) && ann(VTEP_IP_KEY) == Some(my_ip.as_str()) && ann(BACKEND_KEY) == Some("vxlan");
                         mine = Some(pn);
                         continue;
                     }
                     let ip = n.pointer(&["status", "addresses"]).and_then(Value::as_array).and_then(|a| a.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("InternalIP"))).and_then(|x| x.get("address")).and_then(Value::as_str).and_then(kr_apiserver::object::parse_ipv4);
+                    if let Some(theirs) = backend_mismatch("vxlan", n.pointer(&["metadata", "annotations", BACKEND_KEY]).and_then(Value::as_str)) {
+                        self.warn_backend(&meta(n, "name"), "vxlan", theirs);
+                        continue;
+                    }
                     let mac = n.pointer(&["metadata", "annotations", VTEP_MAC_KEY]).and_then(Value::as_str).and_then(parse_mac);
                     if let (Some(ip), Some(mac)) = (ip, mac) {
                         peers.push((pn, ip, mac));
                     }
                 }
                 if !annotated && mine.is_some() {
-                    let p = alloc::format!(r#"{{"metadata":{{"annotations":{{"{VTEP_MAC_KEY}":"{my_mac}","{VTEP_IP_KEY}":"{my_ip}"}}}}}}"#);
+                    let p = alloc::format!(r#"{{"metadata":{{"annotations":{{"{VTEP_MAC_KEY}":"{my_mac}","{VTEP_IP_KEY}":"{my_ip}","{BACKEND_KEY}":"vxlan"}}}}}}"#);
                     if let Ok(p) = json::parse(p.as_bytes()) {
                         let _ = self.c.patch(&alloc::format!("/api/v1/nodes/{}", self.cfg.node_name), "application/merge-patch+json", &p).await;
                     }
@@ -428,6 +434,14 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
     }
 
+    /// Logs a backend mismatch with a peer (once per peer and backend pair).
+    fn warn_backend(&self, peer: &str, mine: &str, theirs: &str) {
+        let key = alloc::format!("{peer}/{theirs}");
+        if self.warned_backend.borrow_mut().insert(key) {
+            kr_rt::eprint(alloc::format!("kubelet: peer node {peer} uses pod network backend {theirs} but this node uses {mine}: skipping it (all nodes must use the same KR_NET_BACKEND)\n").as_bytes());
+        }
+    }
+
     /// Creates `kr.vxlan` (VNI 1, UDP 8472, MTU = uplink - 50) with the node's pod-subnet
     /// network address as a /32 and brings it up; returns its ifindex.
     fn ensure_vxlan(&self, nl: &kr_net::netlink::Netlink, subnet: [u8; 4]) -> Option<i32> {
@@ -452,11 +466,23 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             return self.vxlan_loop().await;
         }
         use kr_net::netlink::RTPROT_KR;
+        let mut announced = false;
         loop {
             if let (Ok(list), Ok(nl)) = (self.c.list("/api/v1/nodes", "").await, kr_net::netlink::Netlink::route()) {
                 let mut want = Vec::new();
                 for n in list.get("items").and_then(Value::as_array).unwrap_or(&[]) {
                     if meta(n, "name") == self.cfg.node_name {
+                        let ann = n.pointer(&["metadata", "annotations", BACKEND_KEY]).and_then(Value::as_str);
+                        if ann != Some("host-gw") && !announced {
+                            let p = alloc::format!(r#"{{"metadata":{{"annotations":{{"{BACKEND_KEY}":"host-gw"}}}}}}"#);
+                            if let Ok(p) = json::parse(p.as_bytes()) {
+                                announced = self.c.patch(&alloc::format!("/api/v1/nodes/{}", self.cfg.node_name), "application/merge-patch+json", &p).await.is_ok();
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(theirs) = backend_mismatch("host-gw", n.pointer(&["metadata", "annotations", BACKEND_KEY]).and_then(Value::as_str)) {
+                        self.warn_backend(&meta(n, "name"), "host-gw", theirs);
                         continue;
                     }
                     let Some(pn) = n.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).and_then(network::PodNet::parse) else { continue };
@@ -1296,6 +1322,14 @@ mod status_tests {
 const VXLAN_DEV: &str = "kr.vxlan";
 const VTEP_MAC_KEY: &str = "kr.io/vtep-mac";
 const VTEP_IP_KEY: &str = "kr.io/vtep-ip";
+const BACKEND_KEY: &str = "kr.io/net-backend";
+
+/// The peer's backend when it differs from ours. A peer without the annotation (older kr,
+/// or not registered its backend yet) is not a mismatch: VXLAN still needs its VTEP annotations.
+/// host-gw routes to a VXLAN peer cannot work (and the reverse), so mismatched peers are skipped.
+fn backend_mismatch<'a>(mine: &str, theirs: Option<&'a str>) -> Option<&'a str> {
+    theirs.filter(|t| *t != mine)
+}
 
 fn fmt_ip(ip: [u8; 4]) -> String {
     alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
@@ -1330,7 +1364,15 @@ fn route_diff(want: &[([u8; 4], u8, [u8; 4])], have: &[([u8; 4], u8, Option<[u8;
 
 #[cfg(test)]
 mod route_tests {
-    use super::{route_diff, set_diff};
+    use super::{backend_mismatch, route_diff, set_diff};
+
+    #[test]
+    fn backend_mismatch_detected() {
+        assert_eq!(backend_mismatch("vxlan", Some("vxlan")), None);
+        assert_eq!(backend_mismatch("vxlan", None), None);
+        assert_eq!(backend_mismatch("vxlan", Some("host-gw")), Some("host-gw"));
+        assert_eq!(backend_mismatch("host-gw", Some("vxlan")), Some("vxlan"));
+    }
 
     #[test]
     fn set_diff_neigh_and_fdb() {
