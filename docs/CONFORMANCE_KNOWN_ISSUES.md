@@ -58,6 +58,8 @@ All addressed since round 7 (KNOWN_ISSUES #104); to be confirmed by the next run
 
 ## API connectivity from pods (10.96.0.1 timeouts) (14)
 
+Likely cause fixed: RLIMIT_NOFILE was 1024 (KNOWN_ISSUES #107).
+
 - [sig-api-machinery] CustomResourceFieldSelectors (setup) CustomResourceFieldSelectors MUST list and watch custom resources matching the field selector — `context deadline exceeded`
 - [sig-api-machinery] Garbage collector (setup) should not delete dependents that have both valid owner and owner that's waiting for dependents to be deleted — `context deadline exceeded`
 - [sig-api-machinery] ResourceQuota should create a ResourceQuota and capture the life of a pod. — `Get "https://10.96.0.1:443/api/v1/namespaces/resourcequota-937/resourcequotas": context deadline exceeded`
@@ -74,6 +76,8 @@ All addressed since round 7 (KNOWN_ISSUES #104); to be confirmed by the next run
 - [sig-storage] Subpath (setup) Atomic writer volumes should support subpaths with downward pod — `wait for service account "default" in namespace "subpath-5296": timed out waiting for the condition`
 
 ## Workload controllers (35)
+
+Mostly addressed (KNOWN_ISSUES #106); environmental: DaemonSet rollback needs 2 nodes.
 
 - [sig-api-machinery] Garbage collector should keep the rc around until all its pods are deleted if the deleteOptions says so — `expected no pods, got &v1.PodList{TypeMeta:v1.TypeMeta{Kind:"", APIVersion:""}, ListMeta:v1.ListMeta{SelfLink:"", ResourceVersion:"16814", Continue:"", Remainin…`
 - [sig-api-machinery] Garbage collector should orphan RS created by deployment when deleteOptions.PropagationPolicy is Orphan — `Failed to verify remaining deployments, rs, and pods: [remaining rs post mortem: &v1.ReplicaSetList{TypeMeta:v1.TypeMeta{Kind:"", APIVersion:""}, ListMeta:v1.Li…`
@@ -132,6 +136,8 @@ Partly addressed (KNOWN_ISSUES #105); open: CRD conversion webhooks and CRs in a
 - [sig-api-machinery] FieldValidation should detect unknown metadata fields in both the root and embedded object of a CR — `error missing duplicate field: the server rejected our request for an unknown reason:`
 
 ## Networking and DNS (14)
+
+Partly addressed (KNOWN_ISSUES #107); open: hostNetwork pods, status.hostIP, DNS for musl resolvers.
 
 - [sig-network] API Server should have Endpoints and EndpointSlices pointing to API Server — `Expected at least 1 EndpointSlice, got 1: []v1.EndpointSubset{v1.EndpointSubset{Addresses:[]v1.EndpointAddress{v1.EndpointAddress{IP:"172.17.0.3", Hostname:"", …`
 - [sig-network] DNS should provide /etc/hosts entries for the cluster — `Unable to read musl_hosts@dns-querier-1.dns-test-service.dns-4467.svc.cluster.local from pod dns-4467/dns-test-a34286d9-09b4-46a9-87e5-0527c227b54a: client rate…`

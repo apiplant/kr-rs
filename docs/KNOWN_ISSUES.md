@@ -70,6 +70,24 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     - `kubectl logs --timestamps` (times are approximate: the file mtime, or the read time when following).
     - Field validation messages: unknown and duplicate fields together; server-side apply's "field not declared in schema"; YAML duplicate keys.
     Remaining: CRD conversion webhooks (and patching a CR in a non-storage version); API aggregation; review APIs in discovery; protobuf tables and spec validation for the new kinds; per-line log timestamps; `kubectl attach` denial message; `kubectl describe service` panic; the Guestbook test.
+106. **Workload controller gaps (conformance round 7)** — *mostly fixed*
+    Fixed (unit tests; most also on a throwaway cluster, none yet by the e2e suite):
+    - Job: `SuccessCriteriaMet`/`CompletionsReached` and `Complete` only after the other pods are gone; `successPolicy` (succeededIndexes, succeededCount); `backoffLimitPerIndex`, `maxFailedIndexes`, `status.failedIndexes`; `podFailurePolicy` (onExitCodes, onPodConditions; FailJob, Ignore, FailIndex, Count); work-queue Jobs keep running pods after the first success.
+    - Adoption and release of orphans by Job, ReplicaSet, ReplicationController and Deployment; `ReplicaFailure` on quota denials.
+    - StatefulSet scale-down halts on an unhealthy pod; kubelet host-port admission (`HostPortConflict`) so evicted StatefulSet pods are recreated; patch-added list items go first (the specs read `containers[0]`).
+    - Garbage collection honours `propagationPolicy` Orphan and Foreground (finalizers on owners).
+    - Scheduler: new pods start `Pending`, `Scheduled`/`FailedScheduling` events, the pod's required node affinity, extended resources, and preemption (lower priority first, `DisruptionTarget`, `nominatedNodeName`).
+    - Priority admission (`spec.priority`, global default, built-in critical classes). The critical classes outside kube-system need a ResourceQuota that covers them, as upstream's default limitedResources. PriorityClass `value` and `preemptionPolicy` are immutable.
+    - Exec probes and hooks get literal and label/annotation fieldRef env; DaemonSet ControllerRevisions carry `controller-revision-hash`.
+    Remaining: the DisruptionTarget condition on surviving victims is unverified; Foreground deletion is unit-tested only; CronJob ReplaceConcurrent and concurrency not checked; DaemonSet rollback needs two nodes.
+107. **Networking gaps (conformance round 7)** — *partly fixed*
+    Fixed:
+    - `kr server` and `kr agent` raise `RLIMIT_NOFILE` to the hard limit. At the default soft limit of 1024 `accept` failed with EMFILE once enough Services were listening, which is the likely cause of the `10.96.0.1 i/o timeout` / TLS handshake timeouts seen across the suite (not reproduced in the e2e run itself).
+    - The service proxy indexes Endpoints and EndpointSlices, uses slices (falling back to Endpoints), yields while reconciling, and backs off when reconciling is slow.
+    - The `kubernetes` Service gets an EndpointSlice.
+    - The EndpointSlice mirroring controller.
+    - `services/[scheme:]name[:port]/proxy`; proxy URLs are parsed by segment (namespaces named `proxy-*` broke it); `https` targets (certificate not verified, as upstream; the TLS client's insecure mode is an explicit separate constructor); HTML links rewritten through the proxy.
+    Remaining: `spec.hostNetwork` is ignored by the kubelet (pods get their own netns and a pod IP); `status.hostIP` is hard-coded to 127.0.0.1; DNS behaviour for musl resolvers (parallel A/AAAA) is unreviewed.
 
 ## Node agent and controllers (phase 4)
 73. **Volume and token gaps** — *mostly fixed*
