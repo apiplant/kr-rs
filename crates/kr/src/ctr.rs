@@ -147,13 +147,16 @@ fn run(mut args: Args) -> i32 {
 
     let maps = IdMaps::for_current_user();
     let id = container_id();
-    let lease = match bridge_network(&store, &id) {
-        Ok(l) => l,
+    let net = match bridge_network(&store, &id, &maps) {
+        Ok(n) => n,
         Err(c) => return c,
     };
     let dirs = match store.create_container(&id) {
         Ok(d) => d,
-        Err(e) => return fail(&format!("create container: {e:?}")),
+        Err(e) => {
+            net.release();
+            return fail(&format!("create container: {e:?}"));
+        }
     };
     let spec = RunSpec {
         rootfs: &rootfs,
@@ -169,21 +172,19 @@ fn run(mut args: Args) -> i32 {
         cgroup_parent: b"",
         user: user.unwrap_or(cfg.user.as_bytes()),
         maps: &maps,
-        net: lease.as_ref().map(|l| NetConfig { ip: l.ip, prefix: network::PREFIX, gateway: network::GATEWAY }),
-        sandbox: None,
+        net: net.root_config(),
+        sandbox: net.sandbox.as_ref(),
         mounts: &[],
         log_fd: None,
         extra_groups: &[],
         readonly_root: false,
     };
-    if let Some(l) = &lease {
+    if let Some(l) = &net.lease {
         let ip = l.ip;
         eprint(format!("kr ctr: {id} at {}.{}.{}.{}\n", ip[0], ip[1], ip[2], ip[3]).as_bytes());
     }
     let code = supervise(&spec);
-    if let Some(l) = lease {
-        l.release();
-    }
+    net.release();
     // Files the container created belong to subordinate ids; delete from inside a userns
     // where they are mapped (and kr is root).
     let ok = match maps.run_as_root(|| store.delete_container(&id).is_ok()) {
@@ -197,20 +198,136 @@ fn run(mut args: Args) -> i32 {
     code
 }
 
-/// As real root, sets up the bridge (idempotent) and leases an address; rootless: no network.
-fn bridge_network(store: &Store, id: &str) -> Result<Option<network::Lease>, i32> {
-    if ns::getuid() != 0 {
-        return Ok(None);
+/// The network of a standalone container: an address on the bridge and, rootless, the sandbox
+/// (a child of the shared infra namespace) that owns the netns the veth peer lives in.
+struct CtrNet {
+    lease: Option<network::Lease>,
+    sandbox: Option<container::Sandbox>,
+}
+
+impl CtrNet {
+    /// Real root: the container child configures its own netns from this.
+    fn root_config(&self) -> Option<NetConfig> {
+        let l = self.lease.as_ref().filter(|_| self.sandbox.is_none())?;
+        Some(NetConfig { ip: l.ip, prefix: network::PREFIX, gateway: network::GATEWAY })
     }
-    network::setup_host().map_err(|e| fail(&format!("network setup: errno {}", e.0)))?;
+
+    /// Stops the sandbox (its veth goes with the netns) and frees the address.
+    fn release(self) {
+        if let Some(sb) = &self.sandbox {
+            sb.stop();
+        }
+        if let Some(l) = self.lease {
+            l.release();
+        }
+    }
+}
+
+/// Leases an address and gets the container onto the bridge: as real root the host bridge,
+/// rootless the one in the shared infra namespace (see [`rootless_infra`]).
+fn bridge_network(store: &Store, id: &str, maps: &IdMaps) -> Result<CtrNet, i32> {
+    let root = ns::getuid() == 0;
+    if root {
+        network::setup_host().map_err(|e| fail(&format!("network setup: errno {}", e.0)))?;
+    }
     let dir = format!("{}/ipam", store.root());
     match ns::mkdir(&nul(dir.as_bytes()), 0o700) {
         Ok(()) | Err(kr_sys::Errno(17)) => {}
         Err(e) => return Err(fail(&format!("mkdir ipam: errno {}", e.0))),
     }
-    // Leases of `kr ctr run` processes that died without cleaning up (SIGKILL).
     network::gc(dir.as_bytes(), |owner| network::owner_alive(owner) != Some(false));
-    network::allocate(dir.as_bytes(), &network::process_owner(id.as_bytes())).map(Some).map_err(|e| fail(&format!("ipam: errno {}", e.0)))
+    let lease = network::allocate(dir.as_bytes(), &network::process_owner(id.as_bytes())).map_err(|e| fail(&format!("ipam: errno {}", e.0)))?;
+    if root {
+        return Ok(CtrNet { lease: Some(lease), sandbox: None });
+    }
+    // The lease comes first so the infra supervisor sees this process as a user.
+    let cfg = NetConfig { ip: lease.ip, prefix: network::PREFIX, gateway: network::GATEWAY };
+    let sandbox = rootless_infra(store.root(), maps).and_then(|infra| container::start_sandbox_in(&infra, id.as_bytes(), id.as_bytes(), maps, Some(cfg)).map_err(|e| format!("sandbox: {}: errno {}", e.step, e.errno.0)));
+    match sandbox {
+        Ok(sb) => Ok(CtrNet { lease: Some(lease), sandbox: Some(sb) }),
+        Err(e) => {
+            lease.release();
+            Err(fail(&format!("network: {e}")))
+        }
+    }
+}
+
+/// Handle on the rootless infra namespace shared by every `kr ctr run` of this root: a user+net
+/// namespace holding the bridge (the kubelet's rootless pod network, ADR-022, minus the
+/// kubelet; no route out). It must outlive any one `kr ctr run`, so a detached supervisor owns
+/// it and exits once no live process holds a lease. Created on demand; racing creators resolve
+/// through the atomic publish of `<root>/ctr-net`, the loser tearing its namespace down.
+fn rootless_infra(root: &str, maps: &IdMaps) -> Result<container::Sandbox, String> {
+    let path = nul(format!("{root}/ctr-net").as_bytes());
+    let attach = || {
+        let pid = network::infra_pid(&kr_sys::fs::read_file(&path, 256).ok()?)?;
+        container::Sandbox::open(pid).ok()
+    };
+    if let Some(sb) = attach() {
+        return Ok(sb);
+    }
+    // A record whose supervisor is gone is stale (SIGKILL); its namespaces went with it.
+    let _ = kr_sys::fs::unlinkat(ns::AT_FDCWD, &path, 0);
+    let mut a = ns::CloneArgs { exit_signal: ns::SIGCHLD as u64, ..Default::default() };
+    // SAFETY: single-threaded runtime (ADR-005); the child never returns.
+    match unsafe { ns::clone3(&mut a) } {
+        Ok(0) => infra_supervisor(root, maps),
+        Ok(_) => {}
+        Err(e) => return Err(format!("fork: errno {}", e.0)),
+    }
+    for _ in 0..100 {
+        if let Some(sb) = attach() {
+            return Ok(sb);
+        }
+        let _ = ns::nanosleep(&kr_sys::Timespec { tv_sec: 0, tv_nsec: 100_000_000 });
+    }
+    Err(String::from("rootless network namespace did not come up"))
+}
+
+/// Body of the detached infra supervisor: creates the namespace and bridge, publishes it, and
+/// lingers until nobody holds a live lease for a few seconds.
+fn infra_supervisor(root: &str, maps: &IdMaps) -> ! {
+    let _ = ns::setsid();
+    if let Ok(null) = ns::open(b"/dev/null\0", ns::O_RDWR, 0) {
+        for fd in 0..3 {
+            let _ = ns::dup_to(null.raw(), fd);
+        }
+    }
+    ns::close_from(3);
+    let Ok(infra) = container::start_sandbox(b"kr-ctr-network", b"", maps, None) else { kr_sys::exit_group(1) };
+    let pn = network::PodNet::default();
+    if !matches!(container::run_in_net(&infra, || network::setup_infra_bridge(&pn)), Ok(0)) {
+        infra.stop();
+        kr_sys::exit_group(1);
+    }
+    let path = nul(format!("{root}/ctr-net").as_bytes());
+    let tmp = nul(format!("{root}/ctr-net.{}", kr_sys::fs::getpid()).as_bytes());
+    let record = network::infra_record(&network::process_owner(b"ctr-net"), infra.pid);
+    // RENAME_NOREPLACE: publishing is atomic and only one creator wins.
+    let published = ns::open(&tmp, ns::O_WRONLY | ns::O_CREAT | kr_sys::fs::O_TRUNC, 0o600)
+        .and_then(|fd| kr_sys::write(fd.raw(), &record))
+        .and_then(|_| kr_sys::fs::renameat2(ns::AT_FDCWD, &tmp, ns::AT_FDCWD, &path, 1));
+    if published.is_err() {
+        let _ = kr_sys::fs::unlinkat(ns::AT_FDCWD, &tmp, 0);
+        infra.stop();
+        kr_sys::exit_group(0);
+    }
+    let ipam = format!("{root}/ipam");
+    let mut idle = 0;
+    while idle < 5 && infra.is_alive() {
+        let _ = ns::nanosleep(&kr_sys::Timespec { tv_sec: 1, tv_nsec: 0 });
+        // Pod leases (no process owner) belong to a kubelet's own namespace and do not count.
+        let live = core::cell::Cell::new(0);
+        network::gc(ipam.as_bytes(), |owner| {
+            let alive = network::owner_alive(owner);
+            live.set(live.get() + (alive == Some(true)) as u32);
+            alive != Some(false)
+        });
+        idle = if live.get() == 0 { idle + 1 } else { 0 };
+    }
+    let _ = kr_sys::fs::unlinkat(ns::AT_FDCWD, &path, 0);
+    infra.stop();
+    kr_sys::exit_group(0)
 }
 
 /// Starts the container and waits for it, forwarding SIGINT/SIGTERM to its pid 1. A second

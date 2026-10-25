@@ -190,6 +190,12 @@ pub struct Sandbox {
 }
 
 impl Sandbox {
+    /// A handle on a sandbox owned by another process (the shared `kr ctr` network namespace),
+    /// good for joining its namespaces. Do not `stop` it.
+    pub fn open(pid: i32) -> Result<Sandbox, Errno> {
+        Ok(Sandbox { pid, pidfd: ns::pidfd_open(pid)? })
+    }
+
     /// A target for joining the pod's network (probes); the sandbox owns the netns.
     pub fn target(&self) -> Result<ExecTarget, Errno> {
         Ok(ExecTarget { pidfd: Rc::new(ns::pidfd_open(self.pid)?), cgroup: None })
@@ -653,12 +659,17 @@ impl IdMaps {
     fn apply(&self, pid: i32, uid: u32, gid: u32) -> Result<(), RunError> {
         let d = fmt_u32(pid as u32);
         if self.nested {
-            // Inside the parent userns we are root; map its whole range 1:1.
+            // Inside the parent userns we are root; map its whole range 1:1. The parent's own
+            // map has the single id and the subordinate range as separate extents, and the
+            // kernel refuses a child extent that spans two of them: one line per extent.
             let base = |f: &[u8]| cstr(&[b"/proc/", &d, b"/", f]);
             let line = |sub: Option<(u32, u32)>| {
-                let mut v = b"0 0 ".to_vec();
-                v.extend_from_slice(&fmt_u32(1 + sub.map_or(0, |s| s.1)));
-                v.push(b'\n');
+                let mut v = b"0 0 1\n".to_vec();
+                if let Some((_, count)) = sub {
+                    v.extend_from_slice(b"1 1 ");
+                    v.extend_from_slice(&fmt_u32(count));
+                    v.push(b'\n');
+                }
                 v
             };
             ns::write_file(&base(b"uid_map"), &line(self.sub_uid)).map_err(err("write nested uid_map"))?;
