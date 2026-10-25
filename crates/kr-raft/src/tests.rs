@@ -494,6 +494,52 @@ fn membership_add_and_remove() {
 }
 
 #[test]
+fn learner_catches_up_without_counting_for_quorum() {
+    // One voter; a learner that is down must not stall commits (as a voter it would: 2 of 2).
+    let mut s = Sim::new(17, 1);
+    for _ in 0..50 {
+        s.step_time();
+    }
+    let raft = Raft::new(cfg(2), 2, HardState::default(), None, Vec::new(), Vec::new());
+    s.nodes.insert(2, Node { raft, disk: Disk::default(), sm: Vec::new(), sm_index: 0, alive: true, voters0: Vec::new() });
+    let l = s.leader().unwrap();
+    s.nodes.get_mut(&l).unwrap().raft.propose_conf(EntryKind::AddLearner(2)).unwrap();
+    s.drain(l);
+    for _ in 0..50 {
+        s.step_time();
+    }
+    assert_eq!(s.nodes[&l].raft.learners(), &[2]);
+    assert_eq!(s.nodes[&2].raft.learners(), &[2], "the learner learns its own membership");
+    s.crash(2);
+    let before = s.nodes[&l].sm_index;
+    s.propose();
+    for _ in 0..50 {
+        s.step_time();
+    }
+    assert!(s.nodes[&l].sm_index > before, "a dead learner stalled the commit");
+    // Back up: it catches up, never campaigns, and only then is promoted.
+    s.restart(2, 99);
+    for _ in 0..200 {
+        s.step_time();
+    }
+    assert_ne!(s.nodes[&2].raft.role(), Role::Leader);
+    assert_eq!(s.leader(), Some(l));
+    assert_eq!(s.nodes[&l].raft.matched(2), Some(s.nodes[&l].raft.last_index()));
+    assert_eq!(s.nodes[&2].sm_index, s.nodes[&l].sm_index);
+    s.nodes.get_mut(&l).unwrap().raft.propose_conf(EntryKind::AddVoter(2)).unwrap();
+    s.drain(l);
+    for _ in 0..100 {
+        s.step_time();
+    }
+    assert_eq!(s.nodes[&2].raft.voters(), &[1, 2]);
+    assert!(s.nodes[&2].raft.learners().is_empty());
+    // Learners survive compaction (snapshot metadata).
+    let li = s.nodes[&l].raft.applied();
+    s.nodes.get_mut(&l).unwrap().raft.compact(li, Rc::from(&b"img"[..]));
+    assert_eq!(s.nodes[&l].raft.snapshot().unwrap().meta.voters, vec![1, 2]);
+}
+
+#[test]
 fn leadership_transfer() {
     let mut s = Sim::new(13, 3);
     for _ in 0..100 {
@@ -511,7 +557,7 @@ fn leadership_transfer() {
 
 #[test]
 fn codec_roundtrips_and_rejects_garbage() {
-    let snap = Snapshot { meta: SnapshotMeta { index: 9, term: 3, voters: vec![1, 2, 3] }, data: Rc::from(&b"state"[..]) };
+    let snap = Snapshot { meta: SnapshotMeta { index: 9, term: 3, voters: vec![1, 2, 3], learners: vec![] }, data: Rc::from(&b"state"[..]) };
     let entries = vec![
         Entry { term: 2, index: 5, kind: EntryKind::Normal, data: b"a".to_vec() },
         Entry { term: 2, index: 6, kind: EntryKind::AddVoter(4), data: Vec::new() },

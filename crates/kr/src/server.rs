@@ -67,10 +67,28 @@ fn issue(dir: &str, file: &str, ca: &(Name, x509::SigningKey, Vec<u8>), subject:
     pki::write_new(&pki::path(dir, &format!("{file}.pem")), x509::pem_encode("CERTIFICATE", &cert).as_bytes(), 0o644)
 }
 
+/// Drops `<file>.pem/.key` if the certificate does not cover `ip` (this machine's address
+/// changed), so that it is issued again with the new address.
+fn drop_if_ip_changed(pki_dir: &str, file: &str, ip: [u8; 4]) {
+    let Ok(b) = fs::read_file(&pki::path(pki_dir, &format!("{file}.pem")), 1 << 20) else { return };
+    let Some(der) = core::str::from_utf8(&b).ok().and_then(|p| x509::pem_decode_all(p, "CERTIFICATE").ok()).and_then(|mut v| (!v.is_empty()).then(|| v.remove(0))) else { return };
+    let host = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    if x509::Certificate::parse(&der).is_ok_and(|c| !c.matches_host(host.as_bytes())) {
+        eprint(format!("kr server: {file}.pem does not cover {host}; issuing a new one\n").as_bytes());
+        for ext in ["pem", "key"] {
+            let _ = fs::unlinkat(fs::AT_FDCWD, &pki::path(pki_dir, &format!("{file}.{ext}")), 0);
+        }
+    }
+}
+
 /// Creates the CA, the apiserver serving cert and the admin client cert if missing.
 fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
     let pki_dir = format!("{data}/pki");
     mkdir_p(&pki_dir)?;
+    if let Ok(adv) = kr_sys::ns::route_source([1, 1, 1, 1]) {
+        drop_if_ip_changed(&pki_dir, "apiserver", adv);
+        drop_if_ip_changed(&pki_dir, "server", adv);
+    }
     if !exists(&pki::path(&pki_dir, "ca.pem")) {
         pki::create_ca(&pki_dir, "kr-cluster-ca".into(), 3650)?;
     }
@@ -173,7 +191,7 @@ fn server_identity(data: &str, advertise: [u8; 4]) -> Result<u64, String> {
 fn import_single_server(data: &str, raft_dir: &str, id: u64) -> Result<(), String> {
     let image = kr_store::Store::open(&format!("{data}/db")).map_err(|_| String::from("cannot open the single-server datastore"))?.image();
     let (mut st, _) = kr_raft::storage::Storage::open(raft_dir).map_err(|e| format!("raft storage: {e:?}"))?;
-    let snap = kr_raft::Snapshot { meta: kr_raft::SnapshotMeta { index: 1, term: 1, voters: alloc::vec![id] }, data: Rc::from(image) };
+    let snap = kr_raft::Snapshot { meta: kr_raft::SnapshotMeta { index: 1, term: 1, voters: alloc::vec![id], learners: Vec::new() }, data: Rc::from(image) };
     st.save_snapshot(&snap).map_err(|e| format!("raft snapshot: {e:?}"))?;
     st.set_hard_state(kr_raft::HardState { term: 1, vote: None, commit: 1 }).map_err(|e| format!("raft hard state: {e:?}"))?;
     let (from, to) = (format!("{data}/db\0"), format!("{data}/db.imported\0"));
@@ -449,6 +467,7 @@ pub fn main(mut args: Args) -> i32 {
             Some((c, l, srv_tls, id)) => {
                 kr_rt::exec::spawn(kr_apiserver::cluster::transport::serve(l, srv_tls, id, c.inbox.clone()));
                 kr_rt::exec::spawn(c.clone().run(api.clone()));
+                kr_rt::exec::spawn(c.clone().keep_registered(api.clone()));
                 if let Some(url) = join_url {
                     let me = kr_apiserver::cluster::ServerAddr { ip: advertise, raft_port: kr_apiserver::cluster::transport::PORT, api_port: port };
                     kr_rt::exec::spawn(become_voter(c.clone(), url, pki_dir.clone(), me));

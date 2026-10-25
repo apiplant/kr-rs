@@ -167,6 +167,16 @@ impl Cluster {
         self.raft.borrow().voters().to_vec()
     }
 
+    pub fn learners(&self) -> Vec<NodeId> {
+        self.raft.borrow().learners().to_vec()
+    }
+
+    /// Leader: `id` has every entry up to the commit index.
+    pub fn caught_up(&self, id: NodeId) -> bool {
+        let r = self.raft.borrow();
+        r.matched(id).is_some_and(|m| m >= r.commit)
+    }
+
     pub fn term(&self) -> u64 {
         self.raft.borrow().term
     }
@@ -310,10 +320,42 @@ impl Cluster {
         }
     }
 
+    /// Keeps `/kr/servers/<id>` equal to this server's current address (e.g. after its IP
+    /// changed): the leader writes its own; a member follower asks the leader through
+    /// `/kr/add-server`, which only updates the address of an existing voter.
+    pub async fn keep_registered(self: Rc<Self>, api: Rc<ApiServer>) {
+        loop {
+            kr_rt::exec::sleep(15_000).await;
+            let Some(me) = self.self_addr.borrow().clone() else { continue };
+            let stored = api.store.borrow().get(&alloc::format!("{SERVERS_PREFIX}{}", self.id)).and_then(|kv| ServerAddr::from_json(&kv.value));
+            if stored.as_ref() == Some(&me) || !self.voters().contains(&self.id) {
+                continue; // up to date, or not a member (the join flow registers it)
+            }
+            if self.ready() {
+                self.register_self(&api);
+                continue;
+            }
+            // Our own certificate is the identity; any server works (a follower forwards it
+            // once). Other servers may still be sending to our old address, so the leader may
+            // be unknown here: try it first, then everyone else.
+            let mut targets: Vec<NodeId> = self.leader().into_iter().collect();
+            targets.extend(self.voters().into_iter().filter(|v| *v != self.id && Some(*v) != self.leader()));
+            let ip = me.ip;
+            let body = alloc::format!(r#"{{"ip":"{}.{}.{}.{}","raftPort":{},"apiPort":{}}}"#, ip[0], ip[1], ip[2], ip[3], me.raft_port, me.api_port);
+            for t in targets {
+                if self.post_as_self(&api, t, "/kr/add-server", body.as_bytes()).await == Some(200) {
+                    kr_rt::eprint(b"kr server: re-registered this server's address\n");
+                    break;
+                }
+            }
+        }
+    }
+
     /// Updates the outbound links from the current voters and their stored addresses.
     fn sync_peers(&self, api: &ApiServer) {
         let mut voters = self.voters();
-        if !voters.contains(&self.id) {
+        voters.extend(self.learners());
+        if !voters.contains(&self.id) || self.learners().contains(&self.id) {
             // Joining: answer the servers we were told about until we learn the membership.
             voters.extend(self.seeds.borrow().keys().filter(|id| !voters.contains(id)).copied().collect::<Vec<_>>());
         }
@@ -378,7 +420,7 @@ impl Cluster {
                 }
             }
             self.leadership_changes(&api);
-            if self.peers.borrow().len() + 1 < self.voters().len() || !self.voters().contains(&self.id) {
+            if self.peers.borrow().len() + 1 < self.voters().len() + self.learners().len() || !self.voters().contains(&self.id) {
                 self.sync_peers(&api); // still missing links (addresses not known yet)
             }
             let wait = next_tick.saturating_sub(kr_rt::exec::now_ms()).max(1);
@@ -428,7 +470,7 @@ impl Cluster {
         let mut membership = false;
         for e in &rd.committed {
             self.apply(api, e);
-            membership |= matches!(e.kind, EntryKind::AddVoter(_) | EntryKind::RemoveVoter(_));
+            membership |= e.kind.is_conf();
         }
         let had_committed = !rd.committed.is_empty();
         self.raft.borrow_mut().advance(rd);

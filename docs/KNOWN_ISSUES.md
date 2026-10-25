@@ -42,10 +42,10 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
     - Fixed: a restarted server could not reach its peers when they were needed for quorum (their addresses are in the replicated store, which is behind on restart); known addresses are now kept in `raft/peers`.
     - Fixed: agents fail over. They follow the `kubernetes` endpoints (every 30 s, saved to `<agent data>/servers` for restarts) and switch to the next server when a request gets no HTTP response; `tools/test/ha.sh` kills the agent's server and restarts the agent while it is down. A write that failed mid-flight is retried on the next server, so it can be applied twice (kubelet writes are idempotent or precondition-guarded). Pods using the `kubernetes` Service already get every server.
     - A removed server never sees its own removal and keeps pre-campaigning until it is stopped (harmless: pre-vote, and its log is behind). Stop and wipe removed servers.
-    - No learners: a joining server is a voter as soon as its add commits, so a 1→2 cluster stalls if the newcomer dies before catching up. Join one server at a time.
-    - A server's address is re-registered only when it becomes leader or rejoins; an IP change of a follower needs a restart with `--server`.
+    - Fixed: a joining server is first a Raft learner (gets the log, counts for no quorum, never campaigns) and is promoted to voter only once it has every committed entry; a newcomer that dies while catching up no longer stalls the cluster. Membership changes are still one at a time.
+    - Fixed: after an IP change a server reissues its API and Raft certificates at start, and re-registers its address through any reachable server (its own certificate is the identity); outbound links reconnect as soon as an address changes (`tools/test/ha.sh ipchange`). A server whose IP changes while running needs a restart.
     - Follower reads are as fresh as its applied log (serializable, like etcd's); only the forwarding client gets read-your-writes.
-    - Snapshots are sent whole in one message (512 MB frame limit).
+    - Snapshots are sent whole in one message (512 MB frame limit; a store image is typically a few MB to tens of MB). Plan: chunked InstallSnapshot if images grow.
 
 ## Node agent and controllers (phase 4)
 73. **Volume and token gaps** — *mostly fixed*

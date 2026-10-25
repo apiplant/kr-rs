@@ -66,6 +66,16 @@ impl Cluster {
             .clone()
     }
 
+    /// POSTs `body` to server `to` as this server itself (no forwarded identity); the status.
+    pub async fn post_as_self(&self, api: &crate::api::ApiServer, to: kr_raft::NodeId, path: &str, body: &[u8]) -> Option<u16> {
+        let a = self.addr_of(api, to)?;
+        let url = alloc::format!("https://{}.{}.{}.{}:{}{}", a.ip[0], a.ip[1], a.ip[2], a.ip[3], a.api_port, path);
+        let http = self.http();
+        let mut resp = kr_rt::exec::timeout(10_000, http.request("POST", &url, &[("Content-Type", "application/json")], body)).await.ok()?.ok()?;
+        let _ = resp.read_to_end(1 << 20).await;
+        Some(resp.status)
+    }
+
     /// Sends the request to `leader` as `user`; `None` if the leader is unreachable.
     #[allow(clippy::too_many_arguments)]
     pub async fn forward(&self, api: &crate::api::ApiServer, leader: kr_raft::NodeId, user: &User, method: &str, path: &str, query: &str, headers: &[(String, String)], body: &[u8]) -> Option<Forwarded> {

@@ -72,6 +72,10 @@ pub fn encode_entry(out: &mut Vec<u8>, e: &Entry) {
             w.u8(3);
             w.u64(id);
         }
+        EntryKind::AddLearner(id) => {
+            w.u8(4);
+            w.u64(id);
+        }
     }
     w.bytes(&e.data);
 }
@@ -84,6 +88,7 @@ fn read_entry(r: &mut R) -> Option<Entry> {
         1 => EntryKind::Noop,
         2 => EntryKind::AddVoter(r.u64().filter(|id| *id != 0)?),
         3 => EntryKind::RemoveVoter(r.u64().filter(|id| *id != 0)?),
+        4 => EntryKind::AddLearner(r.u64().filter(|id| *id != 0)?),
         _ => return None,
     };
     let data = r.bytes()?.to_vec();
@@ -122,6 +127,10 @@ fn write_meta(w: &mut W, m: &SnapshotMeta) {
     for v in &m.voters {
         w.u64(*v);
     }
+    w.u64(m.learners.len() as u64);
+    for v in &m.learners {
+        w.u64(*v);
+    }
 }
 
 fn read_meta(r: &mut R) -> Option<SnapshotMeta> {
@@ -135,7 +144,15 @@ fn read_meta(r: &mut R) -> Option<SnapshotMeta> {
     for _ in 0..n {
         voters.push(r.u64().filter(|id| *id != 0)?);
     }
-    Some(SnapshotMeta { index, term, voters })
+    let n = r.u64()?;
+    if n > 1024 {
+        return None;
+    }
+    let mut learners = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        learners.push(r.u64().filter(|id| *id != 0)?);
+    }
+    Some(SnapshotMeta { index, term, voters, learners })
 }
 
 pub fn encode_snapshot_meta(m: &SnapshotMeta) -> Vec<u8> {

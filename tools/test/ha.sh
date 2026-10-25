@@ -2,9 +2,10 @@
 # HA cluster test (ADR-026): servers krs1..krs3 (Raft) + agent kra1 in throwaway privileged
 # containers (dev only). Checks joining, replication, write forwarding from followers,
 # leader failover after kill -9, restart catch-up and server removal.
-#   tools/test/ha.sh [up|test|import|down]   (default: up + test; leaves the cluster running)
+#   tools/test/ha.sh [up|test|import|ipchange|down]   (default: up + test; leaves the cluster running)
 #   import: a single-server install converted with --cluster-init, a second server joins
 #           (InstallSnapshot), then the first restarts and must reach its peer (2 voters).
+#   ipchange: krs3 moves to another IP and restarts (new certificates, re-registered address).
 # Then: docker exec -e KUBECONFIG=/var/tmp/srv/admin.kubeconfig krs1 kubectl get nodes
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
@@ -27,7 +28,7 @@ down() {
 
 up() {
   down
-  docker network create krha >/dev/null
+  docker network create --subnet 172.30.0.0/24 krha >/dev/null
   for n in $SERVERS kra1; do
     docker run -d --name $n --hostname $n --network krha --privileged --tmpfs /store:exec,size=2g \
       -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" \
@@ -127,7 +128,7 @@ test_() {
 
 import_() {
   down
-  docker network create krha >/dev/null
+  docker network create --subnet 172.30.0.0/24 krha >/dev/null
   for n in krs1 krs2; do
     docker run -d --name $n --hostname $n --network krha --privileged --tmpfs /store:exec,size=2g \
       -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" \
@@ -157,10 +158,29 @@ import_() {
   echo "PASS (import)"
 }
 
+ipchange_() {
+  up
+  docker network disconnect krha krs3
+  docker network connect --ip 172.30.0.99 krha krs3
+  docker exec krs3 pkill -9 -x kr; sleep 1
+  start krs3; wait_api krs3
+  docker exec krs3 grep -q "does not cover 172.30.0.99" /tmp/srv.log || fail "certificates not reissued"
+  for _ in $(seq 60); do k krs1 get endpoints kubernetes -o jsonpath='{.subsets[0].addresses[*].ip}' | grep -q 172.30.0.99 && break; sleep 2; done
+  k krs1 get endpoints kubernetes -o jsonpath='{.subsets[0].addresses[*].ip}' | grep -q 172.30.0.99 || fail "new address not registered"
+  k krs3 create configmap from-new-ip >/dev/null || fail "write on the moved server"
+  for _ in $(seq 20); do k krs1 get configmap from-new-ip >/dev/null 2>&1 && break; sleep 1; done
+  k krs1 get configmap from-new-ip >/dev/null || fail "not replicated"
+  k krs1 create configmap to-new-ip >/dev/null
+  for _ in $(seq 20); do k krs3 get configmap to-new-ip >/dev/null 2>&1 && break; sleep 1; done
+  k krs3 get configmap to-new-ip >/dev/null || fail "moved server does not receive the log"
+  echo "PASS (ipchange)"
+}
+
 case "${1:-all}" in
   up) up ;;
   test) test_ ;;
   import) import_ ;;
+  ipchange) ipchange_ ;;
   down) down ;;
   all) up; test_ ;;
 esac

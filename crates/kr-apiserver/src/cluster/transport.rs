@@ -149,8 +149,13 @@ impl Peer {
         Peer { queue, wake, addr, _task: task }
     }
 
+    /// A changed address takes effect at once: the open connection is dropped (one to a dead
+    /// address can accept writes for minutes before TCP gives up).
     pub fn set_addr(&self, addr: ([u8; 4], u16)) {
-        *self.addr.borrow_mut() = addr;
+        if *self.addr.borrow() != addr {
+            *self.addr.borrow_mut() = addr;
+            self.wake.notify();
+        }
     }
 
     pub fn send(&self, m: &Message) {
@@ -200,6 +205,9 @@ async fn sender(queue: Rc<RefCell<VecDeque<Vec<u8>>>>, wake: Rc<Notify>, addr: R
         };
         backoff = 100;
         loop {
+            if *addr.borrow() != (ip, port) {
+                break; // moved: reconnect to the new address
+            }
             let next = queue.borrow_mut().pop_front();
             match next {
                 Some(f) => {

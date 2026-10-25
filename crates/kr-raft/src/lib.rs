@@ -40,6 +40,37 @@ pub enum EntryKind {
     Noop,
     AddVoter(NodeId),
     RemoveVoter(NodeId),
+    /// A non-voting member: receives the log but counts for no quorum, never campaigns. A
+    /// later `AddVoter` of it promotes it; `RemoveVoter` removes it.
+    AddLearner(NodeId),
+}
+
+impl EntryKind {
+    pub fn is_conf(&self) -> bool {
+        matches!(self, EntryKind::AddVoter(_) | EntryKind::RemoveVoter(_) | EntryKind::AddLearner(_))
+    }
+}
+
+/// Applies a config entry to (voters, learners).
+fn apply_conf(v: &mut Vec<NodeId>, l: &mut Vec<NodeId>, kind: &EntryKind) {
+    match *kind {
+        EntryKind::AddVoter(id) => {
+            l.retain(|x| *x != id);
+            if !v.contains(&id) {
+                v.push(id);
+            }
+        }
+        EntryKind::RemoveVoter(id) => {
+            v.retain(|x| *x != id);
+            l.retain(|x| *x != id);
+        }
+        EntryKind::AddLearner(id) => {
+            if !v.contains(&id) && !l.contains(&id) {
+                l.push(id);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +94,8 @@ pub struct SnapshotMeta {
     pub term: u64,
     /// Voters as of `index`.
     pub voters: Vec<NodeId>,
+    /// Learners as of `index`.
+    pub learners: Vec<NodeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,12 +219,14 @@ pub struct Raft {
     snap_index: u64,
     snap_term: u64,
     snap_voters: Vec<NodeId>,
+    snap_learners: Vec<NodeId>,
     log: Vec<Entry>,
     /// Index of the last entry known persisted by the caller (advance()).
     stable: u64,
     pub commit: u64,
     applied: u64,
     voters: Vec<NodeId>,
+    learners: Vec<NodeId>,
     /// Index of the latest config change entry (in the log, possibly uncommitted).
     pending_conf: u64,
     // timers
@@ -217,10 +252,10 @@ impl Raft {
     /// cluster) in `snap_meta.voters`, and no entries.
     pub fn new(cfg: Config, seed: u64, hs: HardState, snapshot: Option<Snapshot>, voters: Vec<NodeId>, entries: Vec<Entry>) -> Raft {
         let fresh = snapshot.is_none() && entries.is_empty() && hs == HardState::default();
-        let (snap_index, snap_term, snap_voters) = match &snapshot {
-            Some(s) => (s.meta.index, s.meta.term, s.meta.voters.clone()),
-            None if fresh => (0, 0, Vec::new()),
-            None => (0, 0, voters.clone()),
+        let (snap_index, snap_term, snap_voters, snap_learners) = match &snapshot {
+            Some(s) => (s.meta.index, s.meta.term, s.meta.voters.clone(), s.meta.learners.clone()),
+            None if fresh => (0, 0, Vec::new(), Vec::new()),
+            None => (0, 0, voters.clone(), Vec::new()),
         };
         // A brand-new member of a new cluster writes the initial membership as term-0 config
         // entries (identical on every founding member), so nodes that join later learn it by
@@ -248,11 +283,13 @@ impl Raft {
             snap_index,
             snap_term,
             snap_voters,
+            snap_learners,
             log: entries,
             stable,
             commit: hs.commit.max(snap_index).max(boot_commit),
             applied: snap_index,
             voters: Vec::new(),
+            learners: Vec::new(),
             pending_conf: 0,
             elapsed: 0,
             timeout: 0,
@@ -284,6 +321,18 @@ impl Raft {
     }
     pub fn voters(&self) -> &[NodeId] {
         &self.voters
+    }
+
+    pub fn learners(&self) -> &[NodeId] {
+        &self.learners
+    }
+
+    /// Leader only: the highest index known replicated on `id`.
+    pub fn matched(&self, id: NodeId) -> Option<u64> {
+        if id == self.cfg.id {
+            return Some(self.last_index());
+        }
+        self.progress.get(&id).map(|p| p.matched)
     }
     pub fn last_index(&self) -> u64 {
         self.log.last().map_or(self.snap_index, |e| e.index)
@@ -344,6 +393,11 @@ impl Raft {
         self.voters.contains(&id)
     }
 
+    /// Everyone the leader replicates to: voters and learners.
+    fn members(&self) -> Vec<NodeId> {
+        self.voters.iter().chain(self.learners.iter()).copied().collect()
+    }
+
     // ---- randomness / timers ----
 
     fn rand(&mut self) -> u64 {
@@ -367,35 +421,29 @@ impl Raft {
     /// Voters = snapshot voters + every config entry in the log (committed or not), §4.1.
     fn recompute_voters(&mut self) {
         let mut v = self.snap_voters.clone();
+        let mut l = self.snap_learners.clone();
         let mut pending = 0;
         for e in &self.log {
-            match e.kind {
-                EntryKind::AddVoter(id) => {
-                    if !v.contains(&id) {
-                        v.push(id);
-                    }
-                    pending = e.index;
-                }
-                EntryKind::RemoveVoter(id) => {
-                    v.retain(|x| *x != id);
-                    pending = e.index;
-                }
-                _ => {}
+            if e.kind.is_conf() {
+                apply_conf(&mut v, &mut l, &e.kind);
+                pending = e.index;
             }
         }
+        l.sort_unstable();
+        self.learners = l;
         v.sort_unstable();
         self.voters = v;
         self.pending_conf = pending;
         if self.role == Role::Leader {
-            let ids: Vec<NodeId> = self.voters.clone();
+            let ids: Vec<NodeId> = self.members();
             let next = self.last_index() + 1;
             for id in ids {
                 if id != self.cfg.id {
                     self.progress.entry(id).or_insert(Progress { matched: 0, next, state: ProgressState::Probe, inflight: Vec::new(), active: true, snap_wait: 0 });
                 }
             }
-            let voters = self.voters.clone();
-            self.progress.retain(|id, _| voters.contains(id));
+            let members = self.members();
+            self.progress.retain(|id, _| members.contains(id));
         }
     }
 
@@ -526,7 +574,7 @@ impl Raft {
             return Err(ProposeError::Busy);
         }
         match kind {
-            EntryKind::AddVoter(_) | EntryKind::RemoveVoter(_) => self.propose_kind(kind, Vec::new()),
+            k if k.is_conf() => self.propose_kind(k, Vec::new()),
             _ => Err(ProposeError::Busy),
         }
     }
@@ -559,7 +607,7 @@ impl Raft {
     }
 
     fn append_local(&mut self, e: Entry) {
-        let is_conf = matches!(e.kind, EntryKind::AddVoter(_) | EntryKind::RemoveVoter(_));
+        let is_conf = e.kind.is_conf();
         self.log.push(e);
         if is_conf {
             self.recompute_voters();
@@ -712,7 +760,7 @@ impl Raft {
                     // Conflict: drop it and everything after (never committed entries).
                     debug_assert!(e.index > self.commit, "conflict below commit index");
                     let keep = (e.index - self.snap_index - 1) as usize;
-                    conf_changed |= self.log[keep..].iter().any(|x| matches!(x.kind, EntryKind::AddVoter(_) | EntryKind::RemoveVoter(_)));
+                    conf_changed |= self.log[keep..].iter().any(|x| x.kind.is_conf());
                     self.log.truncate(keep);
                     self.truncate_from = Some(self.truncate_from.map_or(e.index, |t| t.min(e.index)));
                     self.stable = self.stable.min(e.index - 1);
@@ -720,7 +768,7 @@ impl Raft {
                 }
                 None => {}
             }
-            conf_changed |= matches!(e.kind, EntryKind::AddVoter(_) | EntryKind::RemoveVoter(_));
+            conf_changed |= e.kind.is_conf();
             self.unstable_from = self.unstable_from.min(e.index);
             self.log.push(e);
         }
@@ -755,6 +803,7 @@ impl Raft {
         self.snap_index = idx;
         self.snap_term = s.meta.term;
         self.snap_voters = s.meta.voters.clone();
+        self.snap_learners = s.meta.learners.clone();
         self.commit = idx;
         self.applied = idx;
         self.unstable_from = self.unstable_from.max(idx + 1);
@@ -855,7 +904,7 @@ impl Raft {
 
     /// After the commit index moves, tell followers (cheap: piggyback on the next Append).
     fn broadcast_append_commit(&mut self) {
-        for id in self.voters.clone() {
+        for id in self.members() {
             if id != self.cfg.id {
                 let p = self.progress.get(&id).cloned();
                 if let Some(p) = p {
@@ -868,7 +917,7 @@ impl Raft {
     }
 
     fn broadcast_append(&mut self) {
-        for id in self.voters.clone() {
+        for id in self.members() {
             if id != self.cfg.id {
                 self.send_append(id);
             }
@@ -988,20 +1037,19 @@ impl Raft {
         let term = self.term_at(index).unwrap();
         // Voters as of `index`: snapshot voters + config entries up to index.
         let mut v = self.snap_voters.clone();
+        let mut l = self.snap_learners.clone();
         for e in self.log.iter().take_while(|e| e.index <= index) {
-            match e.kind {
-                EntryKind::AddVoter(id) if !v.contains(&id) => v.push(id),
-                EntryKind::RemoveVoter(id) => v.retain(|x| *x != id),
-                _ => {}
-            }
+            apply_conf(&mut v, &mut l, &e.kind);
         }
         v.sort_unstable();
+        l.sort_unstable();
         let drop = (index - self.snap_index) as usize;
         self.log.drain(..drop);
         self.snap_index = index;
         self.snap_term = term;
         self.snap_voters = v.clone();
-        self.snap = Some(Snapshot { meta: SnapshotMeta { index, term, voters: v }, data });
+        self.snap_learners = l.clone();
+        self.snap = Some(Snapshot { meta: SnapshotMeta { index, term, voters: v, learners: l }, data });
     }
 }
 

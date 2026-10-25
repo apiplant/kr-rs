@@ -25,6 +25,9 @@ pub struct JoinSecrets {
     pub files: Vec<(String, String)>,
 }
 
+/// How long `/kr/add-server` waits for a learner to catch up before asking it to retry.
+const CATCH_UP_MS: u64 = 20_000;
+
 pub const PATHS: [&str; 3] = ["/kr/join-server", "/kr/add-server", "/kr/remove-server"];
 
 fn ok(v: Value) -> Reply {
@@ -97,11 +100,19 @@ impl Cluster {
                 // The address first (so the leader can reach the new voter), then membership.
                 self.put_addr(api, id, Some(&addr)).await?;
                 if !self.voters().contains(&id) {
-                    let idx = self.propose_conf(EntryKind::AddVoter(id)).map_err(|e| match e {
-                        WriteError::Lost => ApiError::new(503, "ServiceUnavailable", "another membership change is in progress; retry"),
-                        e => write_err(e),
-                    })?;
-                    self.wait_committed(idx).await.map_err(write_err)?;
+                    // A learner first: it receives the log without counting for quorum, so a
+                    // newcomer that dies while catching up cannot stall the cluster.
+                    if !self.learners().contains(&id) {
+                        self.conf(EntryKind::AddLearner(id)).await?;
+                    }
+                    let deadline = kr_rt::exec::now_ms() + CATCH_UP_MS;
+                    while !self.caught_up(id) {
+                        if kr_rt::exec::now_ms() >= deadline || !self.ready() {
+                            return Err(ApiError::new(503, "ServiceUnavailable", "the new server is still catching up; retry"));
+                        }
+                        kr_rt::exec::sleep(200).await;
+                    }
+                    self.conf(EntryKind::AddVoter(id)).await?;
                 }
                 self.refresh_endpoints(api).await?;
                 Ok(ok(self.voters_json()))
@@ -124,11 +135,9 @@ impl Cluster {
                         }
                         return Err(ApiError::new(503, "ServiceUnavailable", "transferring leadership away from the server being removed; retry"));
                     }
-                    let idx = self.propose_conf(EntryKind::RemoveVoter(id)).map_err(|e| match e {
-                        WriteError::Lost => ApiError::new(503, "ServiceUnavailable", "another membership change is in progress; retry"),
-                        e => write_err(e),
-                    })?;
-                    self.wait_committed(idx).await.map_err(write_err)?;
+                    self.conf(EntryKind::RemoveVoter(id)).await?;
+                } else if self.learners().contains(&id) {
+                    self.conf(EntryKind::RemoveVoter(id)).await?;
                 }
                 self.put_addr(api, id, None).await?;
                 self.refresh_endpoints(api).await?;
@@ -136,6 +145,15 @@ impl Cluster {
             }
             _ => Err(ApiError::new(404, "NotFound", "not found")),
         }
+    }
+
+    /// Proposes a membership change and waits for it to commit.
+    async fn conf(&self, kind: EntryKind) -> Result<(), ApiError> {
+        let idx = self.propose_conf(kind).map_err(|e| match e {
+            WriteError::Lost => ApiError::new(503, "ServiceUnavailable", "another membership change is in progress; retry"),
+            e => write_err(e),
+        })?;
+        self.wait_committed(idx).await.map_err(write_err)
     }
 
     fn voters_json(&self) -> Value {

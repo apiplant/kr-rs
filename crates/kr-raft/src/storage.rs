@@ -382,7 +382,7 @@ mod tests {
         let d = dir("snap");
         let (mut s, _) = Storage::open(&d).unwrap();
         s.append(&(1..=20).map(|i| e(1, i)).collect::<Vec<_>>()).unwrap();
-        let snap = Snapshot { meta: SnapshotMeta { index: 12, term: 1, voters: alloc::vec![1, 2, 3] }, data: Rc::from(&b"state@12"[..]) };
+        let snap = Snapshot { meta: SnapshotMeta { index: 12, term: 1, voters: alloc::vec![1, 2, 3], learners: alloc::vec![] }, data: Rc::from(&b"state@12"[..]) };
         s.save_snapshot(&snap).unwrap();
         // Appends keep working on the rewritten log.
         s.append(&[e(2, 21)]).unwrap();
@@ -393,7 +393,7 @@ mod tests {
         assert_eq!(l.entries.last().unwrap(), &e(2, 21));
         // A snapshot covering everything empties the log.
         let (mut s, _) = Storage::open(&d).unwrap();
-        let all = Snapshot { meta: SnapshotMeta { index: 21, term: 2, voters: alloc::vec![1] }, data: Rc::from(&b"s"[..]) };
+        let all = Snapshot { meta: SnapshotMeta { index: 21, term: 2, voters: alloc::vec![1], learners: alloc::vec![] }, data: Rc::from(&b"s"[..]) };
         s.save_snapshot(&all).unwrap();
         drop(s);
         let (_, l) = Storage::open(&d).unwrap();
@@ -407,7 +407,7 @@ mod tests {
         let (mut s, _) = Storage::open(&d).unwrap();
         s.append(&(1..=10).map(|i| e(1, i)).collect::<Vec<_>>()).unwrap();
         // Snapshot file written, log not yet rewritten (simulated by writing the file only).
-        let snap = Snapshot { meta: SnapshotMeta { index: 6, term: 1, voters: alloc::vec![1] }, data: Rc::from(&b"x"[..]) };
+        let snap = Snapshot { meta: SnapshotMeta { index: 6, term: 1, voters: alloc::vec![1], learners: alloc::vec![] }, data: Rc::from(&b"x"[..]) };
         write_atomic(&s.dir, "snapshot", &encode_snapshot(&snap)).unwrap();
         drop(s);
         let (_, l) = Storage::open(&d).unwrap();
