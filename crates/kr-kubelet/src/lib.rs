@@ -208,6 +208,9 @@ pub struct Kubelet<C: Client> {
     podnet: Cell<network::PodNet>,
     /// Peer/backend pairs already reported as a backend mismatch.
     warned_backend: RefCell<alloc::collections::BTreeSet<String>>,
+    /// Container log path -> `(file size, sec, nsec)` samples: the log file keeps no per-line
+    /// times, so `since*` and `timestamps` of `kubectl logs` use when the size was last seen grow.
+    log_marks: RefCell<BTreeMap<String, Vec<(u64, i64, i64)>>>,
 }
 
 enum PullGate {
@@ -226,7 +229,7 @@ const BACKOFF_MAX_MS: u64 = 300_000;
 
 impl<C: Client + Clone + 'static> Kubelet<C> {
     pub fn new(c: C, cfg: Config, store: Store) -> Rc<Self> {
-        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()) })
+        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()) })
     }
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
@@ -299,9 +302,37 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         kr_rt::exec::spawn(async move { w.watch_loop().await });
         let ev = self.clone();
         kr_rt::exec::spawn(async move { ev.eviction_loop().await });
+        let lm = self.clone();
+        kr_rt::exec::spawn(async move { lm.log_mark_loop().await });
         loop {
             self.sync_all().await;
             self.notify.wait(1000).await;
+        }
+    }
+
+    /// Every 500 ms: records when each container log file grew (see `log_marks`). Marks of
+    /// containers that are gone are dropped.
+    async fn log_mark_loop(&self) {
+        loop {
+            kr_rt::exec::sleep(500).await;
+            let paths: Vec<String> = self.pods.borrow().values().flat_map(|p| p.ctrs.iter().map(move |c| alloc::format!("{}/{}.log", p.dir, c.name))).collect();
+            let (sec, nsec) = kr_sys::clock_gettime(0).map(|t| (t.tv_sec, t.tv_nsec)).unwrap_or((0, 0));
+            let mut marks = self.log_marks.borrow_mut();
+            marks.retain(|k, _| paths.contains(k));
+            for path in paths {
+                let Ok(st) = kr_sys::fs::newfstatat(kr_sys::ns::AT_FDCWD, alloc::format!("{path}\0").as_bytes(), 0) else { continue };
+                let size = st.size as u64;
+                let m = marks.entry(path).or_default();
+                match m.last() {
+                    Some(l) if l.0 >= size => {}
+                    _ => {
+                        if m.len() >= 8192 {
+                            m.drain(..1024);
+                        }
+                        m.push((size, sec, nsec));
+                    }
+                }
+            }
         }
     }
 

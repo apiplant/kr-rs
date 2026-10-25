@@ -68,9 +68,7 @@ fn is_ipv6(ip: &str) -> bool {
 
 fn port_key(p: &Value) -> Value {
     let mut v = Value::Object(Vec::new());
-    if let Some(n) = p.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()) {
-        v.set("name", Value::from(n));
-    }
+    v.set("name", Value::from(str_at(p, &["name"])));
     v.set("port", num(int_at(p, &["port"], 0)));
     v.set("protocol", Value::from(match str_at(p, &["protocol"]) {
         "" => "TCP",

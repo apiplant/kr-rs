@@ -95,6 +95,16 @@ fn port_value(p: &Port) -> Value {
     v
 }
 
+/// An EndpointSlice port: like [`port_value`], but `name` is always present (`""` when unnamed), as
+/// upstream; kubectl dereferences it.
+fn slice_port(p: &Port) -> Value {
+    let mut v = port_value(p);
+    if p.0.is_empty() {
+        v.set("name", Value::from(""));
+    }
+    v
+}
+
 /// Resolves one Service port for a pod (`None` when the named port does not exist).
 fn resolve_port(sp: &Value, pod: Option<&Value>) -> Option<Port> {
     let proto = protocol(sp).to_string();
@@ -293,13 +303,13 @@ async fn write_slices<C: Client>(c: &C, svc: &Value, groups: &BTreeMap<String, (
                     e
                 })
                 .collect();
-            wanted.push((slice_name(svc, key, i), ports.iter().map(port_value).collect(), eps));
+            wanted.push((slice_name(svc, key, i), ports.iter().map(slice_port).collect(), eps));
         }
     }
     if wanted.is_empty() {
         let ports: Vec<Port> = sports.iter().filter_map(|sp| resolve_port(sp, None)).collect();
-        let key = json::to_string(&Value::Array(ports.iter().map(port_value).collect()));
-        wanted.push((slice_name(svc, &key, 0), ports.iter().map(port_value).collect(), Vec::new()));
+        let key = json::to_string(&Value::Array(ports.iter().map(slice_port).collect()));
+        wanted.push((slice_name(svc, &key, 0), ports.iter().map(slice_port).collect(), Vec::new()));
     }
 
     let existing = items(&c.list(&endpointslices(Some(ns)), &alloc::format!("labelSelector={}", enc(&alloc::format!("{SERVICE_LABEL}={}", name(svc))))).await?);
