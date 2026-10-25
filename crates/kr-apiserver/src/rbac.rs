@@ -139,12 +139,13 @@ pub fn bootstrap_roles() -> Vec<(&'static str, String)> {
         (
             "system:node",
             alloc::format!(
-                "[{},{},{},{},{},{},{},{},{}]",
+                "[{},{},{},{},{},{},{},{},{},{}]",
                 rule(&[""], &["pods", "services", "endpoints", "namespaces"], READ),
                 rule(&[""], &["pods"], &["delete"]),
                 rule(&[""], &["pods/status", "nodes/status"], &["get", "patch", "update"]),
                 rule(&[""], &["nodes"], &["get", "list", "watch", "create", "patch", "update"]),
                 rule(&[""], &["events"], &["create", "patch", "update"]),
+                rule(&["events.k8s.io"], &["events"], &["create", "patch", "update"]),
                 rule(&[""], &["serviceaccounts/token"], &["create"]),
                 rule(&["coordination.k8s.io"], &["leases"], &["get", "create", "update", "patch"]),
                 rule(&["discovery.k8s.io"], &["endpointslices"], READ),

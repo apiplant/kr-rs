@@ -27,7 +27,7 @@ ensure() {
 
 restart_kr() {
   docker exec "$C" sh -c 'pkill -x kr; sleep 1; rm -rf /var/tmp/srv /store/pods /store/containers /store/ipam' || true
-  docker exec -d "$C" sh -c 'KR_ROOT=/store /krbin/kr server --data /var/tmp/srv > /tmp/srv.log 2>&1'
+  docker exec -d -e KR_REGISTRY_MIRRORS="$("$REPO/tools/test/registry-cache.sh" env)" "$C" sh -c 'KR_ROOT=/store /krbin/kr server --data /var/tmp/srv > /tmp/srv.log 2>&1'
   for _ in $(seq 30); do $K kubectl get nodes 2>/dev/null | grep -q ' Ready' && return; sleep 1; done
   echo "kr did not become ready; see: docker exec $C cat /tmp/srv.log" >&2; exit 1
 }

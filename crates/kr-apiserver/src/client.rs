@@ -147,7 +147,7 @@ impl InProcess {
                     Err(ApiError::new(code, reason, msg))
                 }
             }
-            Reply::Watch(_) | Reply::Http(_) => Err(ApiError::new(500, "InternalError", "unexpected streaming reply")),
+            Reply::Watch(_) | Reply::Http(_) | Reply::Proxy(_) => Err(ApiError::new(500, "InternalError", "unexpected streaming reply")),
         }
     }
 }
@@ -177,7 +177,7 @@ impl Client for InProcess {
         match self.api.handle(&req) {
             Reply::Watch(w) => Ok(Watch { inner: Source::InProcess(w), buf: Vec::new() }),
             Reply::Json(code, s) => Err(ApiError::new(code, "Error", s)),
-            Reply::Http(_) => Err(ApiError::new(500, "InternalError", "unexpected raw reply")),
+            Reply::Http(_) | Reply::Proxy(_) => Err(ApiError::new(500, "InternalError", "unexpected raw reply")),
         }
     }
 }

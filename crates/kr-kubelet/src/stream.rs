@@ -222,15 +222,36 @@ impl<C: Client + Clone + 'static> Proxy<C> {
         if let Some(l) = q.get("limitBytes").and_then(|l| l.parse::<usize>().ok()) {
             out.truncate(l);
         }
+        let stamp = q.flag("timestamps");
+        if stamp {
+            // The log file keeps no per-line times: lines are stamped with the file's last write.
+            let at = kr_sys::fs::newfstatat(kr_sys::ns::AT_FDCWD, path.as_bytes(), 0).map(|s| (s.mtime_sec, s.mtime_nsec)).unwrap_or_else(|_| now_ts());
+            out = stamp_lines(&out, at);
+        }
         if !q.flag("follow") {
             return Ok(Response::new(200, out).with_header("Content-Type", "text/plain"));
         }
         let fd = ns::open(path.as_bytes(), ns::O_RDONLY, 0).map_err(|_| ApiError::not_found("log", &v.container))?;
         let me = self.0.clone();
         let (ns, pod, ctr) = (ns.to_string(), pod.to_string(), v.container.clone());
-        let stream = Follow { fd, pos: data.len() as u64, first: Some(out), timer: None, running: Box::new(move || Proxy(me.clone()).container_running(&ns, &pod, &ctr)) };
+        let stream = Follow { fd, pos: data.len() as u64, first: Some(out), stamp, timer: None, running: Box::new(move || Proxy(me.clone()).container_running(&ns, &pod, &ctr)) };
         Ok(Response { status: 200, headers: alloc::vec![("Content-Type".into(), "text/plain".into())], body: Body::Stream(Box::new(stream)) })
     }
+}
+
+fn now_ts() -> (i64, i64) {
+    kr_sys::clock_gettime(0).map(|t| (t.tv_sec, t.tv_nsec)).unwrap_or((0, 0))
+}
+
+/// Prefixes every line of `data` with an RFC 3339 nano timestamp and a space.
+fn stamp_lines(data: &[u8], (sec, nsec): (i64, i64)) -> Vec<u8> {
+    let t = alloc::format!("{}.{nsec:09}Z ", kr_apiserver::object::rfc3339(sec).trim_end_matches('Z'));
+    let mut out = Vec::with_capacity(data.len() + t.len() * 8);
+    for line in data.split_inclusive(|b| *b == b'\n') {
+        out.extend_from_slice(t.as_bytes());
+        out.extend_from_slice(line);
+    }
+    out
 }
 
 /// `logs -f`: polls the file for growth every 250 ms; ends once the container stopped and
@@ -239,6 +260,8 @@ struct Follow {
     fd: Fd,
     pos: u64,
     first: Option<Vec<u8>>,
+    /// `timestamps=true`: new lines are prefixed with the time they were read.
+    stamp: bool,
     timer: Option<Pin<Box<Sleep>>>,
     running: Box<dyn Fn() -> bool>,
 }
@@ -286,8 +309,11 @@ impl ResponseStream for Follow {
             }
             self.timer = None;
             let alive = (self.running)();
-            let data = self.read_new();
+            let mut data = self.read_new();
             if !data.is_empty() {
+                if self.stamp {
+                    data = stamp_lines(&data, now_ts());
+                }
                 return Poll::Ready(Some(data));
             }
             if !alive {
@@ -374,7 +400,10 @@ async fn exec_session(conn: Box<dyn Conn>, proto: Protocol, target: ExecTarget, 
         if exit.is_some() && out_fut.is_none() && err_fut.is_none() {
             let code = exit.unwrap();
             let status = if code == 0 { channel::status_success() } else { channel::status_exit(code) };
-            let _ = ws.send_binary(&channel::error_frame(&status)).await;
+            // v1 has no success status message (clients treat every non-stdout frame as an error).
+            if code != 0 || proto != Protocol::V1 {
+                let _ = ws.send_binary(&channel::error_frame(&status)).await;
+            }
             let _ = ws.close(1000, "").await;
             return;
         }
@@ -449,7 +478,7 @@ async fn attach_session(conn: Box<dyn Conn>, proto: Protocol, path: String, runn
     // Start at the end: attach shows new output only.
     let mut buf = [0u8; 16384];
     while matches!(kr_sys::read(fd.raw(), &mut buf), Ok(n) if n > 0) {}
-    let mut f = Follow { fd, pos: 0, first: None, timer: None, running: Box::new(running) };
+    let mut f = Follow { fd, pos: 0, first: None, stamp: false, timer: None, running: Box::new(running) };
     loop {
         let next = poll_fn(|cx| {
             if let Poll::Ready(Ok(Message::Close { .. }) | Err(_)) = ws.poll_recv(cx) {

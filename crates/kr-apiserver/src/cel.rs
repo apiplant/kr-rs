@@ -2,7 +2,10 @@
 //! `x-kubernetes-validations`. Supported: `== != < <= > >= ! && || in + - * / % ?:`, field and
 //! index access, `has() size() matches() int() double() string()`, string methods
 //! (`startsWith endsWith contains matches size lowerAscii upperAscii trim`), the comprehension
-//! macros `all exists exists_one filter map`, and string/number/bool/null/list literals.
+//! macros `all exists exists_one filter map`, string/number/bool/null/list/map literals, and
+//! object construction (`Object{spec: Object.spec{replicas: 3}}`, `JSONPatch{op: "add", ...}`)
+//! for MutatingAdmissionPolicy, which evaluates to plain JSON objects. [`Program::type_warnings`]
+//! is a small static checker for the operator overloads (admission policy `status.typeChecking`).
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -70,7 +73,7 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                 out.push(Tok::Op(op));
                 i += 2;
             } else {
-                let op = ["<", ">", "!", "(", ")", "[", "]", ".", ",", "+", "-", "*", "/", "%", "?", ":"].into_iter().find(|o| o.starts_with(c)).ok_or_else(|| format!("unexpected character {c:?}"))?;
+                let op = ["<", ">", "!", "(", ")", "[", "]", "{", "}", ".", ",", "+", "-", "*", "/", "%", "?", ":"].into_iter().find(|o| o.starts_with(c)).ok_or_else(|| format!("unexpected character {c:?}"))?;
                 out.push(Tok::Op(op));
                 i += 1;
             }
@@ -89,7 +92,22 @@ enum E {
     Not(Box<E>),
     Bin(&'static str, Box<E>, Box<E>),
     List(Vec<E>),
+    Map(Vec<(E, E)>),
+    /// `Object{...}`, `Object.spec{...}`, `JSONPatch{...}`: the type path and field initialisers.
+    Struct(String, Vec<(String, E)>),
     Cond(Box<E>, Box<E>, Box<E>),
+}
+
+/// Roots of the object-construction type paths (`Object.spec.template{...}`).
+const TYPE_ROOTS: [&str; 2] = ["Object", "JSONPatch"];
+
+/// `Object.spec.x` as a dotted name, when `e` is such a type path.
+fn type_path(e: &E) -> Option<String> {
+    match e {
+        E::Var(n) if TYPE_ROOTS.contains(&n.as_str()) => Some(n.clone()),
+        E::Field(b, n) => type_path(b).map(|p| format!("{p}.{n}")),
+        _ => None,
+    }
 }
 
 struct P {
@@ -211,6 +229,20 @@ impl P {
                 let k = self.expr()?;
                 self.expect("]")?;
                 e = E::Index(Box::new(e), Box::new(k));
+            } else if let (true, Some(ty)) = (self.peek_op("{"), type_path(&e)) {
+                self.i += 1;
+                let mut fields = Vec::new();
+                while !self.peek_op("}") {
+                    let Some(Tok::Id(n)) = self.t.get(self.i).cloned() else { return Err("expected a field name".into()) };
+                    self.i += 1;
+                    self.expect(":")?;
+                    fields.push((n, self.expr()?));
+                    if !self.eat(",") {
+                        break;
+                    }
+                }
+                self.expect("}")?;
+                e = E::Struct(ty, fields);
             } else {
                 return Ok(e);
             }
@@ -244,6 +276,19 @@ impl P {
                 }
                 self.expect("]")?;
                 Ok(E::List(a))
+            }
+            Tok::Op("{") => {
+                let mut m = Vec::new();
+                while !self.peek_op("}") {
+                    let k = self.expr()?;
+                    self.expect(":")?;
+                    m.push((k, self.expr()?));
+                    if !self.eat(",") {
+                        break;
+                    }
+                }
+                self.expect("}")?;
+                Ok(E::Map(m))
             }
             Tok::Op(o) => Err(format!("unexpected {o:?}")),
         }
@@ -296,6 +341,16 @@ fn check(e: &E, scope: &mut Vec<String>) -> Result<(), String> {
             check(b, scope)
         }
         E::List(v) => v.iter().try_for_each(|x| check(x, scope)),
+        E::Map(m) => m.iter().try_for_each(|(k, v)| {
+            check(k, scope)?;
+            check(v, scope)
+        }),
+        E::Struct(ty, f) => {
+            if !(ty == "JSONPatch" || ty == "Object" || ty.starts_with("Object.")) {
+                return Err(format!("undeclared reference to '{ty}'"));
+            }
+            f.iter().try_for_each(|(_, v)| check(v, scope))
+        }
         E::Cond(a, b, c) => {
             check(a, scope)?;
             check(b, scope)?;
@@ -356,6 +411,17 @@ fn eval(e: &E, vars: &Vars) -> Result<Value, String> {
         },
         E::Not(x) => Value::Bool(!truth(eval(x, vars))?),
         E::List(a) => Value::Array(a.iter().map(|x| eval(x, vars)).collect::<Result<_, _>>()?),
+        E::Map(m) => {
+            let mut o: Vec<(String, Value)> = Vec::new();
+            for (k, v) in m {
+                let Value::String(k) = eval(k, vars)? else { return Err("map keys must be strings".into()) };
+                let v = eval(v, vars)?;
+                o.retain(|(x, _)| *x != k);
+                o.push((k, v));
+            }
+            Value::Object(o)
+        }
+        E::Struct(_, f) => Value::Object(f.iter().map(|(k, v)| Ok((k.clone(), eval(v, vars)?))).collect::<Result<_, String>>()?),
         E::Cond(c, a, b) => {
             if truth(eval(c, vars))? {
                 eval(a, vars)?
@@ -519,6 +585,153 @@ fn size(v: &Value) -> Result<Value, String> {
     Ok(Value::Number(Number::from_u64(n as u64)))
 }
 
+/// CEL type names, as in cel-go's messages; `dyn` is unknown.
+type Ty = &'static str;
+
+fn lit_ty(v: &Value) -> Ty {
+    match v {
+        Value::Null => "null_type",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_integer() => "int",
+        Value::Number(_) => "double",
+        Value::String(_) => "string",
+        Value::Array(_) => "list",
+        Value::Object(_) => "map",
+    }
+}
+
+fn numeric(t: Ty) -> bool {
+    matches!(t, "int" | "uint" | "double")
+}
+
+/// `object.spec.replicas` as ("object", ["spec", "replicas"]).
+fn select_path(e: &E) -> Option<(&str, Vec<&str>)> {
+    match e {
+        E::Var(n) => Some((n.as_str(), Vec::new())),
+        E::Field(b, n) => select_path(b).map(|(r, mut p)| {
+            p.push(n.as_str());
+            (r, p)
+        }),
+        _ => None,
+    }
+}
+
+/// Field types come from `resolve(root, path)` (`None`: unknown). Operators whose operand types
+/// are both known and have no overload are reported, like cel-go's checker.
+fn ty(e: &E, resolve: &dyn Fn(&str, &[&str]) -> Option<Ty>, warns: &mut Vec<String>) -> Ty {
+    let t = |x: &E, w: &mut Vec<String>| ty(x, resolve, w);
+    match e {
+        E::Lit(v) => lit_ty(v),
+        E::Var(_) | E::Field(..) => match select_path(e) {
+            Some((root, path)) => resolve(root, &path).unwrap_or("dyn"),
+            None => {
+                if let E::Field(b, _) = e {
+                    t(b, warns);
+                }
+                "dyn"
+            }
+        },
+        E::Index(a, b) => {
+            t(a, warns);
+            t(b, warns);
+            "dyn"
+        }
+        E::Not(x) => {
+            t(x, warns);
+            "bool"
+        }
+        E::List(v) => {
+            v.iter().for_each(|x| {
+                t(x, warns);
+            });
+            "list"
+        }
+        E::Map(m) => {
+            for (k, v) in m {
+                t(k, warns);
+                t(v, warns);
+            }
+            "map"
+        }
+        E::Struct(_, f) => {
+            f.iter().for_each(|(_, v)| {
+                t(v, warns);
+            });
+            "dyn"
+        }
+        E::Cond(c, a, b) => {
+            t(c, warns);
+            let (x, y) = (t(a, warns), t(b, warns));
+            if x == y { x } else { "dyn" }
+        }
+        E::Func(f, a) => {
+            a.iter().for_each(|x| {
+                t(x, warns);
+            });
+            match f.as_str() {
+                "size" | "int" => "int",
+                "double" => "double",
+                "string" => "string",
+                _ => "bool",
+            }
+        }
+        E::Method(b, m, a) => {
+            t(b, warns);
+            a.iter().skip(if MACROS.contains(&m.as_str()) { 1 } else { 0 }).for_each(|x| {
+                t(x, warns);
+            });
+            match m.as_str() {
+                "size" => "int",
+                "lowerAscii" | "upperAscii" | "trim" => "string",
+                "filter" | "map" => "list",
+                _ => "bool",
+            }
+        }
+        E::Bin(op, l, r) => {
+            let (a, b) = (t(l, warns), t(r, warns));
+            let known = a != "dyn" && b != "dyn";
+            let bad = |w: &mut Vec<String>| w.push(format!("found no matching overload for '_{op}_' applied to '({a}, {b})'"));
+            match *op {
+                "<" | "<=" | ">" | ">=" => {
+                    if known && a != b && !(numeric(a) && numeric(b)) || known && !(numeric(a) || matches!(a, "string" | "bool" | "bytes")) {
+                        bad(warns);
+                    }
+                    "bool"
+                }
+                "&&" | "||" => {
+                    if known && (a != "bool" || b != "bool") {
+                        bad(warns);
+                    }
+                    "bool"
+                }
+                "==" | "!=" | "in" => "bool",
+                "+" => {
+                    if !known {
+                        return "dyn";
+                    }
+                    if a == b && matches!(a, "int" | "uint" | "double" | "string" | "list" | "bytes") {
+                        a
+                    } else {
+                        bad(warns);
+                        "dyn"
+                    }
+                }
+                _ => {
+                    if !known {
+                        return "dyn";
+                    }
+                    if a == b && numeric(a) && !(*op == "%" && a == "double") {
+                        a
+                    } else {
+                        bad(warns);
+                        "dyn"
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A parsed expression.
 pub struct Program {
     e: E,
@@ -542,6 +755,18 @@ impl Program {
             return Err("unexpected trailing tokens".into());
         }
         Ok(Program { e, uses })
+    }
+
+    /// Overload errors a type checker would report, given the field types `resolve` knows.
+    pub fn type_warnings(&self, resolve: &dyn Fn(&str, &[&str]) -> Option<&'static str>) -> Vec<String> {
+        let mut w = Vec::new();
+        ty(&self.e, resolve, &mut w);
+        w
+    }
+
+    /// The static type of the expression (`dyn` when unknown).
+    pub fn static_type(&self, resolve: &dyn Fn(&str, &[&str]) -> Option<&'static str>) -> &'static str {
+        ty(&self.e, resolve, &mut Vec::new())
     }
 
     /// Whether the expression mentions the identifier `name`.
@@ -585,5 +810,29 @@ mod tests {
         assert!(Program::compile("self.l.all(x, y > 1)", &["self"]).is_err());
         assert!(Program::compile("self.foo()", &["self"]).is_err());
         assert!(Program::compile("self.n > oldSelf.n", &["self", "oldSelf"]).unwrap().uses("oldSelf"));
+    }
+
+    #[test]
+    fn construction_and_maps() {
+        let o = json::parse_str(r#"{"n":2}"#).unwrap();
+        let p = Program::compile(r#"Object{spec: Object.spec{replicas: object.n * 2}, metadata: Object.metadata{annotations: {"a": "b", "c": string(object.n)}}}"#, &["object"]).unwrap();
+        let v = p.eval(&[("object", &o)]).unwrap();
+        assert_eq!(json::to_string(&v), r#"{"spec":{"replicas":4},"metadata":{"annotations":{"a":"b","c":"2"}}}"#);
+        let j = Program::compile(r#"[JSONPatch{op: "add", path: "/x", value: 1}]"#, &[]).unwrap().eval(&[]).unwrap();
+        assert_eq!(json::to_string(&j), r#"[{"op":"add","path":"/x","value":1}]"#);
+        assert!(Program::compile("Foo{a: 1}", &[]).is_err(), "only Object and JSONPatch types");
+        assert!(Program::compile("{1: 2}", &[]).unwrap().eval(&[]).is_err());
+    }
+
+    #[test]
+    fn overload_warnings() {
+        let r = |root: &str, path: &[&str]| -> Option<Ty> { (root == "object" && path == ["spec", "replicas"]).then_some("int") };
+        let w = |e: &str| Program::compile(e, &["object"]).unwrap().type_warnings(&r);
+        assert!(w("object.spec.replicas > 1").is_empty());
+        assert_eq!(w("object.spec.replicas > '1'"), ["found no matching overload for '_>_' applied to '(int, string)'"]);
+        assert_eq!(w("'got ' + object.spec.replicas"), ["found no matching overload for '_+_' applied to '(string, int)'"]);
+        assert!(w("'got ' + string(object.spec.replicas)").is_empty());
+        assert!(w("object.spec.other > '1'").is_empty(), "unknown fields are dyn");
+        assert!(w("object.spec.replicas > 1.5").is_empty(), "cross-type numeric comparison");
     }
 }

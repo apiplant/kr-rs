@@ -18,13 +18,13 @@ for n in $NODES; do
     archlinux:base-devel sleep infinity >/dev/null
   docker exec $n sh -c 'command -v bridge >/dev/null || pacman -Sy --noconfirm iproute2 >/dev/null 2>&1'
 done
-docker exec -d kr1 sh -c "${KR_SERVER_ENV:-} KR_ROOT=/store /krbin/kr server --data /var/tmp/srv > /tmp/srv.log 2>&1"
+docker exec -d kr1 sh -c "KR_REGISTRY_MIRRORS=$("$REPO/tools/test/registry-cache.sh" env krnet) ${KR_SERVER_ENV:-} KR_ROOT=/store /krbin/kr server --data /var/tmp/srv > /tmp/srv.log 2>&1"
 for _ in $(seq 60); do $K get --raw /healthz >/dev/null 2>&1 && break; sleep 1; done
 TOKEN=$(docker exec kr1 cat /var/tmp/srv/node-token)
 IP1=$(docker inspect -f '{{.NetworkSettings.Networks.krnet.IPAddress}}' kr1)
 for n in kr2 kr3; do
   docker exec $n sh -c "umask 077; echo '$TOKEN' > /root/kr-token"
-  docker exec -d $n sh -c "${KR_AGENT_ENV:-} KR_ROOT=/store /krbin/kr agent --server https://$IP1:6443 --token-file /root/kr-token > /tmp/agent.log 2>&1"
+  docker exec -d $n sh -c "KR_REGISTRY_MIRRORS=$("$REPO/tools/test/registry-cache.sh" env krnet) ${KR_AGENT_ENV:-} KR_ROOT=/store /krbin/kr agent --server https://$IP1:6443 --token-file /root/kr-token > /tmp/agent.log 2>&1"
 done
 for _ in $(seq 60); do [ "$($K get nodes --no-headers 2>/dev/null | grep -c ' Ready')" = 3 ] && break; sleep 1; done
 $K get nodes

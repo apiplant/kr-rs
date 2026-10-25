@@ -9,6 +9,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod admit;
 pub mod api;
 pub mod client;
 pub mod cluster;
@@ -22,6 +23,7 @@ pub mod node_authz;
 pub mod object;
 pub mod openapi;
 pub mod patch;
+pub mod podproxy;
 pub mod ssa;
 pub mod printers;
 pub mod rbac;
@@ -32,4 +34,5 @@ pub mod regex;
 pub mod resources;
 pub mod server;
 pub mod tokens;
+pub(crate) mod policy;
 pub mod webhook;

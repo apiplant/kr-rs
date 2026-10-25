@@ -62,6 +62,8 @@ pub enum Reply {
     Watch(WatchStream),
     /// A raw HTTP response (node proxy: logs, exec upgrades).
     Http(kr_net::http1::server::Response),
+    /// `pods/proxy`: the transport sends it ([`crate::podproxy::forward`]) and relays the answer.
+    Proxy(crate::podproxy::Target),
 }
 
 impl Reply {
@@ -113,13 +115,16 @@ pub struct ApiServer {
     /// Warnings for the response of the request being handled.
     warnings: RefCell<Vec<String>>,
     /// Parsed webhook configurations, valid for the stamp they were built at.
-    pub(crate) wh_cache: RefCell<Option<([u64; 4], alloc::rc::Rc<crate::webhook::Configs>)>>,
+    pub(crate) wh_cache: RefCell<Option<([u64; 12], alloc::rc::Rc<crate::webhook::Configs>)>>,
 }
 
 /// Default namespaces created on first start.
 /// Kinds whose deletion can orphan or wait for dependents (the garbage collector handles the
 /// `orphan` and `foregroundDeletion` finalizers on them).
 const GC_OWNERS: &[&str] = &["deployments", "replicasets", "replicationcontrollers", "statefulsets", "daemonsets", "jobs", "cronjobs"];
+
+/// How long a list continuation stays consistent (upstream: the 5 minute compaction interval).
+const CONTINUE_TTL_SECS: i64 = 300;
 
 const SYSTEM_NAMESPACES: &[&str] = &["default", "kube-system", "kube-public", "kube-node-lease"];
 
@@ -311,7 +316,7 @@ impl ApiServer {
                     }
                     v
                 };
-                let g = gen_of(old) + u64::from(strip(old) != strip(o));
+                let g = gen_of(old) + u64::from(!object::same_json(&Some(&strip(old)), &Some(&strip(o))));
                 o.entry_object("metadata").set("generation", Value::Number(Number::from_u64(g)));
             }
             Some(_) => {}
@@ -534,6 +539,25 @@ impl ApiServer {
         json::write_str(&pem, &mut body);
         body.push_str("}}");
         self.bootstrap_object(cm, Some(ns), "kube-root-ca.crt", "ConfigMap", &body);
+        // Root CA publisher: a changed or emptied ca.crt is reset.
+        let key = cm.key(Some(ns), "kube-root-ca.crt");
+        let Some(kv) = self.store.borrow().get(&key) else { return };
+        let Ok(mut o) = json::parse(&kv.value) else { return };
+        if o.pointer(&["data", "ca.crt"]).and_then(Value::as_str) != Some(pem.as_str()) && self.writable() {
+            o.entry_object("data").set("ca.crt", Value::String(pem));
+            o.entry_object("metadata").set("resourceVersion", Value::String((self.store.borrow().revision() + 1).to_string()));
+            let _ = self.store.borrow_mut().update(&key, json::to_string(&o).into_bytes(), Some(kv.mod_rev));
+        }
+    }
+
+    /// Re-publishes `kube-root-ca.crt` after a write to the namespace's ConfigMaps (unless the
+    /// namespace is going away).
+    fn republish_root_ca(&self, ns: &str) {
+        let nsr = resources::find("", "v1", "namespaces").unwrap();
+        let live = self.store.borrow().get(&nsr.key(None, ns)).and_then(|kv| json::parse(&kv.value).ok()).is_some_and(|v| v.pointer(&["metadata", "deletionTimestamp"]).is_none());
+        if live {
+            self.ensure_root_ca(ns);
+        }
     }
 
     /// Client certificate user, else a valid ServiceAccount token, else anonymous.
@@ -544,15 +568,22 @@ impl ApiServer {
         let Some(token) = req.bearer else {
             return Ok(User { name: "system:anonymous".into(), groups: alloc::vec!["system:unauthenticated".into()] });
         };
-        let unauthorized = || ApiError::new(401, "Unauthorized", "Unauthorized");
+        self.verify_bearer(token, &[]).map(|(u, _)| u).map_err(|_| ApiError::new(401, "Unauthorized", "Unauthorized"))
+    }
+
+    /// Validates a bearer token (bootstrap token or ServiceAccount JWT); `audiences` empty means
+    /// the API server's own. Returns the user and, for JWTs, the verified claims plus the
+    /// audiences that matched.
+    fn verify_bearer(&self, token: &str, audiences: &[String]) -> Result<(User, Option<(crate::tokens::Claims, Vec<String>)>), &'static str> {
         if let Some(u) = self.bootstrap_user(token) {
-            return Ok(u);
+            return Ok((u, None));
         }
         let sa = self.sa.borrow();
-        let (signer, _) = sa.as_ref().ok_or_else(unauthorized)?;
-        let c = signer.verify(token, (self.now)()).ok_or_else(unauthorized)?;
-        if !c.audiences.iter().any(|a| crate::tokens::API_AUDIENCES.contains(&a.as_str())) {
-            return Err(unauthorized());
+        let (signer, _) = sa.as_ref().ok_or("no service account issuer")?;
+        let c = signer.verify(token, (self.now)()).ok_or("invalid bearer token")?;
+        let matched: Vec<String> = c.audiences.iter().filter(|a| if audiences.is_empty() { crate::tokens::API_AUDIENCES.contains(&a.as_str()) } else { audiences.contains(a) }).cloned().collect();
+        if matched.is_empty() {
+            return Err("invalid audience");
         }
         // Revocation: the ServiceAccount (and a bound pod) must still exist with the same uid.
         let store = self.store.borrow();
@@ -562,17 +593,66 @@ impl ApiServer {
             json::parse(&kv.value).ok()?.pointer(&["metadata", "uid"]).and_then(Value::as_str).map(String::from)
         };
         if uid_of("serviceaccounts", &c.sa_name).as_deref() != Some(c.sa_uid.as_str()) {
-            return Err(unauthorized());
+            return Err("service account no longer exists");
         }
         if let Some((pod, puid)) = &c.pod {
             if uid_of("pods", pod).as_deref() != Some(puid.as_str()) {
-                return Err(unauthorized());
+                return Err("bound pod no longer exists");
             }
         }
-        Ok(User {
+        let user = User {
             name: alloc::format!("system:serviceaccount:{}:{}", c.namespace, c.sa_name),
             groups: alloc::vec!["system:serviceaccounts".into(), alloc::format!("system:serviceaccounts:{}", c.namespace), "system:authenticated".into()],
-        })
+        };
+        Ok((user, Some((c, matched))))
+    }
+
+    /// `authentication.k8s.io/v1` TokenReview: validates the token exactly as request
+    /// authentication does. A rejected token is a 201 with `status.authenticated: false`.
+    fn token_review(&self, req: &Req) -> R<Reply> {
+        let mut r = self.parse_body(req)?;
+        let token = r.pointer(&["spec", "token"]).and_then(Value::as_str).unwrap_or("").to_string();
+        if token.is_empty() {
+            return Err(ApiError::invalid("TokenReview.authentication.k8s.io is invalid: spec.token: Required value"));
+        }
+        let auds: Vec<String> = r.pointer(&["spec", "audiences"]).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+        let mut status = obj(alloc::vec![]);
+        match self.verify_bearer(&token, &auds) {
+            Ok((u, claims)) => {
+                status.set("authenticated", Value::Bool(true));
+                let mut user = obj(alloc::vec![("username", Value::String(u.name.clone()))]);
+                if let Some((c, matched)) = &claims {
+                    user.set("uid", Value::String(c.sa_uid.clone()));
+                    let mut extra = alloc::vec![("authentication.kubernetes.io/credential-id".to_string(), Value::Array(alloc::vec![Value::String(alloc::format!("JTI={}", c.jti))]))];
+                    if let Some((pn, pu)) = &c.pod {
+                        extra.push(("authentication.kubernetes.io/pod-name".into(), Value::Array(alloc::vec![Value::String(pn.clone())])));
+                        extra.push(("authentication.kubernetes.io/pod-uid".into(), Value::Array(alloc::vec![Value::String(pu.clone())])));
+                        let pods = resources::find("", "v1", "pods").unwrap();
+                        let node = self.store.borrow().get(&pods.key(Some(&c.namespace), pn)).and_then(|kv| json::parse(&kv.value).ok()).and_then(|p| p.pointer(&["spec", "nodeName"]).and_then(Value::as_str).map(String::from)).filter(|n| !n.is_empty());
+                        if let Some(n) = node {
+                            let nodes = resources::find("", "v1", "nodes").unwrap();
+                            let nuid = self.store.borrow().get(&nodes.key(None, &n)).and_then(|kv| json::parse(&kv.value).ok()).and_then(|v| v.pointer(&["metadata", "uid"]).and_then(Value::as_str).map(String::from));
+                            extra.push(("authentication.kubernetes.io/node-name".into(), Value::Array(alloc::vec![Value::String(n)])));
+                            if let Some(nu) = nuid {
+                                extra.push(("authentication.kubernetes.io/node-uid".into(), Value::Array(alloc::vec![Value::String(nu)])));
+                            }
+                        }
+                    }
+                    user.set("extra", Value::Object(extra));
+                    status.set("audiences", Value::Array(matched.iter().map(|a| Value::String(a.clone())).collect()));
+                }
+                user.set("groups", Value::Array(u.groups.iter().map(|g| Value::String(g.clone())).collect()));
+                status.set("user", user);
+            }
+            Err(e) => {
+                status.set("authenticated", Value::Bool(false));
+                status.set("error", Value::from(e));
+            }
+        }
+        r.set("apiVersion", Value::from("authentication.k8s.io/v1"));
+        r.set("kind", Value::from("TokenReview"));
+        r.set("status", status);
+        Ok(Reply::Json(201, json::to_string(&r)))
     }
 
     /// RBAC decision for `a` (system:masters short-circuits).
@@ -681,6 +761,43 @@ impl ApiServer {
         !(review || stream)
     }
 
+    /// Rejects admission webhook configurations whose matchConditions do not compile.
+    fn check_webhook_config(rt: &Route, o: &Value) -> R<()> {
+        if rt.res.group != "admissionregistration.k8s.io" || !matches!(rt.res.plural, "mutatingwebhookconfigurations" | "validatingwebhookconfigurations") {
+            return Ok(());
+        }
+        let mut errs = Vec::new();
+        for (i, w) in o.get("webhooks").and_then(Value::as_array).unwrap_or(&[]).iter().enumerate() {
+            for (j, c) in w.get("matchConditions").and_then(Value::as_array).unwrap_or(&[]).iter().enumerate() {
+                let ex = c.get("expression").and_then(Value::as_str).unwrap_or("");
+                if let Err(e) = crate::cel::Program::compile(ex, &["object", "oldObject", "request", "authorizer"]) {
+                    errs.push(alloc::format!("webhooks[{i}].matchConditions[{j}].expression: Invalid value: {ex:?}: compilation failed: {e}"));
+                }
+            }
+        }
+        if errs.is_empty() {
+            return Ok(());
+        }
+        let name = o.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("");
+        Err(ApiError::invalid(alloc::format!("{}.{} \"{name}\" is invalid: {}", rt.res.kind, rt.res.group, errs.join(", "))))
+    }
+
+    /// Server-side apply reports unknown fields of the applied configuration as typed-patch
+    /// conversion errors (`.spec.x: field not declared in schema`), not as strict decoding errors.
+    fn apply_strict_error(req: &Req, rt: &Route, e: ApiError) -> ApiError {
+        let Some(list) = e.message.strip_prefix("strict decoding error: ") else { return e };
+        if !req.content_type.is_some_and(|c| c.starts_with("application/apply-patch")) {
+            return e;
+        }
+        let mut out = alloc::format!("failed to create typed patch object ({}; {}, Kind={}): errors:", req.path, rt.res.group_version(), rt.res.kind);
+        for m in list.split(", ") {
+            if let Some(p) = m.strip_prefix("unknown field \"").and_then(|m| m.strip_suffix('"')) {
+                out.push_str(&alloc::format!("\n  .{p}: field not declared in schema"));
+            }
+        }
+        ApiError::new(e.code, e.reason, out)
+    }
+
     /// Applies `fieldValidation` to unknown/duplicate field messages: reject (Strict), warn
     /// (Warn) or ignore.
     fn fv_report(&self, msgs: Vec<String>) -> R<()> {
@@ -738,10 +855,30 @@ impl ApiServer {
         items.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect()
     }
 
-    /// (count, newest mod revision) of the mutating and validating webhook configurations.
-    pub(crate) fn wh_stamp(&self) -> [u64; 4] {
-        let mut s = [0; 4];
-        for (i, p) in ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"].iter().enumerate() {
+    /// Built-in and custom resources.
+    pub(crate) fn all_resources(&self) -> Vec<&'static Resource> {
+        resources::RESOURCES.iter().chain(self.extra()).collect()
+    }
+
+    /// Stored objects of `r`, in one namespace or all.
+    pub(crate) fn list_values(&self, r: &Resource, ns: Option<&str>) -> Vec<Value> {
+        let prefix = match ns {
+            Some(n) if r.namespaced => alloc::format!("{}{n}/", r.prefix()),
+            _ => r.prefix(),
+        };
+        let (items, _) = self.store.borrow().list(&prefix, None, 0);
+        items.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect()
+    }
+
+    /// The openAPIV3Schema of a served custom resource version.
+    pub(crate) fn custom_schema(&self, group: &str, version: &str, kind: &str) -> Option<Value> {
+        self.custom.borrow().iter().find(|c| c.res.group == group && c.res.version == version && c.res.kind == kind).and_then(|c| c.schema.clone())
+    }
+
+    /// (count, newest mod revision) of the webhook configurations and admission policies.
+    pub(crate) fn wh_stamp(&self) -> [u64; 12] {
+        let mut s = [0; 12];
+        for (i, p) in crate::webhook::CONFIG_PLURALS.iter().enumerate() {
             if let Some(r) = resources::find("admissionregistration.k8s.io", "v1", p) {
                 let (items, _) = self.store.borrow().list(&r.prefix(), None, 0);
                 s[i * 2] = items.len() as u64;
@@ -852,15 +989,23 @@ impl ApiServer {
             ["openid", "v1", "jwks"] => {
                 return self.sa.borrow().as_ref().map(|(s, _)| Reply::Json(200, s.jwks())).ok_or_else(|| ApiError::not_found("jwks", "jwks"));
             }
+            // Review kinds have no metadata to tabulate.
+            ["apis", "authorization.k8s.io" | "authentication.k8s.io", "v1", ..] if wants_table(req.accept) => {
+                return Err(ApiError::new(406, "NotAcceptable", "the resource does not support conversion to a Table"));
+            }
             ["apis", "authorization.k8s.io", "v1", "selfsubjectaccessreviews"] if req.method == "POST" => return self.self_subject_access_review(req, &user),
+            ["apis", "authorization.k8s.io", "v1", "subjectaccessreviews"] if req.method == "POST" => return self.subject_access_review(req, None),
+            ["apis", "authorization.k8s.io", "v1", "namespaces", ns, "localsubjectaccessreviews"] if req.method == "POST" => return self.subject_access_review(req, Some(ns)),
+            ["apis", "authentication.k8s.io", "v1", "tokenreviews"] if req.method == "POST" => return self.token_review(req),
             ["api"] | ["apis"] if req.method == "GET" && discovery::negotiate(req.accept) != discovery::Negotiated::Legacy => return Ok(Reply::aggregated_discovery(req, &extra, segs.len() == 1 && segs[0] == "api")),
             ["api"] => return Ok(Reply::Json(200, discovery::core_versions(&self.server_address))),
             ["api", "v1"] => return Ok(Reply::Json(200, discovery::resource_list(&extra, "", "v1").unwrap())),
             ["apis"] => return Ok(Reply::Json(200, discovery::group_list(&extra))),
             ["openapi", "v3"] => return Ok(Reply::Json(200, crate::openapi::index(&extra))),
+            ["openapi", "v2"] => return Ok(Reply::Json(200, crate::openapi::v2(&self.custom.borrow()))),
             ["openapi", "v3", rest @ ..] => {
                 let p = rest.join("/");
-                return crate::openapi::group_version(&extra, &p).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("openapi", &p));
+                return crate::openapi::group_version(&extra, &self.custom.borrow(), &p).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("openapi", &p));
             }
             ["apis", g] => return discovery::group(&extra, g).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("group", g)),
             ["apis", g, v] => return discovery::resource_list(&extra, g, v).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("groupVersion", v)),
@@ -874,7 +1019,43 @@ impl ApiServer {
         let _ = (group, version, rest);
         let route = resource.ok_or_else(|| ApiError::not_found("path", path))?;
         let reply = self.dispatch(req, &route, &q)?;
+        if route.res.plural == "configmaps" && route.res.group.is_empty() && Self::mutates(req) {
+            if let Some(ns) = &route.namespace {
+                self.republish_root_ca(ns);
+            }
+        }
         Ok(self.convert_reply(&route, reply))
+    }
+
+    /// `pods/<name>[:port]/proxy[/path]`: relays the request to the pod's IP (default port: the
+    /// first container port, else 80).
+    fn pod_proxy(&self, req: &Req, rt: &Route, name: &str) -> R<Reply> {
+        let (pod_name, port) = match name.split_once(':') {
+            Some((n, p)) => (n, Some(p)),
+            None => (name, None),
+        };
+        let (_, pod) = self.get_value(rt, pod_name)?;
+        let ip = pod.pointer(&["status", "podIP"]).and_then(Value::as_str).and_then(object::parse_ipv4).ok_or_else(|| ApiError::bad_request(alloc::format!("pod {pod_name} does not have an IP yet")))?;
+        let port = match port {
+            Some(p) => p.parse::<u16>().ok(),
+            None => pod.pointer(&["spec", "containers"]).and_then(Value::as_array).and_then(|cs| cs.iter().find_map(|c| c.get("ports")?.as_array()?.first()?.get("containerPort")?.as_u64())).map(|p| p as u16).or(Some(80)),
+        }
+        .ok_or_else(|| ApiError::bad_request("invalid port"))?;
+        let path = req.path.split_once("/proxy").map_or("/", |(_, t)| t);
+        let path = if path.is_empty() { "/" } else { path };
+        if !crate::podproxy::proxyable(ip) {
+            return Err(ApiError::bad_request(alloc::format!("address not allowed: pod {pod_name} reports a host-local IP")));
+        }
+        Ok(Reply::Proxy(crate::podproxy::Target {
+            method: req.method.into(),
+            ip,
+            port,
+            path: path.into(),
+            query: req.query.into(),
+            content_type: req.content_type.map(Into::into),
+            accept: req.accept.map(Into::into),
+            body: req.body.to_vec(),
+        }))
     }
 
     fn dispatch(&self, req: &Req, rt: &Route, q: &Query) -> R<Reply> {
@@ -885,6 +1066,7 @@ impl ApiServer {
             }
         }
         match (req.method, &rt.name, sub) {
+            (_, Some(n), Some("proxy")) => self.pod_proxy(req, rt, n),
             ("GET" | "POST", Some(n), Some(sub @ ("log" | "exec" | "attach" | "portforward"))) => {
                 let (_, pod) = self.get_value(rt, n)?;
                 let node = pod.pointer(&["spec", "nodeName"]).and_then(Value::as_str).unwrap_or("").to_string();
@@ -910,7 +1092,8 @@ impl ApiServer {
                 Ok(Reply::Json(200, self.table(rt.res, &[kv], rev, None)))
             }
             ("GET", Some(n), _) => {
-                let (_, v) = self.get_value(rt, n)?;
+                let (_, mut v) = self.get_value(rt, n)?;
+                self.default_on_read(rt, &mut v);
                 Ok(Reply::ok(&v))
             }
             ("POST", None, None) => self.create(req, rt, q),
@@ -927,7 +1110,7 @@ impl ApiServer {
             }
             ("PATCH", Some(n), Some("ephemeralcontainers")) => self.patch(req, rt, n, false, q, true),
             ("PUT", Some(n), s) => self.update(req, rt, n, s == Some("status"), q, None),
-            ("PATCH", Some(n), s) => self.patch(req, rt, n, s == Some("status"), q, false),
+            ("PATCH", Some(n), s) => self.patch(req, rt, n, s == Some("status"), q, false).map_err(|e| Self::apply_strict_error(req, rt, e)),
             ("DELETE", Some(n), None) => self.delete(req, rt, n, q),
             ("DELETE", None, None) => self.delete_collection(rt, q),
             _ => Err(ApiError::new(405, "MethodNotAllowed", alloc::format!("method {} not allowed here", req.method))),
@@ -953,23 +1136,52 @@ impl ApiServer {
         }
     }
 
+    /// The schema of a custom resource that declares defaults: objects stored before a default
+    /// was added get it when read.
+    fn read_defaults(&self, rt: &Route) -> Option<Value> {
+        let custom = self.custom.borrow();
+        let c = custom.iter().find(|c| core::ptr::eq(c.res, rt.res))?;
+        c.schema.as_ref().filter(|s| json::to_string(s).contains("\"default\"")).cloned()
+    }
+
+    fn default_on_read(&self, rt: &Route, v: &mut Value) {
+        if let Some(s) = self.read_defaults(rt) {
+            crate::crd::prune(&s, v, true);
+        }
+    }
+
     fn list(&self, req: &Req, rt: &Route, q: &Query) -> R<Reply> {
         let ls = Selector::parse(q.get("labelSelector").unwrap_or(""))?;
         let fs = FieldSelector::parse(q.get("fieldSelector").unwrap_or(""))?;
         let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(0);
         let prefix = self.list_prefix(rt);
+        // Continue token: base64url("<rev>:<issued>:<last key>"). Pages report the first page's
+        // resourceVersion; a token older than the history window (the compaction interval) is
+        // expired with a fresh "inconsistent" token that continues from the same key.
+        let now = (self.now)();
+        let mut list_rev = None;
         let start_after = match q.get("continue").filter(|c| !c.is_empty()) {
             Some(c) => {
-                let k = kr_fmt::base64::decode_url(c).ok().and_then(|b| String::from_utf8(b).ok()).ok_or_else(|| ApiError::bad_request("invalid continue token"))?;
+                let bad = || ApiError::bad_request("invalid continue token");
+                let t = kr_fmt::base64::decode_url(c).ok().and_then(|b| String::from_utf8(b).ok()).ok_or_else(bad)?;
+                let mut parts = t.splitn(3, ':');
+                let (r, issued, k) = (parts.next().and_then(|r| r.parse::<u64>().ok()), parts.next().and_then(|r| r.parse::<i64>().ok()), parts.next());
+                let (Some(r), Some(issued), Some(k)) = (r, issued, k) else { return Err(bad()) };
                 if !k.starts_with(&prefix) {
                     return Err(ApiError::bad_request("continue token does not match this list"));
                 }
-                Some(k)
+                if now - issued > CONTINUE_TTL_SECS {
+                    let mut e = ApiError::new(410, "Expired", "The provided continue parameter is too old to display a consistent list result. You can start a new list without the continue parameter, or use the continue token in this response to retrieve the remainder of the results. Continuing with the provided token results in an inconsistent list - objects that were created, modified, or deleted between the time the first chunk was returned and now may show up in the list.");
+                    e.cont = Some(kr_fmt::base64::encode_url(alloc::format!("{}:{now}:{k}", self.store.borrow().revision()).as_bytes()));
+                    return Err(e);
+                }
+                list_rev = Some(r);
+                Some(k.to_string())
             }
             None => None,
         };
         let store = self.store.borrow();
-        let rev = store.revision();
+        let rev = list_rev.unwrap_or_else(|| store.revision());
         let mut items: Vec<Kv> = Vec::new();
         let mut cursor = start_after;
         let mut more = false;
@@ -1000,7 +1212,12 @@ impl ApiServer {
             }
         }
         drop(store);
-        let cont = if more { cursor.map(|c| kr_fmt::base64::encode_url(c.as_bytes())) } else { None };
+        let cont = if more { cursor.as_ref().map(|c| kr_fmt::base64::encode_url(alloc::format!("{rev}:{now}:{c}").as_bytes())) } else { None };
+        // Without selectors the number of items after this page is known.
+        let remaining = match (&cont, &cursor) {
+            (Some(_), Some(c)) if ls.is_empty() && fs.is_empty() => Some(self.store.borrow().list(&prefix, Some(c), 0).0.len()),
+            _ => None,
+        };
         if wants_table(req.accept) {
             return Ok(Reply::Json(200, self.table(rt.res, &items, rev, cont.as_deref())));
         }
@@ -1017,12 +1234,23 @@ impl ApiServer {
             out.push_str(",\"continue\":");
             json::write_str(c, &mut out);
         }
+        if let Some(n) = remaining {
+            out.push_str(&alloc::format!(",\"remainingItemCount\":{n}"));
+        }
         out.push_str("},\"items\":[");
+        let defaulted = self.read_defaults(rt);
         for (i, kv) in items.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
-            out.push_str(core::str::from_utf8(&kv.value).unwrap_or("null"));
+            match &defaulted {
+                Some(sch) => {
+                    let mut v = json::parse(&kv.value).unwrap_or(Value::Null);
+                    crate::crd::prune(sch, &mut v, true);
+                    out.push_str(&json::to_string(&v));
+                }
+                None => out.push_str(core::str::from_utf8(&kv.value).unwrap_or("null")),
+            }
         }
         out.push_str("]}");
         Ok(Reply::Json(200, out))
@@ -1090,14 +1318,26 @@ impl ApiServer {
             })?
         } else if ct.starts_with("application/yaml") || ct.starts_with("application/apply-patch+yaml") {
             let s = core::str::from_utf8(req.body).map_err(|_| ApiError::bad_request("body is not UTF-8"))?;
-            kr_fmt::yaml::parse(s).map_err(|_| ApiError::bad_request("invalid YAML body"))?
+            kr_fmt::yaml::parse(s).map_err(|e| {
+                if e.kind == kr_fmt::yaml::ErrorKind::DuplicateKey {
+                    // The decoder names the repeated key: `line 9: key "foo" already set in map`.
+                    let key = s.lines().nth(e.line.saturating_sub(1)).and_then(|l| l.trim_start().split(':').next()).unwrap_or("").trim_matches(['"', '\'']);
+                    return ApiError::bad_request(alloc::format!("error converting YAML to JSON: yaml: line {}: key \"{key}\" already set in map", e.line));
+                }
+                ApiError::bad_request("invalid YAML body")
+            })?
         } else {
             json::parse(req.body).map_err(|_| ApiError::bad_request("invalid JSON body"))?
         };
         if v.has_duplicate_keys() && self.fv_mode.get() != crate::fieldval::Mode::Ignore {
             let mut d = Vec::new();
             crate::fieldval::duplicates(&v, "", &mut d);
-            self.fv_report(d.into_iter().map(|p| alloc::format!("duplicate field \"{p}\"")).collect())?;
+            // Upstream lists the unknown fields before the duplicates in one error.
+            let gv = v.get("apiVersion").and_then(Value::as_str).unwrap_or("");
+            let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
+            let mut msgs: Vec<String> = crate::fieldval::unknown_builtin(gv, kind, &v).unwrap_or_default().into_iter().map(|p| alloc::format!("unknown field \"{p}\"")).collect();
+            msgs.extend(d.into_iter().map(|p| alloc::format!("duplicate field \"{p}\"")));
+            self.fv_report(msgs)?;
         }
         Ok(v)
     }
@@ -1295,11 +1535,18 @@ impl ApiServer {
         if is_crd {
             crate::crd::admit(o, None, (self.now)())?;
         }
+        if rt.res.plural == "validatingadmissionpolicies" {
+            // Type checking runs synchronously (upstream: a controller, shortly after).
+            let st = crate::policy::type_check_status(self, o);
+            o.set("status", st);
+        }
+        Self::check_webhook_config(rt, o)?;
         self.admit_custom(rt, o, None, false)?;
         if rt.res.plural == "pods" {
             let ns = rt.namespace.clone().unwrap_or_default();
             self.admit_pod(o, &ns)?;
             self.admit_priority(o)?;
+            self.admit_pod_classes(o, &ns)?;
         }
         if rt.res.plural == "jobs" {
             admit_job(o, &name)?;
@@ -1320,6 +1567,7 @@ impl ApiServer {
         if rt.res.plural == "resourcequotas" {
             crate::quota::validate(o).map_err(ApiError::invalid)?;
         }
+        admit_immutable(rt.res, o, None)?;
         self.admit_quota(rt, o, None)?;
         {
             use crate::ssa;
@@ -1391,6 +1639,11 @@ impl ApiServer {
         if crate::crd::is_crd(rt.res) {
             crate::crd::admit(&mut new, Some(&old), (self.now)())?;
         }
+        if rt.res.plural == "validatingadmissionpolicies" && !status && new.get("spec") != old.get("spec") {
+            let st = crate::policy::type_check_status(self, &new);
+            new.set("status", st);
+        }
+        Self::check_webhook_config(rt, &new)?;
         self.admit_custom(rt, &mut new, Some(&old), status)?;
         if rt.res.plural == "priorityclasses" {
             for f in ["value", "preemptionPolicy"] {
@@ -1404,6 +1657,9 @@ impl ApiServer {
         }
         if rt.res.plural == "resourcequotas" && !status {
             crate::quota::validate(&new).map_err(ApiError::invalid)?;
+        }
+        if !status {
+            admit_immutable(rt.res, &new, Some(&old))?;
         }
         // Usage can change on update only for these kinds (a Service type/port change moves
         // nodeports/loadbalancers, a PVC may grow); pods fix their resources at create.
@@ -1570,7 +1826,12 @@ impl ApiServer {
             if v.pointer(&["metadata", "deletionTimestamp"]).is_none() {
                 let g = grace.or_else(|| v.pointer(&["spec", "terminationGracePeriodSeconds"]).and_then(Value::as_i64)).unwrap_or(30).max(1);
                 let rev = self.store.borrow().revision() + 1;
+                let gen = v.pointer(&["metadata", "generation"]).and_then(Value::as_u64);
                 let m = v.entry_object("metadata");
+                // Starting a graceful deletion is a (spec-relevant) change: the generation moves.
+                if let Some(gen) = gen {
+                    m.set("generation", Value::Number(Number::from_u64(gen + 1)));
+                }
                 m.set("deletionTimestamp", Value::String(object::rfc3339((self.now)() + g)));
                 m.set("deletionGracePeriodSeconds", Value::Number(Number::from_i64(g)));
                 m.set("resourceVersion", Value::String(rev.to_string()));
@@ -2126,6 +2387,44 @@ impl ApiServer {
         Ok(())
     }
 
+    /// `authorization.k8s.io/v1` SubjectAccessReview / LocalSubjectAccessReview: the decision for
+    /// the user named in the spec, by the same authorizer as real requests.
+    fn subject_access_review(&self, req: &Req, local_ns: Option<&str>) -> R<Reply> {
+        let mut r = self.parse_body(req)?;
+        let kind = if local_ns.is_some() { "LocalSubjectAccessReview" } else { "SubjectAccessReview" };
+        if let Some(ns) = local_ns {
+            let bns = r.pointer(&["metadata", "namespace"]).and_then(Value::as_str).unwrap_or("");
+            if !bns.is_empty() && bns != ns {
+                return Err(ApiError::bad_request("the namespace of the provided object does not match the namespace sent on the request"));
+            }
+        }
+        let spec = r.get("spec").cloned().unwrap_or(Value::Null);
+        let user = spec.get("user").and_then(Value::as_str).unwrap_or("").to_string();
+        let groups: Vec<String> = spec.get("groups").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+        let (ra, nra) = (spec.get("resourceAttributes"), spec.get("nonResourceAttributes"));
+        if user.is_empty() && groups.is_empty() {
+            return Err(ApiError::invalid(alloc::format!("{kind} is invalid: spec.user: Invalid value: \"\": at least one of user or group must be specified")));
+        }
+        if ra.is_some() == nra.is_some() {
+            return Err(ApiError::invalid(alloc::format!("{kind} is invalid: spec.resourceAttributes: Invalid value: exactly one of nonResourceAttributes or resourceAttributes must be specified")));
+        }
+        let f = |v: Option<&Value>, k: &str| v.and_then(|x| x.get(k)).and_then(Value::as_str).unwrap_or("").to_string();
+        let attrs = if ra.is_some() {
+            let namespace = match local_ns {
+                Some(ns) => ns.to_string(),
+                None => f(ra, "namespace"),
+            };
+            crate::rbac::Attrs { verb: f(ra, "verb"), api_group: f(ra, "group"), resource: f(ra, "resource"), subresource: f(ra, "subresource"), namespace, name: f(ra, "name"), resource_request: true, path: String::new() }
+        } else {
+            crate::rbac::Attrs { verb: f(nra, "verb"), path: f(nra, "path"), ..Default::default() }
+        };
+        let ok = self.authorize(&User { name: user, groups }, &attrs, None);
+        r.set("apiVersion", Value::from("authorization.k8s.io/v1"));
+        r.set("kind", Value::from(kind));
+        r.set("status", obj(alloc::vec![("allowed", Value::Bool(ok)), ("denied", Value::Bool(false))]));
+        Ok(Reply::Json(201, json::to_string(&r)))
+    }
+
     /// ServiceAccount admission for pods: default `serviceAccountName`, require it to exist,
     /// and inject the projected `kube-api-access-*` volume unless automounting is disabled.
     fn admit_pod(&self, o: &mut Value, ns: &str) -> R<()> {
@@ -2173,6 +2472,25 @@ impl ApiServer {
                 Some(Value::Array(v)) => v.push(vol),
                 _ => spec.set("volumes", Value::Array(alloc::vec![vol])),
             }
+        }
+        Ok(())
+    }
+
+    /// Sysctl validation, then the RuntimeClass and LimitRanger admission plugins for a new pod.
+    fn admit_pod_classes(&self, o: &mut Value, ns: &str) -> R<()> {
+        let pod_name = o.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("").to_string();
+        let forbid = |e: String| ApiError::new(403, "Forbidden", alloc::format!("pod \"{pod_name}\" is forbidden: {e}"));
+        let spec = o.entry_object("spec");
+        crate::admit::validate_sysctls(spec).map_err(|e| ApiError::invalid(alloc::format!("Pod \"{pod_name}\" is invalid: {e}")))?;
+        if let Some(name) = spec.get("runtimeClassName").and_then(Value::as_str).filter(|n| !n.is_empty()).map(String::from) {
+            let res = resources::find("node.k8s.io", "v1", "runtimeclasses").unwrap();
+            let rc = self.store.borrow().get(&res.key(None, &name)).and_then(|kv| json::parse(&kv.value).ok());
+            crate::admit::runtime_class(spec, &name, rc.as_ref()).map_err(|e| forbid(e))?;
+        }
+        let lr = resources::find("", "v1", "limitranges").unwrap();
+        let ranges: Vec<Value> = self.store.borrow().list(&alloc::format!("{}{ns}/", lr.prefix()), None, 0).0.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect();
+        if !ranges.is_empty() {
+            crate::admit::limit_ranger(spec, &ranges).map_err(|e| forbid(e))?;
         }
         Ok(())
     }
@@ -2332,6 +2650,45 @@ impl ApiServer {
     }
 }
 
+/// Key validation and immutability of ConfigMaps and Secrets (`immutable: true` freezes the data
+/// and cannot be unset) and PriorityClass `value`.
+fn admit_immutable(res: &Resource, new: &Value, old: Option<&Value>) -> R<()> {
+    let core = res.group.is_empty() && matches!(res.plural, "configmaps" | "secrets");
+    if core {
+        let kind = if res.plural == "secrets" { "Secret" } else { "ConfigMap" };
+        for f in ["data", "binaryData", "stringData"] {
+            if let Some(Value::Object(m)) = new.get(f) {
+                for (k, _) in m.iter() {
+                    let ok = !k.is_empty() && k != "." && k != ".." && k.len() <= 253 && k.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+                    if !ok {
+                        return Err(ApiError::invalid(alloc::format!("{kind} is invalid: {f}[{k}]: Invalid value: \"{k}\": a valid config key must consist of alphanumeric characters, '-', '_' or '.'")));
+                    }
+                }
+            }
+        }
+        if let Some(old) = old {
+            if old.get("immutable").and_then(Value::as_bool) == Some(true) {
+                if new.get("immutable").and_then(Value::as_bool) != Some(true) {
+                    return Err(ApiError::invalid(alloc::format!("{kind} is invalid: immutable: Forbidden: field is immutable when `immutable` is set")));
+                }
+                for f in ["data", "binaryData", "stringData"] {
+                    if new.get(f) != old.get(f) && !(f == "stringData" && new.get(f).is_none()) {
+                        return Err(ApiError::invalid(alloc::format!("{kind} is invalid: {f}: Forbidden: field is immutable when `immutable` is set")));
+                    }
+                }
+            }
+        }
+    }
+    if res.plural == "priorityclasses" {
+        if let Some(old) = old {
+            if new.get("value") != old.get("value") {
+                return Err(ApiError::invalid("PriorityClass.scheduling.k8s.io is invalid: value: Forbidden: may not be changed in an update."));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Job defaulting and validation (upstream batch/v1 defaults + generated selector).
 fn admit_job(o: &mut Value, name: &str) -> R<()> {
     let uid = o.pointer(&["metadata", "uid"]).and_then(Value::as_str).unwrap_or("").to_string();
@@ -2400,6 +2757,8 @@ fn parse_route(extra: &[&'static Resource], group: &str, version: &str, rest: &[
         [p] => (*p, None, None),
         [p, n] => (*p, Some(n.to_string()), None),
         [p, n, s] => (*p, Some(n.to_string()), Some(s.to_string())),
+        // pods/<name>[:port]/proxy/<path...>: the path is re-read from the request.
+        [p @ "pods", n, "proxy", ..] => (*p, Some(n.to_string()), Some(String::from("proxy"))),
         _ => return None,
     };
     let res = resources::find_in(extra, group, version, plural)?;

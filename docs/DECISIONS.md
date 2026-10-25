@@ -395,3 +395,16 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
   - Leader-only components run under `Cluster::while_leader` (started when the leader is ready, aborted on step-down).
 
 **Status:** accepted (implemented; gaps in KNOWN_ISSUES #97).
+
+## ADR-027: opt-in registry mirrors (`KR_REGISTRY_MIRRORS`)
+- **What:** `KR_REGISTRY_MIRRORS=registry.k8s.io=http://10.0.0.4:5000,docker.io=https://cache:5000` maps an upstream registry to a mirror. A pull tries the mirror first, anonymously; any failure (unreachable, missing image) falls back to the upstream with the pod's credentials. Like docker's `registry-mirrors`, the mirror is trusted for tag-to-digest resolution only: blobs are still verified against the manifest digests. `http://` mirrors are plain HTTP (the same as the insecure-registry list).
+- **Why:** test runs (conformance, multi-node scripts) downloaded the same ~600 MB of images in every throwaway container. `tools/test/registry-cache.sh` runs one `registry:2` pull-through proxy per upstream with blobs in named docker volumes, and the test scripts pass the mirrors automatically when the caches are up. A warm agnhost pull went from 47 s to 1.7 s.
+- **Not chosen:** a registry config file (containerd `hosts.toml` style). An env var is enough for now; credentials are never sent to mirrors, so a mirror needing auth is not supported.
+**Status:** accepted.
+
+## ADR-028: admission policies in the existing admission pass
+- **What:** ValidatingAdmissionPolicy and MutatingAdmissionPolicy are evaluated in `webhook::run`'s admission pass, on the dry-run result: mutating policies, mutating webhooks, validating policies, validating webhooks (upstream's plugin order). Parsed policies and bindings share the webhook configuration cache, keyed by the count and newest revision of all six configuration kinds.
+- **CEL:** the existing evaluator (`cel.rs`) was extended rather than replaced: map literals and `Object{...}` construction evaluate to plain JSON, so an apply configuration is just a partial object. Typing is a separate static pass over the same AST (`type_warnings`) that only reports operator overloads whose operand types are both known; everything it cannot type is `dyn`, so it never produces warnings cel-go would not.
+- **Type checking is synchronous:** `status.typeChecking` is computed when the policy is written instead of by a controller (upstream sets it shortly after). Clients poll for it, so being early is indistinguishable.
+- **Apply configurations** are merged with the strategic-merge code (list keys from the same tables) rather than structured-merge-diff; the results agree for the common cases (maps, keyed lists) and differ for atomic structs and sets.
+**Status:** accepted.

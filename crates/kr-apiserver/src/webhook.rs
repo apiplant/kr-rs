@@ -44,7 +44,7 @@ fn resource_matches(entries: &[&str], plural: &str, sub: Option<&str>) -> bool {
     })
 }
 
-fn rule_matches(rule: &Value, rt: &Route, op: &str, exact: bool) -> bool {
+pub(crate) fn rule_matches(rule: &Value, rt: &Route, op: &str, exact: bool) -> bool {
     let any = |key: &str, want: &str| {
         let l = strs(rule, key);
         l.iter().any(|x| *x == "*" || *x == want)
@@ -68,6 +68,11 @@ fn rules_match(wh: &Value, rt: &Route, op: &str) -> bool {
 /// selects everything.
 pub(crate) fn label_selector(v: Option<&Value>) -> Option<Selector> {
     let Some(v) = v else { return Some(Selector::default()) };
+    Selector::parse(&label_selector_string(v)?).ok()
+}
+
+/// A LabelSelector object in `labelSelector=` query syntax; `None` for unknown operators.
+pub fn label_selector_string(v: &Value) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for (k, x) in v.get("matchLabels").and_then(Value::as_object).unwrap_or(&[]) {
         parts.push(format!("{k}={}", x.as_str().unwrap_or("")));
@@ -83,7 +88,7 @@ pub(crate) fn label_selector(v: Option<&Value>) -> Option<Selector> {
             _ => return None,
         });
     }
-    Selector::parse(&parts.join(",")).ok()
+    Some(parts.join(","))
 }
 pub use crate::cel::cel_bool;
 
@@ -209,18 +214,20 @@ impl Ctx<'_> {
             let host = format!("{sn}.{sns}.svc");
             (format!("https://{host}:{port}{path}"), format!("{ip} {host}\n"))
         };
+        // Like upstream, the request carries its timeout: `?timeout=1s`.
+        let secs = wh.get("timeoutSeconds").and_then(Value::as_u64).unwrap_or(10).clamp(1, 30);
+        let url = format!("{url}{}timeout={secs}s", if url.contains('?') { '&' } else { '?' });
         let roots = match cc.get("caBundle").and_then(Value::as_str) {
             Some(b) => x509::pem_decode_all(core::str::from_utf8(&kr_fmt::base64::decode(b).map_err(|_| "invalid caBundle")?).map_err(|_| "invalid caBundle")?, "CERTIFICATE").map_err(|_| "invalid caBundle")?,
             None => Vec::new(),
         };
         let cfg = Rc::new(ClientConfig { pinned_ca: None, roots, client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
-        let secs = wh.get("timeoutSeconds").and_then(Value::as_u64).unwrap_or(10).clamp(1, 30);
         let http = Http::with_connector(
             TlsConnector::new(WhResolver(HostsResolver::from_contents(&hosts)), cfg),
             HttpConfig { max_redirects: 0, max_idle: 0, connect_timeout_ms: secs * 1000, head_timeout_ms: secs * 1000, read_timeout_ms: secs * 1000, user_agent: "kr-apiserver".to_string(), ..HttpConfig::default() },
         );
         let fut = async {
-            let mut resp = http.request("POST", &url, &[("Content-Type", "application/json"), ("Accept", "application/json")], review.as_bytes()).await.map_err(|e| format!("Post \"{url}\": {e:?}"))?;
+            let mut resp = http.request("POST", &url, &[("Content-Type", "application/json"), ("Accept", "application/json")], review.as_bytes()).await.map_err(|e| if format!("{e:?}").contains("Timeout") { format!("Post \"{url}\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)") } else { format!("Post \"{url}\": {e:?}") })?;
             if resp.status != 200 {
                 return Err(format!("Post \"{url}\": webhook returned status {}", resp.status));
             }
@@ -281,11 +288,16 @@ impl Ctx<'_> {
 }
 
 
-/// The parsed webhook configurations: every mutating and every validating webhook, in
-/// configuration-name order.
+/// Kinds whose changes invalidate [`Configs`] (see `ApiServer::wh_stamp`).
+pub(crate) const CONFIG_PLURALS: [&str; 6] = ["mutatingwebhookconfigurations", "validatingwebhookconfigurations", "validatingadmissionpolicies", "validatingadmissionpolicybindings", "mutatingadmissionpolicies", "mutatingadmissionpolicybindings"];
+
+/// The parsed admission configuration: every mutating and every validating webhook, in
+/// configuration-name order, and the admission policies with their bindings.
 pub struct Configs {
     muts: Vec<Value>,
     vals: Vec<Value>,
+    vaps: Vec<crate::policy::Bound>,
+    maps: Vec<crate::policy::Bound>,
 }
 
 /// Parsed configurations, rebuilt only when a configuration object was added, changed or removed.
@@ -301,9 +313,21 @@ fn configs(api: &ApiServer) -> Rc<Configs> {
         cfgs.sort_by(|a, b| a.pointer(&["metadata", "name"]).and_then(Value::as_str).cmp(&b.pointer(&["metadata", "name"]).and_then(Value::as_str)));
         cfgs.iter().flat_map(|c| c.get("webhooks").and_then(Value::as_array).unwrap_or(&[]).iter().cloned().collect::<Vec<_>>()).collect::<Vec<_>>()
     };
-    let c = Rc::new(Configs { muts: load("mutatingwebhookconfigurations"), vals: load("validatingwebhookconfigurations") });
+    let pol = |p: &str, b: &str| crate::policy::bind(api.wh_list(GROUP, "v1", p), api.wh_list(GROUP, "v1", b));
+    let c = Rc::new(Configs {
+        muts: load("mutatingwebhookconfigurations"),
+        vals: load("validatingwebhookconfigurations"),
+        vaps: pol("validatingadmissionpolicies", "validatingadmissionpolicybindings"),
+        maps: pol("mutatingadmissionpolicies", "mutatingadmissionpolicybindings"),
+    });
     *api.wh_cache.borrow_mut() = Some((stamp, c.clone()));
     c
+}
+
+/// Whether any webhook or admission policy may apply to `op` on `rt`.
+fn any_admission(api: &ApiServer, rt: &Route, op: &str) -> bool {
+    let c = configs(api);
+    c.muts.iter().chain(&c.vals).any(|w| rules_match(w, rt, op)) || crate::policy::may_apply(&c.vaps, rt, op) || crate::policy::may_apply(&c.maps, rt, op)
 }
 
 fn gather(api: &ApiServer, mutating: bool, rt: &Route, op: &str) -> Vec<Value> {
@@ -388,7 +412,7 @@ pub enum Run {
 async fn admit(api: &ApiServer, req: &Req<'_>, rt: &Route, op: &'static str, mode: Mode, user: &crate::api::User, warns: &RefCell<Vec<String>>) -> Result<Option<Rewrite>, Reply> {
     let muts = gather(api, true, rt, op);
     let vals = gather(api, false, rt, op);
-    if muts.is_empty() && vals.is_empty() {
+    if !any_admission(api, rt, op) {
         return Ok(None);
     }
     let dry = req.query.split('&').any(|p| p == "dryRun=All");
@@ -435,6 +459,11 @@ async fn admit(api: &ApiServer, req: &Req<'_>, rt: &Route, op: &'static str, mod
     let ns = rt.namespace.as_deref().and_then(|n| api.wh_object("", "v1", "namespaces", None, n));
     let ctx = Ctx { api, rt, op, user: user.clone(), dry, ns, kind, options, warns };
     let mut cur = obj0.clone();
+    let cfg = configs(api);
+    let preq = |cur: &Value| crate::policy::Req { rt, op, request: ctx.request(cur, &old), ns: ctx.ns.as_ref(), warns };
+    if !cur.is_null() {
+        crate::policy::mutate(api, &cfg.maps, &preq(&cur), &mut cur, &old).map_err(Reply::err)?;
+    }
     // reinvocationPolicy: IfNeeded webhooks that ran before a later webhook changed the object
     // run once more (never recursively).
     let (mut ran, mut stale): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
@@ -455,6 +484,7 @@ async fn admit(api: &ApiServer, req: &Req<'_>, rt: &Route, op: &'static str, mod
     for i in stale {
         mutate(&ctx, &muts[i], &mut cur, &old).await?;
     }
+    crate::policy::validate(api, &cfg.vaps, &preq(&cur), &cur, &old).map_err(Reply::err)?;
     for wh in &vals {
         ctx.invoke(wh, &cur, &old).await.map_err(Reply::err)?;
     }
@@ -500,7 +530,7 @@ async fn run_inner(api: &ApiServer, req: &Req<'_>, warns: &RefCell<Vec<String>>)
     if !named && op != "CREATE" && op != "DELETE" {
         return Ok(Run::Pass(None));
     }
-    if gather(api, true, &rt, op).is_empty() && gather(api, false, &rt, op).is_empty() {
+    if !any_admission(api, &rt, op) {
         return Ok(Run::Pass(None));
     }
     let user = api.authenticate(req).map_err(Reply::err)?;

@@ -125,7 +125,7 @@ async fn kubelet(c: InProcess) {
                     }
                     continue;
                 }
-                if str_at(&p, &["spec", "nodeName"]).is_empty() || held || (HOLD_ALL.load(Ordering::SeqCst) && str_at(&p, &["status", "phase"]).is_empty()) {
+                if str_at(&p, &["spec", "nodeName"]).is_empty() || held || (HOLD_ALL.load(Ordering::SeqCst) && matches!(str_at(&p, &["status", "phase"]), "" | "Pending")) {
                     continue;
                 }
                 match str_at(&p, &["status", "phase"]) {

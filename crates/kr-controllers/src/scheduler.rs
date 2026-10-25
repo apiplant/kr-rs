@@ -20,7 +20,9 @@
 use crate::util::*;
 use crate::Config;
 use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
+use core::cell::RefCell;
 use alloc::vec::Vec;
 use kr_apiserver::client::{Client, Result};
 use kr_fmt::json::Value;
@@ -28,6 +30,44 @@ use kr_fmt::quantity::Quantity;
 
 /// Sentinel key: every pending pod.
 const ALL: &str = "*";
+
+/// How long a node/pod snapshot is reused across scheduling decisions.
+const SNAPSHOT_MS: u64 = 1000;
+
+/// Nodes and pods as of `at`, shared by the decisions of one burst: listing every pod for every
+/// pod made a 1000-replica Deployment quadratic. Bindings made since are applied to it.
+struct Snapshot {
+    at: u64,
+    nodes: Rc<Vec<Value>>,
+    pods: Rc<Vec<Value>>,
+}
+
+type Snap = Rc<RefCell<Option<Snapshot>>>;
+
+async fn snapshot<C: Client>(c: &C, snap: &Snap) -> Result<(Rc<Vec<Value>>, Rc<Vec<Value>>)> {
+    let now = kr_rt::exec::now_ms();
+    if let Some(s) = snap.borrow().as_ref().filter(|s| now.saturating_sub(s.at) < SNAPSHOT_MS) {
+        return Ok((s.nodes.clone(), s.pods.clone()));
+    }
+    let nodes = Rc::new(items(&c.list("/api/v1/nodes", "").await?));
+    let pods = Rc::new(items(&c.list(&pods(None), "").await?));
+    *snap.borrow_mut() = Some(Snapshot { at: kr_rt::exec::now_ms(), nodes: nodes.clone(), pods: pods.clone() });
+    Ok((nodes, pods))
+}
+
+/// Records a binding in the snapshot, so the next decisions count the pod on its node.
+fn bound(snap: &Snap, pod: &Value, node: &str) {
+    let mut b = snap.borrow_mut();
+    let Some(s) = b.as_mut() else { return };
+    let pods = Rc::make_mut(&mut s.pods);
+    let uid = str_at(pod, &["metadata", "uid"]);
+    let mut p = pod.clone();
+    p.entry_object("spec").set("nodeName", Value::from(node));
+    match pods.iter_mut().find(|x| str_at(x, &["metadata", "uid"]) == uid) {
+        Some(x) => *x = p,
+        None => pods.push(p),
+    }
+}
 
 pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config) {
     let q = Queue::new();
@@ -38,12 +78,14 @@ pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config) {
     g.0.push(kr_rt::exec::spawn(watch_loop(c.clone(), String::from("/api/v1/nodes"), String::new(), cfg, move |_, _| q2.add(ALL))));
     let c2 = c.clone();
     let q2 = q.clone();
+    let snap: Snap = Rc::new(RefCell::new(None));
     drive(
         &cfg,
         &q,
         move |key| {
             let c = c2.clone();
             let q = q2.clone();
+            let snap = snap.clone();
             async move {
                 if key == ALL {
                     for p in items(&c.list(&pods(None), "fieldSelector=spec.nodeName%3D").await?) {
@@ -52,7 +94,7 @@ pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config) {
                     return Ok(None);
                 }
                 let (ns, n) = split_key(&key);
-                schedule_one(&c, &cfg, ns, n).await
+                schedule_one(&c, &cfg, &snap, ns, n).await
             }
         },
         || {
@@ -63,7 +105,7 @@ pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config) {
     .await
 }
 
-async fn schedule_one<C: Client>(c: &C, cfg: &Config, ns: &str, name: &str) -> Result<Option<u64>> {
+async fn schedule_one<C: Client>(c: &C, cfg: &Config, snap: &Snap, ns: &str, name: &str) -> Result<Option<u64>> {
     let path = alloc::format!("{}/{name}", pods(Some(ns)));
     let pod = match c.get(&path).await {
         Ok(p) => p,
@@ -76,15 +118,18 @@ async fn schedule_one<C: Client>(c: &C, cfg: &Config, ns: &str, name: &str) -> R
     if !matches!(str_at(&pod, &["spec", "schedulerName"]), "" | "default-scheduler") {
         return Ok(None);
     }
-    let nodes = items(&c.list("/api/v1/nodes", "").await?);
-    let all_pods = items(&c.list(&pods(None), "").await?);
+    let (nodes, all_pods) = snapshot(c, snap).await?;
     if let Some(why) = unbound_claim(c, ns, &pod).await? {
         let msg = alloc::format!("0/{} nodes are available: {why}.", nodes.len());
         mark_unschedulable(c, cfg, &path, &pod, &msg).await?;
         return Ok(Some(cfg.retry_ms));
     }
     let pinned = volume_affinity(c, ns, &pod).await?;
-    match pick(&pod, &nodes, &all_pods, &pinned) {
+    let picked = pick(&pod, &nodes, &all_pods, &pinned);
+    // Preemption plan (owned: the snapshot is released before any await).
+    let plan: Option<(String, Vec<Value>)> = if picked.is_err() { preemption(&pod, &nodes, &all_pods, &pinned).map(|(n, v)| (str_at(n, &["metadata", "name"]).to_string(), v.into_iter().cloned().collect())) } else { None };
+    drop(all_pods);
+    match picked {
         Ok(node) => {
             let body = obj(alloc::vec![
                 ("apiVersion", Value::from("v1")),
@@ -95,6 +140,7 @@ async fn schedule_one<C: Client>(c: &C, cfg: &Config, ns: &str, name: &str) -> R
             match c.create(&alloc::format!("{path}/binding"), &body).await {
                 Ok(_) => {
                     emit_event(c, cfg, &pod, "Normal", "Scheduled", &alloc::format!("Successfully assigned {ns}/{name} to {node}")).await;
+                    bound(snap, &pod, &node);
                     Ok(None)
                 }
                 Err(e) if e.code == 409 || e.code == 404 => Ok(None), // already bound / gone
@@ -103,16 +149,12 @@ async fn schedule_one<C: Client>(c: &C, cfg: &Config, ns: &str, name: &str) -> R
         }
         Err(msg) => {
             mark_unschedulable(c, cfg, &path, &pod, &msg).await?;
-            if let Some((node, victims)) = preemption(&pod, &nodes, &all_pods, &pinned) {
-                preempt(c, cfg, &path, &pod, name_of(node), &victims).await?;
+            if let Some((node, victims)) = plan {
+                preempt(c, cfg, &path, &pod, &node, &victims.iter().collect::<Vec<_>>()).await?;
             }
             Ok(Some(cfg.retry_ms))
         }
     }
-}
-
-fn name_of(n: &Value) -> &str {
-    name(n)
 }
 
 /// Evicts the victims (marking them with `DisruptionTarget`) and nominates the pod to the node.

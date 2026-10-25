@@ -82,6 +82,22 @@ pub async fn reconcile<C: Client>(c: &C, cfg: &Config, ns: &str) -> Result<Optio
     if !deleting(&n) {
         return Ok(None);
     }
+    // Ordered deletion: pods go first; nothing else is touched while any pod (e.g. one held by a
+    // finalizer) is left.
+    let pods = alloc::format!("/api/v1/namespaces/{ns}/pods");
+    if let Ok(l) = c.list(&pods, "").await {
+        let left = items(&l);
+        if !left.is_empty() {
+            for o in left.iter().filter(|o| !deleting(o)) {
+                delete_ok(c, &alloc::format!("{pods}/{}", name(o))).await?;
+            }
+            let now = (cfg.now)();
+            let msg = alloc::format!("Some resources are remaining: pods. has {} resource instances", left.len());
+            put_conditions(c, &path, condition("NamespaceDeletionContentFailure", true, "ContentDeletionFailed", &msg, now)).await?;
+            put_conditions(c, &path, condition("NamespaceContentRemaining", true, "SomeResourcesRemain", &msg, now)).await?;
+            return Ok(Some(cfg.retry_ms));
+        }
+    }
     let mut remaining = 0usize;
     for list in namespaced_resources(c, ns).await? {
         let Ok(l) = c.list(&list, "").await else { continue };

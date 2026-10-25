@@ -398,6 +398,26 @@ pub struct Sleep {
     state: Option<Rc<TimerState>>,
 }
 
+/// Returns to the executor once: the task is requeued behind I/O, timers and the other ready
+/// tasks (see [`run_queue`]). For loops whose awaits never suspend (in-process API calls).
+pub fn yield_now() -> YieldNow {
+    YieldNow(false)
+}
+
+pub struct YieldNow(bool);
+
+impl Future for YieldNow {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            return Poll::Ready(());
+        }
+        self.0 = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
 /// Completes after at least `ms` milliseconds (never early). The deadline is computed with ns
 /// precision; the wheel entry uses it rounded up (ceil) to the next ms tick.
 pub fn sleep(ms: u64) -> Sleep {

@@ -22,6 +22,55 @@ pub struct Built {
     pub extra_groups: Vec<u32>,
 }
 
+/// Host file backing a container's terminationMessagePath.
+pub fn term_file(pod_dir: &str, name: &str) -> String {
+    alloc::format!("{pod_dir}/{name}.term")
+}
+
+/// The termination message: the file's first 4096 bytes; with `FallbackToLogsOnError`, a failed
+/// container with an empty file reports the tail of its log (80 lines, 2048 bytes) instead.
+pub fn termination_message(pod_dir: &str, name: &str, fallback: bool, failed: bool) -> String {
+    let read = |path: String, limit: usize| kr_sys::fs::read_file(alloc::format!("{path}\0").as_bytes(), limit).unwrap_or_default();
+    let mut msg = read(term_file(pod_dir, name), 4096);
+    msg.truncate(4096);
+    if msg.is_empty() && fallback && failed {
+        let log = read(alloc::format!("{pod_dir}/{name}.log"), 64 << 20);
+        msg = tail_log(&log, 80, 2048).to_vec();
+    }
+    String::from_utf8_lossy(&msg).into_owned()
+}
+
+/// Last `lines` lines of `log`, then at most the last `bytes` bytes of those.
+fn tail_log(log: &[u8], lines: usize, bytes: usize) -> &[u8] {
+    let body = log.strip_suffix(b"\n").unwrap_or(log);
+    let mut start = 0;
+    let mut seen = 0;
+    for (i, b) in body.iter().enumerate().rev() {
+        if *b == b'\n' {
+            seen += 1;
+            if seen == lines {
+                start = i + 1;
+                break;
+            }
+        }
+    }
+    let t = &body[start..];
+    &t[t.len().saturating_sub(bytes)..]
+}
+
+#[cfg(test)]
+mod term_tests {
+    use super::*;
+
+    #[test]
+    fn tail() {
+        assert_eq!(tail_log(b"a\nb\nc\n", 2, 100), b"b\nc");
+        assert_eq!(tail_log(b"a\nb", 5, 100), b"a\nb");
+        assert_eq!(tail_log(b"abcdef", 5, 3), b"def");
+        assert_eq!(tail_log(b"", 5, 3), b"");
+    }
+}
+
 pub fn find_container<'a>(pod: &'a Value, name: &str) -> Option<&'a Value> {
     ["initContainers", "containers", "ephemeralContainers"]
         .iter()
@@ -107,10 +156,28 @@ async fn service_env<C: Client>(c: &C, pod: &Value) -> Vec<(String, String)> {
     out
 }
 
-pub fn write_etc_hosts(pod_dir: &str, hostname: &str, ip: Option<[u8; 4]>) -> Result<(), ()> {
-    let mut s = String::from("# Kubernetes-managed hosts file (kr).\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
-    if let Some(a) = ip {
-        s.push_str(&alloc::format!("{}.{}.{}.{}\t{hostname}\n", a[0], a[1], a[2], a[3]));
+/// The pod's /etc/hosts: kubelet-managed (localhost, the pod's own name, `hostAliases`), or for
+/// hostNetwork pods a copy of the node's file, which upstream does not manage either.
+pub fn write_etc_hosts(pod_dir: &str, pod: &Value, hostname: &str, ip: Option<[u8; 4]>) -> Result<(), ()> {
+    let host_net = pod.pointer(&["spec", "hostNetwork"]).and_then(Value::as_bool) == Some(true);
+    let mut s = if host_net {
+        String::from_utf8(kr_sys::fs::read_file(b"/etc/hosts\0", 1024 * 1024).unwrap_or_default()).unwrap_or_default()
+    } else {
+        let mut s = String::from("# Kubernetes-managed hosts file (kr).\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
+        if let Some(a) = ip {
+            s.push_str(&alloc::format!("{}.{}.{}.{}\t{hostname}\n", a[0], a[1], a[2], a[3]));
+        }
+        s
+    };
+    let aliases = pod.pointer(&["spec", "hostAliases"]).and_then(Value::as_array).unwrap_or(&[]);
+    if !aliases.is_empty() {
+        s.push_str("\n# Entries added by HostAliases.\n");
+        for a in aliases {
+            let names: Vec<&str> = a.get("hostnames").and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_str).collect();
+            if let Some(ip) = a.get("ip").and_then(Value::as_str).filter(|_| !names.is_empty()) {
+                s.push_str(&alloc::format!("{ip}\t{}\n", names.join("\t")));
+            }
+        }
     }
     kr_runtime::store::write_file_atomic(&alloc::format!("{pod_dir}/etc-hosts"), s.as_bytes()).map_err(|_| ())
 }
@@ -336,12 +403,66 @@ fn resource_field_ref(pod: &Value, container: Option<&str>, rf: &Value) -> Optio
         (None, "requests", "cpu" | "memory" | "ephemeral-storage") => return Some(String::from("0")),
         _ => return None,
     };
-    let divisor = quantity(rf.get("divisor")).unwrap_or_else(|| Quantity::from_i64(1, kr_fmt::quantity::Format::DecimalSI));
+    // A zero divisor ("0", as the API server defaults it) means 1, as upstream.
+    let one = || Quantity::from_i64(1, kr_fmt::quantity::Format::DecimalSI);
+    let divisor = quantity(rf.get("divisor")).filter(|d| d.milli_value() != Some(0)).unwrap_or_else(one);
     let (n, d) = if res == "cpu" { (q.milli_value()?, divisor.milli_value()?) } else { (q.value()?, divisor.value()?) };
     if d <= 0 {
         return None;
     }
     Some(alloc::format!("{}", (n + d - 1).div_euclid(d)))
+}
+
+/// A projected `clusterTrustBundle` source: one bundle by `name`, or every bundle of
+/// `signerName` matching `labelSelector` (unset matches none, empty matches all). The
+/// certificates are deduplicated and written to `path`; `optional` tolerates no match.
+async fn cluster_trust_bundle<C: Client>(c: &C, t: &Value, stage: &str, mode: u32) -> Result<(), String> {
+    let path = t.get("path").and_then(Value::as_str).unwrap_or("");
+    let optional = t.get("optional").and_then(Value::as_bool).unwrap_or(false);
+    const CTB: &str = "/apis/certificates.k8s.io/v1/clustertrustbundles";
+    let bundles: Vec<Value> = if let Some(name) = t.get("name").and_then(Value::as_str) {
+        c.get(&alloc::format!("{CTB}/{name}")).await.ok().into_iter().collect()
+    } else if let (Some(signer), Some(sel)) = (t.get("signerName").and_then(Value::as_str), t.get("labelSelector")) {
+        let sel = kr_apiserver::webhook::label_selector_string(sel).ok_or_else(|| alloc::format!("clusterTrustBundle {path}: invalid labelSelector"))?;
+        let list = c.list(CTB, &alloc::format!("labelSelector={}", query_escape(&sel))).await.map_err(|_| alloc::format!("clusterTrustBundle {path}: cannot list bundles"))?;
+        let items = list.get("items").and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+        items.into_iter().filter(|b| b.pointer(&["spec", "signerName"]).and_then(Value::as_str) == Some(signer)).collect()
+    } else {
+        Vec::new()
+    };
+    let certs = pem_certs(bundles.iter().map(|b| b.pointer(&["spec", "trustBundle"]).and_then(Value::as_str).unwrap_or("")));
+    if certs.is_empty() {
+        return if optional { Ok(()) } else { Err(alloc::format!("clusterTrustBundle {path}: no matching bundle")) };
+    }
+    write_item(stage, path, certs.concat().as_bytes(), mode)
+}
+
+/// The distinct certificates of PEM bundles, each re-emitted as one canonical PEM block.
+fn pem_certs<'a>(bundles: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut certs: Vec<String> = Vec::new();
+    for pem in bundles {
+        for block in pem.split("-----END CERTIFICATE-----") {
+            let Some(start) = block.find("-----BEGIN CERTIFICATE-----") else { continue };
+            let cert = alloc::format!("{}\n-----END CERTIFICATE-----\n", block[start..].trim_end());
+            if !certs.contains(&cert) {
+                certs.push(cert);
+            }
+        }
+    }
+    certs
+}
+
+/// Percent-encodes a query value (unreserved characters pass).
+fn query_escape(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&alloc::format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Writes a configMap/secret/projected/downwardAPI volume's files into `stage`.
@@ -372,6 +493,8 @@ async fn stage_volume<C: Client>(c: &C, pod: &Value, vol: &Value, dir: &str, sta
                 materialize(c, ns, "secrets", sec.get("name").and_then(Value::as_str).unwrap_or(""), sec, stage, mode).await?;
             } else if let Some(d) = src.get("downwardAPI") {
                 downward(pod, d, stage, mode)?;
+            } else if let Some(t) = src.get("clusterTrustBundle") {
+                cluster_trust_bundle(c, t, stage, mode).await?;
             }
         }
         Ok(())
@@ -641,7 +764,7 @@ async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str
     }
 }
 
-pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig, pod_dir: &str, ip: Option<[u8; 4]>, node: &str) -> Result<Built, String> {
+pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig, pod_dir: &str, ip: Option<[u8; 4]>, node: &str, store: &kr_runtime::store::Store) -> Result<Built, String> {
     let ns = meta(pod, "namespace");
     // env: image env, then container env (later wins), with $(VAR) expansion.
     let mut env: Vec<(String, String)> = img.env.iter().filter_map(|e| e.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect();
@@ -746,10 +869,25 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         let name = vm.get("name").and_then(Value::as_str).unwrap_or("");
         let target = vm.get("mountPath").and_then(Value::as_str).unwrap_or("");
         let vol = vols.iter().find(|v| v.get("name").and_then(Value::as_str) == Some(name)).ok_or_else(|| alloc::format!("volume {name} not found"))?;
-        let Some(src) = volume_source(c, pod, vol, pod_dir).await? else { continue };
+        let src = if let Some(iv) = vol.get("image") {
+            // OCI image volume: the pulled image's unpacked rootfs, mounted read-only.
+            let r = iv.get("reference").and_then(Value::as_str).unwrap_or("");
+            let (_, _, mut root) = store.image(r).ok_or_else(|| alloc::format!("image {r} not present"))?;
+            root.pop();
+            Some(String::from_utf8(root).map_err(|_| String::from("bad image path"))?)
+        } else {
+            volume_source(c, pod, vol, pod_dir).await?
+        };
+        let Some(src) = src else { continue };
         let mut sub_path = None;
-        if let Some(sub) = vm.get("subPath").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-            if sub.starts_with('/') || sub.split('/').any(|c| c == "..") {
+        let sub_expr = vm.get("subPathExpr").and_then(Value::as_str).filter(|s| !s.is_empty());
+        let sub_plain = vm.get("subPath").and_then(Value::as_str).filter(|s| !s.is_empty());
+        if sub_expr.is_some() && sub_plain.is_some() {
+            return Err(String::from("subPath and subPathExpr are mutually exclusive"));
+        }
+        let sub_expanded = sub_expr.map(|e| expand(e, &env));
+        if let Some(sub) = sub_plain.or(sub_expanded.as_deref()) {
+            if sub.contains('`') || sub.starts_with('/') || sub.split('/').any(|c| c == "..") {
                 return Err(alloc::format!("invalid subPath {sub}"));
             }
             // Resolve inside the volume (RESOLVE_IN_ROOT): a symlink the container created in
@@ -767,8 +905,18 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
             drop(fd);
             sub_path = Some(sub.as_bytes().to_vec());
         }
-        let ro = vm.get("readOnly").and_then(Value::as_bool).unwrap_or(false) || ["configMap", "secret", "projected", "downwardAPI"].iter().any(|k| vol.get(k).is_some());
+        let ro = vm.get("readOnly").and_then(Value::as_bool).unwrap_or(false) || ["configMap", "secret", "projected", "downwardAPI", "image"].iter().any(|k| vol.get(k).is_some());
         mounts.push(Mount { source: src.into_bytes(), sub_path, target: target.as_bytes().to_vec(), readonly: ro });
+    }
+    // terminationMessagePath: a fresh world-writable file per start (any runAsUser must be able to
+    // write it), read back by the kubelet once the container exits.
+    let tpath = ctr.get("terminationMessagePath").and_then(Value::as_str).filter(|p| !p.is_empty()).unwrap_or("/dev/termination-log");
+    if !mounts.iter().any(|m| m.target == tpath.as_bytes()) {
+        let host = term_file(pod_dir, ctr.get("name").and_then(Value::as_str).unwrap_or(""));
+        if let Ok(fd) = kr_sys::ns::open(alloc::format!("{host}\0").as_bytes(), kr_sys::ns::O_WRONLY | kr_sys::ns::O_CREAT | kr_sys::fs::O_TRUNC, 0o666) {
+            let _ = kr_sys::fs::fchmod(fd.raw(), 0o666);
+            mounts.push(Mount { source: host.into_bytes(), sub_path: None, target: tpath.as_bytes().to_vec(), readonly: false });
+        }
     }
     let mut extra_groups: Vec<u32> = pod.pointer(&["spec", "securityContext", "supplementalGroups"]).and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_u64).map(|g| g as u32).collect();
     if let Some(fg) = pod.pointer(&["spec", "securityContext", "fsGroup"]).and_then(Value::as_u64) {
@@ -815,5 +963,35 @@ mod qos_tests {
         assert_eq!(qos_class(&pod(init_ok)), "Guaranteed");
         // Only non-cpu/memory resources do not count.
         assert_eq!(qos_class(&pod(r#"{"spec":{"containers":[{"resources":{"limits":{"ephemeral-storage":"1Gi"}}}]}}"#)), "BestEffort");
+    }
+}
+
+#[cfg(test)]
+mod resource_field_tests {
+    use super::*;
+
+    #[test]
+    fn zero_divisor_means_one() {
+        let p = |s: &str| kr_fmt::json::parse(s.as_bytes()).unwrap();
+        let pod = p(r#"{"spec":{"containers":[{"name":"c","resources":{"limits":{"cpu":"1250m","memory":"64Mi"}}}]}}"#);
+        let rf = |r: &str, d: &str| p(&alloc::format!(r#"{{"containerName":"c","resource":"{r}","divisor":"{d}"}}"#));
+        assert_eq!(resource_field_ref(&pod, None, &rf("limits.cpu", "0")).as_deref(), Some("2"));
+        assert_eq!(resource_field_ref(&pod, None, &rf("limits.cpu", "1m")).as_deref(), Some("1250"));
+        assert_eq!(resource_field_ref(&pod, None, &rf("limits.memory", "0")).as_deref(), Some("67108864"));
+        assert_eq!(resource_field_ref(&pod, None, &rf("limits.memory", "1Mi")).as_deref(), Some("64"));
+    }
+}
+
+#[cfg(test)]
+mod pem_tests {
+    use super::pem_certs;
+
+    #[test]
+    fn blocks_keep_their_line_structure() {
+        let a = "-----BEGIN CERTIFICATE-----\nAAAA\nBBBB\n-----END CERTIFICATE-----\n";
+        let b = "-----BEGIN CERTIFICATE-----\nCCCC\n-----END CERTIFICATE-----";
+        let both = alloc::format!("{a}{b}\n");
+        let got = pem_certs([both.as_str(), a].into_iter());
+        assert_eq!(got, [a, "-----BEGIN CERTIFICATE-----\nCCCC\n-----END CERTIFICATE-----\n"]);
     }
 }

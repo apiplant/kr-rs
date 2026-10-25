@@ -461,7 +461,7 @@ pub async fn reconcile<C: Client>(c: &C, cfg: &Config, ns: &str, jname: &str) ->
         // Start pods up to the wanted number of active ones.
         let want_active = match completions {
             Some(n) => parallelism.min((n - succeeded - failed_idx.len() as i64).max(0)),
-            None if succeeded > 0 => 0,
+            None if succeeded > 0 => active_pods.len() as i64, // the rest of the work queue drains
             None => parallelism,
         };
         let mut missing = want_active - active_pods.len() as i64;

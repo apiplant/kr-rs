@@ -51,3 +51,17 @@ fn wrong_wire_type_is_rejected() {
     body[n - 1] = 0x00;
     assert!(decode_body_as(&body, Some(("v1", "DeleteOptions"))).is_err());
 }
+/// client-go stamps DeleteOptions with the deleted resource's group version (`apps/v1`,
+/// `apiextensions.k8s.io/v1`, ...); conformance round 4 lost ~25 deletes to this.
+#[test]
+fn group_stamped_delete_options() {
+    for av in ["apps/v1", "apiextensions.k8s.io/v1", "storage.k8s.io/v1", "node.k8s.io/v1"] {
+        let mut w = Writer::new();
+        w.message(1, |t| { t.string(1, av).string(2, "DeleteOptions"); })
+            .bytes(2, &[0x08, 0x05]);
+        let mut body = b"k8s\0".to_vec();
+        body.extend_from_slice(w.as_bytes());
+        let v = decode_body_as(&body, None).unwrap_or_else(|e| panic!("{av}: {e}"));
+        assert_eq!(v.get("gracePeriodSeconds"), Some(&Value::Number(kr_fmt::json::Number::from_i64(5))), "{av}");
+    }
+}

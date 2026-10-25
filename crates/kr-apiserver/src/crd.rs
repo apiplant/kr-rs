@@ -159,6 +159,9 @@ pub fn admit(o: &mut Value, old: Option<&Value>, now: i64) -> Result<(), ApiErro
     if o.pointer(&["metadata", "deletionTimestamp"]).is_some() {
         conds.push(terminating(old, now));
     }
+    // Conditions other than the server-managed ones are kept as written (status updates).
+    let written = o.pointer(&["status", "conditions"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+    conds.extend(written.into_iter().filter(|c| !matches!(str_at(c, &["type"]), "NamesAccepted" | "Established" | "Terminating")));
     if old.is_none() {
         // Upstream adds the cleanup finalizer at creation; the controller removes it once the
         // custom resources are gone.

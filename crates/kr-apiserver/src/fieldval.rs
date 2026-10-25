@@ -373,3 +373,53 @@ mod tests {
         assert_eq!(o, ["a.b", "l[0].x"]);
     }
 }
+
+/// The CEL type of the field at `path` in a built-in kind (`apps/v1`, `Deployment`), from the
+/// protobuf tables: `int`, `uint`, `double`, `string`, `bool`, `bytes`, `list`, `map`, or `None`
+/// where unknown or free-form (objects, times, quantities, int-or-string are dynamic).
+pub fn cel_type(api_version: &str, kind: &str, path: &[&str]) -> Option<&'static str> {
+    let mut idx = s::KINDS.iter().find(|k| k.0 == api_version && k.1 == kind)?.2;
+    let mut it = path.iter().peekable();
+    while let Some(key) = it.next() {
+        if opaque(idx) {
+            return None;
+        }
+        let f = lookup(idx, key, 0)?;
+        let last = it.peek().is_none();
+        if f.kind & s::F_REPEATED != 0 {
+            return last.then_some("list");
+        }
+        match f.kind & s::K_MASK {
+            s::K_MESSAGE => idx = f.arg,
+            s::K_MAP => return last.then_some("map"),
+            k if last => {
+                return Some(match k {
+                    s::K_STRING => "string",
+                    s::K_BYTES => "bytes",
+                    s::K_INT32 | s::K_INT64 => "int",
+                    s::K_UINT32 | s::K_UINT64 => "uint",
+                    s::K_BOOL => "bool",
+                    s::K_DOUBLE | s::K_FLOAT => "double",
+                    _ => return None,
+                })
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod cel_type_tests {
+    use super::cel_type;
+
+    #[test]
+    fn deployment_fields() {
+        assert_eq!(cel_type("apps/v1", "Deployment", &["spec", "replicas"]), Some("int"));
+        assert_eq!(cel_type("apps/v1", "Deployment", &["metadata", "name"]), Some("string"));
+        assert_eq!(cel_type("apps/v1", "Deployment", &["spec", "template", "spec", "containers"]), Some("list"));
+        assert_eq!(cel_type("apps/v1", "Deployment", &["metadata", "labels"]), Some("map"));
+        assert_eq!(cel_type("apps/v1", "Deployment", &["metadata", "creationTimestamp"]), None);
+        assert_eq!(cel_type("apps/v1", "Deployment", &["spec", "nope"]), None);
+    }
+}

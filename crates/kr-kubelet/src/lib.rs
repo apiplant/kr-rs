@@ -114,6 +114,7 @@ struct Term {
     reason: &'static str,
     started_at: i64,
     finished_at: i64,
+    message: String,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +128,8 @@ struct Ctr {
     name: String,
     image: String,
     init: bool,
+    /// Init container with `restartPolicy: Always`: keeps running next to the app containers.
+    sidecar: bool,
     eph: bool,
     restart_count: u32,
     state: CState,
@@ -171,6 +174,10 @@ struct PodRt {
     evicted: Option<String>,
     /// (hostIP, protocol, hostPort) of the containers' host ports.
     host_ports: Vec<(String, String, u64)>,
+    /// Set once `activeDeadlineSeconds` passed: containers are killed and the pod is Failed.
+    deadline_exceeded: bool,
+    /// Last reported status and transition time (s) of each pod condition.
+    conds: Vec<(String, bool, i64)>,
 }
 
 struct Exit {
@@ -179,6 +186,7 @@ struct Exit {
     exit_code: i32,
     oom: bool,
     started_at: i64,
+    message: String,
 }
 
 pub struct Kubelet<C: Client> {
@@ -549,7 +557,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let Some(p) = pods.get_mut(&e.pod_uid) else { return };
         let Some(c) = p.ctrs.iter_mut().find(|c| c.name == e.ctr) else { return };
         let reason = if e.oom { "OOMKilled" } else if e.exit_code == 0 { "Completed" } else { "Error" };
-        let term = Term { exit_code: e.exit_code, reason, started_at: e.started_at, finished_at: now() };
+        let term = Term { exit_code: e.exit_code, reason, started_at: e.started_at, finished_at: now(), message: e.message };
         // A container that ran for 10 minutes resets its backoff.
         if term.finished_at - term.started_at > 600 {
             c.backoff_ms = 0;
@@ -597,6 +605,17 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             self.kill_now(uid);
             return;
         }
+        // activeDeadlineSeconds counts from the pod start and may be changed while running.
+        if let Some(secs) = pod.pointer(&["spec", "activeDeadlineSeconds"]).and_then(Value::as_u64) {
+            let mut pods = self.pods.borrow_mut();
+            let p = pods.get_mut(uid).unwrap();
+            let finished = p.ctrs.iter().filter(|c| !c.init && !c.eph).all(|c| matches!(c.state, CState::Terminated(_)));
+            p.deadline_exceeded |= !finished && now() - p.start_time >= secs as i64;
+        }
+        if self.pods.borrow()[uid].deadline_exceeded {
+            self.kill_now(uid);
+            return;
+        }
         if self.pods.borrow()[uid].sandbox.is_none() {
             if let Err(e) = self.start_sandbox(uid, pod) {
                 self.pods.borrow_mut().get_mut(uid).unwrap().failed_setup = Some(e);
@@ -608,6 +627,16 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let n_init = self.pods.borrow()[uid].ctrs.iter().filter(|c| c.init).count();
         for i in 0..n_init {
             let state = self.pods.borrow()[uid].ctrs[i].state.clone();
+            if self.pods.borrow()[uid].ctrs[i].sidecar {
+                // Sidecar: the next init container waits for it to start; it restarts whatever its exit.
+                if matches!(state, CState::Running { .. }) && self.pods.borrow()[uid].ctrs[i].started {
+                    continue;
+                }
+                if !matches!(state, CState::Running { .. }) {
+                    self.maybe_start(uid, pod, i).await;
+                }
+                return;
+            }
             match state {
                 CState::Terminated(t) if t.exit_code == 0 => continue,
                 CState::Running { .. } => return,
@@ -642,7 +671,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 match p.ctrs.iter().position(|c| c.name == name) {
                     Some(i) => i,
                     None => {
-                        p.ctrs.push(Ctr { name: name.into(), image: e.get("image").and_then(Value::as_str).unwrap_or("").into(), init: false, eph: true, restart_count: 0, state: CState::Waiting("ContainerCreating", String::new()), last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: false, ready: false });
+                        p.ctrs.push(Ctr { name: name.into(), image: e.get("image").and_then(Value::as_str).unwrap_or("").into(), init: false, sidecar: false, eph: true, restart_count: 0, state: CState::Waiting("ContainerCreating", String::new()), last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: false, ready: false });
                         p.ctrs.len() - 1
                     }
                 }
@@ -664,6 +693,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     name: c.get("name").and_then(Value::as_str).unwrap_or("").into(),
                     image: c.get("image").and_then(Value::as_str).unwrap_or("").into(),
                     init,
+                    sidecar: init && c.get("restartPolicy").and_then(Value::as_str) == Some("Always"),
                     eph: false,
                     restart_count: 0,
                     state: CState::Waiting("ContainerCreating", String::new()),
@@ -681,7 +711,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         let prio = pod.pointer(&["spec", "priorityClassName"]).and_then(Value::as_str).unwrap_or("");
         let critical = prio.starts_with("system-") && prio.ends_with("-critical") || pod.pointer(&["metadata", "annotations", "kubernetes.io/config.mirror"]).is_some();
-        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ctrs, start_time: now(), kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, critical, evicted: None, host_ports: host_ports(pod) }
+        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ctrs, start_time: now(), kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod) }
     }
 
     fn start_sandbox(&self, uid: &str, pod: &Value) -> Result<(), String> {
@@ -721,7 +751,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         } else {
             None
         };
-        spec::write_etc_hosts(&dir, &hostname, ip).map_err(|_| String::from("cannot write /etc/hosts"))?;
+        spec::write_etc_hosts(&dir, pod, &hostname, ip).map_err(|_| String::from("cannot write /etc/hosts"))?;
         spec::write_resolv_conf(&dir, pod).map_err(|_| String::from("cannot write /etc/resolv.conf"))?;
         let mut pods = self.pods.borrow_mut();
         let p = pods.get_mut(uid).unwrap();
@@ -782,7 +812,33 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let pods = self.pods.borrow();
             (pods[uid].dir.clone(), pods[uid].ip)
         };
-        let built = match spec::build(&self.c, pod, cspec.unwrap_or(&Value::Null), &img, &pod_dir, pod_ip, &self.cfg.node_name).await {
+        // Image volumes (`volumes[].image`) need their image pulled first.
+        let first = self.pods.borrow()[uid].ctrs[i].seq == 0;
+        for vol in pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]) {
+            let Some(iv) = vol.get("image") else { continue };
+            let vimage = iv.get("reference").and_then(Value::as_str).unwrap_or("");
+            let vpolicy = iv.get("pullPolicy").and_then(Value::as_str).unwrap_or("");
+            let vlatest = !vimage.contains(':') || vimage.ends_with(":latest");
+            let need = self.store.image(vimage).is_none() || (first && (vpolicy == "Always" || (vpolicy.is_empty() && vlatest)));
+            let vkey = spec::pull_key(pod, vimage);
+            let vgate = if need && vpolicy != "Never" { self.pull_gate(&vkey, vimage) } else { PullGate::Ready };
+            if matches!(vgate, PullGate::Start) {
+                let creds = self.pull_creds(pod).await;
+                self.start_pull(vkey.clone(), vimage.to_string(), creds);
+            }
+            if !matches!(vgate, PullGate::Ready) {
+                let failed = match self.pulls.borrow().get(&vkey) {
+                    Some(Pull::Failed { msg, .. }) => Some(msg.clone()),
+                    _ => None,
+                };
+                match failed {
+                    Some(m) => self.set_waiting(uid, i, "ImagePullBackOff", m),
+                    None => self.set_waiting(uid, i, "ContainerCreating", alloc::format!("pulling image {vimage}")),
+                }
+                return;
+            }
+        }
+        let built = match spec::build(&self.c, pod, cspec.unwrap_or(&Value::Null), &img, &pod_dir, pod_ip, &self.cfg.node_name, &self.store).await {
             Ok(b) => b,
             Err(msg) => {
                 // A claim that is not bound yet is the pod waiting for its volume, not a config error.
@@ -850,7 +906,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     let cs = cspec.cloned().unwrap_or(Value::Null);
                     c.probes = [probe::Kind::Startup, probe::Kind::Liveness, probe::Kind::Readiness]
                         .into_iter()
-                        .filter(|_| !c.init && !c.eph)
+                        .filter(|_| (!c.init || c.sidecar) && !c.eph)
                         .filter_map(|k| cs.get(k.field()).map(|p| (k, probe::State::new(p.clone(), now_ms()))))
                         .collect();
                     c.started = !c.probes.iter().any(|(k, _)| *k == probe::Kind::Startup);
@@ -868,7 +924,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                         }
                     });
                 }
-                self.spawn_waiter(uid.to_string(), name, cid, running, started);
+                let fallback_logs = cspec.and_then(|c| c.get("terminationMessagePolicy")).and_then(Value::as_str) == Some("FallbackToLogsOnError");
+                self.spawn_waiter(uid.to_string(), name, cid, running, started, pod_dir, fallback_logs);
             }
             Err(e) => {
                 let _ = self.maps.run_as_root(|| self.store.delete_container(&cid).is_ok());
@@ -894,6 +951,12 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         // A completed pull is recorded by removing the entry and the image being present.
         if self.store.image(image).is_some() && !pulls.contains_key(key) && self.pulled_once(key) {
             return PullGate::Ready;
+        }
+        // Another identity is pulling the same image (every e2e namespace is its own key): wait
+        // for it rather than download it again; if it fails, this key then pulls on its own.
+        let prefix = alloc::format!("{image}\0");
+        if pulls.iter().any(|(k, p)| k.starts_with(&prefix) && matches!(p, Pull::InProgress)) {
+            return PullGate::Wait;
         }
         pulls.insert(key.to_string(), Pull::InProgress);
         PullGate::Start
@@ -945,7 +1008,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         self.done_pulls.borrow().iter().any(|i| i == key)
     }
 
-    fn spawn_waiter(self: &Rc<Self>, pod_uid: String, ctr: String, cid: String, running: Running, started_at: i64) {
+    fn spawn_waiter(self: &Rc<Self>, pod_uid: String, ctr: String, cid: String, running: Running, started_at: i64, pod_dir: String, fallback_logs: bool) {
         let me = self.clone();
         kr_rt::exec::spawn(async move {
             let (exit_code, oom) = match running.wait().await {
@@ -953,7 +1016,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 Err(_) => (128, false),
             };
             let _ = me.maps.run_as_root(|| me.store.delete_container(&cid).is_ok());
-            me.exits.borrow_mut().push(Exit { pod_uid, ctr, exit_code, oom, started_at });
+            let message = spec::termination_message(&pod_dir, &ctr, fallback_logs, exit_code != 0);
+            me.exits.borrow_mut().push(Exit { pod_uid, ctr, exit_code, oom, started_at, message });
             me.notify.notify();
         });
     }
@@ -1060,6 +1124,10 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 p.kill_at = Some(now_ms() + grace * 1000);
                 let pod_target = p.sandbox.as_ref().and_then(|s| s.target().ok());
                 for c in &p.ctrs {
+                    // Sidecars outlive the app containers (their hooks may need them): see below.
+                    if c.sidecar {
+                        continue;
+                    }
                     let Some(s) = c.signaller.clone() else { continue };
                     let cspec = ["containers", "initContainers"].iter().flat_map(|k| pod.pointer(&["spec", k]).and_then(Value::as_array).unwrap_or(&[]).iter()).find(|cs| cs.get("name").and_then(Value::as_str) == Some(c.name.as_str())).cloned();
                     let hook = cspec.as_ref().and_then(|cs| cs.pointer(&["lifecycle", "preStop"])).cloned();
@@ -1078,12 +1146,23 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     }
                 }
             }
+            // Sidecars stop once every other container has.
+            if p.ctrs.iter().filter(|c| !c.sidecar).all(|c| c.signaller.is_none()) {
+                for c in p.ctrs.iter().filter(|c| c.sidecar) {
+                    if let Some(s) = &c.signaller {
+                        let _ = s.send(kr_sys::ns::SIGTERM);
+                    }
+                }
+            }
             p.kill_at.unwrap()
         };
         if now_ms() >= deadline {
             self.kill_now(uid);
         }
         if self.all_stopped(uid) {
+            // A pod kept by finalizers stays visible: record that nothing runs any more
+            // (terminal phase, terminated containers), as upstream's kubelet does.
+            self.report_final_status(uid, pod).await;
             self.cleanup(uid);
             // Finish the deletion: the API object is removed once nothing runs.
             let path = alloc::format!("/api/v1/namespaces/{}/pods/{}", meta(pod, "namespace"), meta(pod, "name"));
@@ -1122,10 +1201,12 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     /// Builds the pod status and patches it if it changed.
     async fn report_status(&self, uid: &str, pod: &Value) {
         let (status, path) = {
-            let pods = self.pods.borrow();
-            let Some(p) = pods.get(uid) else { return };
+            let mut pods = self.pods.borrow_mut();
+            let Some(p) = pods.get_mut(uid) else { return };
             let policy = pod.pointer(&["spec", "restartPolicy"]).and_then(Value::as_str).unwrap_or("Always");
-            (status_json(p, policy), alloc::format!("/api/v1/namespaces/{}/pods/{}/status", p.ns, p.name))
+            let mut status = status_json(p, policy);
+            stamp_conditions(p, &mut status, pod.pointer(&["metadata", "generation"]).and_then(Value::as_i64).unwrap_or(0));
+            (status, alloc::format!("/api/v1/namespaces/{}/pods/{}/status", p.ns, p.name))
         };
         let text = json::to_string(&status);
         if self.pods.borrow().get(uid).is_some_and(|p| p.last_status == text) {
@@ -1145,6 +1226,62 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
 }
 
 
+impl<C: Client + Clone + 'static> Kubelet<C> {
+    /// Status for a pod whose containers have all stopped after deletion: `Succeeded` if every
+    /// regular container exited 0, else `Failed`; not ready.
+    async fn report_final_status(&self, uid: &str, pod: &Value) {
+        let (mut status, path) = {
+            let pods = self.pods.borrow();
+            let Some(p) = pods.get(uid) else { return };
+            let policy = pod.pointer(&["spec", "restartPolicy"]).and_then(Value::as_str).unwrap_or("Always");
+            (status_json(p, policy), alloc::format!("/api/v1/namespaces/{}/pods/{}/status", p.ns, p.name))
+        };
+        let ok = self.pods.borrow().get(uid).is_some_and(|p| p.ctrs.iter().filter(|c| !c.init).all(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code == 0)));
+        if let Value::Object(f) = &mut status {
+            f.retain(|(k, _)| k != "phase");
+            f.push((String::from("phase"), Value::from(if ok { "Succeeded" } else { "Failed" })));
+            f.push((String::from("qosClass"), Value::from(spec::qos_class(pod))));
+            for (k, v) in f.iter_mut() {
+                if k == "conditions" {
+                    for c in v.as_array_mut().into_iter().flatten() {
+                        if matches!(c.get("type").and_then(Value::as_str), Some("Ready" | "ContainersReady")) {
+                            c.set("status", Value::from("False"));
+                        }
+                    }
+                }
+            }
+        }
+        let patch = Value::Object(alloc::vec![(String::from("status"), status)]);
+        let _ = self.c.patch(&path, "application/merge-patch+json", &patch).await;
+    }
+}
+
+/// Gives each condition the time its status last changed and stamps `observedGeneration` (the
+/// pod's `metadata.generation` this status was computed for) on the status and its conditions.
+fn stamp_conditions(p: &mut PodRt, status: &mut Value, generation: i64) {
+    let gen = Value::Number(Number::from_i64(generation));
+    let Some(Value::Array(conds)) = status.get_mut("conditions") else { return };
+    for c in conds.iter_mut() {
+        let ty = c.get("type").and_then(Value::as_str).unwrap_or("").to_string();
+        let ok = c.get("status").and_then(Value::as_str) == Some("True");
+        let at = match p.conds.iter_mut().find(|(t, _, _)| *t == ty) {
+            Some(e) => {
+                if e.1 != ok {
+                    *e = (ty, ok, now());
+                }
+                e.2
+            }
+            None => {
+                p.conds.push((ty, ok, p.start_time));
+                p.start_time
+            }
+        };
+        c.set("lastTransitionTime", Value::String(rfc3339(at)));
+        c.set("observedGeneration", gen.clone());
+    }
+    status.set("observedGeneration", gen);
+}
+
 fn status_json(p: &PodRt, policy: &str) -> Value {
     let t = |s: i64| Value::String(rfc3339(s));
     let o = |f: Vec<(&str, Value)>| Value::Object(f.into_iter().map(|(k, v)| (k.into(), v)).collect());
@@ -1152,13 +1289,17 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
         match s {
             CState::Waiting(r, m) => o(alloc::vec![("waiting", o(alloc::vec![("reason", Value::from(*r)), ("message", Value::from(m.as_str()))]))]),
             CState::Running { started_at, .. } => o(alloc::vec![("running", o(alloc::vec![("startedAt", t(*started_at))]))]),
-            CState::Terminated(tm) => o(alloc::vec![(
-                "terminated",
-                o(alloc::vec![("exitCode", Value::Number(Number::from_i64(tm.exit_code as i64))), ("reason", Value::from(tm.reason)), ("startedAt", t(tm.started_at)), ("finishedAt", t(tm.finished_at))])
-            )]),
+            CState::Terminated(tm) => {
+                let mut f = alloc::vec![("exitCode", Value::Number(Number::from_i64(tm.exit_code as i64))), ("reason", Value::from(tm.reason)), ("startedAt", t(tm.started_at)), ("finishedAt", t(tm.finished_at))];
+                if !tm.message.is_empty() {
+                    f.push(("message", Value::from(tm.message.as_str())));
+                }
+                o(alloc::vec![("terminated", o(f))])
+            }
         }
     };
-    let inits_done = p.ctrs.iter().filter(|c| c.init).all(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code == 0));
+    let init_ok = |c: &Ctr| if c.sidecar { matches!(c.state, CState::Running { .. }) && c.started } else { matches!(&c.state, CState::Terminated(t) if t.exit_code == 0) };
+    let inits_done = p.ctrs.iter().filter(|c| c.init).all(init_ok);
     let cstat = |c: &Ctr| -> Value {
         let id = match &c.state {
             CState::Running { id, .. } => alloc::format!("kr://{id}"),
@@ -1171,11 +1312,15 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
             ("image", Value::from(c.image.as_str())),
             ("imageID", Value::from("")),
             ("containerID", Value::String(id)),
-            ("ready", Value::Bool(if c.init { matches!(&c.state, CState::Terminated(t) if t.exit_code == 0) } else { ready && !c.eph })),
+            ("ready", Value::Bool(if c.sidecar { ready } else if c.init { init_ok(c) } else { ready && !c.eph })),
             ("started", Value::Bool(running && c.started)),
             ("restartCount", Value::Number(Number::from_u64(c.restart_count as u64))),
             ("state", match &c.state {
                 CState::Waiting("ContainerCreating", m) if !c.init && !c.eph && !inits_done => state_json(&CState::Waiting("PodInitializing", m.clone())),
+                // Init containers queued behind one that has not completed yet.
+                CState::Waiting("ContainerCreating", m) if c.init && p.ctrs.iter().take_while(|o| !core::ptr::eq(*o, c)).any(|o| o.init && !matches!(&o.state, CState::Terminated(t) if t.exit_code == 0)) => {
+                    state_json(&CState::Waiting("PodInitializing", m.clone()))
+                }
                 s => state_json(s),
             }),
         ];
@@ -1185,12 +1330,12 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
     let apps: Vec<&Ctr> = p.ctrs.iter().filter(|c| !c.init && !c.eph).collect();
     let all_running = !apps.is_empty() && apps.iter().all(|c| matches!(c.state, CState::Running { .. }) && c.started && c.ready);
     let all_done = !apps.is_empty() && apps.iter().all(|c| matches!(c.state, CState::Terminated(_)));
-    let failed = apps.iter().any(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code != 0)) || p.ctrs.iter().any(|c| c.init && matches!(&c.state, CState::Terminated(t) if t.exit_code != 0) && policy == "Never");
-    let phase = if p.failed_setup.is_some() || p.evicted.is_some() {
+    let failed = apps.iter().any(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code != 0)) || p.ctrs.iter().any(|c| c.init && !c.sidecar && matches!(&c.state, CState::Terminated(t) if t.exit_code != 0) && policy == "Never");
+    let phase = if p.failed_setup.is_some() || p.evicted.is_some() || p.deadline_exceeded {
         "Failed"
     } else if all_done && policy != "Always" && (policy == "Never" || !failed) {
         if failed { "Failed" } else { "Succeeded" }
-    } else if failed && policy == "Never" && apps.iter().all(|c| !matches!(c.state, CState::Running { .. })) && p.ctrs.iter().any(|c| c.init && matches!(&c.state, CState::Terminated(t) if t.exit_code != 0)) {
+    } else if failed && policy == "Never" && apps.iter().all(|c| !matches!(c.state, CState::Running { .. })) && p.ctrs.iter().any(|c| c.init && !c.sidecar && matches!(&c.state, CState::Terminated(t) if t.exit_code != 0)) {
         "Failed"
     } else if apps.iter().any(|c| matches!(c.state, CState::Running { .. })) || (inits_done && apps.iter().any(|c| c.last_term.is_some())) {
         "Running"
@@ -1207,7 +1352,7 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
         }
         o(f)
     };
-    let incomplete: Vec<&str> = p.ctrs.iter().filter(|c| c.init && !matches!(&c.state, CState::Terminated(t) if t.exit_code == 0)).map(|c| c.name.as_str()).collect();
+    let incomplete: Vec<&str> = p.ctrs.iter().filter(|c| c.init && !init_ok(c)).map(|c| c.name.as_str()).collect();
     let init_why = Some(("ContainersNotInitialized", alloc::format!("containers with incomplete status: [{}]", incomplete.join(" "))));
     let notready = || Some(("ContainersNotReady", {
         let n: Vec<&str> = apps.iter().filter(|c| !(matches!(c.state, CState::Running { .. }) && c.started && c.ready)).map(|c| c.name.as_str()).collect();
@@ -1236,6 +1381,10 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
     if let Some(msg) = &p.evicted {
         f.push(("message", Value::from(msg.as_str())));
         f.push(("reason", Value::from("Evicted")));
+    }
+    if p.deadline_exceeded {
+        f.push(("message", Value::from("Pod was active on the node longer than the specified deadline")));
+        f.push(("reason", Value::from("DeadlineExceeded")));
     }
     if let Some(msg) = &p.failed_setup {
         f.push(("message", Value::from(msg.as_str())));
@@ -1266,10 +1415,10 @@ mod status_tests {
     use alloc::vec;
 
     fn ctr(name: &str, init: bool, eph: bool, state: CState) -> Ctr {
-        Ctr { name: name.into(), image: "img".into(), init, eph, restart_count: 0, state, last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: true, ready: true }
+        Ctr { name: name.into(), image: "img".into(), init, sidecar: false, eph, restart_count: 0, state, last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: true, ready: true }
     }
     fn done(code: i32) -> CState {
-        CState::Terminated(Term { exit_code: code, reason: if code == 0 { "Completed" } else { "Error" }, started_at: 1, finished_at: 2 })
+        CState::Terminated(Term { exit_code: code, reason: if code == 0 { "Completed" } else { "Error" }, started_at: 1, finished_at: 2, message: String::new() })
     }
     fn run() -> CState {
         CState::Running { started_at: 1, id: "x".into() }
@@ -1278,7 +1427,7 @@ mod status_tests {
         CState::Waiting("ContainerCreating", String::new())
     }
     fn pod(ctrs: Vec<Ctr>) -> PodRt {
-        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ctrs, start_time: 0, kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, critical: false, evicted: None, host_ports: Vec::new() }
+        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ctrs, start_time: 0, kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new() }
     }
     fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
         path.iter().try_fold(v, |v, k| match k.parse::<usize>() {
@@ -1304,6 +1453,30 @@ mod status_tests {
         assert_eq!(s(i, &["message"]), Some("containers with incomplete status: [init1 init2]"));
         assert_eq!(s(cond(&st, "Ready"), &["reason"]), Some("ContainersNotReady"));
         assert_eq!(s(&st, &["initContainerStatuses", "1", "name"]), Some("init2"));
+        // Queued behind init1; init1 itself is the one being created.
+        assert_eq!(s(&st, &["initContainerStatuses", "1", "state", "waiting", "reason"]), Some("PodInitializing"));
+        let st = status_json(&pod(vec![ctr("init1", true, false, creating()), ctr("init2", true, false, creating())]), "Always");
+        assert_eq!(s(&st, &["initContainerStatuses", "0", "state", "waiting", "reason"]), Some("ContainerCreating"));
+    }
+
+    #[test]
+    fn condition_times_and_generation() {
+        let mut p = pod(vec![ctr("run1", false, false, creating())]);
+        p.start_time = 100;
+        p.ctrs[0].ready = false;
+        let mut st = status_json(&p, "Always");
+        stamp_conditions(&mut p, &mut st, 3);
+        assert_eq!(s(cond(&st, "Ready"), &["lastTransitionTime"]), Some(rfc3339(100).as_str()));
+        assert_eq!(at(&st, &["observedGeneration"]).and_then(Value::as_i64), Some(3));
+        assert_eq!(at(cond(&st, "Ready"), &["observedGeneration"]).and_then(Value::as_i64), Some(3));
+        p.ctrs[0].state = run();
+        p.ctrs[0].ready = true;
+        let mut st = status_json(&p, "Always");
+        stamp_conditions(&mut p, &mut st, 4);
+        assert_eq!(s(cond(&st, "Ready"), &["status"]), Some("True"));
+        assert_ne!(s(cond(&st, "Ready"), &["lastTransitionTime"]), Some(rfc3339(100).as_str()));
+        assert_eq!(s(cond(&st, "PodScheduled"), &["lastTransitionTime"]), Some(rfc3339(100).as_str()));
+        assert_eq!(at(cond(&st, "Ready"), &["observedGeneration"]).and_then(Value::as_i64), Some(4));
     }
 
     #[test]
@@ -1327,7 +1500,7 @@ mod status_tests {
     fn failing_init_always() {
         let mut i = ctr("init1", true, false, CState::Waiting("CrashLoopBackOff", String::new()));
         i.restart_count = 2;
-        i.last_term = Some(Term { exit_code: 1, reason: "Error", started_at: 1, finished_at: 2 });
+        i.last_term = Some(Term { exit_code: 1, reason: "Error", started_at: 1, finished_at: 2, message: String::new() });
         let st = status_json(&pod(vec![i, ctr("run1", false, false, creating())]), "Always");
         assert_eq!(s(&st, &["phase"]), Some("Pending"));
         assert_eq!(at(&st, &["initContainerStatuses", "0", "restartCount"]).and_then(Value::as_u64), Some(2));
