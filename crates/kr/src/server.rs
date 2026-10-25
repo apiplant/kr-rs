@@ -166,6 +166,20 @@ fn server_identity(data: &str, advertise: [u8; 4]) -> Result<u64, String> {
     Ok(id)
 }
 
+/// Converts a single-server datastore to HA: its image becomes the Raft snapshot at index 1
+/// with this server as the only voter (servers that join later receive it as InstallSnapshot).
+/// The old directory is renamed to `db.imported` afterwards, so a crash in between just
+/// imports again.
+fn import_single_server(data: &str, raft_dir: &str, id: u64) -> Result<(), String> {
+    let image = kr_store::Store::open(&format!("{data}/db")).map_err(|_| String::from("cannot open the single-server datastore"))?.image();
+    let (mut st, _) = kr_raft::storage::Storage::open(raft_dir).map_err(|e| format!("raft storage: {e:?}"))?;
+    let snap = kr_raft::Snapshot { meta: kr_raft::SnapshotMeta { index: 1, term: 1, voters: alloc::vec![id] }, data: Rc::from(image) };
+    st.save_snapshot(&snap).map_err(|e| format!("raft snapshot: {e:?}"))?;
+    st.set_hard_state(kr_raft::HardState { term: 1, vote: None, commit: 1 }).map_err(|e| format!("raft hard state: {e:?}"))?;
+    let (from, to) = (format!("{data}/db\0"), format!("{data}/db.imported\0"));
+    fs::renameat2(fs::AT_FDCWD, from.as_bytes(), fs::AT_FDCWD, to.as_bytes(), 0).map_err(|e| format!("rename db: errno {}", e.0))
+}
+
 /// Files a joining server receives (relative to the data dir) and their modes.
 const JOIN_FILES: [(&str, u32); 5] = [("pki/ca.pem", 0o644), ("pki/ca.key", 0o600), ("pki/sa.key", 0o600), ("node-token", 0o600), ("server-token", 0o600)];
 
@@ -314,9 +328,10 @@ pub fn main(mut args: Args) -> i32 {
     }
     // The address pods, agents and other servers use to reach this API server.
     let advertise = kr_sys::ns::route_source([1, 1, 1, 1]).unwrap_or([127, 0, 0, 1]);
-    if ha && raft_fresh && exists(&pki::path(&format!("{data}/db"), "log")) {
-        // TODO(kr-raft): import the single-server store as the initial Raft snapshot.
-        return fail("this server already has a single-server datastore; converting it to HA is not supported yet");
+    // An existing single-server datastore: imported on --cluster-init, never thrown away by a join.
+    let import_db = ha && raft_fresh && exists(&pki::path(&format!("{data}/db"), "log"));
+    if import_db && join_url.is_some() {
+        return fail("this server already has a single-server datastore; it can found a cluster (--cluster-init) but not join one");
     }
     let setup = || -> Result<(Rc<ServerConfig>, kr_store::Store), String> {
         // The CA travels in the chain so joining agents can pin it by hash.
@@ -353,6 +368,10 @@ pub fn main(mut args: Args) -> i32 {
             let voters = if raft_fresh && join_url.is_none() { alloc::vec![id] } else { Vec::new() };
             let mut seed = [0u8; 8];
             kr_sys::getrandom(&mut seed);
+            if import_db {
+                import_single_server(&data, &raft_dir, id)?;
+                print(b"kr server: imported the single-server datastore as the initial Raft snapshot\n");
+            }
             let c = kr_apiserver::cluster::Cluster::open(&api, id, &raft_dir, voters, cli_tls, u64::from_le_bytes(seed))?;
             c.set_self_addr(kr_apiserver::cluster::ServerAddr { ip: advertise, raft_port: kr_apiserver::cluster::transport::PORT, api_port: port });
             c.set_join_secrets(join_secrets(&data)?);

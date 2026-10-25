@@ -2,7 +2,9 @@
 # HA cluster test (ADR-026): servers krs1..krs3 (Raft) + agent kra1 in throwaway privileged
 # containers (dev only). Checks joining, replication, write forwarding from followers,
 # leader failover after kill -9, restart catch-up and server removal.
-#   tools/test/ha.sh [up|test|down]     (default: up + test; leaves the cluster running)
+#   tools/test/ha.sh [up|test|import|down]   (default: up + test; leaves the cluster running)
+#   import: a single-server install converted with --cluster-init, a second server joins
+#           (InstallSnapshot), then the first restarts and must reach its peer (2 voters).
 # Then: docker exec -e KUBECONFIG=/var/tmp/srv/admin.kubeconfig krs1 kubectl get nodes
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
@@ -108,9 +110,42 @@ test_() {
   echo "PASS"
 }
 
+import_() {
+  down
+  docker network create krha >/dev/null
+  for n in krs1 krs2; do
+    docker run -d --name $n --hostname $n --network krha --privileged --tmpfs /store:exec,size=2g \
+      -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" \
+      archlinux:base-devel sleep infinity >/dev/null
+  done
+  start krs1; wait_api krs1
+  k krs1 create configmap legacy --from-literal=a=b >/dev/null
+  WANT=$(k krs1 get configmap legacy -o jsonpath='{.metadata.uid}/{.metadata.resourceVersion}')
+  docker exec krs1 pkill -x kr; sleep 2
+  start krs1 --cluster-init; wait_api krs1
+  docker exec krs1 grep -q "imported the single-server datastore" /tmp/srv.log || fail "no import"
+  [ "$(k krs1 get configmap legacy -o jsonpath='{.metadata.uid}/{.metadata.resourceVersion}')" = "$WANT" ] || fail "legacy object changed"
+  k krs1 create configmap after-import >/dev/null
+  TOKEN=$(docker exec krs1 cat /var/tmp/srv/server-token)
+  docker exec krs2 sh -c "umask 077; echo '$TOKEN' > /root/server-token"
+  start krs2 --server "https://$(ip krs1):6443" --token-file /root/server-token; wait_api krs2
+  for _ in $(seq 60); do docker exec krs2 grep -q "joined as voter" /tmp/srv.log && break; sleep 1; done
+  for _ in $(seq 30); do k krs2 get configmap legacy after-import >/dev/null 2>&1 && break; sleep 1; done
+  k krs2 get configmap legacy after-import >/dev/null || fail "krs2 did not get the snapshot"
+  # Two voters: the restarted server is needed for quorum and must find krs2 on its own.
+  docker exec krs1 pkill -9 -x kr; sleep 1
+  start krs1; wait_api krs1
+  for _ in $(seq 30); do k krs1 get configmap after-import >/dev/null 2>&1 && break; sleep 1; done
+  k krs1 get configmap after-import >/dev/null || fail "krs1 did not recover after restart"
+  for _ in $(seq 30); do k krs1 create configmap after-restart >/dev/null 2>&1 && break; sleep 1; done
+  k krs2 get configmap after-restart >/dev/null || fail "no quorum after restart"
+  echo "PASS (import)"
+}
+
 case "${1:-all}" in
   up) up ;;
   test) test_ ;;
+  import) import_ ;;
   down) down ;;
   all) up; test_ ;;
 esac

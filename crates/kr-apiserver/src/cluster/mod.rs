@@ -95,6 +95,9 @@ pub struct Cluster {
     /// HTTP client for forwarding writes to the leader (created on first use).
     /// This server's own address, registered under [`SERVERS_PREFIX`] when it leads.
     self_addr: RefCell<Option<ServerAddr>>,
+    /// Peer addresses as last saved to `peers` (a restarted server must reach the others
+    /// before its store, where the addresses are replicated, is caught up).
+    saved_peers: RefCell<String>,
     join_secrets: RefCell<Option<join::JoinSecrets>>,
     forwarder: RefCell<Option<Rc<kr_net::http1::client::Client<kr_net::tls::TlsConnector>>>>,
 }
@@ -126,10 +129,21 @@ impl Cluster {
             was_ready: Cell::new(false),
             epoch: Cell::new(0),
             self_addr: RefCell::new(None),
+            saved_peers: RefCell::new(String::new()),
             join_secrets: RefCell::new(None),
             forwarder: RefCell::new(None),
         };
         api.store.borrow_mut().set_visible(c.committed_rev.get());
+        if let Ok(Some(b)) = c.storage.borrow().load_extra("peers") {
+            *c.saved_peers.borrow_mut() = String::from_utf8_lossy(&b).into_owned();
+            if let Ok(kr_fmt::json::Value::Object(m)) = kr_fmt::json::parse(&b) {
+                for (id, a) in m {
+                    if let (Ok(id), Some(a)) = (id.parse::<NodeId>(), ServerAddr::from_json(kr_fmt::json::to_string(&a).as_bytes())) {
+                        c.seeds.borrow_mut().insert(id, a);
+                    }
+                }
+            }
+        }
         Ok(Rc::new(c))
     }
 
@@ -306,17 +320,29 @@ impl Cluster {
         let store = api.store.borrow();
         let mut peers = self.peers.borrow_mut();
         peers.retain(|id, _| voters.contains(id));
+        let mut known = String::from("{");
         for id in voters {
             if id == self.id {
                 continue;
             }
             let stored = store.get(&alloc::format!("{SERVERS_PREFIX}{id}")).and_then(|kv| ServerAddr::from_json(&kv.value));
             let Some(a) = stored.or_else(|| self.seeds.borrow().get(&id).cloned()) else { continue };
+            if known.len() > 1 {
+                known.push(',');
+            }
+            known.push_str(&alloc::format!("\"{id}\":{}", a.to_json()));
             match peers.get(&id) {
                 Some(p) => p.set_addr((a.ip, a.raft_port)),
                 None => {
                     peers.insert(id, Peer::new((a.ip, a.raft_port), self.tls.clone()));
                 }
+            }
+        }
+        known.push('}');
+        if *self.saved_peers.borrow() != known {
+            // Best effort: without it a restart still works whenever a quorum is up.
+            if self.storage.borrow_mut().save_extra("peers", known.as_bytes()).is_ok() {
+                *self.saved_peers.borrow_mut() = known;
             }
         }
     }

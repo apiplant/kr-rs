@@ -387,6 +387,8 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
   - The server token (`server-token`, `K10<ca hash>::server:<secret>`) is created only on HA servers and copied to joiners.
   - Joining is two-phase: `/kr/join-server` (token) returns key material and the current server addresses; the joiner issues its own certificates, starts Raft as a non-member that answers the known servers, then calls `/kr/add-server` with its `system:kr-server:<id>` certificate (the id comes from the certificate, never the body). The voter is added only once the newcomer listens, so a 1→2 change can commit.
   - Forwarded requests carry `Kr-Forwarded-Identity` (base64 JSON user and groups), honoured only from `system:kr-servers` certificates and forwarded at most once; the leader returns `Kr-Revision` and the follower waits to apply it before answering.
+  - Converting a single-server install: `--cluster-init` on an existing datastore writes its image as the Raft snapshot at index 1 (term 1, this server the only voter) and renames `db` to `db.imported`.
+  - Peer addresses are also saved in `raft/peers` and loaded as seeds at start: the replicated `/kr/servers/` entries are only applied after a quorum is reached, which may need those very peers.
   - Leader-only components run under `Cluster::while_leader` (started when the leader is ready, aborted on step-down).
 
 **Status:** accepted (implemented; gaps in KNOWN_ISSUES #97).

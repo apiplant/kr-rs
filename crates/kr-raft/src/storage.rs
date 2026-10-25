@@ -153,7 +153,7 @@ impl Storage {
     pub fn open(dir: &str) -> Result<(Storage, Loaded)> {
         mkdir_p(dir)?;
         let dfd = fs::openat(AT_FDCWD, &cname(dir), fs::O_RDONLY | fs::O_DIRECTORY | fs::O_CLOEXEC, 0)?;
-        for t in ["hardstate.tmp", "snapshot.tmp", "log.tmp.w", "log.tmp.w.tmp"] {
+        for t in ["hardstate.tmp", "snapshot.tmp", "peers.tmp", "log.tmp.w", "log.tmp.w.tmp"] {
             let _ = fs::unlinkat(dfd.raw(), &cname(t), 0);
         }
         let hs = match read_all(&dfd, "hardstate")? {
@@ -277,6 +277,16 @@ impl Storage {
     }
 
     /// Saves a snapshot durably and drops log entries it covers (log rewritten atomically).
+    /// The driver's own small state next to the log (atomic replace): e.g. peer addresses,
+    /// which must be known before the log is applied.
+    pub fn save_extra(&mut self, name: &'static str, data: &[u8]) -> Result<()> {
+        write_atomic(&self.dir, name, data)
+    }
+
+    pub fn load_extra(&self, name: &'static str) -> Result<Option<Vec<u8>>> {
+        read_all(&self.dir, name)
+    }
+
     pub fn save_snapshot(&mut self, s: &Snapshot) -> Result<()> {
         write_atomic(&self.dir, "snapshot", &encode_snapshot(s))?;
         self.compact_log(s.meta.index)

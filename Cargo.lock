@@ -12,6 +12,7 @@ dependencies = [
  "kr-fmt",
  "kr-kubelet",
  "kr-net",
+ "kr-raft",
  "kr-rt",
  "kr-runtime",
  "kr-store",

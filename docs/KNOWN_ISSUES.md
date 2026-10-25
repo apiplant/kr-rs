@@ -38,7 +38,8 @@ Living list, grouped by what still needs doing. Each item: **status**, impact, p
 97. **HA (kr-raft, ADR-026) gaps** — *partly fixed*
     `kr server --cluster-init` starts a Raft-replicated control plane; `kr server --server https://<any server>:6443 --token-file <server-token>` joins one (2-phase: key material, then `POST /kr/add-server` with its own server certificate); `POST /kr/remove-server {"id":N}` (system:masters) removes one. Followers serve reads and watches locally and forward writes (HTTP and in-process) to the leader; controllers and the scheduler run on the leader only. `tools/test/ha.sh` (3 servers + agent: join, forwarding, kill -9 of the leader, controller hand-over, catch-up, identical stores, removal) passes; Raft itself is checked by a chaos simulation (`crates/kr-raft/src/tests.rs`).
     Remaining:
-    - An existing single-server datastore cannot be converted to HA yet (refused at start); plan: import its image as the initial Raft snapshot.
+    - Fixed: an existing single-server datastore is converted by `kr server --cluster-init` (its image becomes the Raft snapshot at index 1, the old dir is kept as `db.imported`; `tools/test/ha.sh import`). Joining with an existing datastore is refused.
+    - Fixed: a restarted server could not reach its peers when they were needed for quorum (their addresses are in the replicated store, which is behind on restart); known addresses are now kept in `raft/peers`.
     - Agents talk to the one server in `--server`; no client-side failover or load-balanced address yet (plan: agents learn the `kubernetes` endpoints and rotate on failure).
     - A removed server never sees its own removal and keeps pre-campaigning until it is stopped (harmless: pre-vote, and its log is behind). Stop and wipe removed servers.
     - No learners: a joining server is a voter as soon as its add commits, so a 1→2 cluster stalls if the newcomer dies before catching up. Join one server at a time.

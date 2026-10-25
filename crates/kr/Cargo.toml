@@ -12,6 +12,7 @@ kr-fmt = { path = "../kr-fmt" }
 kr-crypto = { path = "../kr-crypto" }
 kr-net = { path = "../kr-net" }
 kr-store = { path = "../kr-store" }
+kr-raft = { path = "../kr-raft" }
 kr-apiserver = { path = "../kr-apiserver" }
 kr-kubelet = { path = "../kr-kubelet" }
 kr-controllers = { path = "../kr-controllers" }
