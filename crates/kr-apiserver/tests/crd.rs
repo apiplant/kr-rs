@@ -89,7 +89,9 @@ fn crd_is_established_and_validated() {
 }
 
 #[test]
-fn protobuf_crd_gets_415() {
+/// Protobuf CRD bodies are decoded (proto tables include apiextensions): an empty one is
+/// rejected by validation, not as an unsupported media type.
+fn protobuf_crd_is_decoded() {
     let api = server();
     let mut body = b"k8s\0".to_vec();
     // runtime.Unknown { typeMeta { apiVersion, kind } }
@@ -101,8 +103,8 @@ fn protobuf_crd_gets_415() {
     body.extend_from_slice(&[0x0a, tm.len() as u8]);
     body.extend_from_slice(&tm);
     body.extend_from_slice(&[0x12, 0]);
-    let (c, _) = call(&api, "POST", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions", "application/vnd.kubernetes.protobuf", std::str::from_utf8(&body).unwrap());
-    assert_eq!(c, 415);
+    let (c, b) = call(&api, "POST", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions", "application/vnd.kubernetes.protobuf", std::str::from_utf8(&body).unwrap());
+    assert!(c == 400 || c == 422, "{c} {b}");
 }
 
 #[test]

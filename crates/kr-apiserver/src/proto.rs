@@ -121,7 +121,8 @@ fn message(buf: &[u8], idx: u16, depth: usize) -> R<Value> {
         s::M_DURATION => return duration(buf),
         s::M_INT_OR_STRING => return int_or_string(buf),
         s::M_QUANTITY => return quantity(buf),
-        s::M_RAW_EXTENSION | s::M_FIELDS_V1 => return raw_json(buf),
+        s::M_RAW_EXTENSION | s::M_FIELDS_V1 | s::M_EXT_JSON => return raw_json(buf),
+        s::M_SCHEMA_OR_ARRAY | s::M_SCHEMA_OR_BOOL | s::M_SCHEMA_OR_STRINGS => return schema_union(buf, idx, depth),
         _ => {}
     }
     let fields = fields_of(idx);
@@ -348,6 +349,32 @@ fn quantity(buf: &[u8]) -> R<Value> {
     Ok(Value::String(q))
 }
 
+/// The CRD schema unions, whose JSON form is one of their alternatives:
+/// `JSONSchemaPropsOrArray` {1 schema, 2 jSONSchemas} → schema object or array of schemas;
+/// `JSONSchemaPropsOrBool` {1 allows, 2 schema} → schema object or bool;
+/// `JSONSchemaPropsOrStringArray` {1 schema, 2 property} → schema object or array of strings.
+fn schema_union(buf: &[u8], idx: u16, depth: usize) -> R<Value> {
+    let schema_num = if idx == s::M_SCHEMA_OR_BOOL { 2 } else { 1 };
+    let schema_idx = fields_of(idx).iter().find(|f| f.num == schema_num).map(|f| f.arg).ok_or("protobuf: bad schema")?;
+    let (mut schema, mut list, mut allows) = (None, Vec::new(), false);
+    simple(buf, |n, v| {
+        match (idx, n, v) {
+            (_, n, wire::Value::Bytes(b)) if n == schema_num as u32 => schema = Some(message(b, schema_idx, depth + 1)?),
+            (s::M_SCHEMA_OR_ARRAY, 2, wire::Value::Bytes(b)) => list.push(message(b, schema_idx, depth + 1)?),
+            (s::M_SCHEMA_OR_STRINGS, 2, wire::Value::Bytes(b)) => list.push(Value::from(core::str::from_utf8(b).map_err(|_| "protobuf: invalid UTF-8")?)),
+            (s::M_SCHEMA_OR_BOOL, 1, wire::Value::Varint(x)) => allows = x != 0,
+            (_, 1 | 2, _) => return Err("protobuf: wrong wire type in schema union"),
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok(match (schema, idx) {
+        (Some(v), _) => v,
+        (None, s::M_SCHEMA_OR_BOOL) => Value::Bool(allows),
+        (None, _) => Value::Array(list),
+    })
+}
+
 /// `runtime.RawExtension` / `meta/v1.FieldsV1`: the embedded JSON document.
 fn raw_json(buf: &[u8]) -> R<Value> {
     let mut raw: &[u8] = &[];
@@ -421,6 +448,86 @@ mod tests {
         let mut b = MAGIC.to_vec();
         b.extend_from_slice(w.as_bytes());
         assert!(decode_body(&b).is_err());
+    }
+
+    #[test]
+    fn custom_resource_definition() {
+        // properties.n: integer with default 3; items: array of strings; additionalProperties
+        // false; x-kubernetes-preserve-unknown-fields on the root.
+        let mut json_raw = Writer::new();
+        json_raw.bytes(1, b"3");
+        let mut n = Writer::new();
+        n.string(5, "integer");
+        n.bytes(8, json_raw.as_bytes());
+        let mut item = Writer::new();
+        item.string(5, "string");
+        let mut items = Writer::new();
+        items.bytes(1, item.as_bytes());
+        let mut list = Writer::new();
+        list.string(5, "array");
+        list.bytes(24, items.as_bytes());
+        let mut no_extra = Writer::new();
+        no_extra.varint(1, 0);
+        let mut root = Writer::new();
+        root.string(5, "object");
+        for (k, v) in [("n", &n), ("list", &list)] {
+            root.message(29, |e| {
+                e.string(1, k);
+                e.bytes(2, v.as_bytes());
+            });
+        }
+        root.bytes(30, no_extra.as_bytes());
+        root.varint(38, 1);
+        let mut validation = Writer::new();
+        validation.bytes(1, root.as_bytes());
+        let mut version = Writer::new();
+        version.string(1, "v1").varint(2, 1).varint(3, 1);
+        version.bytes(4, validation.as_bytes());
+        let mut names = Writer::new();
+        names.string(1, "widgets").string(4, "Widget");
+        let mut spec = Writer::new();
+        spec.string(1, "example.com");
+        spec.bytes(3, names.as_bytes());
+        spec.string(4, "Namespaced");
+        spec.bytes(7, version.as_bytes());
+        let mut meta = Writer::new();
+        meta.string(1, "widgets.example.com");
+        let mut crd = Writer::new();
+        crd.bytes(1, meta.as_bytes());
+        crd.bytes(2, spec.as_bytes());
+        let v = decode_body(&envelope("apiextensions.k8s.io/v1", "CustomResourceDefinition", crd.as_bytes())).unwrap();
+        let want = br#"{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{"name":"widgets.example.com"},
+            "spec":{"group":"example.com","names":{"plural":"widgets","kind":"Widget"},"scope":"Namespaced","versions":[{"name":"v1","served":true,"storage":true,
+            "schema":{"openAPIV3Schema":{"type":"object","properties":{"n":{"type":"integer","default":3},"list":{"type":"array","items":{"type":"string"}}},
+            "additionalProperties":false,"x-kubernetes-preserve-unknown-fields":true}}}]}}"#;
+        let got = v.pointer(&["spec", "versions"]).cloned();
+        let want = json::parse(want).unwrap();
+        assert_eq!(got, want.pointer(&["spec", "versions"]).cloned());
+        assert_eq!(v.pointer(&["spec", "names"]), want.pointer(&["spec", "names"]));
+        // The union alternatives: a schema wins over the bool, string arrays stay strings.
+        let mut ob = Writer::new();
+        ob.varint(1, 1);
+        assert_eq!(schema_union(ob.as_bytes(), s::M_SCHEMA_OR_BOOL, 0).unwrap(), Value::Bool(true));
+        let mut sa = Writer::new();
+        sa.string(2, "a").string(2, "b");
+        assert_eq!(schema_union(sa.as_bytes(), s::M_SCHEMA_OR_STRINGS, 0).unwrap(), json::parse(br#"["a","b"]"#).unwrap());
+    }
+
+    #[test]
+    fn binding_and_eviction_bodies() {
+        let mut meta = Writer::new();
+        meta.string(1, "p");
+        let mut target = Writer::new();
+        target.string(3, "node-1").string(1, "Node");
+        let mut b = Writer::new();
+        b.bytes(1, meta.as_bytes());
+        b.bytes(2, target.as_bytes());
+        let v = decode_body(&envelope("v1", "Binding", b.as_bytes())).unwrap();
+        assert_eq!(v.pointer(&["target", "name"]).and_then(Value::as_str), Some("node-1"));
+        let mut e = Writer::new();
+        e.bytes(1, meta.as_bytes());
+        let v = decode_body(&envelope("policy/v1", "Eviction", e.as_bytes())).unwrap();
+        assert_eq!(v.pointer(&["metadata", "name"]).and_then(Value::as_str), Some("p"));
     }
 
     #[test]

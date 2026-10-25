@@ -33,6 +33,12 @@ for _n, _p, _pkg in [("meta_v1", "pkg/apis/meta/v1", "k8s.io.apimachinery.pkg.ap
                      ("intstr", "pkg/util/intstr", "k8s.io.apimachinery.pkg.util.intstr"),
                      ("resource", "pkg/api/resource", "k8s.io.apimachinery.pkg.api.resource")]:
     SOURCES[_n] = ("apimachinery", _p, _pkg)
+APIEXT = "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1"
+SOURCES["apiextensions_v1"] = ("apiextensions-apiserver", "pkg/apis/apiextensions/v1", APIEXT)
+# Go files with more struct tags than types.go: local name -> [(file, local suffix)].
+EXTRA_GO = {"apiextensions_v1": [("types_jsonschema.go", "_jsonschema.go")]}
+# Group -> proto package prefix, for groups outside k8s.io/api.
+GROUP_PKG = {"apiextensions.k8s.io": "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions"}
 
 REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 OUT = os.path.join(REPO, "crates", "kr-apiserver", "src", "proto_schema.rs")
@@ -45,14 +51,21 @@ SPECIAL = {
     "FIELDS_V1": META + ".FieldsV1", "INT_OR_STRING": "k8s.io.apimachinery.pkg.util.intstr.IntOrString",
     "QUANTITY": "k8s.io.apimachinery.pkg.api.resource.Quantity",
     "RAW_EXTENSION": "k8s.io.apimachinery.pkg.runtime.RawExtension",
+    # CRD schemas: free-form JSON and the "schema or X" unions.
+    "EXT_JSON": APIEXT + ".JSON", "SCHEMA_OR_ARRAY": APIEXT + ".JSONSchemaPropsOrArray",
+    "SCHEMA_OR_BOOL": APIEXT + ".JSONSchemaPropsOrBool", "SCHEMA_OR_STRINGS": APIEXT + ".JSONSchemaPropsOrStringArray",
 }
+# Packages whose JSON names are taken from the types.go tags (`$ref`, `x-kubernetes-...`).
+JSON_NAMES_FROM_GO = {APIEXT}
 # Extra top-level kinds beyond resources.rs: (apiVersion, kind, message).
 EXTRA_ROOTS = [("v1", "DeleteOptions", META + ".DeleteOptions"),
                ("autoscaling/v1", "Scale", "k8s.io.api.autoscaling.v1.Scale"),
                ("authentication.k8s.io/v1", "TokenRequest", "k8s.io.api.authentication.v1.TokenRequest"),
                ("authentication.k8s.io/v1", "TokenReview", "k8s.io.api.authentication.v1.TokenReview"),
                ("authorization.k8s.io/v1", "SelfSubjectAccessReview", "k8s.io.api.authorization.v1.SelfSubjectAccessReview"),
-               ("authorization.k8s.io/v1", "SubjectAccessReview", "k8s.io.api.authorization.v1.SubjectAccessReview")]
+               ("authorization.k8s.io/v1", "SubjectAccessReview", "k8s.io.api.authorization.v1.SubjectAccessReview"),
+               ("v1", "Binding", "k8s.io.api.core.v1.Binding"),
+               ("policy/v1", "Eviction", "k8s.io.api.policy.v1.Eviction")]
 # Fields whose JSON name legitimately differs from the proto name (message, number) -> json name.
 NAME_OVERRIDES = {("k8s.io.api.admissionregistration.v1.Variable", 2): "expression", ("k8s.io.api.admissionregistration.v1.Variable", 1): "name", ("k8s.io.api.admissionregistration.v1.Validation", 1): "expression", ("k8s.io.api.admissionregistration.v1.MutatingWebhookConfiguration", 2): "webhooks", ("k8s.io.api.admissionregistration.v1.ValidatingWebhookConfiguration", 2): "webhooks", ("k8s.io.api.authentication.v1.BoundObjectReference", 4): "uid", ("k8s.io.api.networking.v1.IngressClassParametersReference", 1): "apiGroup"}
 
@@ -65,7 +78,7 @@ F_REPEATED, F_KEEP_ZERO, F_INLINE = 0x10, 0x20, 0x40
 
 def fetch(scratch):
     for name, (repo, path, _) in SOURCES.items():
-        for fname, dst in (("generated.proto", name + ".proto"), ("types.go", name + ".go")):
+        for fname, dst in [("generated.proto", name + ".proto"), ("types.go", name + ".go")] + [(f, name + sfx) for f, sfx in EXTRA_GO.get(name, [])]:
             dest = os.path.join(scratch, dst)
             try:
                 with urllib.request.urlopen(RAW % (repo, path + "/" + fname)) as r:
@@ -154,9 +167,10 @@ def build(scratch):
     protos, gos = {}, {}
     for name, (_, _, pkg) in SOURCES.items():
         protos.update(parse_proto(os.path.join(scratch, name + ".proto"), pkg))
-        gp = os.path.join(scratch, name + ".go")
-        if os.path.exists(gp):
-            gos.update(parse_go(gp, pkg))
+        for sfx in [".go"] + [x[1] for x in EXTRA_GO.get(name, [])]:
+            gp = os.path.join(scratch, name + sfx)
+            if os.path.exists(gp):
+                gos.update(parse_go(gp, pkg))
     return protos, gos
 
 
@@ -165,7 +179,7 @@ def roots(protos):
     src = open(RESOURCES_RS).read()
     for m in re.finditer(r'r!\("([^"]*)",\s*"([^"]+)",\s*"([^"]+)"', src):
         g, v, kind = m.groups()
-        pkg = "k8s.io.api." + (g.split(".")[0] if g else "core") + "." + v
+        pkg = GROUP_PKG.get(g, "k8s.io.api." + (g.split(".")[0] if g else "core")) + "." + v
         out.append(((g + "/" + v) if g else v, kind, pkg + "." + kind))
     out += EXTRA_ROOTS
     for av, kind, full in out:
@@ -239,6 +253,8 @@ def main():
                 jname = ""
             elif (m, num) in NAME_OVERRIDES:
                 jname = NAME_OVERRIDES[(m, num)]
+            elif jname and m.rsplit(".", 1)[0] in JSON_NAMES_FROM_GO:
+                pass
             elif jname and jname != pname and m not in SPECIAL.values():
                 sys.exit("JSON name mismatch %s.%d proto=%s json=%s" % (m, num, pname, jname))
             else:
@@ -261,7 +277,7 @@ def main():
     o = []
     w = o.append
     w("//! Kubernetes protobuf field tables (generated; do not edit).\n")
-    w("//!\n//! Generated by `tools/gen_k8s_proto_schema.py` from the k8s.io/api and k8s.io/apimachinery\n")
+    w("//!\n//! Generated by `tools/gen_k8s_proto_schema.py` from the k8s.io/api, k8s.io/apimachinery and apiextensions-apiserver\n")
     w("//! %s `generated.proto` files (plus `types.go` for inline embedding and omitempty).\n" % VERSION)
     w("//! %d messages, %d fields. Consumed by [`crate::proto`].\n\n" % (len(order), len(fields)))
     w("/// One field of a message: number, JSON name (a slice of [`NAMES`]), kind and flags.\n")
