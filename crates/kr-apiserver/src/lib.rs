@@ -10,6 +10,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod admit;
+pub mod aggregator;
 pub mod api;
 pub mod client;
 pub mod cluster;

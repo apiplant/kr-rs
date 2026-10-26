@@ -156,7 +156,7 @@ fn crd(e: &Env, strategy: &str, path: &str, storage: &str) -> Value {
     } else {
         r#"{"strategy":"None"}"#.to_string()
     };
-    let ver = |n: &str| format!(r#"{{"name":"{n}","served":true,"storage":{},"schema":{{"openAPIV3Schema":{{"type":"object","x-kubernetes-preserve-unknown-fields":true}}}}}}"#, n == storage);
+    let ver = |n: &str| format!(r#"{{"name":"{n}","served":true,"storage":{},"schema":{{"openAPIV3Schema":{{"type":"object","x-kubernetes-preserve-unknown-fields":true}}}},"selectableFields":[{}]}}"#, n == storage, if n == "v1" { r#"{"jsonPath":".hostPort"}"# } else { r#"{"jsonPath":".host"},{"jsonPath":".port"}"# });
     v(&format!(
         r#"{{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{{"name":"{p}s.conv.example.com"}},"spec":{{"group":"conv.example.com","scope":"Namespaced","names":{{"plural":"{p}s","singular":"{p}","kind":"{k}","listKind":"{k}List"}},"conversion":{conv},"versions":[{},{}]}}}}"#,
         ver("v1"), ver("v2"), p = if strategy == "Webhook" { if path == "/bad-meta" { "bad" } else { "hook" } } else { "none" }, k = if strategy == "Webhook" { if path == "/bad-meta" { "Bad" } else { "Hook" } } else { "None" }
@@ -219,6 +219,25 @@ fn run() {
         let r = c.update(&format!("{v2}/two"), &put).await.unwrap();
         assert_eq!((s(&r, "apiVersion").as_deref(), s(&r, "port").as_deref()), (Some("conv.example.com/v2"), Some("10")), "{r:?}");
         assert_eq!(s(&stored("two"), "hostPort").as_deref(), Some("h:10"));
+        // field selectors on selectableFields apply to the object in the requested version
+        let names = |l: &Value| -> Vec<String> {
+            let mut n: Vec<String> = l.get("items").and_then(Value::as_array).unwrap().iter().map(|i| i.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap().to_string()).collect();
+            n.sort();
+            n
+        };
+        assert_eq!(names(&c.list(&v2, "fieldSelector=host%3Dlocalhost").await.unwrap()), ["one"]);
+        assert_eq!(names(&c.list(&v2, "fieldSelector=host%3Dh%2Cport%3D10").await.unwrap()), ["two"]);
+        assert_eq!(names(&c.list(&v2, "fieldSelector=host%3Dh%2Cport%3D1").await.unwrap()), Vec::<String>::new());
+        assert_eq!(names(&c.list(&v1, "fieldSelector=hostPort%3Dh%3A10").await.unwrap()), ["two"]);
+        assert_eq!(c.list(&v1, "fieldSelector=host%3Dh").await.unwrap_err().code, 400);
+        // a collection delete selected by the v2 fields removes exactly the matches
+        c.create(&v2, &cr("v2", "Hook", "tmp", r#""host":"zz","port":"1""#)).await.unwrap();
+        c.create(&v2, &cr("v2", "Hook", "tmp2", r#""host":"zz","port":"2""#)).await.unwrap();
+        let q = format!("{v2}?fieldSelector=host%3Dzz%2Cport%3D2");
+        c.delete(&q).await.unwrap();
+        assert_eq!(c.get(&format!("{v1}/tmp")).await.map(|_| ()).map_err(|e| e.code), Ok(()));
+        assert_eq!(c.get(&format!("{v1}/tmp2")).await.unwrap_err().code, 404);
+        c.delete(&format!("{v2}/tmp")).await.unwrap();
         // dry-run leaves nothing behind; a strict unknown-field request is judged on the v2 object
         c.create(&format!("{v2}?dryRun=All"), &cr("v2", "Hook", "ghost", r#""host":"g","port":"1""#)).await.unwrap();
         assert_eq!(c.get(&format!("{v1}/ghost")).await.unwrap_err().code, 404);
@@ -256,6 +275,13 @@ fn run() {
         }
         writer.await.unwrap();
         assert_eq!(kinds, ["ADDED", "ADDED", "ADDED", "MODIFIED", "ADDED"]);
+        // a watch with a field selector sees an object leave the selection as DELETED
+        let mut w = c.watch(&v2, "fieldSelector=host%3Dlocalhost").await.unwrap();
+        let ev = w.next().await.expect("no initial event");
+        assert_eq!((ev.kind.as_str(), ev.object.pointer(&["metadata", "name"]).and_then(Value::as_str)), ("ADDED", Some("one")));
+        c.patch(&format!("{v2}/one"), "application/merge-patch+json", &v(r#"{"host":"moved"}"#)).await.unwrap();
+        let ev = w.next().await.expect("no DELETED event");
+        assert_eq!((ev.kind.as_str(), ev.object.pointer(&["metadata", "name"]).and_then(Value::as_str)), ("DELETED", Some("one")), "{ev:?}");
         // a webhook that changes metadata is refused
         c.create(CRDS, &crd(&e, "Webhook", "/bad-meta", "v1")).await.unwrap();
         sleep(100).await;

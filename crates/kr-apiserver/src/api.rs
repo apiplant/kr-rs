@@ -76,13 +76,19 @@ pub enum Reply {
 }
 
 impl Reply {
-    fn aggregated_discovery(req: &Req, extra: &[&'static Resource], core: bool) -> Reply {
+    fn aggregated_discovery(api: &ApiServer, req: &Req, extra: &[&'static Resource], core: bool) -> Reply {
         use kr_net::http1::server::Response;
         let ver = match discovery::negotiate(req.accept) {
             discovery::Negotiated::Aggregated(v) => v,
             _ => return Reply::Http(Response::new(406, Vec::new())),
         };
-        let body = discovery::aggregated(extra, core, ver);
+        let mut body = discovery::aggregated(extra, core, ver);
+        if !core {
+            if let Ok(mut doc) = json::parse(body.as_bytes()) {
+                crate::aggregator::merge_aggregated(api, &mut doc);
+                body = json::to_string(&doc);
+            }
+        }
         let tag = discovery::etag(&body);
         let matched = req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("if-none-match") && v.split(',').any(|t| t.trim() == tag || t.trim() == "*"));
         let resp = if matched { Response::new(304, Vec::new()) } else { Response::new(200, body.into_bytes()) };
@@ -129,6 +135,10 @@ pub struct ApiServer {
     /// synchronous handlers can read them in that version: (store key, mod revision, apiVersion).
     /// Valid by construction (a new revision misses); bounded.
     pub(crate) conv_cache: RefCell<VecDeque<((String, u64, String), Value)>>,
+    /// Front proxy credentials for aggregated API servers (see `aggregator`).
+    pub(crate) front: RefCell<Option<alloc::rc::Rc<crate::aggregator::FrontProxy>>>,
+    /// Group versions served by extension API servers, from the availability probe.
+    pub(crate) agg: RefCell<Vec<crate::aggregator::AggGroup>>,
 }
 
 /// Default namespaces created on first start.
@@ -231,7 +241,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()) };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()) };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -341,7 +351,12 @@ impl ApiServer {
 
     /// Rewrites apiVersion in a response to the requested version (conversion strategy None).
     fn convert_reply(&self, rt: &Route, reply: Reply) -> Reply {
-        let multi = {
+        // Events (core and events.k8s.io) and HorizontalPodAutoscalers (v1, v2) are stored once and
+        // served under each version's name.
+        let shared_events = (rt.res.plural == "events" && (rt.res.group.is_empty() || rt.res.group == "events.k8s.io")) || (rt.res.plural == "horizontalpodautoscalers" && rt.res.group == "autoscaling");
+        let multi = if shared_events {
+            true
+        } else {
             let custom = self.custom.borrow();
             let Some(c) = custom.iter().find(|c| core::ptr::eq(c.res, rt.res)) else { return reply };
             // Webhook conversion is done by the transport (`convert::post`).
@@ -505,6 +520,15 @@ impl ApiServer {
             let body = alloc::format!(r#"{{"metadata":{{"name":"{name}","labels":{{"kubernetes.io/bootstrapping":"rbac-defaults"}}}},"roleRef":{{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"{role}"}},"subjects":{subjects}}}"#);
             self.bootstrap_object(crbr, None, name, "ClusterRoleBinding", &body);
         }
+        // Extension API servers authenticate the aggregator through this ConfigMap, which they
+        // may read with this Role (bound by whoever deploys them).
+        let rr = resources::find("rbac.authorization.k8s.io", "v1", "roles").unwrap();
+        self.bootstrap_object(rr, Some("kube-system"), "extension-apiserver-authentication-reader", "Role", r#"{"metadata":{"name":"extension-apiserver-authentication-reader","namespace":"kube-system","labels":{"kubernetes.io/bootstrapping":"rbac-defaults"}},"rules":[{"apiGroups":[""],"resources":["configmaps"],"resourceNames":["extension-apiserver-authentication"],"verbs":["get","list","watch"]}]}"#);
+        if let Some(ca) = self.sa.borrow().as_ref().map(|(_, p)| p.clone()) {
+            let cmr = resources::find("", "v1", "configmaps").unwrap();
+            let body = crate::aggregator::auth_configmap(&ca, &self.front_proxy());
+            self.bootstrap_object(cmr, Some("kube-system"), "extension-apiserver-authentication", "ConfigMap", &body);
+        }
         let pcr = resources::find("scheduling.k8s.io", "v1", "priorityclasses").unwrap();
         for (name, value) in [("system-node-critical", 2_000_001_000i64), ("system-cluster-critical", 2_000_000_000)] {
             let body = alloc::format!(r#"{{"metadata":{{"name":"{name}"}},"value":{value},"description":"Used for system critical pods that must not be moved from their current node."}}"#);
@@ -581,13 +605,55 @@ impl ApiServer {
 
     /// Client certificate user, else a valid ServiceAccount token, else anonymous.
     pub(crate) fn authenticate(&self, req: &Req) -> R<User> {
-        if let Some(u) = &req.user {
-            return Ok(u.clone());
-        }
-        let Some(token) = req.bearer else {
-            return Ok(User { name: "system:anonymous".into(), groups: alloc::vec!["system:unauthenticated".into()] });
+        let base = match (&req.user, req.bearer) {
+            (Some(u), _) => u.clone(),
+            (None, None) => return Ok(User { name: "system:anonymous".into(), groups: alloc::vec!["system:unauthenticated".into()] }),
+            (None, Some(token)) => self.verify_bearer(token, &[]).map(|(u, _)| u).map_err(|_| ApiError::new(401, "Unauthorized", "Unauthorized"))?,
         };
-        self.verify_bearer(token, &[]).map(|(u, _)| u).map_err(|_| ApiError::new(401, "Unauthorized", "Unauthorized"))
+        self.impersonate(req, base)
+    }
+
+    /// `Impersonate-User` / `Impersonate-Group`: the caller needs the `impersonate` verb on each
+    /// identity it assumes. Without `Impersonate-User` the headers are ignored.
+    fn impersonate(&self, req: &Req, caller: User) -> R<User> {
+        let header = |name: &str| req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone()).collect::<Vec<_>>();
+        let Some(target) = header("impersonate-user").into_iter().next() else { return Ok(caller) };
+        let check = |resource: &str, namespace: &str, name: &str| -> R<()> {
+            let attrs = crate::rbac::Attrs { verb: "impersonate".into(), resource: resource.into(), namespace: namespace.into(), name: name.into(), resource_request: true, ..Default::default() };
+            if self.authorize(&caller, &attrs, None) {
+                return Ok(());
+            }
+            let scope = if namespace.is_empty() { "at the cluster scope".to_string() } else { alloc::format!("in the namespace \"{namespace}\"") };
+            Err(ApiError::new(403, "Forbidden", alloc::format!("User \"{}\" cannot impersonate resource \"{resource}\" in API group \"\" {scope}", caller.name)))
+        };
+        let mut groups = header("impersonate-group");
+        if let Some(rest) = target.strip_prefix("system:serviceaccount:") {
+            let (ns, name) = rest.split_once(':').unwrap_or((rest, ""));
+            check("serviceaccounts", ns, name)?;
+            if groups.is_empty() {
+                groups = alloc::vec!["system:serviceaccounts".into(), alloc::format!("system:serviceaccounts:{ns}")];
+            }
+        } else {
+            check("users", "", &target)?;
+        }
+        for g in &groups {
+            check("groups", "", g)?;
+        }
+        if !groups.iter().any(|g| g == "system:authenticated" || g == "system:unauthenticated") {
+            groups.push("system:authenticated".into());
+        }
+        Ok(User { name: target, groups })
+    }
+
+    /// `authentication.k8s.io/v1` SelfSubjectReview: who the (possibly impersonated) caller is.
+    fn self_subject_review(&self, req: &Req, user: &User) -> R<Reply> {
+        let mut r = self.parse_body(req)?;
+        let mut info = obj(alloc::vec![("username", Value::String(user.name.clone()))]);
+        info.set("groups", Value::Array(user.groups.iter().map(|g| Value::String(g.clone())).collect()));
+        r.set("apiVersion", Value::from("authentication.k8s.io/v1"));
+        r.set("kind", Value::from("SelfSubjectReview"));
+        r.set("status", obj(alloc::vec![("userInfo", info)]));
+        Ok(Reply::Json(201, json::to_string(&r)))
     }
 
     /// Validates a bearer token (bootstrap token or ServiceAccount JWT); `audiences` empty means
@@ -707,6 +773,54 @@ impl ApiServer {
             json::parse(&kv.value).ok()?.get("rules").and_then(Value::as_array).map(|a| a.to_vec())
         };
         crate::rbac::allowed(user, a, &crbs, &rbs, &lookup)
+    }
+
+    /// `authorization.k8s.io/v1` SelfSubjectRulesReview: the caller's rules in `spec.namespace`
+    /// from RBAC (a system:masters member gets everything).
+    fn self_subject_rules_review(&self, req: &Req, user: &User) -> R<Reply> {
+        let mut r = self.parse_body(req)?;
+        let ns = r.pointer(&["spec", "namespace"]).and_then(Value::as_str).unwrap_or("").to_string();
+        let rules: Vec<Value> = if is_masters(user) {
+            alloc::vec![
+                json::parse(br#"{"verbs":["*"],"apiGroups":["*"],"resources":["*"]}"#).unwrap(),
+                json::parse(br#"{"verbs":["*"],"nonResourceURLs":["*"]}"#).unwrap(),
+            ]
+        } else {
+            let store = self.store.borrow();
+            let list = |plural: &str, ns: Option<&str>| -> Vec<Value> {
+                let Some(r) = resources::find("rbac.authorization.k8s.io", "v1", plural) else { return Vec::new() };
+                let prefix = match ns {
+                    Some(n) => alloc::format!("{}{n}/", r.prefix()),
+                    None => r.prefix(),
+                };
+                store.list(&prefix, None, 0).0.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect()
+            };
+            let crbs = list("clusterrolebindings", None);
+            let rbs = if ns.is_empty() { Vec::new() } else { list("rolebindings", Some(&ns)) };
+            let lookup = |kind: &str, rns: &str, name: &str| -> Option<Vec<Value>> {
+                let (plural, nsopt) = if kind == "Role" { ("roles", Some(rns)) } else { ("clusterroles", None) };
+                let r = resources::find("rbac.authorization.k8s.io", "v1", plural)?;
+                json::parse(&store.get(&r.key(nsopt, name))?.value).ok()?.get("rules").and_then(Value::as_array).map(|a| a.to_vec())
+            };
+            crate::rbac::rules_for(user, &crbs, &rbs, &ns, &lookup)
+        };
+        let strs = |v: Option<&Value>| v.cloned().unwrap_or_else(|| Value::Array(Vec::new()));
+        let (mut res, mut non) = (Vec::new(), Vec::new());
+        for rule in &rules {
+            if rule.get("nonResourceURLs").is_some() {
+                non.push(obj(alloc::vec![("verbs", strs(rule.get("verbs"))), ("nonResourceURLs", strs(rule.get("nonResourceURLs")))]));
+            } else {
+                let mut f = alloc::vec![("verbs", strs(rule.get("verbs"))), ("apiGroups", strs(rule.get("apiGroups"))), ("resources", strs(rule.get("resources")))];
+                if let Some(n) = rule.get("resourceNames") {
+                    f.push(("resourceNames", n.clone()));
+                }
+                res.push(obj(f));
+            }
+        }
+        r.set("apiVersion", Value::from("authorization.k8s.io/v1"));
+        r.set("kind", Value::from("SelfSubjectRulesReview"));
+        r.set("status", obj(alloc::vec![("resourceRules", Value::Array(res)), ("nonResourceRules", Value::Array(non)), ("incomplete", Value::Bool(false))]));
+        Ok(Reply::Json(201, json::to_string(&r)))
     }
 
     fn forbidden(user: &User, a: &crate::rbac::Attrs) -> ApiError {
@@ -941,7 +1055,9 @@ impl ApiServer {
                 resource: rt.res.plural.into(),
                 subresource: rt.sub.clone().unwrap_or_default(),
                 namespace: rt.namespace.clone().unwrap_or_default(),
-                name: rt.name.clone().unwrap_or_default(),
+                // A list or watch limited to one name by `fieldSelector=metadata.name=<n>` is
+                // authorized as an access to that name (resourceNames rules apply).
+                name: rt.name.clone().or_else(|| q.get("fieldSelector").and_then(|f| f.split(',').find_map(|t| t.trim().strip_prefix("metadata.name=").map(|n| n.trim_start_matches('=').to_string())))).unwrap_or_default(),
                 resource_request: true,
                 path: String::new(),
             },
@@ -1018,20 +1134,31 @@ impl ApiServer {
                 return Err(ApiError::new(406, "NotAcceptable", "the resource does not support conversion to a Table"));
             }
             ["apis", "authorization.k8s.io", "v1", "selfsubjectaccessreviews"] if req.method == "POST" => return self.self_subject_access_review(req, &user),
+            ["apis", "authorization.k8s.io", "v1", "selfsubjectrulesreviews"] if req.method == "POST" => return self.self_subject_rules_review(req, &user),
             ["apis", "authorization.k8s.io", "v1", "subjectaccessreviews"] if req.method == "POST" => return self.subject_access_review(req, None),
             ["apis", "authorization.k8s.io", "v1", "namespaces", ns, "localsubjectaccessreviews"] if req.method == "POST" => return self.subject_access_review(req, Some(ns)),
             ["apis", "authentication.k8s.io", "v1", "tokenreviews"] if req.method == "POST" => return self.token_review(req),
-            ["api"] | ["apis"] if req.method == "GET" && discovery::negotiate(req.accept) != discovery::Negotiated::Legacy => return Ok(Reply::aggregated_discovery(req, &extra, segs.len() == 1 && segs[0] == "api")),
+            ["apis", "authentication.k8s.io", "v1", "selfsubjectreviews"] if req.method == "POST" => return self.self_subject_review(req, &user),
+            ["api"] | ["apis"] if req.method == "GET" && discovery::negotiate(req.accept) != discovery::Negotiated::Legacy => return Ok(Reply::aggregated_discovery(self, req, &extra, segs.len() == 1 && segs[0] == "api")),
             ["api"] => return Ok(Reply::Json(200, discovery::core_versions(&self.server_address))),
             ["api", "v1"] => return Ok(Reply::Json(200, discovery::resource_list(&extra, "", "v1").unwrap())),
-            ["apis"] => return Ok(Reply::Json(200, discovery::group_list(&extra))),
+            ["apis"] => {
+                let mut doc = json::parse(discovery::group_list(&extra).as_bytes()).unwrap_or(Value::Null);
+                crate::aggregator::merge_groups(self, &mut doc);
+                return Ok(Reply::Json(200, json::to_string(&doc)));
+            }
             ["openapi", "v3"] => return Ok(Reply::Json(200, crate::openapi::index(&extra))),
             ["openapi", "v2"] => return Ok(Reply::Json(200, crate::openapi::v2(&self.custom.borrow()))),
             ["openapi", "v3", rest @ ..] => {
                 let p = rest.join("/");
                 return crate::openapi::group_version(&extra, &self.custom.borrow(), &p).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("openapi", &p));
             }
-            ["apis", g] => return discovery::group(&extra, g).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("group", g)),
+            ["apis", g] => {
+                if let Some(d) = crate::aggregator::group_doc_for(self, g).filter(|_| discovery::group(&extra, g).is_none()) {
+                    return Ok(Reply::Json(200, json::to_string(&d)));
+                }
+                return discovery::group(&extra, g).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("group", g));
+            }
             ["apis", g, v] => return discovery::resource_list(&extra, g, v).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("groupVersion", v)),
             _ => {}
         }
@@ -1052,6 +1179,13 @@ impl ApiServer {
                     if let Ok(mut b) = json::parse(req.body) {
                         let gv = alloc::format!("{}/{sv}", route.res.group);
                         b.set("apiVersion", Value::from(gv.as_str()));
+                        body = json::to_string(&b).into_bytes();
+                    }
+                }
+                // A server-side apply body names its own version; JSON is valid YAML.
+                if req.method == "PATCH" && req.content_type.is_some_and(|c| c.starts_with("application/apply-patch")) {
+                    if let Some(mut b) = core::str::from_utf8(req.body).ok().and_then(|t| kr_fmt::yaml::parse(t).ok()) {
+                        b.set("apiVersion", Value::from(alloc::format!("{}/{sv}", route.res.group).as_str()));
                         body = json::to_string(&b).into_bytes();
                     }
                 }
@@ -1144,6 +1278,11 @@ impl ApiServer {
             }
         }
         match (req.method, &rt.name, sub) {
+            // `.../proxy` without the trailing slash redirects, so relative links resolve.
+            ("GET" | "HEAD", Some(_), Some("proxy")) if req.path.ends_with("/proxy") => {
+                let loc = if req.query.is_empty() { alloc::format!("{}/", req.path) } else { alloc::format!("{}/?{}", req.path, req.query) };
+                Ok(Reply::Http(kr_net::http1::server::Response::new(301, Vec::new()).with_header("Location", &loc)))
+            }
             (_, Some(n), Some("proxy")) if rt.res.plural == "services" => self.service_proxy(req, rt, n),
             (_, Some(n), Some("proxy")) => self.pod_proxy(req, rt, n),
             ("GET" | "POST", Some(n), Some(sub @ ("log" | "exec" | "attach" | "portforward"))) => {
@@ -1188,8 +1327,14 @@ impl ApiServer {
                 self.update(req, rt, n, false, q, Some((kv, old, new)))
             }
             ("PATCH", Some(n), Some("ephemeralcontainers")) => self.patch(req, rt, n, false, q, true),
-            ("PUT", Some(n), s) => self.update(req, rt, n, s == Some("status"), q, None),
-            ("PATCH", Some(n), s) => self.patch(req, rt, n, s == Some("status"), q, false).map_err(|e| Self::apply_strict_error(req, rt, e)),
+            ("PUT", Some(n), Some("resize")) => {
+                let (kv, old) = self.get_value(rt, n)?;
+                let mut new = self.parse_body(req)?;
+                resize_only(&old, &mut new)?;
+                self.update(req, rt, n, false, q, Some((kv, old, new)))
+            }
+            ("PUT", Some(n), s) => self.update(req, rt, n, matches!(s, Some("status" | "approval")), q, None),
+            ("PATCH", Some(n), s) => self.patch(req, rt, n, matches!(s, Some("status" | "approval")), q, false).map_err(|e| Self::apply_strict_error(req, rt, e)),
             ("DELETE", Some(n), None) => self.delete(req, rt, n, q),
             ("DELETE", None, None) => self.delete_collection(rt, q),
             _ => Err(ApiError::new(405, "MethodNotAllowed", alloc::format!("method {} not allowed here", req.method))),
@@ -1226,6 +1371,20 @@ impl ApiServer {
         c.push_back(((rt.res.key(rt.namespace.as_deref(), name), kv.mod_rev, rt.res.group_version()), obj));
     }
 
+    /// The field selector of a request: terms every version understands, and the terms on a custom
+    /// resource's `selectableFields`. The latter are returned apart (second) when the CRD converts
+    /// with a webhook: they apply to the object in the requested version, so the transport
+    /// evaluates them after conversion ([`crate::convert`]).
+    pub(crate) fn field_selectors(&self, rt: &Route, q: &Query) -> R<(FieldSelector, FieldSelector)> {
+        let labels: Vec<String> = self.custom.borrow().iter().find(|c| core::ptr::eq(c.res, rt.res)).map(|c| c.selectable.clone()).unwrap_or_default();
+        let (mut now, later) = FieldSelector::parse_for(q.get("fieldSelector").unwrap_or(""), &labels)?;
+        if self.conversion_webhook(rt.res).is_some() {
+            return Ok((now, later));
+        }
+        now.extend(later);
+        Ok((now, FieldSelector::default()))
+    }
+
     /// The storage version of the CRD of `res` when `res` is another served version of it.
     pub(crate) fn storage_version(&self, res: &'static Resource) -> Option<String> {
         let custom = self.custom.borrow();
@@ -1256,7 +1415,7 @@ impl ApiServer {
 
     fn list(&self, req: &Req, rt: &Route, q: &Query) -> R<Reply> {
         let ls = Selector::parse(q.get("labelSelector").unwrap_or(""))?;
-        let fs = FieldSelector::parse(q.get("fieldSelector").unwrap_or(""))?;
+        let fs = self.field_selectors(rt, q)?.0;
         let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(0);
         let prefix = self.list_prefix(rt);
         // Continue token: base64url("<rev>:<issued>:<last key>"). Pages report the first page's
@@ -1490,7 +1649,15 @@ impl ApiServer {
 
     /// In HA mode only the leader may change the store (a follower's store is exactly the
     /// committed log); writes elsewhere are forwarded to the leader.
-    fn writable(&self) -> bool {
+    pub(crate) fn now(&self) -> i64 {
+        (self.now)()
+    }
+
+    pub(crate) fn rng(&self) -> fn(&mut [u8]) {
+        self.rng
+    }
+
+    pub(crate) fn writable(&self) -> bool {
         self.cluster.borrow().as_ref().is_none_or(|c| c.ready())
     }
 
@@ -1656,6 +1823,9 @@ impl ApiServer {
         if rt.res.plural == "jobs" {
             admit_job(o, &name)?;
         }
+        if rt.res.plural == "podcertificaterequests" && rt.res.group == "certificates.k8s.io" {
+            crate::admit::check_max_expiration("spec.maxExpirationSeconds", o.pointer(&["spec", "maxExpirationSeconds"])).map_err(|e| ApiError::invalid(alloc::format!("PodCertificateRequest.certificates.k8s.io \"{name}\" is invalid: {e}")))?;
+        }
         if rt.res.plural == "services" {
             self.admit_service(o, None)?;
         }
@@ -1799,7 +1969,9 @@ impl ApiServer {
         let deleting = new.pointer(&["metadata", "deletionTimestamp"]).is_some();
         let no_finalizers = new.pointer(&["metadata", "finalizers"]).and_then(Value::as_array).is_none_or(|f| f.is_empty());
         let no_spec_finalizers = rt.res.plural != "namespaces" || new.pointer(&["spec", "finalizers"]).and_then(Value::as_array).is_none_or(|f| f.is_empty());
-        if deleting && no_finalizers && no_spec_finalizers {
+        // A graceful deletion (grace period left) completes when the kubelet deletes with 0.
+        let grace_over = new.pointer(&["metadata", "deletionGracePeriodSeconds"]).and_then(Value::as_i64).is_none_or(|g| g == 0);
+        if deleting && no_finalizers && no_spec_finalizers && grace_over {
             self.store.borrow_mut().delete(&kv.key, Some(kv.mod_rev)).map_err(|e| store_err(e, rt.res.singular, name))?;
             if crate::crd::is_crd(rt.res) {
                 self.unregister_crd(&new);
@@ -1875,6 +2047,9 @@ impl ApiServer {
         r.map_err(|e| ApiError::invalid(e.0))?;
         if eph {
             eph_only(&old, &mut new)?;
+        }
+        if rt.sub.as_deref() == Some("resize") {
+            resize_only(&old, &mut new)?;
         }
         // A patch never carries a resourceVersion precondition unless it sets one explicitly.
         if p.pointer(&["metadata", "resourceVersion"]).is_none() {
@@ -2008,16 +2183,27 @@ impl ApiServer {
 
     fn delete_collection(&self, rt: &Route, q: &Query) -> R<Reply> {
         let ls = Selector::parse(q.get("labelSelector").unwrap_or(""))?;
-        let fs = FieldSelector::parse(q.get("fieldSelector").unwrap_or(""))?;
+        let fs = self.field_selectors(rt, q)?.0;
         let prefix = self.list_prefix(rt);
         let (items, _) = self.store.borrow().list(&prefix, None, 0);
+        // Each match is deleted as a single DELETE would (graceful pods, finalizers, owner
+        // propagation, CRD teardown), so a collection delete leaves nothing half-done.
         let mut deleted = Vec::new();
         for kv in items {
             let Ok(v) = json::parse(&kv.value) else { continue };
-            if ls.matches(&v) && fs.matches(&v) {
-                if self.store.borrow_mut().delete(&kv.key, Some(kv.mod_rev)).is_ok() {
-                    deleted.push(v);
+            if !(ls.matches(&v) && fs.matches(&v)) {
+                continue;
+            }
+            let name = v.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("").to_string();
+            let item_rt = Route { res: rt.res, namespace: rt.namespace.clone(), name: Some(name.clone()), sub: None };
+            match self.delete_with(&item_rt, &name, q, kv, v.clone(), &Value::Null) {
+                Ok(Reply::Json(_, body)) => {
+                    let out = json::parse(body.as_bytes()).ok().filter(|o| o.get("kind").and_then(Value::as_str) != Some("Status")).unwrap_or(v);
+                    deleted.push(out);
                 }
+                Ok(_) => deleted.push(v),
+                Err(e) if e.code == 404 => {}
+                Err(e) => return Err(e),
             }
         }
         self.sync()?;
@@ -2656,6 +2842,7 @@ impl ApiServer {
         let forbid = |e: String| ApiError::new(403, "Forbidden", alloc::format!("pod \"{pod_name}\" is forbidden: {e}"));
         let spec = o.entry_object("spec");
         crate::admit::validate_sysctls(spec).map_err(|e| ApiError::invalid(alloc::format!("Pod \"{pod_name}\" is invalid: {e}")))?;
+        crate::admit::validate_pod_certificates(spec).map_err(|e| ApiError::invalid(alloc::format!("Pod \"{pod_name}\" is invalid: {e}")))?;
         if let Some(name) = spec.get("runtimeClassName").and_then(Value::as_str).filter(|n| !n.is_empty()).map(String::from) {
             let res = resources::find("node.k8s.io", "v1", "runtimeclasses").unwrap();
             let rc = self.store.borrow().get(&res.key(None, &name)).and_then(|kv| json::parse(&kv.value).ok());
@@ -2768,7 +2955,7 @@ impl ApiServer {
 
     fn watch(&self, rt: &Route, q: &Query) -> R<Reply> {
         let ls = Selector::parse(q.get("labelSelector").unwrap_or(""))?;
-        let fs = FieldSelector::parse(q.get("fieldSelector").unwrap_or(""))?;
+        let fs = self.field_selectors(rt, q)?.0;
         let prefix = self.list_prefix(rt);
         let rv = q.get("resourceVersion").unwrap_or("");
         let mut store = self.store.borrow_mut();
@@ -3072,6 +3259,30 @@ impl crate::node_authz::Pods for StorePods<'_> {
         let prefix = alloc::format!("{}{ns}/", r.prefix());
         self.0.store.borrow().list(&prefix, None, 0).0.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect()
     }
+}
+
+/// pods/resize: only the containers' `resources` (and the pod-level `spec.resources`) may change.
+fn resize_only(old: &Value, new: &mut Value) -> R<()> {
+    let mut out = old.clone();
+    for key in ["containers", "initContainers"] {
+        let Some(have) = new.pointer(&["spec", key]).and_then(Value::as_array).map(|a| a.to_vec()) else { continue };
+        let Some(list) = out.entry_object("spec").get_mut(key).and_then(Value::as_array_mut) else { continue };
+        for c in list.iter_mut() {
+            let name = c.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            if let Some(n) = have.iter().find(|n| n.get("name").and_then(Value::as_str) == Some(name.as_str())) {
+                match n.get("resources") {
+                    Some(r) => c.set("resources", r.clone()),
+                    None => drop(c.remove("resources")),
+                }
+            }
+        }
+    }
+    match new.pointer(&["spec", "resources"]) {
+        Some(r) => out.entry_object("spec").set("resources", r.clone()),
+        None => drop(out.entry_object("spec").remove("resources")),
+    }
+    *new = out;
+    Ok(())
 }
 
 /// pods/ephemeralcontainers: only spec.ephemeralContainers may change, and existing entries are immutable.

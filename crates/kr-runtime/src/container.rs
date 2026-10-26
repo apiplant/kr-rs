@@ -12,6 +12,7 @@
 //! Setup failures in the child are reported back over a CLOEXEC pipe as `(step, errno)`; a
 //! successful execve closes that pipe, which the parent reads as EOF = started.
 
+use alloc::string::String;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use kr_sys::ns::{self, CloneArgs};
@@ -213,6 +214,36 @@ impl Sandbox {
     pub fn is_alive(&self) -> bool {
         matches!(ns::pidfd_try_wait(&self.pidfd), Ok(None))
     }
+
+    /// Sets namespaced sysctls (`kernel.shm_rmid_forced`, `net.ipv4.ip_local_port_range`, ...) for
+    /// the pod: a helper joins the sandbox's namespaces and writes under /proc/sys. The error
+    /// names the first sysctl that could not be set.
+    pub fn apply_sysctls(&self, list: &[(String, String)]) -> Result<(), String> {
+        if list.is_empty() {
+            return Ok(());
+        }
+        let mut flags = ns::CLONE_NEWUSER | ns::CLONE_NEWIPC | ns::CLONE_NEWUTS;
+        if !self.host_net {
+            flags |= ns::CLONE_NEWNET;
+        }
+        let r = fork_into(&self.pidfd, flags, None, || {
+            for (i, (name, value)) in list.iter().enumerate() {
+                let path = alloc::format!("/proc/sys/{}\0", name.replace('.', "/"));
+                let ok = ns::open(path.as_bytes(), ns::O_WRONLY, 0).ok().is_some_and(|fd| kr_sys::write(fd.raw(), value.as_bytes()).is_ok());
+                if !ok {
+                    return 10 + i as i32;
+                }
+            }
+            0
+        })
+        .map_err(|e| alloc::format!("sysctls: {}: errno {}", e.step, e.errno.0))?;
+        let status = ns::wait4(r.pid).map_err(|e| alloc::format!("sysctls: wait4: errno {}", e.0))?;
+        match ns::exit_code(status) {
+            0 => Ok(()),
+            c if c >= 10 => Err(alloc::format!("sysctl {:?} cannot be set", list.get((c - 10) as usize).map(|s| s.0.as_str()).unwrap_or(""))),
+            c => Err(alloc::format!("sysctls: helper exited {c}")),
+        }
+    }
 }
 
 /// Starts a pod sandbox. `net` (root only) attaches it to the bridge with that address.
@@ -354,7 +385,8 @@ fn sandbox_inner(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfi
     if let Err(e) = maps.apply(pid, uid, gid) {
         return fail(e);
     }
-    if net.is_some() {
+    if let Some(n) = &net {
+        network::forget_neighbour(n.ip);
         if let Err(e) = network::attach(pid, id) {
             return fail(RunError { step: "attach network", errno: e });
         }
@@ -574,7 +606,8 @@ pub fn start(spec: &RunSpec) -> Result<Running, RunError> {
         running.finish();
         return Err(e);
     }
-    if spec.net.is_some() {
+    if let Some(n) = &spec.net {
+        network::forget_neighbour(n.ip);
         if let Err(e) = network::attach(pid, spec.id) {
             let _ = ns::kill(pid, ns::SIGKILL);
             let _ = ns::wait4(pid);
@@ -1081,6 +1114,13 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
         if e != Errno(1) {
             return (9, e);
         }
+    }
+
+    // The container's own cgroup (the namespace root) as the cgroup2 filesystem, read-only, as
+    // runtimes do; limits are visible there (`cpu.max`, `memory.max`). Best effort.
+    if spec.limits.is_empty() == false {
+        let _ = ns::mkdir(b"/sys/fs/cgroup\0", 0o555);
+        let _ = ns::mount(Some(b"cgroup\0"), b"/sys/fs/cgroup\0", Some(b"cgroup2\0"), ns::MS_RDONLY | ns::MS_NOSUID | ns::MS_NODEV | ns::MS_NOEXEC, None);
     }
 
     step!(25, mount_volumes(spec.mounts));

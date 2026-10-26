@@ -164,6 +164,17 @@ impl Cgroup {
         Ok(cg)
     }
 
+    /// Re-applies `l` to a live cgroup: unlike [`Self::apply`], an unset limit lifts the old one.
+    fn reapply(&self, l: &Limits) -> Result<(), Errno> {
+        if l.memory_bytes.is_none() {
+            self.set(b"memory.max", b"max")?;
+        }
+        if l.cpu_milli.is_none() {
+            self.set(b"cpu.max", b"max")?;
+        }
+        self.apply(l)
+    }
+
     fn set(&self, file: &[u8], value: &[u8]) -> Result<(), Errno> {
         ns::write_file(&nul(&[&self.path, b"/", file]), value)
     }
@@ -187,11 +198,10 @@ impl Cgroup {
             v.extend_from_slice(&dec(CPU_PERIOD_US));
             self.set(b"cpu.max", &v)?;
         }
-        if let Some(r) = l.cpu_request_milli {
-            // Upstream: shares = milli * 1024 / 1000 (min 2), weight = 1 + (shares - 2) * 9999 / 262142.
-            let shares = (r.saturating_mul(1024) / 1000).clamp(2, 262_144);
-            self.set(b"cpu.weight", &dec(1 + (shares - 2) * 9999 / 262_142))?;
-        }
+        // Upstream: shares = milli * 1024 / 1000 (min 2), weight = 1 + (shares - 2) * 9999 / 262142.
+        // Without a request a container gets the minimum share, not the cgroup default (100).
+        let shares = l.cpu_request_milli.map_or(2, |r| (r.saturating_mul(1024) / 1000).clamp(2, 262_144));
+        self.set(b"cpu.weight", &dec(1 + (shares - 2) * 9999 / 262_142))?;
         if let Some((file, v)) = l.memory_protection() {
             // Best effort: without the memory controller delegated (rootless) the file is missing
             // or not writable, which only means no reservation.
@@ -289,6 +299,12 @@ impl PodCgroup {
         Ok(pod)
     }
 
+    /// Changes the pod cgroup's limits (the summed container limits).
+    pub fn update(&self, limits: &Limits) -> Result<(), Errno> {
+        let cg = Cgroup { path: self.path.clone(), dir: ns::open(&nul(&[&self.path]), ns::O_RDONLY | ns::O_DIRECTORY, 0)? };
+        cg.reapply(limits)
+    }
+
     /// Path relative to the base; the `parent` argument of [`Cgroup::create_in`].
     pub fn rel(&self) -> &[u8] {
         &self.rel
@@ -316,6 +332,17 @@ impl PodCgroup {
         rmdir_retry(&leaf);
         rmdir_retry(&self.path);
     }
+}
+
+/// Changes the limits of a running container's cgroup (`parent` as in [`Cgroup::create_in`]).
+pub fn update_container(parent: &[u8], name: &[u8], limits: &Limits) -> Result<(), Errno> {
+    let mut path = base()?;
+    path.push(b'/');
+    path.extend_from_slice(parent);
+    path.push(b'/');
+    path.extend_from_slice(name);
+    let cg = Cgroup { dir: ns::open(&nul(&[&path]), ns::O_RDONLY | ns::O_DIRECTORY, 0)?, path };
+    cg.reapply(limits)
 }
 
 /// Directories of the tree under `root`, children before their parent. `list` returns the

@@ -456,7 +456,14 @@ pub struct FieldSelector(Vec<(Vec<String>, bool, String)>);
 
 impl FieldSelector {
     pub fn parse(s: &str) -> Result<FieldSelector, ApiError> {
+        Self::parse_for(s, &[]).map(|(b, _)| b)
+    }
+
+    /// Like [`Self::parse`], also accepting the `custom` labels (a custom resource's
+    /// `selectableFields`); the terms on those come back as the second selector.
+    pub fn parse_for(s: &str, custom: &[String]) -> Result<(FieldSelector, FieldSelector), ApiError> {
         let mut out = Vec::new();
+        let mut extra = Vec::new();
         for p in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             let (k, neg, v) = if let Some((k, v)) = p.split_once("!=") {
                 (k, true, v)
@@ -480,13 +487,24 @@ impl FieldSelector {
                 "spec.signerName", "regarding.kind", "regarding.namespace", "regarding.name", "regarding.uid", "regarding.apiVersion", "regarding.fieldPath", "reportingController",
             ];
             let f = k.trim();
-            if !FIELDS.contains(&f) {
+            let is_custom = custom.iter().any(|c| c == f);
+            if !is_custom && !FIELDS.contains(&f) {
                 return Err(ApiError::bad_request(alloc::format!("field label not supported: {f}")));
             }
-            let path: Vec<String> = f.split('.').map(String::from).collect();
-            out.push((path, neg, v.trim().to_string()));
+            // Events: the legacy `source` label is the reporting component.
+            let path: Vec<String> = if f == "source" { alloc::vec!["source".into(), "component".into()] } else { f.split('.').map(String::from).collect() };
+            if is_custom { &mut extra } else { &mut out }.push((path, neg, v.trim().to_string()));
         }
-        Ok(FieldSelector(out))
+        Ok((FieldSelector(out), FieldSelector(extra)))
+    }
+
+    pub fn clone_of(other: &FieldSelector) -> FieldSelector {
+        FieldSelector(other.0.clone())
+    }
+
+    /// Adds the terms of `other`.
+    pub fn extend(&mut self, other: FieldSelector) {
+        self.0.extend(other.0);
     }
 
     pub fn is_empty(&self) -> bool {

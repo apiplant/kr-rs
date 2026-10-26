@@ -146,6 +146,9 @@ struct Ctr {
     started: bool,
     /// readinessProbe verdict (true without a readiness probe).
     ready: bool,
+    /// The container's `resources` as last applied (JSON; "" when unset): reported in the status,
+    /// and compared with the spec to resize a running container in place.
+    res: String,
 }
 
 struct PodRt {
@@ -161,6 +164,10 @@ struct PodRt {
     start_time: i64,
     /// Kill deadline (ms) once termination started.
     kill_at: Option<u64>,
+    /// When the final status of a terminating pod was reported. The API object is removed a little
+    /// later (upstream: after the status manager has pushed the status), so clients can observe
+    /// the terminated pod.
+    stopped_at: Option<u64>,
     last_status: String,
     failed_setup: Option<String>,
     /// Last refresh of configMap/secret/projected volumes (ms).
@@ -563,6 +570,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 self.terminate(&uid, pod).await;
             } else {
                 self.sync_pod(&uid, pod).await;
+                self.apply_resize(&uid, pod);
                 self.run_probes(&uid, pod);
                 self.refresh_volumes(&uid, pod).await;
             }
@@ -651,6 +659,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         if self.pods.borrow()[uid].sandbox.is_none() {
             if let Err(e) = self.start_sandbox(uid, pod) {
+                self.emit_event(pod, "Warning", "FailedCreatePodSandBox", &e).await;
                 self.pods.borrow_mut().get_mut(uid).unwrap().failed_setup = Some(e);
                 return;
             }
@@ -704,7 +713,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 match p.ctrs.iter().position(|c| c.name == name) {
                     Some(i) => i,
                     None => {
-                        p.ctrs.push(Ctr { name: name.into(), image: e.get("image").and_then(Value::as_str).unwrap_or("").into(), init: false, sidecar: false, eph: true, restart_count: 0, state: CState::Waiting("ContainerCreating", String::new()), last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: false, ready: false });
+                        p.ctrs.push(Ctr { name: name.into(), image: e.get("image").and_then(Value::as_str).unwrap_or("").into(), init: false, sidecar: false, eph: true, restart_count: 0, state: CState::Waiting("ContainerCreating", String::new()), last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: false, ready: false, res: String::new() });
                         p.ctrs.len() - 1
                     }
                 }
@@ -739,12 +748,13 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     probes: Vec::new(),
                     started: false,
                     ready: false,
+                    res: c.get("resources").map(json::to_string).unwrap_or_default(),
                 });
             }
         }
         let prio = pod.pointer(&["spec", "priorityClassName"]).and_then(Value::as_str).unwrap_or("");
         let critical = prio.starts_with("system-") && prio.ends_with("-critical") || pod.pointer(&["metadata", "annotations", "kubernetes.io/config.mirror"]).is_some();
-        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, node_ip: self.cfg.node_ip, ctrs, start_time: now(), kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod) }
+        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, node_ip: self.cfg.node_ip, ctrs, start_time: now(), kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod) }
     }
 
     fn start_sandbox(&self, uid: &str, pod: &Value) -> Result<(), String> {
@@ -782,6 +792,23 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 return Err(alloc::format!("sandbox: {}: errno {}", e.step, e.errno.0));
             }
         };
+        let sysctls: Vec<(String, String)> = pod
+            .pointer(&["spec", "securityContext", "sysctls"])
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|s| Some((s.get("name")?.as_str()?.to_string(), s.get("value")?.as_str()?.to_string()))).collect())
+            .unwrap_or_default();
+        // As containerd and CRI-O do: any port may be bound without privileges inside a pod's own
+        // network namespace (best effort; the sysctl is namespaced).
+        if !host_net {
+            let _ = sb.apply_sysctls(&[(String::from("net.ipv4.ip_unprivileged_port_start"), String::from("0"))]);
+        }
+        if let Err(e) = sb.apply_sysctls(&sysctls) {
+            sb.stop();
+            if let Some(l) = lease {
+                l.release();
+            }
+            return Err(e);
+        }
         // Pod cgroup: summed limits, the sandbox in its `pause` leaf, containers underneath.
         // Skipped silently without a delegated cgroup.
         let cg = if self.cfg.cgroups {
@@ -953,6 +980,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     c.started = !c.probes.iter().any(|(k, _)| *k == probe::Kind::Startup);
                     c.ready = !c.probes.iter().any(|(k, _)| *k == probe::Kind::Readiness);
                 }
+                self.emit_event(pod, "Normal", "Started", &alloc::format!("Started container {name}")).await;
                 // postStart: a failing hook kills the container (restartPolicy decides the rest).
                 if let Some(hook) = cspec.and_then(|c| c.pointer(&["lifecycle", "postStart"])).cloned() {
                     let (sig, target, ctr) = (running.signaller(), running.target(), cspec.cloned().unwrap_or(Value::Null));
@@ -1147,6 +1175,56 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
     }
 
+    /// In-place resize: containers whose `resources` changed in the spec get their cgroup limits
+    /// updated (and the pod cgroup the new sum); the status then reports the new values.
+    fn apply_resize(&self, uid: &str, pod: &Value) {
+        let mut pods = self.pods.borrow_mut();
+        let Some(p) = pods.get_mut(uid) else { return };
+        let mut changed = false;
+        for key in ["initContainers", "containers"] {
+            for c in pod.pointer(&["spec", key]).and_then(Value::as_array).unwrap_or(&[]) {
+                let name = c.get("name").and_then(Value::as_str).unwrap_or("");
+                let want = c.get("resources").map(json::to_string).unwrap_or_default();
+                let rel = p.cg.as_ref().map(|cg| cg.rel().to_vec());
+                let Some(ctr) = p.ctrs.iter_mut().find(|x| x.name == name && !x.eph) else { continue };
+                if ctr.res == want {
+                    continue;
+                }
+                if let (CState::Running { id, .. }, Some(rel)) = (&ctr.state, rel) {
+                    let _ = kr_runtime::cgroup::update_container(&rel, id.as_bytes(), &spec::container_limits(pod, c));
+                }
+                ctr.res = want;
+                changed = true;
+            }
+        }
+        if let (true, Some(cg)) = (changed, &p.cg) {
+            let _ = cg.update(&spec::pod_resources(pod).0);
+        }
+    }
+
+    /// Records an event for the pod (best effort), as the kubelet's recorder does.
+    async fn emit_event(&self, pod: &Value, ty: &str, reason: &str, message: &str) {
+        let ns = meta(pod, "namespace");
+        let at = Value::String(rfc3339(now()));
+        let o = |f: Vec<(&str, Value)>| Value::Object(f.into_iter().map(|(k, v)| (String::from(k), v)).collect());
+        let ev = o(alloc::vec![
+            ("apiVersion", Value::from("v1")),
+            ("kind", Value::from("Event")),
+            ("metadata", o(alloc::vec![("generateName", Value::String(alloc::format!("{}.", meta(pod, "name")))), ("namespace", Value::from(ns))])),
+            ("involvedObject", o(alloc::vec![("apiVersion", Value::from("v1")), ("kind", Value::from("Pod")), ("namespace", Value::from(ns)), ("name", Value::from(meta(pod, "name"))), ("uid", Value::from(meta(pod, "uid")))])),
+            ("type", Value::from(ty)),
+            ("reason", Value::from(reason)),
+            ("message", Value::from(message)),
+            ("source", o(alloc::vec![("component", Value::from("kubelet")), ("host", Value::from(self.cfg.node_name.as_str()))])),
+            ("reportingComponent", Value::from("kubelet")),
+            ("reportingInstance", Value::from(self.cfg.node_name.as_str())),
+            ("firstTimestamp", at.clone()),
+            ("lastTimestamp", at),
+            ("count", Value::Number(kr_fmt::json::Number::from_i64(1))),
+        ]);
+        let _ = self.c.create(&alloc::format!("/api/v1/namespaces/{ns}/events"), &ev).await;
+    }
+
     /// Graceful termination for a pod with a deletionTimestamp.
     async fn terminate(&self, uid: &str, pod: &Value) {
         if !self.pods.borrow().contains_key(uid) {
@@ -1203,7 +1281,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         if self.all_stopped(uid) {
             // A pod kept by finalizers stays visible: record that nothing runs any more
             // (terminal phase, terminated containers), as upstream's kubelet does.
+            let since = self.pods.borrow_mut().get_mut(uid).map(|p| *p.stopped_at.get_or_insert_with(now_ms));
             self.report_final_status(uid, pod).await;
+            if since.is_some_and(|t| now_ms().saturating_sub(t) < 300) {
+                return;
+            }
             self.cleanup(uid);
             // Finish the deletion: the API object is removed once nothing runs.
             let path = alloc::format!("/api/v1/namespaces/{}/pods/{}", meta(pod, "namespace"), meta(pod, "name"));
@@ -1246,7 +1328,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let Some(p) = pods.get_mut(uid) else { return };
             let policy = pod.pointer(&["spec", "restartPolicy"]).and_then(Value::as_str).unwrap_or("Always");
             let mut status = status_json(p, policy);
+            if let Some(r) = pod.pointer(&["spec", "resources"]).filter(|r| r.as_object().is_some_and(|m| !m.is_empty())) {
+                status.set("resources", r.clone());
+            }
             stamp_conditions(p, &mut status, pod.pointer(&["metadata", "generation"]).and_then(Value::as_i64).unwrap_or(0));
+            keep_foreign_conditions(pod, &mut status);
             (status, alloc::format!("/api/v1/namespaces/{}/pods/{}/status", p.ns, p.name))
         };
         let text = json::to_string(&status);
@@ -1278,6 +1364,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             (status_json(p, policy), alloc::format!("/api/v1/namespaces/{}/pods/{}/status", p.ns, p.name))
         };
         let ok = self.pods.borrow().get(uid).is_some_and(|p| p.ctrs.iter().filter(|c| !c.init).all(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code == 0)));
+        keep_foreign_conditions(pod, &mut status);
         if let Value::Object(f) = &mut status {
             f.retain(|(k, _)| k != "phase");
             f.push((String::from("phase"), Value::from(if ok { "Succeeded" } else { "Failed" })));
@@ -1294,6 +1381,19 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         let patch = Value::Object(alloc::vec![(String::from("status"), status)]);
         let _ = self.c.patch(&path, "application/merge-patch+json", &patch).await;
+    }
+}
+
+/// Conditions other components set on the pod (`DisruptionTarget` from the scheduler or the
+/// eviction API, ...) survive the kubelet's status writes, which replace the whole list.
+fn keep_foreign_conditions(pod: &Value, status: &mut Value) {
+    const OWNED: [&str; 6] = ["PodScheduled", "Initialized", "ContainersReady", "Ready", "PodReadyToStartContainers", "PodResizeInProgress"];
+    let old: Vec<Value> = pod.pointer(&["status", "conditions"]).and_then(Value::as_array).map(|a| a.iter().filter(|c| !OWNED.contains(&c.get("type").and_then(Value::as_str).unwrap_or(""))).cloned().collect()).unwrap_or_default();
+    if old.is_empty() {
+        return;
+    }
+    if let Some(Value::Array(conds)) = status.get_mut("conditions") {
+        conds.extend(old);
     }
 }
 
@@ -1365,6 +1465,14 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
                 s => state_json(s),
             }),
         ];
+        if let Ok(r) = json::parse(c.res.as_bytes()) {
+            if let Some(req) = r.get("requests").filter(|q| q.as_object().is_some_and(|m| !m.is_empty())) {
+                f.push(("allocatedResources", req.clone()));
+            }
+            f.push(("resources", r));
+        } else {
+            f.push(("resources", o(Vec::new())));
+        }
         f.push(("lastState", c.last_term.as_ref().filter(|_| !matches!(c.state, CState::Terminated(_))).map(|tm| state_json(&CState::Terminated(tm.clone()))).unwrap_or(o(Vec::new()))));
         o(f)
     };
@@ -1460,7 +1568,7 @@ mod status_tests {
     use alloc::vec;
 
     fn ctr(name: &str, init: bool, eph: bool, state: CState) -> Ctr {
-        Ctr { name: name.into(), image: "img".into(), init, sidecar: false, eph, restart_count: 0, state, last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: true, ready: true }
+        Ctr { name: name.into(), image: "img".into(), init, sidecar: false, eph, restart_count: 0, state, last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: true, ready: true, res: String::new() }
     }
     fn done(code: i32) -> CState {
         CState::Terminated(Term { exit_code: code, reason: if code == 0 { "Completed" } else { "Error" }, started_at: 1, finished_at: 2, message: String::new() })
@@ -1472,7 +1580,7 @@ mod status_tests {
         CState::Waiting("ContainerCreating", String::new())
     }
     fn pod(ctrs: Vec<Ctr>) -> PodRt {
-        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, node_ip: [10, 0, 0, 1], ctrs, start_time: 0, kill_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new() }
+        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, node_ip: [10, 0, 0, 1], ctrs, start_time: 0, kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new() }
     }
     fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
         path.iter().try_fold(v, |v, k| match k.parse::<usize>() {

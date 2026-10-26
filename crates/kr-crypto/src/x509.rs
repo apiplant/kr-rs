@@ -695,6 +695,26 @@ impl SigningKey {
     }
 }
 
+/// A PKCS#10 certification request with an empty subject and no attributes (what the kubelet
+/// sends for a projected pod certificate: signers only read the public key), signed by `key`.
+pub fn certification_request(key: &SigningKey) -> Vec<u8> {
+    let mut info = Vec::new();
+    der::nested(&mut info, der::SEQUENCE, |i| {
+        der::uint(i, &[0]);
+        der::tlv(i, der::SEQUENCE, &[]);
+        i.extend_from_slice(&key.public().spki());
+        der::tlv(i, der::ctx(0), &[]);
+    });
+    let sig = key.sign(&info);
+    let mut out = Vec::new();
+    der::nested(&mut out, der::SEQUENCE, |o| {
+        o.extend_from_slice(&info);
+        write_sig_alg(o, key.sig_alg());
+        der::bit_string(o, &sig);
+    });
+    out
+}
+
 /// Key identifier: SHA-256 of the subjectPublicKey bits, truncated to 160 bits (RFC 7093).
 fn key_id(k: &PublicKey) -> [u8; 20] {
     let rsa_bits;
@@ -957,6 +977,23 @@ pub fn private_key_from_sec1(der_bytes: &[u8]) -> Result<SigningKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certification_request_is_signed_by_the_key() {
+        let key = SigningKey::P256(p256::SecretKey::from_seed(&[7u8; 48]));
+        let der_csr = certification_request(&key);
+        let mut top = der::Reader::new(&der_csr);
+        let mut seq = top.sequence().unwrap();
+        let (_, info_body, info_full) = seq.any().unwrap();
+        let mut info = der::Reader::new(info_body);
+        assert_eq!(info.small_uint().unwrap(), 0);
+        assert!(info.sequence().unwrap().is_empty()); // empty subject
+        let (_, _, spki) = info.any().unwrap();
+        assert_eq!(spki, &key.public().spki()[..]);
+        seq.sequence().unwrap(); // signatureAlgorithm
+        let sig = seq.bit_string().unwrap();
+        assert!(key.public().verify(key.sig_alg(), info_full, sig));
+    }
 
     #[test]
     fn civil_roundtrip() {

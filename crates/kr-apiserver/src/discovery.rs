@@ -1,7 +1,7 @@
 //! Legacy discovery documents: `/api`, `/api/v1`, `/apis`, `/apis/<group>/<version>`.
 //! Also aggregated discovery (`apidiscovery.k8s.io/v2`) for `/api` and `/apis`.
 
-use crate::resources::{self, Resource, RESOURCES};
+use crate::resources::{self, Resource, REVIEWS};
 use alloc::string::String;
 use alloc::vec::Vec;
 use kr_fmt::json::{self, Value};
@@ -20,13 +20,17 @@ fn strings(v: &[&str]) -> Value {
 
 const VERBS: &[&str] = &["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"];
 
+fn verbs(r: &Resource) -> &'static [&'static str] {
+    if REVIEWS.iter().any(|x| core::ptr::eq(x, r)) { &["create"] } else { VERBS }
+}
+
 fn resource_entries(r: &Resource) -> Vec<Value> {
     let mut out = alloc::vec![obj(alloc::vec![
         ("name", s(r.plural)),
         ("singularName", s(r.singular)),
         ("namespaced", Value::Bool(r.namespaced)),
         ("kind", s(r.kind)),
-        ("verbs", strings(VERBS)),
+        ("verbs", strings(verbs(r))),
         ("shortNames", strings(r.short)),
         ("categories", strings(r.categories)),
         ("storageVersionHash", s("")),
@@ -55,7 +59,7 @@ fn resource_entries(r: &Resource) -> Vec<Value> {
 
 /// APIResourceList for one group/version.
 pub fn resource_list(extra: &[&'static Resource], group: &str, version: &str) -> Option<String> {
-    let items: Vec<Value> = RESOURCES.iter().chain(extra.iter().copied()).filter(|r| r.group == group && r.version == version).flat_map(resource_entries).collect();
+    let items: Vec<Value> = resources::advertised(extra).filter(|r| r.group == group && r.version == version).flat_map(resource_entries).collect();
     if items.is_empty() {
         return None;
     }
@@ -196,7 +200,7 @@ fn agg_resource(r: &Resource) -> Value {
         ("responseKind", rk(r.kind, r.group, r.version)),
         ("scope", s(if r.namespaced { "Namespaced" } else { "Cluster" })),
         ("singularResource", s(r.singular)),
-        ("verbs", strings(VERBS)),
+        ("verbs", strings(verbs(r))),
         ("shortNames", strings(r.short)),
         ("categories", strings(r.categories)),
         ("subresources", Value::Array(subs)),
@@ -208,7 +212,7 @@ fn agg_group(extra: &[&'static Resource], g: &str) -> Value {
     let versions: Vec<Value> = vs
         .into_iter()
         .map(|v| {
-            let res: Vec<Value> = RESOURCES.iter().chain(extra.iter().copied()).filter(|r| r.group == g && r.version == v).map(agg_resource).collect();
+            let res: Vec<Value> = resources::advertised(extra).filter(|r| r.group == g && r.version == v).map(agg_resource).collect();
             obj(alloc::vec![("version", s(v)), ("resources", Value::Array(res)), ("freshness", s("Current"))])
         })
         .collect();

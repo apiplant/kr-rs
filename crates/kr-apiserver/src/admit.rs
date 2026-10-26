@@ -36,6 +36,50 @@ pub fn validate_sysctls(spec: &Value) -> Result<(), String> {
     }
 }
 
+/// Bounds of `maxExpirationSeconds` on pod certificates (1 hour .. 91 days).
+pub const PCR_MIN_EXPIRATION: i64 = 3600;
+pub const PCR_MAX_EXPIRATION: i64 = 7_862_400;
+
+/// `maxExpirationSeconds` of a pod certificate projection or request, if invalid.
+pub fn check_max_expiration(path: &str, v: Option<&Value>) -> Result<(), String> {
+    let Some(n) = v.and_then(Value::as_i64) else { return Ok(()) };
+    if n < PCR_MIN_EXPIRATION {
+        return Err(format!("{path}: Invalid value: {n}: if provided, maxExpirationSeconds must be >= {PCR_MIN_EXPIRATION}"));
+    }
+    if n > PCR_MAX_EXPIRATION {
+        return Err(format!("{path}: Invalid value: {n}: if provided, maxExpirationSeconds must be <= {PCR_MAX_EXPIRATION}"));
+    }
+    Ok(())
+}
+
+/// `projected` volume `podCertificate` sources: signer, key type and `maxExpirationSeconds`.
+pub fn validate_pod_certificates(spec: &Value) -> Result<(), String> {
+    let mut errs = Vec::new();
+    for (i, vol) in spec.get("volumes").and_then(Value::as_array).unwrap_or(&[]).iter().enumerate() {
+        for (j, src) in vol.pointer(&["projected", "sources"]).and_then(Value::as_array).unwrap_or(&[]).iter().enumerate() {
+            let Some(pc) = src.get("podCertificate") else { continue };
+            let at = format!("spec.volumes[{i}].projected.sources[{j}].podCertificate");
+            if pc.get("signerName").and_then(Value::as_str).is_none_or(str::is_empty) {
+                errs.push(format!("{at}.signerName: Required value"));
+            }
+            if !matches!(pc.get("keyType").and_then(Value::as_str), Some("RSA3072" | "RSA4096" | "ECDSAP256" | "ECDSAP384" | "ECDSAP521" | "ED25519")) {
+                errs.push(format!("{at}.keyType: Unsupported value: {:?}", pc.get("keyType").and_then(Value::as_str).unwrap_or("")));
+            }
+            if let Err(e) = check_max_expiration(&format!("{at}.maxExpirationSeconds"), pc.get("maxExpirationSeconds")) {
+                errs.push(e);
+            }
+            if ["credentialBundlePath", "keyPath", "certificateChainPath"].iter().all(|k| pc.get(k).and_then(Value::as_str).is_none_or(str::is_empty)) {
+                errs.push(format!("{at}: Required value: must set at least one of credentialBundlePath, keyPath or certificateChainPath"));
+            }
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join(", "))
+    }
+}
+
 /// RuntimeClass admission: `rc` is the named class (None when it does not exist). Copies
 /// `overhead.podFixed` into `spec.overhead` and merges `scheduling.nodeSelector` / `tolerations`.
 pub fn runtime_class(spec: &mut Value, name: &str, rc: Option<&Value>) -> Result<(), String> {

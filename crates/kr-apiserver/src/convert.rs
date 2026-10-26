@@ -12,7 +12,8 @@
 //! are converted by [`watch`]. In-process clients see objects as stored.
 
 use crate::api::{version_path, ApiServer, Reply, Req, WatchStream};
-use crate::object::{obj, ApiError};
+use crate::api::Route;
+use crate::object::{obj, ApiError, FieldSelector};
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::rc::Rc;
@@ -207,6 +208,51 @@ pub async fn write(api: &ApiServer, req: &Req<'_>) -> Option<(Reply, Vec<String>
     Some((reply, warns))
 }
 
+/// The part of the request's field selector that applies to the object in the requested version
+/// (a custom resource's `selectableFields` when the CRD converts with a webhook).
+fn deferred_selector(api: &ApiServer, rt: &Route, req: &Req<'_>) -> FieldSelector {
+    crate::api::Query::parse(req.query).ok().and_then(|q| api.field_selectors(rt, &q).ok()).map(|s| s.1).unwrap_or_default()
+}
+
+/// DELETE of a collection selected by a version-specific field selector: lists the converted
+/// objects, keeps the matching ones and deletes those by name. `None`: not such a request.
+pub async fn delete_collection(api: &ApiServer, req: &Req<'_>) -> Option<Reply> {
+    if req.method != "DELETE" {
+        return None;
+    }
+    let rt = api.wh_route(req.path)?;
+    if rt.name.is_some() || rt.sub.is_some() || (rt.res.namespaced && rt.namespace.is_none()) {
+        return None;
+    }
+    api.conversion_webhook(rt.res)?;
+    if deferred_selector(api, &rt, req).is_empty() {
+        return None;
+    }
+    let user = api.authenticate(req).ok()?;
+    let lreq = Req { method: "GET", path: req.path, query: req.query, content_type: None, accept: None, body: b"", user: Some(user.clone()), bearer: req.bearer, headers: req.headers, authz_verb: Some("deletecollection") };
+    let listed = post(api, &lreq, api.handle(&lreq)).await;
+    let Reply::Json(code, body) = &listed else { return Some(listed) };
+    if *code >= 300 {
+        return Some(listed);
+    }
+    let list = json::parse(body.as_bytes()).ok()?;
+    let dry = req.query.split('&').any(|p| p == "dryRun=All");
+    let mut deleted = Vec::new();
+    for item in list.get("items").and_then(Value::as_array).unwrap_or(&[]) {
+        let Some(n) = item.pointer(&["metadata", "name"]).and_then(Value::as_str) else { continue };
+        let path = format!("{}/{}", req.path.trim_end_matches('/'), n);
+        let ireq = Req { method: "DELETE", path: &path, query: if dry { "dryRun=All" } else { "" }, content_type: req.content_type, accept: None, body: req.body, user: Some(user.clone()), bearer: req.bearer, headers: req.headers, authz_verb: Some("deletecollection") };
+        match api.handle(&ireq) {
+            Reply::Json(c, _) if c < 300 => deleted.push(item.clone()),
+            Reply::Json(404, _) => {}
+            other => return Some(other),
+        }
+    }
+    let mut out = list;
+    out.set("items", Value::Array(deleted));
+    Some(Reply::Json(200, json::to_string(&out)))
+}
+
 /// Converts the objects in a successful response of a webhook-converted custom resource to the
 /// requested version.
 pub async fn post(api: &ApiServer, req: &Req<'_>, reply: Reply) -> Reply {
@@ -226,7 +272,14 @@ pub async fn post(api: &ApiServer, req: &Req<'_>, reply: Reply) -> Reply {
         convert_items(api, &cc, &gv, &mut [&mut v]).await
     } else if kind == format!("{}List", rt.res.kind) {
         match v.get_mut("items").and_then(Value::as_array_mut) {
-            Some(items) => convert_items(api, &cc, &gv, &mut items.iter_mut().collect::<Vec<_>>()).await,
+            Some(items) => {
+                let r = convert_items(api, &cc, &gv, &mut items.iter_mut().collect::<Vec<_>>()).await;
+                let sel = deferred_selector(api, &rt, req);
+                if r.is_ok() && !sel.is_empty() {
+                    items.retain(|i| sel.matches(i));
+                }
+                r
+            }
             None => return reply,
         }
     } else {
@@ -239,7 +292,7 @@ pub async fn post(api: &ApiServer, req: &Req<'_>, reply: Reply) -> Reply {
     }
 }
 
-type Pending = Pin<Box<dyn Future<Output = (Vec<u8>, bool)>>>;
+type Pending = Pin<Box<dyn Future<Output = (Vec<u8>, bool, Vec<String>)>>>;
 
 /// A watch of a webhook-converted custom resource: delivers each event's object in the requested
 /// version. Events are converted a chunk at a time (one webhook call per stored version in it),
@@ -252,6 +305,10 @@ struct ConvWatch {
     inner: WatchStream,
     pending: Option<Pending>,
     done: bool,
+    /// Field selector on the converted objects, and the names of those that matched so far (an
+    /// object that stops matching is delivered as DELETED, one that starts as ADDED).
+    sel: FieldSelector,
+    live: Vec<String>,
 }
 
 /// Wraps a watch reply of a webhook-converted custom resource in a [`ConvWatch`].
@@ -259,7 +316,8 @@ pub fn watch(api: &Rc<ApiServer>, req: &Req<'_>, reply: Reply) -> Reply {
     let Reply::Watch(inner) = reply else { return reply };
     let Some(rt) = api.wh_route(req.path) else { return Reply::Watch(inner) };
     let Some(cc) = api.conversion_webhook(rt.res) else { return Reply::Watch(inner) };
-    let w = ConvWatch { api: api.clone(), cc, gv: rt.res.group_version(), inner, pending: None, done: false };
+    let sel = deferred_selector(api, &rt, req);
+    let w = ConvWatch { api: api.clone(), cc, gv: rt.res.group_version(), inner, pending: None, done: false, sel, live: Vec::new() };
     Reply::Http(Response { status: 200, headers: alloc::vec![("Content-Type".into(), "application/json".into())], body: Body::Stream(Box::new(w)) })
 }
 
@@ -268,33 +326,54 @@ fn needs(ev: &Value, gv: &str) -> bool {
     matches!(ev.get("type").and_then(Value::as_str), Some("ADDED" | "MODIFIED" | "DELETED")) && ev.pointer(&["object", "apiVersion"]).and_then(Value::as_str).is_some_and(|v| v != gv)
 }
 
-/// Converts the events in `chunk` (newline-delimited watch events). The flag: the stream ends.
-async fn convert_chunk(api: Rc<ApiServer>, cc: Value, gv: String, chunk: Vec<u8>) -> (Vec<u8>, bool) {
+/// Converts the events in `chunk` (newline-delimited watch events) and applies the field selector
+/// to the converted objects. The flag: the stream ends.
+async fn convert_chunk(api: Rc<ApiServer>, cc: Value, gv: String, chunk: Vec<u8>, sel: FieldSelector, mut live: Vec<String>) -> (Vec<u8>, bool, Vec<String>) {
     let mut evs: Vec<Value> = chunk.split(|b| *b == b'\n').filter(|l| !l.is_empty()).filter_map(|l| json::parse(l).ok()).collect();
     let mut objs: Vec<&mut Value> = evs.iter_mut().filter(|e| needs(e, &gv)).filter_map(|e| e.get_mut("object")).collect();
     if let Err(e) = convert_items(&api, &cc, &gv, &mut objs).await {
-        let Reply::Json(_, status) = Reply::err(e) else { return (Vec::new(), true) };
+        let Reply::Json(_, status) = Reply::err(e) else { return (Vec::new(), true, live) };
         let mut out = format!("{{\"type\":\"ERROR\",\"object\":{status}}}").into_bytes();
         out.push(b'\n');
-        return (out, true);
+        return (out, true, live);
     }
     let mut out = Vec::new();
-    for e in &evs {
-        out.extend_from_slice(json::to_string(e).as_bytes());
+    for mut e in evs {
+        if !sel.is_empty() && matches!(e.get("type").and_then(Value::as_str), Some("ADDED" | "MODIFIED" | "DELETED")) {
+            let name = e.pointer(&["object", "metadata", "name"]).and_then(Value::as_str).unwrap_or("").to_string();
+            let key = format!("{}/{name}", e.pointer(&["object", "metadata", "namespace"]).and_then(Value::as_str).unwrap_or(""));
+            let was = live.iter().position(|l| *l == key);
+            let matched = e.get("type").and_then(Value::as_str) != Some("DELETED") && e.get("object").is_some_and(|o| sel.matches(o));
+            let kind = match (was, matched) {
+                (None, true) => {
+                    live.push(key);
+                    "ADDED"
+                }
+                (Some(_), true) => "MODIFIED",
+                (Some(i), false) => {
+                    live.swap_remove(i);
+                    "DELETED"
+                }
+                (None, false) => continue,
+            };
+            e.set("type", Value::from(kind));
+        }
+        out.extend_from_slice(json::to_string(&e).as_bytes());
         out.push(b'\n');
     }
-    (out, false)
+    (out, false, live)
 }
 
 impl ResponseStream for ConvWatch {
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
         loop {
             if let Some(f) = self.pending.as_mut() {
-                let (out, end) = match f.as_mut().poll(cx) {
+                let (out, end, live) = match f.as_mut().poll(cx) {
                     Poll::Ready(r) => r,
                     Poll::Pending => return Poll::Pending,
                 };
                 self.pending = None;
+                self.live = live;
                 self.done = end;
                 return Poll::Ready(Some(out));
             }
@@ -304,10 +383,11 @@ impl ResponseStream for ConvWatch {
             match self.inner.poll_chunk(cx) {
                 Poll::Ready(Some(chunk)) => {
                     let convert = chunk.split(|b| *b == b'\n').filter(|l| !l.is_empty()).any(|l| json::parse(l).is_ok_and(|e| needs(&e, &self.gv)));
-                    if !convert {
+                    if !convert && self.sel.is_empty() {
                         return Poll::Ready(Some(chunk));
                     }
-                    self.pending = Some(Box::pin(convert_chunk(self.api.clone(), self.cc.clone(), self.gv.clone(), chunk)));
+                    let sel = FieldSelector::clone_of(&self.sel);
+                    self.pending = Some(Box::pin(convert_chunk(self.api.clone(), self.cc.clone(), self.gv.clone(), chunk, sel, core::mem::take(&mut self.live))));
                 }
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,

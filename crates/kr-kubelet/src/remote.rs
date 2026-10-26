@@ -25,7 +25,7 @@ use kr_net::http1::{websocket, Transport};
 use kr_net::tls::TlsStream;
 
 pub const KUBELET_PORT: u16 = 10250;
-const UPGRADE_PROTOCOLS: [&str; 5] = ["v5.channel.k8s.io", "v4.channel.k8s.io", "SPDY/3.1+portforward.k8s.io", "v2.portforward.k8s.io", "portforward.k8s.io"];
+const UPGRADE_PROTOCOLS: [&str; 8] = ["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io", "binary.k8s.io", "base64.binary.k8s.io", "SPDY/3.1+portforward.k8s.io", "v2.portforward.k8s.io", "portforward.k8s.io"];
 
 pub struct Router {
     pub local_node: String,

@@ -135,7 +135,9 @@ pub async fn reconcile<C: Client>(c: &C, ns: &str, dname: &str) -> Result<Option
     let Some((sel_str, sel)) = ds.get("spec").and_then(|s| s.get("selector")).and_then(parse_selector) else { return Ok(None) };
     let template = ds.pointer(&["spec", "template"]).cloned().unwrap_or(Value::Null);
     let tspec = template.get("spec").cloned().unwrap_or(Value::Null);
-    let (rev, revs) = ensure_revision(c, &ds, "DaemonSet", &template).await?;
+    let (rev_name, revs) = ensure_revision(c, &ds, "DaemonSet", &template).await?;
+    // The pods' `controller-revision-hash` is the revision's hash, not its `<name>-<hash>` name.
+    let rev = rev_name.strip_prefix(&alloc::format!("{dname}-")).unwrap_or(&rev_name).to_string();
     let generation = int_at(&ds, &["metadata", "generation"], 1).to_string();
 
     let nodes = items(&c.list(NODES, "").await?);
@@ -260,8 +262,9 @@ pub async fn reconcile<C: Client>(c: &C, ns: &str, dname: &str) -> Result<Option
     .await?;
 
     let limit = int_at(&ds, &["spec", "revisionHistoryLimit"], 10).max(0) as usize;
-    let mut live: Vec<&str> = alloc::vec![rev.as_str()];
-    live.extend(all.iter().map(pod_hash));
+    let mut live_names: Vec<String> = alloc::vec![rev_name.clone()];
+    live_names.extend(all.iter().map(|p| alloc::format!("{dname}-{}", pod_hash(p))));
+    let live: Vec<&str> = live_names.iter().map(String::as_str).collect();
     trim_revisions(c, ns, &revs, &live, limit).await?;
     Ok(None)
 }

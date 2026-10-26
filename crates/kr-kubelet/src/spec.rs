@@ -163,7 +163,7 @@ pub fn write_etc_hosts(pod_dir: &str, pod: &Value, hostname: &str, ip: Option<[u
     let mut s = if host_net {
         String::from_utf8(kr_sys::fs::read_file(b"/etc/hosts\0", 1024 * 1024).unwrap_or_default()).unwrap_or_default()
     } else {
-        let mut s = String::from("# Kubernetes-managed hosts file (kr).\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
+        let mut s = String::from("# Kubernetes-managed hosts file.\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
         if let Some(a) = ip {
             // With a subdomain the pod is also `<hostname>.<subdomain>.<ns>.svc.<domain>`,
             // listed first as upstream's kubelet does (getent / `hostname -f` read it).
@@ -264,32 +264,27 @@ fn quantity(v: Option<&Value>) -> Option<Quantity> {
     v.and_then(Value::as_str).and_then(|s| Quantity::parse(s).ok()).or_else(|| v.and_then(Value::as_i64).map(|n| Quantity::from_i64(n, kr_fmt::quantity::Format::DecimalSI)))
 }
 
-/// Pod QoS class, as upstream: Guaranteed when every container (init included) has cpu and
-/// memory limits and any request equals its limit; BestEffort when no container sets any cpu or
-/// memory request or limit; otherwise Burstable.
+/// Pod QoS class (computed by the API server at creation; see `kr_apiserver::defaults::qos_class`).
 pub(crate) fn qos_class(pod: &Value) -> &'static str {
-    let (mut any, mut guaranteed, mut n) = (false, true, 0);
-    for key in ["initContainers", "containers"] {
-        for c in pod.pointer(&["spec", key]).and_then(Value::as_array).unwrap_or(&[]) {
-            n += 1;
-            for res in ["cpu", "memory"] {
-                let q = |kind: &str| quantity(c.pointer(&["resources", kind, res])).and_then(|q| q.milli_value());
-                let (req, lim) = (q("requests").filter(|v| *v != 0), q("limits").filter(|v| *v != 0));
-                any |= req.is_some() || lim.is_some();
-                match lim {
-                    None => guaranteed = false,
-                    Some(l) => guaranteed &= req.is_none_or(|r| r == l),
-                }
-            }
-        }
+    kr_apiserver::defaults::qos_class(pod)
+}
+
+/// A container's cgroup limits from its `resources`.
+pub(crate) fn container_limits(pod: &Value, ctr: &Value) -> Limits {
+    let mut limits = Limits { pids: Some(4096), ..Default::default() };
+    if let Some(m) = quantity(ctr.pointer(&["resources", "limits", "memory"])) {
+        limits.memory_bytes = m.value().and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
     }
-    if n > 0 && guaranteed {
-        "Guaranteed"
-    } else if any {
-        "Burstable"
-    } else {
-        "BestEffort"
+    if let Some(cpu) = quantity(ctr.pointer(&["resources", "limits", "cpu"])) {
+        limits.cpu_milli = cpu.milli_value().and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
     }
+
+    if let Some(cpu) = quantity(ctr.pointer(&["resources", "requests", "cpu"])).or_else(|| quantity(ctr.pointer(&["resources", "limits", "cpu"]))) {
+        limits.cpu_request_milli = cpu.milli_value().and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
+    }
+    limits.memory_request_bytes = quantity(ctr.pointer(&["resources", "requests", "memory"])).or_else(|| quantity(ctr.pointer(&["resources", "limits", "memory"]))).and_then(|m| m.value()).and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
+    limits.memory_guaranteed = qos_class(pod) == "Guaranteed";
+    limits
 }
 
 /// The pod cgroup's limits (summed container limits plus `spec.overhead`, init containers
@@ -439,9 +434,102 @@ async fn cluster_trust_bundle<C: Client>(c: &C, t: &Value, stage: &str, mode: u3
     };
     let certs = pem_certs(bundles.iter().map(|b| b.pointer(&["spec", "trustBundle"]).and_then(Value::as_str).unwrap_or("")));
     if certs.is_empty() {
-        return if optional { Ok(()) } else { Err(alloc::format!("clusterTrustBundle {path}: no matching bundle")) };
+        // An optional source with no bundle still produces its (empty) file.
+        return if optional { write_item(stage, path, b"", mode) } else { Err(alloc::format!("clusterTrustBundle {path}: no matching bundle")) };
     }
     write_item(stage, path, certs.concat().as_bytes(), mode)
+}
+
+/// A projected `podCertificate` source: a fresh key pair, a PodCertificateRequest to the named
+/// signer and the issued chain, written as one credential bundle and/or key and chain files. The
+/// files already in the volume are kept until 80% of the certificate's lifetime has passed.
+async fn pod_certificate<C: Client>(c: &C, pod: &Value, t: &Value, dir: &str, stage: &str, mode: u32) -> Result<(), String> {
+    use kr_crypto::x509;
+    let field = |k: &str| t.get(k).and_then(Value::as_str).unwrap_or("");
+    let (bundle, key_path, chain_path) = (field("credentialBundlePath"), field("keyPath"), field("certificateChainPath"));
+    let cur = |p: &str| kr_sys::fs::read_file(alloc::format!("{dir}/..data/{p}\0").as_bytes(), 1 << 20).ok();
+    // The leaf of the current chain decides whether it is still fresh.
+    let current_chain = if !bundle.is_empty() { cur(bundle) } else { cur(chain_path) };
+    let fresh = current_chain.as_deref().and_then(|b| core::str::from_utf8(b).ok()).and_then(|pem| x509::pem_decode_all(pem, "CERTIFICATE").ok()).and_then(|certs| {
+        let leaf = certs.into_iter().next()?;
+        let cert = x509::Certificate::parse(&leaf).ok()?;
+        Some(cert.not_before + (cert.not_after - cert.not_before) * 8 / 10 > now_secs())
+    });
+    if fresh == Some(true) {
+        let reuse = |p: &str, out: &mut Vec<u8>| cur(p).map(|d| out.extend_from_slice(&d));
+        let mut data = Vec::new();
+        if !bundle.is_empty() && reuse(bundle, &mut data).is_some() {
+            return write_item(stage, bundle, &data, mode);
+        }
+        if let (Some(k), Some(ch)) = (cur(key_path), cur(chain_path)) {
+            write_item(stage, key_path, &k, mode)?;
+            return write_item(stage, chain_path, &ch, mode);
+        }
+    }
+    if field("keyType") != "ECDSAP256" {
+        return Err(alloc::format!("podCertificate: key type {:?} is not supported", field("keyType")));
+    }
+    let mut seed = [0u8; 48];
+    kr_sys::getrandom(&mut seed);
+    let key = x509::SigningKey::P256(kr_crypto::p256::SecretKey::from_seed(&seed));
+    let (ns, pod_name) = (meta(pod, "namespace"), meta(pod, "name"));
+    let sa_name = pod.pointer(&["spec", "serviceAccountName"]).and_then(Value::as_str).unwrap_or("default");
+    let sa = c.get(&alloc::format!("/api/v1/namespaces/{ns}/serviceaccounts/{sa_name}")).await.map_err(|_| alloc::format!("podCertificate: serviceaccount {sa_name} not found"))?;
+    let node_name = pod.pointer(&["spec", "nodeName"]).and_then(Value::as_str).unwrap_or("");
+    let node = c.get(&alloc::format!("/api/v1/nodes/{node_name}")).await.map_err(|_| alloc::format!("podCertificate: node {node_name} not found"))?;
+    let mut spec = alloc::vec![
+        ("signerName", Value::from(field("signerName"))),
+        ("podName", Value::from(pod_name)),
+        ("podUID", Value::from(meta(pod, "uid"))),
+        ("serviceAccountName", Value::from(sa_name)),
+        ("serviceAccountUID", Value::from(meta(&sa, "uid"))),
+        ("nodeName", Value::from(node_name)),
+        ("nodeUID", Value::from(meta(&node, "uid"))),
+        ("stubPKCS10Request", Value::String(kr_fmt::base64::encode(&x509::certification_request(&key)))),
+    ];
+    if let Some(m) = t.get("maxExpirationSeconds") {
+        spec.push(("maxExpirationSeconds", m.clone()));
+    }
+    if let Some(a) = t.get("userAnnotations").filter(|a| a.as_object().is_some_and(|o| !o.is_empty())) {
+        spec.push(("unverifiedUserAnnotations", a.clone()));
+    }
+    let req = Value::Object(alloc::vec![
+        ("apiVersion".into(), Value::from("certificates.k8s.io/v1")),
+        ("kind".into(), Value::from("PodCertificateRequest")),
+        ("metadata".into(), Value::Object(alloc::vec![("generateName".into(), Value::String(alloc::format!("{pod_name}-"))), ("namespace".into(), Value::from(ns))])),
+        ("spec".into(), Value::Object(spec.into_iter().map(|(k, v)| (k.into(), v)).collect())),
+    ]);
+    let base = alloc::format!("/apis/certificates.k8s.io/v1/namespaces/{ns}/podcertificaterequests");
+    let created = c.create(&base, &req).await.map_err(|e| alloc::format!("podCertificate: creating the request: {}", e.message))?;
+    let path = alloc::format!("{base}/{}", meta(&created, "name"));
+    let mut issued = None;
+    for _ in 0..300 {
+        let Ok(cur) = c.get(&path).await else { break };
+        let conds = cur.pointer(&["status", "conditions"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+        if let Some(bad) = conds.iter().find(|x| matches!(x.get("type").and_then(Value::as_str), Some("Denied" | "Failed"))) {
+            let _ = c.delete(&path).await;
+            return Err(alloc::format!("podCertificate: request {} by the signer: {}", bad.get("type").and_then(Value::as_str).unwrap_or(""), bad.get("message").and_then(Value::as_str).unwrap_or("")));
+        }
+        if let Some(chain) = cur.pointer(&["status", "certificateChain"]).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            issued = Some(chain.to_string());
+            break;
+        }
+        kr_rt::exec::sleep(100).await;
+    }
+    let _ = c.delete(&path).await;
+    let chain = issued.ok_or("podCertificate: the signer has not issued the certificate yet")?;
+    let chain = if chain.ends_with('\n') { chain } else { chain + "\n" };
+    let key_pem = x509::pem_encode("PRIVATE KEY", &x509::private_key_to_pkcs8(&key));
+    if !bundle.is_empty() {
+        write_item(stage, bundle, alloc::format!("{key_pem}{chain}").as_bytes(), mode)?;
+    }
+    if !key_path.is_empty() {
+        write_item(stage, key_path, key_pem.as_bytes(), mode)?;
+    }
+    if !chain_path.is_empty() {
+        write_item(stage, chain_path, chain.as_bytes(), mode)?;
+    }
+    Ok(())
 }
 
 /// The distinct certificates of PEM bundles, each re-emitted as one canonical PEM block.
@@ -502,6 +590,8 @@ async fn stage_volume<C: Client>(c: &C, pod: &Value, vol: &Value, dir: &str, sta
                 downward(pod, d, stage, mode)?;
             } else if let Some(t) = src.get("clusterTrustBundle") {
                 cluster_trust_bundle(c, t, stage, mode).await?;
+            } else if let Some(t) = src.get("podCertificate") {
+                pod_certificate(c, pod, t, dir, stage, mode).await?;
             }
         }
         Ok(())
@@ -854,19 +944,7 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         (None, None) => img.user.clone(),
     };
 
-    let mut limits = Limits { pids: Some(4096), ..Default::default() };
-    if let Some(m) = quantity(ctr.pointer(&["resources", "limits", "memory"])) {
-        limits.memory_bytes = m.value().and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
-    }
-    if let Some(cpu) = quantity(ctr.pointer(&["resources", "limits", "cpu"])) {
-        limits.cpu_milli = cpu.milli_value().and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
-    }
-
-    if let Some(cpu) = quantity(ctr.pointer(&["resources", "requests", "cpu"])).or_else(|| quantity(ctr.pointer(&["resources", "limits", "cpu"]))) {
-        limits.cpu_request_milli = cpu.milli_value().and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
-    }
-    limits.memory_request_bytes = quantity(ctr.pointer(&["resources", "requests", "memory"])).or_else(|| quantity(ctr.pointer(&["resources", "limits", "memory"]))).and_then(|m| m.value()).and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0);
-    limits.memory_guaranteed = qos_class(pod) == "Guaranteed";
+    let limits = container_limits(pod, ctr);
     let vols = pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]);
     let mut mounts = alloc::vec![
         Mount { source: alloc::format!("{pod_dir}/etc-hosts").into_bytes(), sub_path: None, target: b"/etc/hosts".to_vec(), readonly: false },

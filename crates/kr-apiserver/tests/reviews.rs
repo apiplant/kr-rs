@@ -156,3 +156,55 @@ fn reviews_need_permission() {
     assert_eq!(call_as(&api, nobody(), "POST", "/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews", sar).0, 403);
     assert_eq!(call_as(&api, None, "POST", "/apis/authentication.k8s.io/v1/tokenreviews", r#"{"spec":{"token":"x"}}"#).0 / 100, 4);
 }
+
+#[test]
+fn reviews_are_discoverable_create_only() {
+    let api = server();
+    for (path, plural) in [("/apis/authentication.k8s.io/v1", "tokenreviews"), ("/apis/authentication.k8s.io/v1", "selfsubjectreviews"), ("/apis/authorization.k8s.io/v1", "subjectaccessreviews")] {
+        let (c, d) = call(&api, "GET", path, "");
+        assert_eq!(c, 200, "{path}");
+        let res = d.get("resources").and_then(Value::as_array).unwrap();
+        let r = res.iter().find(|r| r.get("name").and_then(Value::as_str) == Some(plural)).unwrap_or_else(|| panic!("{plural} not advertised"));
+        assert_eq!(r.get("verbs").and_then(Value::as_array).map(|v| v.len()), Some(1));
+    }
+    assert!(json::to_string(&call(&api, "GET", "/apis", "").1).contains("authentication.k8s.io"));
+}
+
+#[test]
+fn impersonation_and_self_subject_review() {
+    let api = server();
+    let headers = [("Impersonate-User".to_string(), "system:serviceaccount:default:e2e".to_string())];
+    let as_imp = |user: Option<User>, hdrs: &[(String, String)], method: &str, path: &str, body: &str| {
+        let req = Req { method, path, query: "", content_type: Some("application/json"), accept: None, body: body.as_bytes(), user, bearer: None, headers: hdrs, authz_verb: None };
+        match api.handle(&req) {
+            Reply::Json(c, b) => (c, json::parse(b.as_bytes()).unwrap_or(Value::Null)),
+            _ => panic!("unexpected reply"),
+        }
+    };
+    let who = "/apis/authentication.k8s.io/v1/selfsubjectreviews";
+    let (c, r) = as_imp(admin(), &headers, "POST", who, "{}");
+    assert_eq!(c, 201);
+    assert_eq!(r.pointer(&["status", "userInfo", "username"]).and_then(Value::as_str), Some("system:serviceaccount:default:e2e"));
+    // The impersonated identity is authorized as itself: it cannot list configmaps.
+    assert_eq!(as_imp(admin(), &headers, "GET", "/api/v1/namespaces/default/configmaps", "").0, 403);
+    // A caller without the impersonate verb is refused.
+    let nobody = Some(User { name: "nobody".into(), groups: vec!["system:authenticated".into()] });
+    assert_eq!(as_imp(nobody, &headers, "POST", who, "{}").0, 403);
+}
+
+#[test]
+fn self_subject_rules_review() {
+    let api = server();
+    let review = |u: Option<User>| call_as(&api, u, "POST", "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", r#"{"spec":{"namespace":"default"}}"#);
+    let (c, r) = review(admin());
+    assert_eq!(c, 201);
+    assert!(json::to_string(&r).contains(r#""resources":["*"]"#));
+    // A user bound to the view role by a RoleBinding gets its rules, only in that namespace.
+    assert_eq!(call(&api, "POST", "/apis/rbac.authorization.k8s.io/v1/namespaces/default/rolebindings", r#"{"metadata":{"name":"b"},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"view"},"subjects":[{"kind":"User","name":"bob"}]}"#).0, 201);
+    let bob = Some(User { name: "bob".into(), groups: vec!["system:authenticated".into()] });
+    let (_, r) = review(bob.clone());
+    let rules = r.pointer(&["status", "resourceRules"]).and_then(Value::as_array).unwrap();
+    assert!(rules.iter().any(|x| json::to_string(x).contains("configmaps")));
+    let (_, other) = call_as(&api, bob, "POST", "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", r#"{"spec":{"namespace":"kube-system"}}"#);
+    assert!(!json::to_string(&other).contains("configmaps"));
+}

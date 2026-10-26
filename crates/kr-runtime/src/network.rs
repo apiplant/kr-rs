@@ -66,6 +66,11 @@ fn exists_ok(r: Result<(), Errno>) -> Result<(), Errno> {
     }
 }
 
+/// The bridge's fixed MAC (locally administered, from the gateway address).
+fn gateway_mac(gw: [u8; 4]) -> [u8; 6] {
+    [0x02, 0x6b, gw[0], gw[1], gw[2], gw[3]]
+}
+
 /// Creates (idempotently) the bridge, its gateway address, IPv4 forwarding and the NAT table.
 pub fn setup_host() -> Result<(), Errno> {
     setup_host_with(&PodNet::default())
@@ -76,6 +81,7 @@ pub fn setup_host_with(pn: &PodNet) -> Result<(), Errno> {
     exists_ok(nl.bridge_add(BRIDGE))?;
     let br = netlink::ifindex(BRIDGE)?;
     exists_ok(nl.addr_add(br, pn.gateway, pn.prefix))?;
+    nl.link_set_mac(br, gateway_mac(pn.gateway))?;
     nl.link_up(br)?;
     ns::write_file(b"/proc/sys/net/ipv4/ip_forward\0", b"1")?;
     kr_net::nft::ensure_masquerade(&kr_net::nft::Masquerade { table: NFT_TABLE, cidr: CLUSTER_CIDR.0, prefix: CLUSTER_CIDR.1, bridge: BRIDGE })
@@ -92,6 +98,7 @@ pub fn setup_infra_bridge(pn: &PodNet) -> i32 {
     let _ = nl.bridge_add(BRIDGE);
     let Ok(br) = netlink::ifindex(BRIDGE) else { return 2 };
     let _ = nl.addr_add(br, pn.gateway, pn.prefix);
+    let _ = nl.link_set_mac(br, gateway_mac(pn.gateway));
     if nl.link_up(br).is_err() {
         return 3;
     }
@@ -136,11 +143,23 @@ pub fn attach(pid: i32, id: &[u8]) -> Result<(), Errno> {
     r
 }
 
+/// Forgets the host's ARP entry for a pod address that is being handed to a new pod: addresses
+/// are reused, and a stale entry would send packets to the previous pod's MAC (dropped) until it
+/// expires.
+pub fn forget_neighbour(ip: [u8; 4]) {
+    if let (Ok(nl), Ok(br)) = (Netlink::route(), netlink::ifindex(BRIDGE)) {
+        let _ = nl.neigh_flush(br, ip);
+    }
+}
+
 /// Child side, inside the container netns (before capabilities are dropped).
 pub fn configure_child(c: &NetConfig) -> Result<(), Errno> {
     let nl = Netlink::route()?;
     let idx = netlink::ifindex(b"eth0")?;
     nl.addr_add(idx, c.ip, c.prefix)?;
+    // Announce the address (gratuitous ARP) when the link comes up, so peers holding the previous
+    // owner's MAC for a reused address learn the new one at once. Best effort.
+    let _ = ns::write_file(b"/proc/sys/net/ipv4/conf/eth0/arp_notify\0", b"1");
     nl.link_up(idx)?;
     nl.route_add([0; 4], 0, Some(c.gateway), idx)
 }

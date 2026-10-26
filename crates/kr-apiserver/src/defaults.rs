@@ -31,14 +31,77 @@ fn obj<'a>(o: &'a mut Value, key: &str) -> Option<&'a mut Value> {
     o.get_mut(key).filter(|v| matches!(v, Value::Object(_)))
 }
 
+fn quantity_of(v: Option<&Value>) -> Option<kr_fmt::quantity::Quantity> {
+    use kr_fmt::quantity::{Format, Quantity};
+    v.and_then(Value::as_str).and_then(|s| Quantity::parse(s).ok()).or_else(|| v.and_then(Value::as_i64).map(|n| Quantity::from_i64(n, Format::DecimalSI)))
+}
+
+/// Pod QoS class, as upstream: Guaranteed when every container (init included) has cpu and
+/// memory limits and any request equals its limit; BestEffort when no container sets any cpu or
+/// memory request or limit; otherwise Burstable.
+pub fn qos_class(pod: &Value) -> &'static str {
+    let (mut any, mut guaranteed, mut n) = (false, true, 0);
+    for key in ["initContainers", "containers"] {
+        for c in pod.pointer(&["spec", key]).and_then(Value::as_array).unwrap_or(&[]) {
+            n += 1;
+            for res in ["cpu", "memory"] {
+                let q = |kind: &str| quantity_of(c.pointer(&["resources", kind, res])).and_then(|q| q.milli_value());
+                let (req, lim) = (q("requests").filter(|v| *v != 0), q("limits").filter(|v| *v != 0));
+                any |= req.is_some() || lim.is_some();
+                match lim {
+                    None => guaranteed = false,
+                    Some(l) => guaranteed &= req.is_none_or(|r| r == l),
+                }
+            }
+        }
+    }
+    if n > 0 && guaranteed {
+        "Guaranteed"
+    } else if any {
+        "Burstable"
+    } else {
+        "BestEffort"
+    }
+}
+
+/// core/v1 and events.k8s.io/v1 Events are two views of one object: the fields of one API are
+/// copied to the other's when that is not set (as upstream's conversion does).
+fn event(o: &mut Value) {
+    let copy = |o: &mut Value, from: &[&str], to: &[&str]| {
+        if o.pointer(to).is_none_or(Value::is_null) {
+            if let Some(v) = o.pointer(from).filter(|v| !v.is_null()).cloned() {
+                let (last, parents) = to.split_last().unwrap();
+                let mut cur = &mut *o;
+                for p in parents {
+                    cur = cur.entry_object(p);
+                }
+                cur.set(last, v);
+            }
+        }
+    };
+    for (a, b) in [("involvedObject", "regarding"), ("message", "note")] {
+        copy(o, &[a], &[b]);
+        copy(o, &[b], &[a]);
+    }
+    copy(o, &["source", "component"], &["reportingController"]);
+    copy(o, &["reportingController"], &["source", "component"]);
+    copy(o, &["reportingComponent"], &["reportingController"]);
+    copy(o, &["source", "host"], &["reportingInstance"]);
+    copy(o, &["reportingInstance"], &["source", "host"]);
+}
+
 /// Applies the defaults for `kind` (identified by its resource plural and group).
 pub fn apply(group: &str, plural: &str, o: &mut Value) {
     match (group, plural) {
         ("", "pods") => {
             pod_spec(o.entry_object("spec"));
             def(o.entry_object("status"), "phase", s("Pending"));
+            let qos = qos_class(o);
+            def(o.entry_object("status"), "qosClass", s(qos));
         }
         ("", "podtemplates") => template(o),
+        ("", "events") | ("events.k8s.io", "events") => event(o),
+        ("certificates.k8s.io", "podcertificaterequests") => def(o.entry_object("spec"), "maxExpirationSeconds", int(86400)),
         ("", "replicationcontrollers") => {
             let sp = o.entry_object("spec");
             def(sp, "replicas", int(1));

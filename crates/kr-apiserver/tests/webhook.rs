@@ -344,7 +344,8 @@ fn run() {
         let r = last("/deny-exec");
         let s = |p: &[&str]| r.pointer(p).and_then(Value::as_str).map(String::from);
         assert_eq!((s(&["operation"]).as_deref(), s(&["subResource"]).as_deref(), s(&["kind", "kind"]).as_deref(), s(&["name"]).as_deref()), (Some("CONNECT"), Some("exec"), Some("PodExecOptions"), Some("nopod")));
-        assert_eq!(r.get("object"), Some(&Value::Null));
+        // The connect options are the object (agnhost's attach webhook reads them there) and the options.
+        assert_eq!(r.get("object"), r.get("options"));
         let o = r.get("options").unwrap();
         assert_eq!((o.get("kind").and_then(Value::as_str), o.get("container").and_then(Value::as_str), o.get("stdout").and_then(Value::as_bool), o.get("tty").and_then(Value::as_bool)), (Some("PodExecOptions"), Some("main"), Some(true), Some(false)));
         assert_eq!(json::to_string(o.get("command").unwrap()), r#"["ls","-l"]"#);

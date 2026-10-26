@@ -135,11 +135,95 @@ fn status_of(rs: &Value, f: &str) -> i64 {
     int_at(rs, &["status", f], 0)
 }
 
-async fn scale<C: Client>(c: &C, ns: &str, rs: &mut Value, n: i64) -> Result<()> {
-    let patch = obj(alloc::vec![("spec", obj(alloc::vec![("replicas", num(n))]))]);
+const DESIRED_ANN: &str = "deployment.kubernetes.io/desired-replicas";
+const MAX_ANN: &str = "deployment.kubernetes.io/max-replicas";
+
+fn ann_of(rs: &Value, key: &str) -> Option<i64> {
+    rs.pointer(&["metadata", "annotations", key]).and_then(Value::as_str).and_then(|s| s.parse().ok())
+}
+
+/// Scales `rs` to `n` and records the Deployment's size at that time (desired and desired+surge),
+/// which later tells a rollout step from a scaling of the Deployment, and how to share it out.
+async fn scale<C: Client>(c: &C, ns: &str, d: &Value, rs: &mut Value, n: i64) -> Result<()> {
+    let desired = int_at(d, &["spec", "replicas"], 1).max(0);
+    let max = desired + fenceposts(d, desired).0;
+    let anns = obj(alloc::vec![(DESIRED_ANN, Value::String(desired.to_string())), (MAX_ANN, Value::String(max.to_string()))]);
+    let patch = obj(alloc::vec![("metadata", obj(alloc::vec![("annotations", anns.clone())])), ("spec", obj(alloc::vec![("replicas", num(n))]))]);
     c.patch(&alloc::format!("{}/{}", replicasets(Some(ns)), name(rs)), MERGE, &patch).await?;
     rs.entry_object("spec").set("replicas", num(n));
+    if let Value::Object(f) = anns {
+        for (k, v) in f {
+            rs.entry_object("metadata").entry_object("annotations").set(&k, v);
+        }
+    }
     Ok(())
+}
+
+/// The share of the Deployment's replicas to add to `rs` (upstream `getReplicaSetFraction`
+/// clamped by what is left to add).
+fn proportion(d: &Value, rs: &Value, to_add: i64, added: i64) -> i64 {
+    let desired = int_at(d, &["spec", "replicas"], 1).max(0);
+    if desired == 0 || to_add == 0 || to_add == added {
+        return 0;
+    }
+    let cur = spec_replicas(rs);
+    let fraction = match ann_of(rs, MAX_ANN).filter(|m| *m > 0) {
+        None => 0,
+        Some(annotated) => {
+            let max = desired + fenceposts(d, desired).0;
+            // Rounded as Go's math.Round on the integer quotient.
+            ((2 * cur * max + annotated) / (2 * annotated)) - cur
+        }
+    };
+    let allowed = to_add - added;
+    if to_add > 0 { fraction.min(allowed) } else { fraction.max(allowed) }
+}
+
+/// Scaling of the Deployment in the middle of a rollout: the change is shared among the live
+/// ReplicaSets in proportion to their size. `true`: handled (no rollout step this round).
+async fn scale_event<C: Client>(c: &C, ns: &str, d: &Value, desired: i64, new_rs: &mut Value, olds: &mut [Value]) -> Result<bool> {
+    let scaling = |rs: &Value| ann_of(rs, DESIRED_ANN).is_some_and(|a| a != desired) && spec_replicas(rs) > 0;
+    if !(scaling(new_rs) || olds.iter().any(scaling)) {
+        return Ok(false);
+    }
+    // The ReplicaSets that have replicas (upstream `FilterActiveReplicaSets`).
+    let active = olds.iter().filter(|o| spec_replicas(o) > 0).count() + (spec_replicas(new_rs) > 0) as usize;
+    if active == 1 {
+        let rs = if spec_replicas(new_rs) > 0 { new_rs } else { olds.iter_mut().find(|o| spec_replicas(o) > 0).unwrap() };
+        if spec_replicas(rs) != desired || ann_of(rs, DESIRED_ANN) != Some(desired) {
+            scale(c, ns, d, rs, desired).await?;
+        }
+        return Ok(true);
+    }
+    let allowed = desired + fenceposts(d, desired).0;
+    let total: i64 = olds.iter().map(spec_replicas).sum::<i64>() + spec_replicas(new_rs);
+    let to_add = allowed - total;
+    // Largest first; ties: newer first when growing, older first when shrinking.
+    let mut order: Vec<(i64, i64, usize)> = olds.iter().enumerate().filter(|(_, o)| spec_replicas(o) > 0).map(|(i, o)| (spec_replicas(o), revision_of(o), i)).collect();
+    order.push((spec_replicas(new_rs), revision_of(new_rs), usize::MAX));
+    order.retain(|(n, _, _)| *n > 0);
+    order.sort_by(|a, b| b.0.cmp(&a.0).then(if to_add > 0 { b.1.cmp(&a.1) } else { a.1.cmp(&b.1) }));
+    let mut added = 0;
+    let mut sizes: Vec<(usize, i64)> = Vec::new();
+    for (n, _, idx) in order.iter() {
+        let rs = if *idx == usize::MAX { &*new_rs } else { &olds[*idx] };
+        let p = proportion(d, rs, to_add, added);
+        added += p;
+        sizes.push((*idx, n + p));
+    }
+    // What the rounding left over goes to the largest ReplicaSet.
+    if let (Some(first), true) = (sizes.first_mut(), to_add != 0) {
+        first.1 = (first.1 + to_add - added).max(0);
+    }
+    for (idx, size) in sizes {
+        let rs = if idx == usize::MAX { &mut *new_rs } else { &mut olds[idx] };
+        // The annotations follow too even when the size does not change; otherwise the same
+        // scaling event would be seen again and the rollout never resumes.
+        if spec_replicas(rs) != size || ann_of(rs, DESIRED_ANN) != Some(desired) {
+            scale(c, ns, d, rs, size).await?;
+        }
+    }
+    Ok(true)
 }
 
 fn new_replicaset(d: &Value, hash: &str, revision: i64) -> Value {
@@ -254,11 +338,11 @@ pub async fn reconcile<C: Client>(c: &C, cfg: &Config, ns: &str, dname: &str) ->
         let live = olds.iter().filter(|o| spec_replicas(o) > 0).count() + new_rs.as_ref().map_or(0, |n| (spec_replicas(n) > 0) as usize);
         if live <= 1 {
             match new_rs.as_mut().filter(|n| spec_replicas(n) > 0 || live == 0) {
-                Some(n) if spec_replicas(n) != desired => scale(c, ns, n, desired).await?,
+                Some(n) if spec_replicas(n) != desired => scale(c, ns, &d, n, desired).await?,
                 Some(_) => {}
                 None => {
                     if let Some(o) = olds.iter_mut().find(|o| spec_replicas(o) > 0).filter(|o| spec_replicas(o) != desired) {
-                        scale(c, ns, o, desired).await?;
+                        scale(c, ns, &d, o, desired).await?;
                     }
                 }
             }
@@ -266,14 +350,14 @@ pub async fn reconcile<C: Client>(c: &C, cfg: &Config, ns: &str, dname: &str) ->
     } else if let Some(new_rs) = new_rs.as_mut() {
         if recreate {
             for old in olds.iter_mut().filter(|o| spec_replicas(o) > 0) {
-                scale(c, ns, old, 0).await?;
+                scale(c, ns, &d, old, 0).await?;
             }
             let old_uids: Vec<&str> = olds.iter().map(uid).collect();
             let left = items(&c.list(&pods(Some(ns)), "").await?).iter().filter(|p| !pod_terminal(p) && controller_ref(p).is_some_and(|r| old_uids.contains(&str_at(r, &["uid"])))).count();
             if left > 0 {
                 wait = Some(cfg.retry_ms);
             } else if spec_replicas(new_rs) != desired {
-                scale(c, ns, new_rs, desired).await?;
+                scale(c, ns, &d, new_rs, desired).await?;
             }
         } else {
             rolling(c, ns, &d, desired, new_rs, &mut olds).await?;
@@ -290,16 +374,19 @@ pub async fn reconcile<C: Client>(c: &C, cfg: &Config, ns: &str, dname: &str) ->
 
 /// One rolling-update step (see the module docs).
 async fn rolling<C: Client>(c: &C, ns: &str, d: &Value, desired: i64, new_rs: &mut Value, olds: &mut [Value]) -> Result<()> {
+    if scale_event(c, ns, d, desired, new_rs, olds).await? {
+        return Ok(());
+    }
     let (surge, max_unavail) = fenceposts(d, desired);
     let total: i64 = olds.iter().map(spec_replicas).sum::<i64>() + spec_replicas(new_rs);
     let cur = spec_replicas(new_rs);
     if cur > desired {
-        return scale(c, ns, new_rs, desired).await;
+        return scale(c, ns, d, new_rs, desired).await;
     }
     if cur < desired {
         let room = desired + surge - total;
         if room > 0 {
-            return scale(c, ns, new_rs, desired.min(cur + room)).await;
+            return scale(c, ns, d, new_rs, desired.min(cur + room)).await;
         }
     }
     let min_available = desired - max_unavail;
@@ -319,7 +406,7 @@ async fn rolling<C: Client>(c: &C, ns: &str, d: &Value, desired: i64, new_rs: &m
             continue;
         }
         let n = (spec - avail).min(max_scaled_down - cleaned);
-        scale(c, ns, old, spec - n).await?;
+        scale(c, ns, d, old, spec - n).await?;
         cleaned += n;
     }
     // Then healthy ones, as long as availability stays above the floor.
@@ -334,7 +421,7 @@ async fn rolling<C: Client>(c: &C, ns: &str, d: &Value, desired: i64, new_rs: &m
             continue;
         }
         let n = spec.min(budget);
-        scale(c, ns, old, spec - n).await?;
+        scale(c, ns, d, old, spec - n).await?;
         budget -= n;
     }
     Ok(())
@@ -493,5 +580,27 @@ mod tests {
         assert_eq!(template_hash(&a), template_hash(&b));
         assert_ne!(template_hash(&a), template_hash(&c));
         assert!(template_hash(&a).bytes().all(|x| b"bcdfghjklmnpqrstvwxz2456789".contains(&x)));
+    }
+}
+
+#[cfg(test)]
+mod proportional_tests {
+    use super::*;
+
+    fn v(s: &str) -> Value {
+        kr_fmt::json::parse_str(s).unwrap()
+    }
+
+    /// The conformance scenario: 10 replicas (maxSurge 3) scaled to 30 mid-rollout, with 8 and 5
+    /// replicas in the old and new ReplicaSet (both annotated max 13) -> 20 and 13.
+    #[test]
+    fn scaling_is_shared_in_proportion() {
+        let d = v(r#"{"spec":{"replicas":30,"strategy":{"rollingUpdate":{"maxSurge":3,"maxUnavailable":2}}}}"#);
+        let rs = |n: i64| v(&alloc::format!(r#"{{"metadata":{{"annotations":{{"deployment.kubernetes.io/max-replicas":"13"}}}},"spec":{{"replicas":{n}}}}}"#));
+        let to_add = 33 - 13;
+        let first = proportion(&d, &rs(8), to_add, 0);
+        assert_eq!(first, 12);
+        assert_eq!(proportion(&d, &rs(5), to_add, first), 8);
+        assert_eq!(proportion(&d, &rs(5), to_add, to_add), 0);
     }
 }

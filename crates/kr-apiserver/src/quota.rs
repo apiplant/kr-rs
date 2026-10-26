@@ -82,6 +82,24 @@ pub fn usage(plural: &str, group: &str, obj: &Value) -> Vec<(String, Quantity)> 
                 out.push((format!("requests.{res}"), req));
                 out.push((format!("limits.{res}"), lim));
             }
+            // Extended resources (`example.com/dongle`) count as `requests.<name>`.
+            let mut ext: Vec<&str> = Vec::new();
+            for key in ["containers", "initContainers"] {
+                for c in list(spec, key) {
+                    for kind in ["requests", "limits"] {
+                        if let Some(m) = c.pointer(&["resources", kind]).and_then(Value::as_object) {
+                            ext.extend(m.iter().map(|(k, _)| k.as_str()).filter(|k| k.contains('/') && !k.starts_with("kubernetes.io/")));
+                        }
+                    }
+                }
+            }
+            ext.sort();
+            ext.dedup();
+            for res in ext {
+                let req = pod_resource(spec, "requests", res);
+                let req = if req == zero() { pod_resource(spec, "limits", res) } else { req };
+                out.push((format!("requests.{res}"), req));
+            }
         }
         ("services", "") => {
             let ty = obj.pointer(&["spec", "type"]).and_then(Value::as_str).unwrap_or("ClusterIP");
@@ -307,6 +325,7 @@ pub fn source_of(name: &str) -> Option<&'static crate::resources::Resource> {
         "services" | "services.nodeports" | "services.loadbalancers" => ("services", ""),
         "persistentvolumeclaims" | "requests.storage" => ("persistentvolumeclaims", ""),
         "replicationcontrollers" | "resourcequotas" | "secrets" | "configmaps" => (name, ""),
+        n if n.starts_with("requests.") && n.contains('/') => ("pods", ""),
         _ => return None,
     };
     resources::find(group, "v1", plural)

@@ -29,6 +29,8 @@ pub struct Custom {
     pub webhook: Option<Value>,
     /// The CRD's storage version (new objects are stored as this one).
     pub storage: String,
+    /// Field selector labels of this version (`selectableFields` JSON paths without the leading dot).
+    pub selectable: Vec<String>,
 }
 
 impl Custom {
@@ -266,9 +268,14 @@ pub fn build(crd: &Value, existing: &[Custom]) -> Vec<Custom> {
                 categories: leak_all(&cats),
             }))
         });
-        out.push(Custom { res, crd: str_at(crd, &["metadata", "name"]).to_string(), schema: v.pointer(&["schema", "openAPIV3Schema"]).cloned(), scale, webhook: webhook.clone(), storage: storage.clone() });
+        out.push(Custom { res, crd: str_at(crd, &["metadata", "name"]).to_string(), schema: v.pointer(&["schema", "openAPIV3Schema"]).cloned(), scale, webhook: webhook.clone(), storage: storage.clone(), selectable: selectable_labels(v) });
     }
     out
+}
+
+/// Field selector labels a CRD version declares in `selectableFields`.
+fn selectable_labels(v: &Value) -> Vec<String> {
+    v.get("selectableFields").and_then(Value::as_array).map(|a| a.iter().filter_map(|f| f.get("jsonPath").and_then(Value::as_str)).map(|p| p.trim_start_matches('.').to_string()).collect()).unwrap_or_default()
 }
 
 /// Path like `.spec.replicas` as segments.

@@ -415,3 +415,13 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **Scope:** the baseline and restricted checks of `latest` with upstream's wording (clients and e2e tests match on it). `-version` labels are accepted and ignored; no exemption configuration; `audit` is accepted but kr has no audit log.
 - **Why built in:** hostNetwork, privileged and hostPath pods are otherwise available to anyone who can create pods. kr's user-namespaced sandboxes reduce the blast radius, but namespaces need the same declarative guardrail upstream gives.
 **Status:** accepted.
+
+## ADR-030: round 8 design choices (reviews, selectable fields, pod certificates)
+- **Review kinds** are a separate static table (`resources::REVIEWS`), advertised in discovery as `create`-only and never stored; the handlers stay where they were. They are not part of `RESOURCES`, so the generic REST paths, OpenAPI and the protobuf table generator do not see them (the generator lists them in `EXTRA_ROOTS`).
+- **Impersonation** is part of authentication (`ApiServer::authenticate`): the caller is authorized for `impersonate` on `users`, `serviceaccounts`, `groups`, then the request continues as the impersonated identity, with `system:authenticated` added. UID and extra headers are ignored.
+- **CRD selectable fields** are parsed per request (`ApiServer::field_selectors`). When a conversion webhook exists, terms on custom fields are returned apart and evaluated on the converted objects by the transport (`convert.rs`), because the sync handlers only see the stored version. A collection delete with such terms is therefore a list, the filter and per-item deletes there (admission webhooks are not consulted for those items).
+- **Pod certificates:** the kubelet owns key generation (the private key never reaches the API), the API server only checks bounds and shape of the request, the signer is whatever updates the request status. Rotation is the kubelet's re-stage after 80% of the lifetime, not `beginRefreshAt`. Only ECDSAP256 (kr-crypto has no RSA key generation, and P-384/P-521 or Ed25519 PKCS#10 signing are not needed by the suite).
+- **Pod resize** applies `resources` to the live cgroups in the kubelet's periodic sync and reports them in the status; no `PodResize*` conditions are produced, since nothing is deferred or infeasible in a single-node kr.
+- **ControllerRevision data** reproduces the Go rendering instead of the template as stored, because upstream clients compare the bytes; the template hash used for naming is unchanged.
+
+**Status:** accepted.

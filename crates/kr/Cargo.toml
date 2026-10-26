@@ -16,3 +16,9 @@ kr-raft = { path = "../kr-raft" }
 kr-apiserver = { path = "../kr-apiserver" }
 kr-kubelet = { path = "../kr-kubelet" }
 kr-controllers = { path = "../kr-controllers" }
+
+# No_std binary with no unit tests of its own (its code is covered by the library crates and tools/test/*.sh); the std test harness cannot link with it.
+[[bin]]
+name = "kr"
+path = "src/main.rs"
+test = false

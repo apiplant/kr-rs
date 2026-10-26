@@ -56,7 +56,7 @@ fn local_op(op: u8, proto: u8, ip: [u8; 4], port: u16) -> Result<Option<Fd>, Err
                 kr_sys::setsockopt(fd.raw(), 1, 2, &1i32.to_ne_bytes())?; // SO_REUSEADDR
                 kr_sys::bind(fd.raw(), &kr_sys::SockaddrIn::new(ip, port))?;
                 if proto == TCP {
-                    kr_sys::listen(fd.raw(), 1024)?;
+                    kr_sys::listen(fd.raw(), 4096)?;
                 }
             } else {
                 match kr_sys::connect(fd.raw(), &kr_sys::SockaddrIn::new(ip, port)) {
@@ -144,11 +144,31 @@ impl NodeNet {
 
     /// Dials a backend; pod-CIDR addresses from the node namespace, others from the host.
     fn dial(&self, proto: u8, ip: [u8; 4], port: u16) -> Result<Fd, Errno> {
+        // A backend on this host (the API server) is reached over loopback: the connections the
+        // proxy closes first leave TIME_WAIT sockets, which the kernel only reuses on loopback
+        // (tcp_tw_reuse=2); to the node address ~28k connections exhaust the ephemeral ports.
+        let ip = if proto == TCP && !in_cidr(ip, POD_CIDR) && is_local(ip) { [127, 0, 0, 1] } else { ip };
         if matches!(self, NodeNet::Factory { .. }) && !in_cidr(ip, POD_CIDR) {
             return local_op(OP_CONNECT, proto, ip, port)?.ok_or(Errno(5));
         }
         self.op(OP_CONNECT, proto, ip, port)?.ok_or(Errno(5))
     }
+}
+
+/// Whether `ip` is an address of this host (the route to it is sourced from itself); the last
+/// answer for a local address is remembered.
+fn is_local(ip: [u8; 4]) -> bool {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static KNOWN: AtomicU32 = AtomicU32::new(0);
+    let n = u32::from_be_bytes(ip);
+    if n != 0 && KNOWN.load(Ordering::Relaxed) == n {
+        return true;
+    }
+    let local = ns::route_source(ip).is_ok_and(|src| src == ip);
+    if local {
+        KNOWN.store(n, Ordering::Relaxed);
+    }
+    local
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -365,12 +385,23 @@ async fn tcp_loop(listener: Async<Fd>, backends: Rc<RefCell<Backends>>, net: Rc<
             let count = b.borrow().eps.len().max(1);
             for attempt in 0..count.min(3) {
                 let Some((ip, port)) = b.borrow().pick(peer, attempt) else { return };
-                let Ok(fd) = n.dial(TCP, ip, port) else { continue };
+                let note = |what: &str| {
+                    let _ = kr_sys::write(2, alloc::format!("kr: proxy dial {}.{}.{}.{}:{port} {what}\n", ip[0], ip[1], ip[2], ip[3]).as_bytes());
+                };
+                let fd = match n.dial(TCP, ip, port) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        note(&alloc::format!("failed: errno {}", e.0));
+                        continue;
+                    }
+                };
                 let Ok(up) = Async::new(fd) else { continue };
                 if kr_rt::exec::timeout(5000, up.wait_writable()).await.is_err() {
+                    note("timed out after 5s");
                     continue;
                 }
-                if kr_sys::socket_error(up.get_ref().raw()).map(|e| e != 0).unwrap_or(true) {
+                if let Some(e) = kr_sys::socket_error(up.get_ref().raw()).ok().filter(|e| *e != 0) {
+                    note(&alloc::format!("refused or unreachable: errno {e}"));
                     continue;
                 }
                 splice(client, up).await;

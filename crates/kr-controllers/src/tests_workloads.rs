@@ -337,7 +337,8 @@ fn daemonset_covers_nodes_and_respects_taints() {
         for p in live_pods(&c).await {
             let r = controller_ref(&p).unwrap();
             assert_eq!((str_at(r, &["kind"]), str_at(r, &["uid"])), ("DaemonSet", uid(&created)));
-            assert_eq!(str_at(&p, &["metadata", "labels", "controller-revision-hash"]), name(&revs[0]));
+            // The revision's hash (its label), not its `<daemonset>-<hash>` name.
+            assert_eq!(str_at(&p, &["metadata", "labels", "controller-revision-hash"]), str_at(&revs[0], &["metadata", "labels", "controller-revision-hash"]));
             assert_eq!(str_at(&p, &["metadata", "labels", "pod-template-generation"]), "1");
             let tols = p.pointer(&["spec", "tolerations"]).and_then(Value::as_array).unwrap();
             for (k, e) in [

@@ -87,6 +87,27 @@ pub fn allowed(u: &User, a: &Attrs, crbs: &[Value], rbs: &[Value], role_rules: &
     a.resource_request && !a.namespace.is_empty() && rbs.iter().any(|b| check(b, &a.namespace, &a.namespace))
 }
 
+/// Every rule the user gets from the ClusterRoleBindings and the RoleBindings of `ns` (those
+/// RoleBindings are in `rbs`): what a SelfSubjectRulesReview reports.
+pub fn rules_for(u: &User, crbs: &[Value], rbs: &[Value], ns: &str, role_rules: &dyn Fn(&str, &str, &str) -> Option<Vec<Value>>) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut take = |binding: &Value, bns: &str, role_ns: &str| {
+        let subjects = binding.get("subjects").and_then(Value::as_array).unwrap_or(&[]);
+        if !subjects.iter().any(|s| subject_matches(s, u, bns)) {
+            return;
+        }
+        let kind = binding.pointer(&["roleRef", "kind"]).and_then(Value::as_str).unwrap_or("");
+        let name = binding.pointer(&["roleRef", "name"]).and_then(Value::as_str).unwrap_or("");
+        let rns = if kind == "Role" { role_ns } else { "" };
+        out.extend(role_rules(kind, rns, name).unwrap_or_default());
+    };
+    crbs.iter().for_each(|b| take(b, "", ""));
+    if !ns.is_empty() {
+        rbs.iter().for_each(|b| take(b, ns, ns));
+    }
+    out
+}
+
 // ---- bootstrap policy (a subset of upstream's) ----
 
 fn rule(groups: &[&str], resources: &[&str], verbs: &[&str]) -> String {
@@ -132,14 +153,15 @@ pub fn bootstrap_roles() -> Vec<(&'static str, String)> {
         ("edit", edit),
         ("view", view),
         ("system:discovery", alloc::format!("[{}]", nonres(&["/api", "/api/*", "/apis", "/apis/*", "/healthz", "/livez", "/readyz", "/openapi", "/openapi/*", "/version", "/version/"], &["get"]))),
+        ("system:auth-delegator", alloc::format!("[{},{}]", rule(&["authentication.k8s.io"], &["tokenreviews"], &["create"]), rule(&["authorization.k8s.io"], &["subjectaccessreviews"], &["create"]))),
         ("system:public-info-viewer", alloc::format!("[{}]", nonres(&["/healthz", "/livez", "/readyz", "/version", "/version/"], &["get"]))),
-        ("system:basic-user", alloc::format!("[{}]", rule(&["authorization.k8s.io"], &["selfsubjectaccessreviews", "selfsubjectrulesreviews"], &["create"]))),
+        ("system:basic-user", alloc::format!("[{},{}]", rule(&["authorization.k8s.io"], &["selfsubjectaccessreviews", "selfsubjectrulesreviews"], &["create"]), rule(&["authentication.k8s.io"], &["selfsubjectreviews"], &["create"]))),
         // Node agents (kubelet + proxy). Secrets, configmaps and PVCs come from the Node
         // authorizer (node_authz), scoped to the node's own pods.
         (
             "system:node",
             alloc::format!(
-                "[{},{},{},{},{},{},{},{},{},{}]",
+                "[{},{},{},{},{},{},{},{},{},{},{},{},{}]",
                 rule(&[""], &["pods", "services", "endpoints", "namespaces"], READ),
                 rule(&[""], &["pods"], &["delete"]),
                 rule(&[""], &["pods/status", "nodes/status"], &["get", "patch", "update"]),
@@ -149,6 +171,9 @@ pub fn bootstrap_roles() -> Vec<(&'static str, String)> {
                 rule(&[""], &["serviceaccounts/token"], &["create"]),
                 rule(&["coordination.k8s.io"], &["leases"], &["get", "create", "update", "patch"]),
                 rule(&["discovery.k8s.io"], &["endpointslices"], READ),
+                rule(&[""], &["serviceaccounts"], &["get"]),
+                rule(&["certificates.k8s.io"], &["podcertificaterequests"], &["create", "get", "list", "watch", "delete"]),
+                rule(&["certificates.k8s.io"], &["clustertrustbundles"], READ),
                 nonres(&["/api", "/api/*", "/apis", "/apis/*", "/version", "/healthz"], &["get"])
             ),
         ),

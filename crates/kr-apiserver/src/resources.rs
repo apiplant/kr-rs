@@ -28,7 +28,8 @@ impl Resource {
 
     /// Store key prefix for this resource (ending in `/`).
     pub fn prefix(&self) -> String {
-        let g = if self.group.is_empty() { "core" } else { self.group };
+        // events.k8s.io events and core events are two views of the same objects.
+        let g = if self.group.is_empty() || (self.group == "events.k8s.io" && self.plural == "events") { "core" } else { self.group };
         alloc::format!("/registry/{g}/{}/", self.plural)
     }
 
@@ -57,7 +58,7 @@ pub static RESOURCES: &[Resource] = &[
     // core/v1
     r!("", "v1", "Namespace", "namespaces", "namespace", false, ["ns"], ["status", "finalize"], []),
     r!("", "v1", "Node", "nodes", "node", false, ["no"], ["status"], []),
-    r!("", "v1", "Pod", "pods", "pod", true, ["po"], ["status", "binding", "log", "exec", "attach", "portforward", "ephemeralcontainers", "eviction", "proxy"], ["all"]),
+    r!("", "v1", "Pod", "pods", "pod", true, ["po"], ["status", "binding", "log", "exec", "attach", "portforward", "ephemeralcontainers", "eviction", "proxy", "resize"], ["all"]),
     r!("", "v1", "Service", "services", "service", true, ["svc"], ["status", "proxy"], ["all"]),
     r!("", "v1", "Endpoints", "endpoints", "endpoints", true, ["ep"], [], []),
     r!("", "v1", "ConfigMap", "configmaps", "configmap", true, ["cm"], [], []),
@@ -114,6 +115,8 @@ pub static RESOURCES: &[Resource] = &[
     r!("storage.k8s.io", "v1", "VolumeAttributesClass", "volumeattributesclasses", "volumeattributesclass", false, ["vac"], [], []),
     r!("policy", "v1", "PodDisruptionBudget", "poddisruptionbudgets", "poddisruptionbudget", true, ["pdb"], ["status"], []),
     r!("scheduling.k8s.io", "v1", "PriorityClass", "priorityclasses", "priorityclass", false, ["pc"], [], []),
+    r!("autoscaling", "v2", "HorizontalPodAutoscaler", "horizontalpodautoscalers", "horizontalpodautoscaler", true, ["hpa"], ["status"], ["all"]),
+    r!("autoscaling", "v1", "HorizontalPodAutoscaler", "horizontalpodautoscalers", "horizontalpodautoscaler", true, ["hpa"], ["status"], ["all"]),
     r!("events.k8s.io", "v1", "Event", "events", "event", true, [], [], []),
     r!("apiregistration.k8s.io", "v1", "APIService", "apiservices", "apiservice", false, [], ["status"], ["api-extensions"]),
     r!("storagemigration.k8s.io", "v1", "StorageVersionMigration", "storageversionmigrations", "storageversionmigration", false, [], ["status"], []),
@@ -123,6 +126,21 @@ pub static RESOURCES: &[Resource] = &[
     r!("rbac.authorization.k8s.io", "v1", "ClusterRole", "clusterroles", "clusterrole", false, [], [], []),
     r!("rbac.authorization.k8s.io", "v1", "ClusterRoleBinding", "clusterrolebindings", "clusterrolebinding", false, [], [], []),
 ];
+
+/// Create-only virtual resources (reviews): advertised in discovery, never stored.
+pub static REVIEWS: &[Resource] = &[
+    r!("authentication.k8s.io", "v1", "TokenReview", "tokenreviews", "tokenreview", false, [], [], []),
+    r!("authentication.k8s.io", "v1", "SelfSubjectReview", "selfsubjectreviews", "selfsubjectreview", false, [], [], []),
+    r!("authorization.k8s.io", "v1", "SubjectAccessReview", "subjectaccessreviews", "subjectaccessreview", false, [], [], []),
+    r!("authorization.k8s.io", "v1", "SelfSubjectAccessReview", "selfsubjectaccessreviews", "selfsubjectaccessreview", false, [], [], []),
+    r!("authorization.k8s.io", "v1", "SelfSubjectRulesReview", "selfsubjectrulesreviews", "selfsubjectrulesreview", false, [], [], []),
+    r!("authorization.k8s.io", "v1", "LocalSubjectAccessReview", "localsubjectaccessreviews", "localsubjectaccessreview", true, [], [], []),
+];
+
+/// Every resource discovery advertises: built-in, review and custom.
+pub fn advertised<'a>(extra: &'a [&'static Resource]) -> impl Iterator<Item = &'a Resource> {
+    RESOURCES.iter().chain(REVIEWS.iter()).chain(extra.iter().copied())
+}
 
 /// Looks up a built-in resource by group, version and plural.
 pub fn find(group: &str, version: &str, plural: &str) -> Option<&'static Resource> {
@@ -137,7 +155,7 @@ pub fn find_in(extra: &[&'static Resource], group: &str, version: &str, plural: 
 /// Non-core (group, version) pairs in discovery order.
 pub fn group_versions(extra: &[&'static Resource]) -> alloc::vec::Vec<(&'static str, &'static str)> {
     let mut out: alloc::vec::Vec<(&'static str, &'static str)> = alloc::vec::Vec::new();
-    for r in RESOURCES.iter().chain(extra.iter().copied()) {
+    for r in advertised(extra) {
         if !r.group.is_empty() && !out.contains(&(r.group, r.version)) {
             out.push((r.group, r.version));
         }

@@ -63,8 +63,9 @@ const READ_LIMIT: usize = usize::MAX >> 1;
 /// Logs smaller than this are never rewritten (a rewrite costs a snapshot write and fsyncs).
 const COMPACT_MIN_LOG: u64 = 8 << 20;
 
-/// Default number of events retained for watch replay.
-pub const DEFAULT_HISTORY: usize = 10_000;
+/// Default number of events retained for watch replay (a few minutes of a busy cluster, so a client
+/// that listed and then started a watch much later still resumes instead of being told to re-list).
+pub const DEFAULT_HISTORY: usize = 100_000;
 
 #[derive(Clone, Debug)]
 pub struct Kv {

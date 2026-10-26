@@ -31,7 +31,23 @@ impl ResponseStream for Watch {
     }
 }
 
+fn log_line(msg: &str) {
+    let _ = kr_sys::write(2, msg.as_bytes());
+}
+
+/// Handles a request; one slower than 300 ms is logged (the single-threaded loop is stalled for
+/// as long as its synchronous parts run, which is what clients see as timeouts).
 pub async fn handle(api: &Rc<ApiServer>, req: Request) -> Response {
+    let (t0, method, path) = (kr_rt::exec::now_ms(), req.method.clone(), alloc::string::String::from(req.path()));
+    let resp = handle_inner(api, req).await;
+    let took = kr_rt::exec::now_ms().saturating_sub(t0);
+    if took >= 300 && !path.contains("/watch") && resp.status != 101 {
+        log_line(&alloc::format!("kr: slow request {method} {path} {} {took}ms\n", resp.status));
+    }
+    resp
+}
+
+async fn handle_inner(api: &Rc<ApiServer>, req: Request) -> Response {
     // Another server forwarding a write for one of its clients (ADR-026).
     let peer_cert = req.peer.client_certs.as_deref().and_then(|c| c.first()).map(|c| c.as_slice());
     let forwarded = forward::trusted_identity(peer_cert, req.header(forward::IDENTITY));
@@ -85,11 +101,19 @@ pub async fn handle(api: &Rc<ApiServer>, req: Request) -> Response {
             Ok(l) | Err(l) => return respond(Reply::err(crate::api::not_leader(l))),
         }
     }
+    // Aggregated APIs (APIServices backed by a Service) are served by their extension server.
+    if let Some(reply) = crate::aggregator::proxy(api, &r).await {
+        return respond(reply);
+    }
     let before = api.revision();
     if let Some(reply) = crate::convert::pre(api, &r).await {
         return respond(reply);
     }
-    let (res, mut warnings) = crate::webhook::run(api, &r).await;
+    // A collection delete selected by a converted version's fields is a list and per-item deletes.
+    let (res, mut warnings) = match crate::convert::delete_collection(api, &r).await {
+        Some(reply) => (Ok(Run::Done(reply)), alloc::vec::Vec::new()),
+        None => crate::webhook::run(api, &r).await,
+    };
     let rewritten;
     let reply = match res {
         Err(reply) => reply,
@@ -179,13 +203,38 @@ pub async fn run(api: Rc<ApiServer>, addr: [u8; 4], port: u16, tls: Rc<kr_crypto
             }
         }
     });
-    let listener = server::listen(addr, port, 512)?;
+    // Availability of aggregated APIs: probe every Service-backed APIService every few seconds.
+    let a2 = api.clone();
+    kr_rt::exec::spawn(async move {
+        loop {
+            crate::aggregator::probe_all(&a2).await;
+            let rev = a2.revision();
+            if rev > a2.durable_rev() {
+                let _ = a2.commit(rev).await;
+            }
+            kr_rt::exec::sleep(2000).await;
+        }
+    });
+    // Event-loop stalls: a 50 ms sleep that returns much later means something ran too long.
+    kr_rt::exec::spawn(async move {
+        loop {
+            let t0 = kr_rt::exec::now_ms();
+            kr_rt::exec::sleep(50).await;
+            let lag = kr_rt::exec::now_ms().saturating_sub(t0).saturating_sub(50);
+            if lag >= 250 {
+                log_line(&alloc::format!("kr: event loop stalled {lag}ms\n"));
+            }
+        }
+    });
+    let listener = server::listen(addr, port, 4096)?;
     serve(api, listener, tls).await
 }
 
 /// Serves the API on an already bound listener (no background flushing; see [`run`]).
 pub async fn serve(api: Rc<ApiServer>, listener: kr_rt::exec::Async<kr_sys::Fd>, tls: Rc<kr_crypto::tls::ServerConfig>) -> kr_net::Result<()> {
-    let cfg = Rc::new(ServerConfig { tls: Some(tls), idle_timeout_ms: 300_000, ..ServerConfig::default() });
+    // Parallel clients keep hundreds of idle connections; one over the cap is closed unanswered
+    // (the client sees EOF), so the cap sits well above any realistic client count.
+    let cfg = Rc::new(ServerConfig { tls: Some(tls), idle_timeout_ms: 300_000, max_connections: 32_768, ..ServerConfig::default() });
     let handler = move |req: Request| -> HandlerFuture {
         let api = api.clone();
         Box::pin(async move { handle(&api, req).await })

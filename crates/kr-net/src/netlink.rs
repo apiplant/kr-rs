@@ -268,6 +268,17 @@ impl Netlink {
         })
     }
 
+    /// Sets the link-layer address of `index`. On a bridge this also pins it: a bridge whose
+    /// address was never set takes the lowest address of its ports, so adding a port changed the
+    /// gateway's MAC and every pod kept sending to the old one until its ARP entry expired.
+    pub fn link_set_mac(&self, index: i32, mac: [u8; 6]) -> Result<(), Errno> {
+        self.one(|b| {
+            b.begin(RTM_NEWLINK, NLM_F_ACK);
+            b.raw(&ifinfo(index, 0, 0));
+            b.attr(IFLA_ADDRESS, &mac);
+        })
+    }
+
     /// Attaches `index` to the bridge `master`.
     pub fn link_set_master(&self, index: i32, master: i32) -> Result<(), Errno> {
         self.one(|b| {
@@ -520,6 +531,18 @@ impl Netlink {
 
     pub fn neigh_del(&self, ifindex: i32, ip: [u8; 4], mac: [u8; 6]) -> Result<(), Errno> {
         self.transact(&neigh_msg(RTM_DELNEIGH, false, ifindex, ip, mac))
+    }
+
+    /// Removes the (any state) ARP entry for `ip` on `ifindex`; ENOENT when there is none.
+    pub fn neigh_flush(&self, ifindex: i32, ip: [u8; 4]) -> Result<(), Errno> {
+        self.one(|b| {
+            b.begin(RTM_DELNEIGH, NLM_F_ACK);
+            let mut h = [0u8; 12];
+            h[0] = AF_INET;
+            h[4..8].copy_from_slice(&ifindex.to_ne_bytes());
+            b.raw(&h);
+            b.attr(NDA_DST, &ip);
+        })
     }
 
     /// Adds (or replaces) a forwarding entry: frames for `mac` go to the VTEP at `dst`.

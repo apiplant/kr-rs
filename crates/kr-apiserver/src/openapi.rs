@@ -120,6 +120,9 @@ pub fn definition_name(c: &Custom) -> String {
 /// apiVersion/kind/metadata properties and the group-version-kind extension.
 fn definition(c: &Custom, prefix: &str) -> Value {
     let mut d = match &c.schema {
+        // A CRD without validation (the root is only `type: object` with unknown fields
+        // preserved) is published as an empty object schema, as upstream does for v2.
+        Some(Value::Object(f)) if prefix == V2_REF && f.iter().all(|(k, _)| matches!(k.as_str(), "type" | "x-kubernetes-preserve-unknown-fields")) => o(alloc::vec![("type", Value::from("object"))]),
         Some(Value::Object(f)) => Value::Object(f.clone()),
         _ => o(alloc::vec![("type", Value::from("object"))]),
     };

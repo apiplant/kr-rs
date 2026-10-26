@@ -243,7 +243,9 @@ async fn write_status<C: Client>(c: &C, k: Kind, ns: &str, name: &str, [replicas
         let mut conds: Vec<Value> = rs.pointer(&["status", "conditions"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
         let old = conds.iter().position(|x| str_at(x, &["type"]) == "ReplicaFailure");
         match (failure, old) {
-            (Some(msg), o) if o.is_none_or(|i| str_at(&conds[i], &["message"]) != msg) => {
+            // Only set when absent (as upstream): the message names a generated pod, so refreshing
+            // it on every refused creation would rewrite the object on each sync.
+            (Some(msg), None) => {
                 let cond = obj(alloc::vec![
                     ("type", Value::from("ReplicaFailure")),
                     ("status", Value::from("True")),

@@ -95,7 +95,7 @@ pub use crate::cel::cel_bool;
 // ---- calling ----
 
 
-struct WhResolver(HostsResolver);
+pub(crate) struct WhResolver(pub(crate) HostsResolver);
 
 impl Resolver for WhResolver {
     async fn resolve(&self, host: &str) -> kr_net::Result<Vec<IpAddr>> {
@@ -223,7 +223,11 @@ impl Ctx<'_> {
         let review = json::to_string(&obj(alloc::vec![("apiVersion", Value::from("admission.k8s.io/v1")), ("kind", Value::from("AdmissionReview")), ("request", request)]));
         let resp = match self.call(wh, &review).await {
             Ok(r) => r,
-            Err(e) => return fail(&e),
+            Err(e) => {
+                // Visible even when failurePolicy: Ignore swallows it.
+                let _ = kr_sys::write(2, format!("kr: webhook {name} call failed ({}): {e}\n", if ignore { "ignored" } else { "fatal" }).as_bytes());
+                return fail(&e);
+            }
         };
         let Some(r) = resp.get("response") else { return fail("webhook response has no \"response\"") };
         if r.get("uid").and_then(Value::as_str) != Some(uid.as_str()) {
@@ -430,8 +434,10 @@ async fn admit(api: &ApiServer, req: &Req<'_>, rt: &Route, op: &'static str, mod
             let o = options_object(sub, req.query);
             let k = o.get("kind").and_then(Value::as_str).unwrap_or("");
             kind = Some(("", "v1", if k == "PodExecOptions" { "PodExecOptions" } else if k == "PodAttachOptions" { "PodAttachOptions" } else { "PodPortForwardOptions" }));
-            options = Some(o);
-            (Value::Null, Value::Null)
+            // The connect options are the request's object (webhooks read `object` for the
+            // container, stdin, command...) and also its `options`.
+            options = Some(o.clone());
+            (o, Value::Null)
         }
         Mode::Body(k) => {
             kind = Some(k);

@@ -336,6 +336,19 @@ pub struct Entry {
     pub fields: Value,
 }
 
+/// Keys in byte order at every level, as Go renders the field sets (clients that decode the
+/// object into a map and encode it again must get the same bytes).
+fn sort_keys(v: &Value) -> Value {
+    match v {
+        Value::Object(f) => {
+            let mut f: Vec<(String, Value)> = f.iter().map(|(k, v)| (k.clone(), sort_keys(v))).collect();
+            f.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(f)
+        }
+        v => v.clone(),
+    }
+}
+
 impl Entry {
     fn same_identity(&self, manager: &str, apply: bool, sub: &str) -> bool {
         self.manager == manager && self.apply == apply && self.subresource == sub
@@ -350,7 +363,7 @@ impl Entry {
             o.set("time", Value::from(self.time.as_str()));
         }
         o.set("fieldsType", Value::from("FieldsV1"));
-        o.set("fieldsV1", self.fields.clone());
+        o.set("fieldsV1", sort_keys(&self.fields));
         if !self.subresource.is_empty() {
             o.set("subresource", Value::from(self.subresource.as_str()));
         }

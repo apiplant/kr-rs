@@ -21,7 +21,7 @@ import os, re, sys, urllib.request
 VERSION = "v0.37.0"
 RAW = "https://raw.githubusercontent.com/kubernetes/%s/" + VERSION + "/%s"
 API_GROUPS = ["core/v1", "apps/v1", "batch/v1", "coordination/v1", "discovery/v1", "networking/v1",
-              "policy/v1", "scheduling/v1", "rbac/v1", "autoscaling/v1", "authentication/v1", "authorization/v1", "scheduling/v1alpha3",
+              "policy/v1", "scheduling/v1", "rbac/v1", "autoscaling/v1", "autoscaling/v2", "authentication/v1", "authorization/v1", "events/v1", "scheduling/v1alpha3",
               "admissionregistration/v1", "certificates/v1", "flowcontrol/v1", "node/v1", "resource/v1", "storage/v1"]
 # local name -> (repo, path inside repo, proto package prefix, go package basename)
 SOURCES = {}
@@ -35,10 +35,12 @@ for _n, _p, _pkg in [("meta_v1", "pkg/apis/meta/v1", "k8s.io.apimachinery.pkg.ap
     SOURCES[_n] = ("apimachinery", _p, _pkg)
 APIEXT = "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.v1"
 SOURCES["apiextensions_v1"] = ("apiextensions-apiserver", "pkg/apis/apiextensions/v1", APIEXT)
+SOURCES["apiregistration_v1"] = ("kube-aggregator", "pkg/apis/apiregistration/v1", "k8s.io.kube_aggregator.pkg.apis.apiregistration.v1")
 # Go files with more struct tags than types.go: local name -> [(file, local suffix)].
 EXTRA_GO = {"apiextensions_v1": [("types_jsonschema.go", "_jsonschema.go")]}
 # Group -> proto package prefix, for groups outside k8s.io/api.
-GROUP_PKG = {"apiextensions.k8s.io": "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions"}
+GROUP_PKG = {"apiextensions.k8s.io": "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions",
+             "apiregistration.k8s.io": "k8s.io.kube_aggregator.pkg.apis.apiregistration"}
 
 REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 OUT = os.path.join(REPO, "crates", "kr-apiserver", "src", "proto_schema.rs")
@@ -57,6 +59,8 @@ SPECIAL = {
 }
 # Packages whose JSON names are taken from the types.go tags (`$ref`, `x-kubernetes-...`).
 JSON_NAMES_FROM_GO = {APIEXT}
+# Groups outside k8s.io/api (storagemigration): served as JSON only.
+JSON_ONLY_GROUPS = {"storagemigration.k8s.io"}
 # Extra top-level kinds beyond resources.rs: (apiVersion, kind, message).
 EXTRA_ROOTS = [("v1", "DeleteOptions", META + ".DeleteOptions"),
                ("autoscaling/v1", "Scale", "k8s.io.api.autoscaling.v1.Scale"),
@@ -64,6 +68,9 @@ EXTRA_ROOTS = [("v1", "DeleteOptions", META + ".DeleteOptions"),
                ("authentication.k8s.io/v1", "TokenReview", "k8s.io.api.authentication.v1.TokenReview"),
                ("authorization.k8s.io/v1", "SelfSubjectAccessReview", "k8s.io.api.authorization.v1.SelfSubjectAccessReview"),
                ("authorization.k8s.io/v1", "SubjectAccessReview", "k8s.io.api.authorization.v1.SubjectAccessReview"),
+               ("authorization.k8s.io/v1", "LocalSubjectAccessReview", "k8s.io.api.authorization.v1.LocalSubjectAccessReview"),
+               ("authorization.k8s.io/v1", "SelfSubjectRulesReview", "k8s.io.api.authorization.v1.SelfSubjectRulesReview"),
+               ("authentication.k8s.io/v1", "SelfSubjectReview", "k8s.io.api.authentication.v1.SelfSubjectReview"),
                ("v1", "Binding", "k8s.io.api.core.v1.Binding"),
                ("policy/v1", "Eviction", "k8s.io.api.policy.v1.Eviction"),
                ("v1", "Status", META + ".Status")]
@@ -180,6 +187,8 @@ def roots(protos):
     src = open(RESOURCES_RS).read()
     for m in re.finditer(r'r!\("([^"]*)",\s*"([^"]+)",\s*"([^"]+)"', src):
         g, v, kind = m.groups()
+        if g in JSON_ONLY_GROUPS:
+            continue
         pkg = GROUP_PKG.get(g, "k8s.io.api." + (g.split(".")[0] if g else "core")) + "." + v
         out.append(((g + "/" + v) if g else v, kind, pkg + "." + kind))
     # Lists (protobuf responses): `<Kind>List` next to every served kind.

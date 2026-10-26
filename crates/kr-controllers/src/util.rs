@@ -624,6 +624,25 @@ pub fn has_condition(o: &Value, ty: &str) -> bool {
 
 // ---- ControllerRevisions (StatefulSet, DaemonSet) ----
 
+/// The revision `data` of an owner (upstream `getPatch`): a strategic-merge patch replacing
+/// `spec.template`, serialised as Go does for the typed template -- keys sorted, no creation
+/// timestamp and empty `resources` where those fields are not omitted. Clients (and `kubectl
+/// rollout`) compare it byte for byte with their own rendering of the object.
+fn revision_data(template: &Value) -> Value {
+    let mut t = canonical(template);
+    // v0.37 types carry `omitzero` on the zero creationTimestamp: no key at all.
+    t.entry_object("metadata").remove("creationTimestamp");
+    for key in ["containers", "initContainers", "ephemeralContainers"] {
+        if let Some(list) = t.entry_object("spec").get_mut(key).and_then(Value::as_array_mut) {
+            for c in list.iter_mut().filter(|c| c.get("resources").is_none()) {
+                c.set("resources", Value::Object(Vec::new()));
+            }
+        }
+    }
+    t.set("$patch", Value::from("replace"));
+    canonical(&obj(alloc::vec![("spec", obj(alloc::vec![("template", t)]))]))
+}
+
 /// Finds or creates the ControllerRevision `<owner>-<hash of template>` for `owner`, bumping
 /// its `revision` above every other one when the template is reused (rollback). Returns the
 /// revision's name and all revisions controlled by the owner (including the new one).
@@ -656,7 +675,7 @@ pub async fn ensure_revision<C: Client>(c: &C, owner: &Value, kind: &str, templa
                         ("ownerReferences", Value::Array(alloc::vec![owner_ref(owner, "apps/v1", kind)])),
                     ])
                 ),
-                ("data", obj(alloc::vec![("spec", obj(alloc::vec![("template", template.clone())]))])),
+                ("data", revision_data(template)),
                 ("revision", num(max + 1)),
             ]);
             match c.create(&controllerrevisions(Some(ns)), &rev).await {
