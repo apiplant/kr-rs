@@ -146,7 +146,7 @@ fn rejections() {
     // Wrong host.
     let mut s = Connection::server(server(&p, ClientAuth::None, false, vec![]), rng, NOW);
     let mut c = Connection::client(client(&p, false, vec![]), b"evil.example", rng, NOW);
-    assert_eq!(pump(&mut c, &mut s, usize::MAX), Err(('c', Error::Local(tls::Alert::BadCertificate))));
+    assert_eq!(pump(&mut c, &mut s, usize::MAX), Err(('c', Error::Local(tls::Alert::CertHostMismatch))));
     // Expired (client clock far in the future).
     let mut s = Connection::server(server(&p, ClientAuth::None, false, vec![]), rng, NOW);
     let mut c = Connection::client(client(&p, false, vec![]), b"api.kr.local", rng, NOW + 86400 * 365);

@@ -95,7 +95,9 @@ const MAX_CIPHERTEXT: usize = MAX_PLAINTEXT + 256;
 /// Largest handshake message we accept (certificate chains are the big ones).
 const MAX_HANDSHAKE: usize = 64 * 1024;
 
-/// TLS alert descriptions used here.
+/// TLS alert descriptions used here. Values from 200 are internal refinements of
+/// `BadCertificate` (the alert sent on the wire), kept so errors say what was wrong with the
+/// certificate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Alert {
@@ -105,6 +107,13 @@ pub enum Alert {
     RecordOverflow = 22,
     HandshakeFailure = 40,
     BadCertificate = 42,
+    // Not on the wire: the same alert (42) is sent, but the reason stays visible in `Error`.
+    CertParse = 200,
+    CertBadSignature = 201,
+    CertUsage = 202,
+    CertHostMismatch = 203,
+    CertUnsupportedKey = 204,
+    CertNoKey = 205,
     CertificateExpired = 45,
     IllegalParameter = 47,
     UnknownCa = 48,
@@ -115,6 +124,16 @@ pub enum Alert {
     MissingExtension = 109,
     CertificateRequired = 116,
     NoApplicationProtocol = 120,
+}
+
+impl Alert {
+    /// The alert description byte sent to the peer.
+    pub fn wire(self) -> u8 {
+        match self {
+            Alert::CertParse | Alert::CertBadSignature | Alert::CertUsage | Alert::CertHostMismatch | Alert::CertUnsupportedKey | Alert::CertNoKey => Alert::BadCertificate as u8,
+            a => a as u8,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -793,7 +812,7 @@ impl Connection {
 
     fn send_alert(&mut self, a: Alert) {
         let level = if a == Alert::CloseNotify { 1 } else { 2 };
-        let body = [level, a as u8];
+        let body = [level, a.wire()];
         match self.write_keys.as_mut() {
             Some(k) => k.seal(CT_ALERT, &body, &mut self.out),
             None => {
@@ -1245,10 +1264,14 @@ impl Connection {
             return fail(match e {
                 VerifyError::Expired => Alert::CertificateExpired,
                 VerifyError::UnknownIssuer | VerifyError::NotCa => Alert::UnknownCa,
-                _ => Alert::BadCertificate,
+                VerifyError::Parse => Alert::CertParse,
+                VerifyError::BadSignature => Alert::CertBadSignature,
+                VerifyError::Usage => Alert::CertUsage,
+                VerifyError::HostMismatch => Alert::CertHostMismatch,
+                VerifyError::UnsupportedKey => Alert::CertUnsupportedKey,
             });
         }
-        let leaf = x509::Certificate::parse(&chain[0]).or(fail(Alert::BadCertificate))?;
+        let leaf = x509::Certificate::parse(&chain[0]).or(fail(Alert::CertParse))?;
         self.peer_key = leaf.public_key.clone();
         self.peer_certs = chain;
         self.state = if is_server { State::SrvWaitCertVerify } else { State::CliWaitCertVerify };
@@ -1273,7 +1296,7 @@ impl Connection {
             SIG_RSA_PSS_RSAE_SHA512 => SigAlg::RsaPss(crate::rsa::HashAlg::Sha512, 64),
             _ => return fail(Alert::IllegalParameter),
         };
-        let key = self.peer_key.as_ref().ok_or(Error::Local(Alert::BadCertificate))?;
+        let key = self.peer_key.as_ref().ok_or(Error::Local(Alert::CertNoKey))?;
         if !key.verify(alg, &content, sig) {
             return fail(Alert::DecryptError);
         }
@@ -1574,10 +1597,14 @@ impl Connection {
             return fail(match e {
                 VerifyError::Expired => Alert::CertificateExpired,
                 VerifyError::UnknownIssuer | VerifyError::NotCa => Alert::UnknownCa,
-                _ => Alert::BadCertificate,
+                VerifyError::Parse => Alert::CertParse,
+                VerifyError::BadSignature => Alert::CertBadSignature,
+                VerifyError::Usage => Alert::CertUsage,
+                VerifyError::HostMismatch => Alert::CertHostMismatch,
+                VerifyError::UnsupportedKey => Alert::CertUnsupportedKey,
             });
         }
-        let leaf = x509::Certificate::parse(&chain[0]).or(fail(Alert::BadCertificate))?;
+        let leaf = x509::Certificate::parse(&chain[0]).or(fail(Alert::CertParse))?;
         // The suite fixes the certificate key type.
         let ecdsa_key = matches!(leaf.public_key, Some(PublicKey::P256(_)) | Some(PublicKey::P384(_)));
         if ecdsa_key != is_ecdsa12(self.suite) {
@@ -1621,7 +1648,7 @@ impl Connection {
         signed.extend_from_slice(&self.client_random);
         signed.extend_from_slice(&self.server_random);
         signed.extend_from_slice(&body[..params_len]);
-        let key = self.peer_key.as_ref().ok_or(Error::Local(Alert::BadCertificate))?;
+        let key = self.peer_key.as_ref().ok_or(Error::Local(Alert::CertNoKey))?;
         if !key.verify(alg, &signed, sig) {
             return fail(Alert::DecryptError);
         }

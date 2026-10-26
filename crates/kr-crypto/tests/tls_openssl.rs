@@ -349,11 +349,18 @@ fn kr12_vs_s_server(tag: &str, rsa: bool, tls12: bool, extra: &[&str]) -> Result
         });
         assert_eq!(got, b"hello from openssl\n");
     }));
-    let _ = srv.kill();
+    if r.is_ok() {
+        // Close cleanly so s_server flushes its buffered stdout before exiting.
+        c.close();
+        let _ = sock.write_all(&c.take_output());
+        drop(srv.stdin.take());
+    } else {
+        let _ = srv.kill();
+    }
     let out = srv.wait_with_output().unwrap();
     match r {
         Ok(()) => {
-            assert!(String::from_utf8_lossy(&out.stdout).contains("hello from kr"));
+            assert!(String::from_utf8_lossy(&out.stdout).contains("hello from kr"), "s_server stdout: {}", String::from_utf8_lossy(&out.stdout));
             Ok(c.cipher_suite())
         }
         Err(e) => Err(e.downcast_ref::<String>().cloned().unwrap_or_default()),
