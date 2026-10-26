@@ -185,6 +185,22 @@ fn history_limit_bounds_replay() {
 }
 
 #[test]
+fn history_budget_bounds_memory() {
+    let mut s = Store::in_memory();
+    s.set_history_budget(64 * 1024);
+    let big = "y".repeat(1000);
+    s.create("/k/a", v(&big)).unwrap();
+    for i in 0..500 {
+        s.update("/k/a", v(&format!("{i}{big}")), None).unwrap();
+    }
+    // 500 updates of ~1 KB (plus the previous value) would be ~1 MB: only the tail is kept.
+    let first = s.watch("", 0).map(|_| ()).err();
+    assert!(matches!(first, Some(Error::Compacted { .. })), "{first:?}");
+    let mut w = s.watch("", s.revision() - 5).unwrap();
+    assert_eq!(core::iter::from_fn(|| w.try_next()).count(), 5);
+}
+
+#[test]
 fn watch_overflow_closes() {
     let mut s = Store::in_memory();
     let mut slow = s.watch("", 0).unwrap();

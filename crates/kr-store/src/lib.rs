@@ -63,6 +63,9 @@ const READ_LIMIT: usize = usize::MAX >> 1;
 /// Logs smaller than this are never rewritten (a rewrite costs a snapshot write and fsyncs).
 const COMPACT_MIN_LOG: u64 = 8 << 20;
 
+/// Upper bound on the memory held by the replay history (keys, values and previous values).
+pub const DEFAULT_HISTORY_BYTES: usize = 32 << 20;
+
 /// Default number of events retained for watch replay (a few minutes of a busy cluster, so a client
 /// that listed and then started a watch much later still resumes instead of being told to re-list).
 pub const DEFAULT_HISTORY: usize = 100_000;
@@ -123,6 +126,9 @@ pub struct Store {
     rev: u64,
     history: VecDeque<Event>,
     hist_cap: usize,
+    /// Bytes held by `history` (see [`DEFAULT_HISTORY_BYTES`]) and its limit.
+    hist_bytes: usize,
+    hist_budget: usize,
     /// Events with `rev <= hist_floor` have been dropped.
     hist_floor: u64,
     watchers: Vec<Weak<RefCell<WatchState>>>,
@@ -173,6 +179,8 @@ impl Store {
             rev: 0,
             history: VecDeque::new(),
             hist_cap: DEFAULT_HISTORY,
+            hist_bytes: 0,
+            hist_budget: DEFAULT_HISTORY_BYTES,
             hist_floor: 0,
             watchers: Vec::new(),
             persist: None,
@@ -311,6 +319,7 @@ impl Store {
         self.live_bytes = fresh.live_bytes;
         self.rev = fresh.rev;
         self.history.clear();
+        self.hist_bytes = 0;
         self.held.clear();
         self.hist_floor = self.rev;
         if self.visible != u64::MAX {
@@ -464,6 +473,12 @@ impl Store {
         self.trim_history();
     }
 
+    /// Bounds the memory of the replay history (default [`DEFAULT_HISTORY_BYTES`]).
+    pub fn set_history_budget(&mut self, bytes: usize) {
+        self.hist_budget = bytes;
+        self.trim_history();
+    }
+
     /// Number of live (not dropped) watchers.
     pub fn watcher_count(&mut self) -> usize {
         self.watchers.retain(|w| w.strong_count() > 0);
@@ -587,14 +602,23 @@ impl Store {
         } else {
             self.notify(&ev);
         }
+        self.hist_bytes += Self::event_bytes(&ev);
         self.history.push_back(ev);
         self.trim_history();
         kv
     }
 
+    fn event_bytes(e: &Event) -> usize {
+        let kv = |k: &Kv| k.key.len() + k.value.len() + 48;
+        kv(&e.kv) + e.prev.as_ref().map_or(0, kv) + 48
+    }
+
+    /// Drops the oldest events beyond the count cap or the byte budget (a watch resuming from
+    /// before the floor is told to re-list). The newest event always stays.
     fn trim_history(&mut self) {
-        while self.history.len() > self.hist_cap {
+        while self.history.len() > 1 && (self.history.len() > self.hist_cap || self.hist_bytes > self.hist_budget) {
             if let Some(e) = self.history.pop_front() {
+                self.hist_bytes = self.hist_bytes.saturating_sub(Self::event_bytes(&e));
                 self.hist_floor = e.rev;
             }
         }
@@ -696,7 +720,9 @@ impl Store {
     pub fn compact(&mut self, rev: u64) -> Result<(), Error> {
         let rev = rev.min(self.rev);
         while self.history.front().is_some_and(|e| e.rev <= rev) {
-            self.history.pop_front();
+            if let Some(e) = self.history.pop_front() {
+                self.hist_bytes = self.hist_bytes.saturating_sub(Self::event_bytes(&e));
+            }
         }
         self.hist_floor = self.hist_floor.max(rev);
         if let Some(p) = &self.persist {
