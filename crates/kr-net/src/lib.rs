@@ -21,6 +21,7 @@ pub mod spdy;
 mod spdy_dict;
 pub mod tcp;
 pub mod tls;
+pub mod usernat;
 
 use kr_sys::Errno;
 

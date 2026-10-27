@@ -425,3 +425,13 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **ControllerRevision data** reproduces the Go rendering instead of the template as stored, because upstream clients compare the bytes; the template hash used for naming is unchanged.
 
 **Status:** accepted.
+
+## ADR-030: rootless pod egress through a TUN device and a userspace NAT
+
+**Context:** rootless pods live in an infra user+net namespace that had no route out. The host namespace cannot be reached by veth without privileges, and nftables masquerade needs root.
+**Decision:** the infra namespace gets a TUN device `kr-out` (100.64.255.1/30) as its default route. kr, in the host namespace, receives the descriptor over SCM_RIGHTS and serves it with `kr_net::usernat`, a slirp-style engine (no I/O, unit-tested) that terminates the pod's TCP itself and relays each flow over ordinary host sockets; UDP flows map to host UDP sockets; ICMP echo goes out through an unprivileged ICMP socket (`ping_group_range`). DNS to 100.64.255.2:53 is redirected to the host's first nameserver, which `kr ctr run` writes into resolv.conf. The pod sees the real destination address (transparent), so no rewriting rules exist. Driver: `kr-kubelet/src/egress.rs`.
+- Window scaling is offered when the pod's SYN has it (shift 4, 1 MiB); IP fragments are reassembled and generated. No retransmission timers toward the pod (the TUN is lossless), IPv4 only.
+- Service ClusterIPs and pod-to-pod traffic never reach the TUN (local routes in the infra namespace).
+- `kr ctr run`: the detached infra supervisor runs the same driver on its own executor (`exec::reset_after_fork` drops the inherited reactor state).
+
+**Status:** accepted.

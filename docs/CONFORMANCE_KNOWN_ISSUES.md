@@ -7,7 +7,7 @@ Results of the Kubernetes v1.37 conformance suite (Sonobuoy `non-disruptive-conf
 | Cluster | Run | Result |
 |---|---|---|
 | Two nodes (`KR_NODES=2`: server `kr1` and agent `kr2`) | round 19 | **460 passed, 0 failed** (20 min) |
-| One node | round 20 | 455 passed, 5 failed (20 min) |
+| One node | round 21 | 458 passed, 2 failed (the two-node specs) |
 
 A single node can pass at most 458: the two specs below need a second node, and are expected to fail there.
 
@@ -35,6 +35,7 @@ The last three share one cause: all of them call the CRD conversion webhook pod,
 | 15-18 | 2026-10-26 | 457, 459, 459, 459 (two nodes) | stale ARP entries for reused pod IPs, remote-node websocket subprotocols, Deployment rollout stall |
 | 19 | 2026-10-26 | **460** (two nodes) | |
 | 20 | 2026-10-27 | 455 (one node) | the two-node specs plus 3 intermittent conversion-webhook certificate failures |
+| 21 | 2026-10-27 | 458 (one node) | only the two-node specs; the conversion-webhook failures did not recur (#113 diagnostics added) |
 
 The causes behind the intermittent failures, for future triage:
 - A burst of new pods used to change the bridge's MAC (a bridge without a fixed address takes the lowest MAC of its ports), so existing pods sent to the old gateway MAC until their ARP entry expired. Fixed by pinning the MAC.

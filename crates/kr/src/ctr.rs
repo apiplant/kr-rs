@@ -158,6 +158,11 @@ fn run(mut args: Args) -> i32 {
             return fail(&format!("create container: {e:?}"));
         }
     };
+    // Rootless containers resolve through the egress driver's forwarder; with a root bridge the
+    // host's own resolvers are reachable (loopback stubs are not, so those get the forwarder too).
+    let resolv = format!("{}/resolv.conf", dirs.root);
+    let _ = kr_runtime::store::write_file_atomic(&resolv, resolv_conf(net.sandbox.is_some()).as_bytes());
+    let mounts = [Mount { source: resolv.into_bytes(), sub_path: None, target: b"/etc/resolv.conf".to_vec(), readonly: false }];
     let spec = RunSpec {
         rootfs: &rootfs,
         upper: dirs.upper.as_bytes(),
@@ -174,7 +179,7 @@ fn run(mut args: Args) -> i32 {
         maps: &maps,
         net: net.root_config(),
         sandbox: net.sandbox.as_ref(),
-        mounts: &[],
+        mounts: &mounts,
         log_fd: None,
         extra_groups: &[],
         readonly_root: false,
@@ -252,6 +257,21 @@ fn bridge_network(store: &Store, id: &str, maps: &IdMaps) -> Result<CtrNet, i32>
     }
 }
 
+/// `/etc/resolv.conf` for a container: rootless, the egress driver's forwarder (it reaches the
+/// host's resolver even when that is a loopback stub); as root, the host's non-loopback
+/// nameservers, or a public one when it only has a stub.
+fn resolv_conf(rootless: bool) -> String {
+    if rootless {
+        return format!("nameserver {}.{}.{}.{}\n", network::EGRESS_DNS[0], network::EGRESS_DNS[1], network::EGRESS_DNS[2], network::EGRESS_DNS[3]);
+    }
+    let host = String::from_utf8(kr_sys::fs::read_file(b"/etc/resolv.conf\0", 16384).unwrap_or_default()).unwrap_or_default();
+    let mut out: String = host.lines().filter(|l| l.trim().strip_prefix("nameserver").map(|a| !a.trim().starts_with("127.") && a.trim() != "::1").unwrap_or(false)).map(|l| format!("{l}\n")).collect();
+    if out.is_empty() {
+        out.push_str("nameserver 1.1.1.1\n");
+    }
+    out
+}
+
 /// Handle on the rootless infra namespace shared by every `kr ctr run` of this root: a user+net
 /// namespace holding the bridge (the kubelet's rootless pod network, ADR-022, minus the
 /// kubelet; no route out). It must outlive any one `kr ctr run`, so a detached supervisor owns
@@ -300,6 +320,8 @@ fn infra_supervisor(root: &str, maps: &IdMaps) -> ! {
         infra.stop();
         kr_sys::exit_group(1);
     }
+    // Outbound traffic (ADR-030): the TUN is served below, once the lease loop runs on an executor.
+    let egress = network::open_egress(&infra).ok();
     let path = nul(format!("{root}/ctr-net").as_bytes());
     let tmp = nul(format!("{root}/ctr-net.{}", kr_sys::fs::getpid()).as_bytes());
     let record = network::infra_record(&network::process_owner(b"ctr-net"), infra.pid);
@@ -313,18 +335,26 @@ fn infra_supervisor(root: &str, maps: &IdMaps) -> ! {
         kr_sys::exit_group(0);
     }
     let ipam = format!("{root}/ipam");
-    let mut idle = 0;
-    while idle < 5 && infra.is_alive() {
-        let _ = ns::nanosleep(&kr_sys::Timespec { tv_sec: 1, tv_nsec: 0 });
-        // Pod leases (no process owner) belong to a kubelet's own namespace and do not count.
-        let live = core::cell::Cell::new(0);
-        network::gc(ipam.as_bytes(), |owner| {
-            let alive = network::owner_alive(owner);
-            live.set(live.get() + (alive == Some(true)) as u32);
-            alive != Some(false)
-        });
-        idle = if live.get() == 0 { idle + 1 } else { 0 };
-    }
+    // The parent's reactor state (if any) was inherited by the fork.
+    kr_rt::exec::reset_after_fork();
+    let infra = kr_rt::exec::block_on(async move {
+        if let Some(tun) = egress {
+            kr_rt::exec::spawn(kr_kubelet::egress::run(tun));
+        }
+        let mut idle = 0;
+        while idle < 5 && infra.is_alive() {
+            kr_rt::exec::sleep(1000).await;
+            // Pod leases (no process owner) belong to a kubelet's own namespace and do not count.
+            let live = core::cell::Cell::new(0);
+            network::gc(ipam.as_bytes(), |owner| {
+                let alive = network::owner_alive(owner);
+                live.set(live.get() + (alive == Some(true)) as u32);
+                alive != Some(false)
+            });
+            idle = if live.get() == 0 { idle + 1 } else { 0 };
+        }
+        infra
+    });
     let _ = kr_sys::fs::unlinkat(ns::AT_FDCWD, &path, 0);
     infra.stop();
     kr_sys::exit_group(0)

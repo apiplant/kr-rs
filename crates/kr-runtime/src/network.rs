@@ -1,6 +1,7 @@
 //! Built-in bridge network (KNOWN_ISSUES #50, ADR-019): replaces the CNI bridge + host-local
 //! plugins. Real root uses the host namespace; rootless, the bridge lives in an infra user+net
-//! namespace (ADR-022) that has no route out, so rootless containers reach each other only.
+//! namespace (ADR-022); its default route is a TUN device served by a userspace NAT
+//! (`kr_net::usernat`, ADR-030), so rootless pods also reach the outside.
 //!
 //! Layout: bridge `kr0` owns the gateway address of a /16; each container gets one address from
 //! a file-based IPAM, a veth pair whose peer is created directly inside the container's netns as
@@ -104,6 +105,44 @@ pub fn setup_infra_bridge(pn: &PodNet) -> i32 {
     }
     let _ = ns::write_file(b"/proc/sys/net/ipv4/ip_forward\0", b"1");
     0
+}
+
+/// Rootless egress device inside the infra namespaces: pods' default route.
+pub const EGRESS_DEV: &[u8] = b"kr-out";
+/// Rootless: DNS queries (UDP/TCP 53) to this address leave through the egress driver to the
+/// host's first nameserver, even when that one is a loopback stub the pod cannot reach itself.
+pub const EGRESS_DNS: [u8; 4] = [100, 64, 255, 2];
+
+/// Runs inside the infra namespaces: creates the TUN `kr-out`, gives it an address, makes it the
+/// default route and sends its descriptor over `sock` (SCM_RIGHTS). Returns an exit code.
+fn setup_infra_egress(sock: i32) -> i32 {
+    let Ok(tun) = ns::tun_open(EGRESS_DEV) else { return 1 };
+    let Ok(nl) = Netlink::route() else { return 2 };
+    let Ok(idx) = netlink::ifindex(EGRESS_DEV) else { return 3 };
+    // Link-local-ish transit address; the userspace NAT answers for every destination.
+    if nl.addr_add(idx, [100, 64, 255, 1], 30).is_err() || nl.link_up(idx).is_err() {
+        return 4;
+    }
+    if exists_ok(nl.route_add([0, 0, 0, 0], 0, None, idx)).is_err() {
+        return 5;
+    }
+    match ns::send_fd(sock, b"t", tun.raw()) {
+        Ok(_) => 0,
+        Err(_) => 6,
+    }
+}
+
+/// Rootless: gives the infra namespaces a default route out through a TUN device and returns
+/// the device's descriptor, to be served by `kr_net::usernat` in the host namespace.
+pub fn open_egress(infra: &crate::container::Sandbox) -> Result<kr_sys::Fd, Errno> {
+    let (ours, theirs) = ns::socketpair()?;
+    let raw = theirs.raw();
+    let code = crate::container::run_in_net(infra, move || setup_infra_egress(raw)).map_err(|e| e.errno)?;
+    if code != 0 {
+        return Err(Errno(100 + code));
+    }
+    let mut b = [0u8; 1];
+    ns::recv_fd(ours.raw(), &mut b)?.1.ok_or(Errno(5))
 }
 
 /// Host-side veth name for a container: `krv` + 8 hex digits of an FNV-1a hash of its id.

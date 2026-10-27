@@ -374,6 +374,24 @@ pub fn link_up(name: &[u8]) -> Result<()> {
     check(unsafe { syscall3(n::IOCTL, sock.raw() as usize, SIOCSIFFLAGS, ifr.as_mut_ptr() as usize) }).map(|_| ())
 }
 
+const TUNSETIFF: usize = 0x4004_54ca;
+
+/// Opens a TUN device (IP packets, no packet-info header) named `name`, non-blocking. Needs
+/// CAP_NET_ADMIN in the netns owner; the device lives in the caller's network namespace but
+/// the descriptor works from any process.
+pub fn tun_open(name: &[u8]) -> Result<Fd> {
+    if name.is_empty() || name.len() >= 16 {
+        return Err(Errno(22));
+    }
+    let fd = open(b"/dev/net/tun\0", 2 | super::O_NONBLOCK, 0)?; // O_RDWR
+    let mut ifr = [0u8; 40];
+    ifr[..name.len()].copy_from_slice(name);
+    ifr[16..18].copy_from_slice(&0x1001u16.to_ne_bytes()); // IFF_TUN | IFF_NO_PI
+    // SAFETY: ifr is a writable 40-byte ifreq.
+    check(unsafe { syscall3(n::IOCTL, fd.raw() as usize, TUNSETIFF, ifr.as_mut_ptr() as usize) })?;
+    Ok(fd)
+}
+
 /// Sets real, effective and saved gid. Call before `setresuid`.
 pub fn setresgid(gid: u32) -> Result<()> {
     // SAFETY: plain integer arguments.

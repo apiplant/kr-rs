@@ -496,6 +496,18 @@ struct Reactor {
     free: Vec<usize>,
 }
 
+/// In a forked child that will run its own executor: forgets the parent's epoll instance and
+/// I/O registrations (the child's copy of the descriptor is closed, the parent's keeps working).
+pub fn reset_after_fork() {
+    let mut io = ex().io.borrow_mut();
+    if io.epfd >= 0 {
+        let _ = sys::close(io.epfd);
+    }
+    io.epfd = -1;
+    io.slab.clear();
+    io.free.clear();
+}
+
 fn ensure_epfd() -> Result<i32, Errno> {
     let mut io = ex().io.borrow_mut();
     if io.epfd < 0 {

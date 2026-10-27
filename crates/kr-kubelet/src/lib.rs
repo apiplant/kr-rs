@@ -20,6 +20,7 @@ extern crate std;
 pub mod evict;
 pub mod node;
 pub mod dns;
+pub mod egress;
 mod probe;
 pub mod proxy;
 pub mod remote;
@@ -273,11 +274,20 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         } else {
             match container::start_sandbox(b"kr-pod-network", b"", &self.maps, None) {
                 Ok(infra) => {
-                    // ip_forward + bridge inside the infra namespaces; outbound NAT is not
-                    // possible rootless (no route out), so a failure there is tolerated.
+                    // ip_forward + bridge inside the infra namespaces; egress is set up
+                    // separately and optional.
                     let ok = container::run_in_net(&infra, || network::setup_infra_bridge(&pn));
                     match ok {
-                        Ok(0) => *self.infra.borrow_mut() = Some(infra),
+                        Ok(0) => {
+                            // Outbound traffic: a TUN default route served by the userspace NAT.
+                            match network::open_egress(&infra) {
+                                Ok(tun) => {
+                                    kr_rt::exec::spawn(egress::run(tun));
+                                }
+                                Err(e) => kr_rt::eprint(alloc::format!("kubelet: rootless egress unavailable (errno {}); pods have no outbound connectivity\n", e.0).as_bytes()),
+                            }
+                            *self.infra.borrow_mut() = Some(infra);
+                        }
                         r => {
                             kr_rt::eprint(alloc::format!("kubelet: rootless pod network setup failed ({}); pods get no IP\n", r.map(|c| c.to_string()).unwrap_or_else(|e| alloc::format!("{}: errno {}", e.step, e.errno.0))).as_bytes());
                             infra.stop();

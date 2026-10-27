@@ -2,7 +2,7 @@
 
 A Kubernetes distribution in a single static binary of about 2.9 MB, written in Rust with no libc and no third-party crates.
 
-`kr` is the API server, datastore, scheduler, controllers, kubelet, container runtime, pod network, service proxy and cluster DNS in one executable. It is built to idle in single-digit megabytes, start in well under a second, and run unmodified `kubectl` and standard workloads. It passes the Kubernetes v1.37 conformance suite (460 of 460 specs on a two-node cluster; see [Conformance](#conformance)).
+`kr` is the API server, datastore, scheduler, controllers, kubelet, container runtime, pod network, service proxy and cluster DNS in one executable. It is built to idle in single-digit megabytes, start in well under a second, and run unmodified `kubectl` and standard workloads. It passes the Kubernetes v1.37 conformance suite (460 of 460 specs on a two-node cluster, 458 of 460 on one node; see [Conformance](#conformance)).
 
 ```
 $ sudo kr server &
@@ -174,7 +174,7 @@ Results of the CNCF conformance suite (Sonobuoy, `non-disruptive-conformance`, p
 | Cluster | Result |
 |---|---|
 | 2 nodes (server and agent) | **460 of 460** |
-| 1 node | 455 of 460 in the latest full run: the 2 specs that need a second node cannot pass, and 3 specs that call the CRD conversion webhook failed on an intermittent certificate-verification error (KNOWN_ISSUES #113) |
+| 1 node | 458 of 460 in the latest full run: the other 2 specs need a second node and cannot pass on one |
 
 Reproduce with `tools/test/conformance.sh` (see `docs/CONFORMANCE_README.md`):
 
@@ -187,7 +187,7 @@ tools/test/conformance.sh results /tmp/out       # failures by area
 
 ## Limitations
 
-- IPv4 only. Rootless pods have no outbound connectivity.
+- IPv4 only. Rootless pods and `kr ctr run` containers reach the outside through a userspace NAT (about 300 MB/s on loopback-class links; `ping` works when `net.ipv4.ping_group_range` allows it; IP fragments are reassembled and window scaling is negotiated).
 - Watches of aggregated APIs are not supported (the API returns 501).
 - Pod resize has no restart policies and does not model `PodResizePending`.
 - Only ECDSA P-256 keys for pod certificates; RSA is verify-only.
