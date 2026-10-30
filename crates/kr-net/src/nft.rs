@@ -14,6 +14,7 @@ const NFNL_MSG_BATCH_BEGIN: u16 = 0x10; // NFNL_MSG_BATCH_BEGIN (NLMSG_MIN_TYPE)
 const NFNL_MSG_BATCH_END: u16 = 0x11; // NFNL_MSG_BATCH_END (NLMSG_MIN_TYPE + 1)
 const NFPROTO_UNSPEC: u8 = 0; // NFPROTO_UNSPEC (batch messages)
 const NFPROTO_IPV4: u8 = 2; // NFPROTO_IPV4
+const NFPROTO_IPV6: u8 = 10; // NFPROTO_IPV6
 
 const NFT_MSG_NEWTABLE: u16 = 0; // NFT_MSG_NEWTABLE
 const NFT_MSG_DELTABLE: u16 = 2; // NFT_MSG_DELTABLE
@@ -106,14 +107,14 @@ fn ifname(name: &[u8]) -> [u8; IFNAMSIZ] {
     v
 }
 
-fn new_table(b: &mut NlBuf, table: &[u8], flags: u16) {
-    msg(b, NFT_MSG_NEWTABLE, flags, NFPROTO_IPV4, 0);
+fn new_table(b: &mut NlBuf, fam: u8, table: &[u8], flags: u16) {
+    msg(b, NFT_MSG_NEWTABLE, flags, fam, 0);
     b.attr_str(NFTA_TABLE_NAME, table);
     b.end();
 }
 
-fn new_chain(b: &mut NlBuf, table: &[u8], name: &[u8], ty: &[u8], hook: u32, prio: u32) {
-    msg(b, NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE, NFPROTO_IPV4, 0);
+fn new_chain(b: &mut NlBuf, fam: u8, table: &[u8], name: &[u8], ty: &[u8], hook: u32, prio: u32) {
+    msg(b, NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE, fam, 0);
     b.attr_str(NFTA_CHAIN_TABLE, table);
     b.attr_str(NFTA_CHAIN_NAME, name);
     b.nest_begin(NFTA_CHAIN_HOOK);
@@ -182,8 +183,8 @@ fn verdict_accept(b: &mut NlBuf) {
 }
 
 /// Appends a rule to `chain`; `exprs` writes the expression list.
-fn rule(b: &mut NlBuf, table: &[u8], chain: &[u8], exprs: impl FnOnce(&mut NlBuf)) {
-    msg(b, NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | NLM_F_APPEND, NFPROTO_IPV4, 0);
+fn rule(b: &mut NlBuf, fam: u8, table: &[u8], chain: &[u8], exprs: impl FnOnce(&mut NlBuf)) {
+    msg(b, NFT_MSG_NEWRULE, NLM_F_ACK | NLM_F_CREATE | NLM_F_APPEND, fam, 0);
     b.attr_str(NFTA_RULE_TABLE, table);
     b.attr_str(NFTA_RULE_CHAIN, chain);
     b.nest_begin(NFTA_RULE_EXPRESSIONS);
@@ -205,49 +206,69 @@ fn masquerade_batch(m: &Masquerade) -> NlBuf {
     for i in 0..4 {
         net[i] = m.cidr[i] & mask[i];
     }
-    let bridge = ifname(m.bridge);
+    // saddr / daddr offsets in the IPv4 header
+    family_batch(NFPROTO_IPV4, m.table, &net, &mask, 12, 16, m.bridge)
+}
+
+/// The same for IPv6: table `ip6 <table>` masquerading the pod `/prefix` network.
+fn masquerade_batch6(m: &Masquerade6) -> NlBuf {
+    let mut mask = [0u8; 16];
+    for (i, byte) in mask.iter_mut().enumerate() {
+        let bits = (m.prefix as i32 - 8 * i as i32).clamp(0, 8);
+        *byte = if bits == 0 { 0 } else { 0xffu8 << (8 - bits) };
+    }
+    let mut net = [0u8; 16];
+    for i in 0..16 {
+        net[i] = m.cidr[i] & mask[i];
+    }
+    // saddr / daddr offsets in the IPv6 header
+    family_batch(NFPROTO_IPV6, m.table, &net, &mask, 8, 24, m.bridge)
+}
+
+fn family_batch(fam: u8, table: &[u8], net: &[u8], mask: &[u8], src_off: u32, dst_off: u32, bridge: &[u8]) -> NlBuf {
+    let bridge = ifname(bridge);
     let mut b = NlBuf::new();
     batch_msg(&mut b, NFNL_MSG_BATCH_BEGIN);
     // Create (no-op if present), delete, create again: atomically replaces any old table.
-    new_table(&mut b, m.table, NLM_F_ACK | NLM_F_CREATE);
-    msg(&mut b, NFT_MSG_DELTABLE, NLM_F_ACK, NFPROTO_IPV4, 0);
-    b.attr_str(NFTA_TABLE_NAME, m.table);
+    new_table(&mut b, fam, table, NLM_F_ACK | NLM_F_CREATE);
+    msg(&mut b, NFT_MSG_DELTABLE, NLM_F_ACK, fam, 0);
+    b.attr_str(NFTA_TABLE_NAME, table);
     b.end();
-    new_table(&mut b, m.table, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
-    new_chain(&mut b, m.table, b"postrouting", b"nat", NF_INET_POST_ROUTING, 100);
-    new_chain(&mut b, m.table, b"forward", b"filter", NF_INET_FORWARD, 0);
-    // ip saddr <cidr> ip daddr != <cidr> oifname != <bridge> masquerade
-    rule(&mut b, m.table, b"postrouting", |b| {
+    new_table(&mut b, fam, table, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+    new_chain(&mut b, fam, table, b"postrouting", b"nat", NF_INET_POST_ROUTING, 100);
+    new_chain(&mut b, fam, table, b"forward", b"filter", NF_INET_FORWARD, 0);
+    // saddr <cidr> daddr != <cidr> oifname != <bridge> masquerade
+    rule(&mut b, fam, table, b"postrouting", |b| {
         expr_begin(b, b"payload");
         b.attr_u32_be(NFTA_PAYLOAD_DREG, NFT_REG_1);
         b.attr_u32_be(NFTA_PAYLOAD_BASE, NFT_PAYLOAD_NETWORK_HEADER);
-        b.attr_u32_be(NFTA_PAYLOAD_OFFSET, 12); // saddr in the IPv4 header
-        b.attr_u32_be(NFTA_PAYLOAD_LEN, 4);
+        b.attr_u32_be(NFTA_PAYLOAD_OFFSET, src_off);
+        b.attr_u32_be(NFTA_PAYLOAD_LEN, mask.len() as u32);
         expr_end(b);
-        bitwise_and(b, &mask);
-        cmp(b, NFT_CMP_EQ, &net);
-        // ip daddr & mask != net: traffic to other pods keeps its source address
+        bitwise_and(b, mask);
+        cmp(b, NFT_CMP_EQ, net);
+        // daddr & mask != net: traffic to other pods keeps its source address
         expr_begin(b, b"payload");
         b.attr_u32_be(NFTA_PAYLOAD_DREG, NFT_REG_1);
         b.attr_u32_be(NFTA_PAYLOAD_BASE, NFT_PAYLOAD_NETWORK_HEADER);
-        b.attr_u32_be(NFTA_PAYLOAD_OFFSET, 16); // daddr in the IPv4 header
-        b.attr_u32_be(NFTA_PAYLOAD_LEN, 4);
+        b.attr_u32_be(NFTA_PAYLOAD_OFFSET, dst_off);
+        b.attr_u32_be(NFTA_PAYLOAD_LEN, mask.len() as u32);
         expr_end(b);
-        bitwise_and(b, &mask);
-        cmp(b, NFT_CMP_NEQ, &net);
+        bitwise_and(b, mask);
+        cmp(b, NFT_CMP_NEQ, net);
         meta(b, NFT_META_OIFNAME);
         cmp(b, NFT_CMP_NEQ, &bridge);
         expr_begin(b, b"masq");
         expr_end(b);
     });
     // iifname <bridge> accept
-    rule(&mut b, m.table, b"forward", |b| {
+    rule(&mut b, fam, table, b"forward", |b| {
         meta(b, NFT_META_IIFNAME);
         cmp(b, NFT_CMP_EQ, &bridge);
         verdict_accept(b);
     });
     // oifname <bridge> ct state established,related accept
-    rule(&mut b, m.table, b"forward", |b| {
+    rule(&mut b, fam, table, b"forward", |b| {
         meta(b, NFT_META_OIFNAME);
         cmp(b, NFT_CMP_EQ, &bridge);
         expr_begin(b, b"ct");
@@ -260,6 +281,20 @@ fn masquerade_batch(m: &Masquerade) -> NlBuf {
     });
     batch_msg(&mut b, NFNL_MSG_BATCH_END);
     b
+}
+
+/// Parameters of the IPv6 container-bridge NAT table (family `ip6`).
+pub struct Masquerade6<'a> {
+    pub table: &'a [u8],
+    pub cidr: [u8; 16],
+    pub prefix: u8,
+    pub bridge: &'a [u8],
+}
+
+/// Idempotently (re)creates table `ip6 <table>`: like [`ensure_masquerade`] for IPv6.
+pub fn ensure_masquerade6(m: &Masquerade6) -> Result<(), Errno> {
+    let b = masquerade_batch6(m);
+    Netlink::open(NETLINK_NETFILTER)?.transact(&b)
 }
 
 /// Idempotently (re)creates table `ip <table>` with a NAT postrouting chain masquerading

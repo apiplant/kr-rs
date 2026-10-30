@@ -14,7 +14,9 @@
 //!   `ready` (Ready and not terminating, or `publishNotReadyAddresses`), `serving` (Ready) and
 //!   `terminating`. Pods are grouped by resolved ports (one slice each, 100 endpoints at most per
 //!   slice); with no pods a placeholder slice keeps the ports that need no pod to resolve.
-//!   Slices of the Service that are no longer wanted are deleted. IPv6 pod IPs are not published.
+//!   Slices of the Service that are no longer wanted are deleted. Dual stack: pods publish
+//!   `status.podIPs`; a Service gets one set of slices per family in `spec.ipFamilies`
+//!   (addressType IPv4 / IPv6), and its Endpoints carry the primary family.
 //! * **Ports.** Each Service port resolves per pod: no `targetPort` means `port`, a number is
 //!   used as is and a name is looked up in the pod's container ports (same protocol). A port that
 //!   does not resolve for a pod is left out for that pod.
@@ -125,6 +127,8 @@ fn resolve_port(sp: &Value, pod: Option<&Value>) -> Option<Port> {
 
 struct Member {
     ip: String,
+    /// The pod's IPv6 address (second `status.podIPs` entry), if it has one.
+    ip6: Option<String>,
     node: String,
     pod_name: String,
     pod_uid: String,
@@ -137,8 +141,17 @@ fn target_ref(m: &Member, ns: &str) -> Value {
     obj(alloc::vec![("kind", Value::from("Pod")), ("namespace", Value::from(ns)), ("name", Value::from(m.pod_name.as_str())), ("uid", Value::from(m.pod_uid.as_str()))])
 }
 
-fn address(m: &Member, ns: &str) -> Value {
-    let mut a = obj(alloc::vec![("ip", Value::from(m.ip.as_str()))]);
+/// The member's address in a family: `ip` is the primary (IPv4 on this cluster) podIP.
+fn ip_in(m: &Member, v6: bool) -> Option<&str> {
+    if v6 {
+        m.ip6.as_deref().or(m.ip.contains(':').then_some(m.ip.as_str()))
+    } else {
+        (!m.ip.contains(':')).then_some(m.ip.as_str())
+    }
+}
+
+fn address(m: &Member, ip: &str, ns: &str) -> Value {
+    let mut a = obj(alloc::vec![("ip", Value::from(ip))]);
     if let Some(h) = &m.hostname {
         a.set("hostname", Value::from(h.as_str()));
     }
@@ -186,8 +199,10 @@ pub async fn reconcile<C: Client>(c: &C, ns: &str, sname: &str) -> Result<()> {
         }
         let key = json::to_string(&Value::Array(ports.iter().map(port_value).collect()));
         let hostname = (!str_at(p, &["spec", "hostname"]).is_empty() && str_at(p, &["spec", "subdomain"]) == sname).then(|| str_at(p, &["spec", "hostname"]).to_string());
+        let ip6 = p.pointer(&["status", "podIPs"]).and_then(Value::as_array).and_then(|a| a.iter().filter_map(|x| x.get("ip").and_then(Value::as_str)).find(|i| i.contains(':'))).map(String::from);
         let m = Member {
             ip: ip.to_string(),
+            ip6,
             node: str_at(p, &["spec", "nodeName"]).to_string(),
             pod_name: name(p).to_string(),
             pod_uid: uid(p).to_string(),
@@ -201,20 +216,23 @@ pub async fn reconcile<C: Client>(c: &C, ns: &str, sname: &str) -> Result<()> {
         ms.sort_by(|a, b| (a.ip.as_str(), a.pod_name.as_str()).cmp(&(b.ip.as_str(), b.pod_name.as_str())));
     }
 
-    write_endpoints(c, &svc, &groups, publish_unready, headless).await?;
-    write_slices(c, &svc, &groups, &sports, publish_unready).await
+    let families: Vec<String> = svc.pointer(&["spec", "ipFamilies"]).and_then(Value::as_array).map(|a| a.iter().filter_map(|f| f.as_str().map(String::from)).collect()).unwrap_or_default();
+    let families = if families.is_empty() { alloc::vec![String::from("IPv4")] } else { families };
+    write_endpoints(c, &svc, &groups, publish_unready, headless, families[0] == "IPv6").await?;
+    write_slices(c, &svc, &groups, &sports, publish_unready, &families).await
 }
 
-async fn write_endpoints<C: Client>(c: &C, svc: &Value, groups: &BTreeMap<String, (Vec<Port>, Vec<Member>)>, publish_unready: bool, headless: bool) -> Result<()> {
+async fn write_endpoints<C: Client>(c: &C, svc: &Value, groups: &BTreeMap<String, (Vec<Port>, Vec<Member>)>, publish_unready: bool, headless: bool, v6: bool) -> Result<()> {
     let ns = namespace(svc);
     let mut subsets: Vec<Value> = Vec::new();
     for (ports, ms) in groups.values() {
         let (mut ready, mut unready) = (Vec::new(), Vec::new());
         for m in ms.iter().filter(|m| !m.terminating) {
+            let Some(ip) = ip_in(m, v6) else { continue };
             if m.ready || publish_unready {
-                ready.push(address(m, ns));
+                ready.push(address(m, ip, ns));
             } else {
-                unready.push(address(m, ns));
+                unready.push(address(m, ip, ns));
             }
         }
         if ready.is_empty() && unready.is_empty() {
@@ -273,20 +291,25 @@ fn slice_name(svc: &Value, key: &str, chunk: usize) -> String {
     alloc::format!("{}-{}", name(svc), safe_encode(&h.to_string()))
 }
 
-async fn write_slices<C: Client>(c: &C, svc: &Value, groups: &BTreeMap<String, (Vec<Port>, Vec<Member>)>, sports: &[Value], publish_unready: bool) -> Result<()> {
+async fn write_slices<C: Client>(c: &C, svc: &Value, groups: &BTreeMap<String, (Vec<Port>, Vec<Member>)>, sports: &[Value], publish_unready: bool, families: &[String]) -> Result<()> {
     let ns = namespace(svc);
     // (name, ports, endpoints)
-    let mut wanted: Vec<(String, Vec<Value>, Vec<Value>)> = Vec::new();
+    // (name, ports, endpoints, addressType)
+    let mut wanted: Vec<(String, Vec<Value>, Vec<Value>, &'static str)> = Vec::new();
+    for fam in families.iter().map(String::as_str) {
+    let v6 = fam == "IPv6";
+    let atype: &'static str = if v6 { "IPv6" } else { "IPv4" };
+    let fam_key = if v6 { "|v6" } else { "" };
     for (key, (ports, ms)) in groups {
-        let ms: Vec<&Member> = ms.iter().filter(|m| !m.ip.contains(':')).collect();
+        let ms: Vec<(&Member, &str)> = ms.iter().filter_map(|m| ip_in(m, v6).map(|ip| (m, ip))).collect();
         if ms.is_empty() {
             continue;
         }
         for (i, chunk) in ms.chunks(MAX_PER_SLICE).enumerate() {
             let eps = chunk
                 .iter()
-                .map(|m| {
-                    let mut e = obj(alloc::vec![("addresses", Value::Array(alloc::vec![Value::from(m.ip.as_str())]))]);
+                .map(|(m, ip)| {
+                    let mut e = obj(alloc::vec![("addresses", Value::Array(alloc::vec![Value::from(*ip)]))]);
                     let conds = obj(alloc::vec![
                         ("ready", Value::Bool((m.ready && !m.terminating) || publish_unready)),
                         ("serving", Value::Bool(m.ready || publish_unready)),
@@ -303,13 +326,15 @@ async fn write_slices<C: Client>(c: &C, svc: &Value, groups: &BTreeMap<String, (
                     e
                 })
                 .collect();
-            wanted.push((slice_name(svc, key, i), ports.iter().map(slice_port).collect(), eps));
+            wanted.push((slice_name(svc, &alloc::format!("{key}{fam_key}"), i), ports.iter().map(slice_port).collect(), eps, atype));
         }
+    }
     }
     if wanted.is_empty() {
         let ports: Vec<Port> = sports.iter().filter_map(|sp| resolve_port(sp, None)).collect();
         let key = json::to_string(&Value::Array(ports.iter().map(slice_port).collect()));
-        wanted.push((slice_name(svc, &key, 0), ports.iter().map(slice_port).collect(), Vec::new()));
+        let atype: &'static str = if families.first().map(String::as_str) == Some("IPv6") { "IPv6" } else { "IPv4" };
+        wanted.push((slice_name(svc, &key, 0), ports.iter().map(slice_port).collect(), Vec::new(), atype));
     }
 
     let existing = items(&c.list(&endpointslices(Some(ns)), &alloc::format!("labelSelector={}", enc(&alloc::format!("{SERVICE_LABEL}={}", name(svc))))).await?);
@@ -318,7 +343,7 @@ async fn write_slices<C: Client>(c: &C, svc: &Value, groups: &BTreeMap<String, (
             delete_ok(c, &alloc::format!("{}/{}", endpointslices(Some(ns)), name(e))).await?;
         }
     }
-    for (sname, ports, eps) in wanted {
+    for (sname, ports, eps, atype) in wanted {
         let labels = obj(alloc::vec![(SERVICE_LABEL, Value::from(name(svc))), (MANAGED_BY, Value::from(MANAGER))]);
         let (ports, eps) = (Value::Array(ports), Value::Array(eps));
         let path = alloc::format!("{}/{sname}", endpointslices(Some(ns)));
@@ -337,7 +362,7 @@ async fn write_slices<C: Client>(c: &C, svc: &Value, groups: &BTreeMap<String, (
                                 ("ownerReferences", Value::Array(alloc::vec![owner_ref(svc, "v1", "Service")])),
                             ])
                         ),
-                        ("addressType", Value::from("IPv4")),
+                        ("addressType", Value::from(atype)),
                         ("endpoints", eps.clone()),
                         ("ports", ports.clone()),
                     ]);
@@ -346,14 +371,14 @@ async fn write_slices<C: Client>(c: &C, svc: &Value, groups: &BTreeMap<String, (
                 Some(mut s) => {
                     let same = canonical(s.get("endpoints").unwrap_or(&Value::Null)) == canonical(&eps)
                         && canonical(s.get("ports").unwrap_or(&Value::Null)) == canonical(&ports)
-                        && s.get("addressType").and_then(Value::as_str) == Some("IPv4")
+                        && s.get("addressType").and_then(Value::as_str) == Some(atype)
                         && canonical(s.pointer(&["metadata", "labels"]).unwrap_or(&Value::Null)) == canonical(&labels);
                     if same {
                         return Ok(());
                     }
                     s.set("endpoints", eps.clone());
                     s.set("ports", ports.clone());
-                    s.set("addressType", Value::from("IPv4"));
+                    s.set("addressType", Value::from(atype));
                     s.entry_object("metadata").set("labels", labels.clone());
                     c.update(&path, &s).await.map(|_| ())
                 }

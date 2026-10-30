@@ -38,6 +38,41 @@ impl IpAddr {
     }
 }
 
+/// RFC 5952 text: lowercase hex groups, the longest run of two or more zero groups as `::`.
+pub fn ipv6_string(a: [u8; 16]) -> String {
+    let g: [u16; 8] = core::array::from_fn(|i| u16::from_be_bytes([a[2 * i], a[2 * i + 1]]));
+    let (mut best, mut best_len, mut i) = (0usize, 0usize, 0usize);
+    while i < 8 {
+        if g[i] == 0 {
+            let start = i;
+            while i < 8 && g[i] == 0 {
+                i += 1;
+            }
+            if i - start > best_len && i - start > 1 {
+                best = start;
+                best_len = i - start;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    let mut out = String::new();
+    let mut i = 0;
+    while i < 8 {
+        if best_len > 0 && i == best {
+            out.push_str("::");
+            i += best_len;
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with(':') {
+            out.push(':');
+        }
+        out.push_str(&alloc::format!("{:x}", g[i]));
+        i += 1;
+    }
+    out
+}
+
 /// Strict dotted quad: four decimal parts of 1-3 digits, no leading zeros, each <= 255.
 pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     let mut out = [0u8; 4];

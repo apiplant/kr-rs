@@ -658,6 +658,56 @@ pub fn recv_from(sock: i32, buf: &mut [u8]) -> Result<(usize, [u8; 4], u16)> {
     Ok((n as usize, [addr[4], addr[5], addr[6], addr[7]], u16::from_be_bytes([addr[2], addr[3]])))
 }
 
+/// recvfrom on a datagram socket of either family: (bytes, source as an IPv4-mapped or IPv6
+/// address, source port).
+pub fn recv_from_any(sock: i32, buf: &mut [u8]) -> Result<(usize, [u8; 16], u16)> {
+    let mut addr = [0u8; 28];
+    let mut len: u32 = 28;
+    // SAFETY: buf, addr and len are valid writable buffers for the call.
+    let n = check(unsafe { super::syscall6(sock_nr::RECVFROM, sock as usize, buf.as_mut_ptr() as usize, buf.len(), 0, addr.as_mut_ptr() as usize, &mut len as *mut u32 as usize) })?;
+    let port = u16::from_be_bytes([addr[2], addr[3]]);
+    let ip = if u16::from_ne_bytes([addr[0], addr[1]]) == super::AF_INET6 as u16 {
+        let mut a = [0u8; 16];
+        a.copy_from_slice(&addr[8..24]);
+        a
+    } else {
+        super::map4([addr[4], addr[5], addr[6], addr[7]])
+    };
+    Ok((n as usize, ip, port))
+}
+
+/// sendto an address of either family (an IPv4-mapped address on an AF_INET socket is sent as
+/// IPv4, anything else as IPv6).
+pub fn send_to_any(sock: i32, data: &[u8], ip: [u8; 16], port: u16) -> Result<usize> {
+    if let Some(v4) = super::unmap4(ip) {
+        return send_to(sock, data, v4, port);
+    }
+    let addr = super::SockaddrIn6::new(ip, port);
+    // SAFETY: data and addr are valid for the call.
+    check(unsafe { super::syscall6(sock_nr::SENDTO, sock as usize, data.as_ptr() as usize, data.len(), MSG_NOSIGNAL, &addr as *const _ as usize, core::mem::size_of::<super::SockaddrIn6>()) }).map(|n| n as usize)
+}
+
+/// Address of a connected socket's peer (getpeername), IPv4-mapped for AF_INET.
+pub fn peer_addr(fd: i32) -> Option<[u8; 16]> {
+    #[cfg(target_arch = "x86_64")]
+    const GETPEERNAME: usize = 52;
+    #[cfg(target_arch = "aarch64")]
+    const GETPEERNAME: usize = 205;
+    let mut addr = [0u8; 28];
+    let mut len: u32 = 28;
+    // SAFETY: addr/len describe a writable sockaddr buffer.
+    check(unsafe { syscall3(GETPEERNAME, fd as usize, addr.as_mut_ptr() as usize, &mut len as *mut u32 as usize) }).ok()?;
+    match u16::from_ne_bytes([addr[0], addr[1]]) as i32 {
+        super::AF_INET => Some(super::map4([addr[4], addr[5], addr[6], addr[7]])),
+        super::AF_INET6 => {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(&addr[8..24]);
+            Some(a)
+        }
+        _ => None,
+    }
+}
+
 /// sendto an IPv4 address.
 pub fn send_to(sock: i32, data: &[u8], ip: [u8; 4], port: u16) -> Result<usize> {
     let addr = super::SockaddrIn::new(ip, port);

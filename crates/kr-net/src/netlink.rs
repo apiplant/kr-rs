@@ -193,6 +193,9 @@ const RTA_GATEWAY: u16 = 5;
 const IFF_UP: u32 = 1;
 const AF_UNSPEC: u8 = 0;
 const AF_INET: u8 = 2;
+const AF_INET6: u8 = 10;
+const IFA_FLAGS: u16 = 8;
+const IFA_F_NODAD: u32 = 0x02;
 
 /// struct ifinfomsg.
 fn ifinfo(index: i32, flags: u32, change: u32) -> [u8; 16] {
@@ -299,6 +302,44 @@ impl Netlink {
             b.raw(&h);
             b.attr(IFA_LOCAL, &addr);
             b.attr(IFA_ADDRESS, &addr);
+        })
+    }
+
+    /// Adds an IPv6 address without duplicate address detection (pod addresses are unique by
+    /// construction; DAD would leave them tentative for a second); EEXIST when present.
+    pub fn addr_add6(&self, index: i32, addr: [u8; 16], prefix: u8) -> Result<(), Errno> {
+        self.one(|b| {
+            b.begin(RTM_NEWADDR, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+            let mut h = [0u8; 8]; // struct ifaddrmsg
+            h[0] = AF_INET6;
+            h[1] = prefix;
+            h[4..8].copy_from_slice(&(index as u32).to_ne_bytes());
+            b.raw(&h);
+            b.attr(IFA_LOCAL, &addr);
+            b.attr(IFA_ADDRESS, &addr);
+            b.attr_u32(IFA_FLAGS, IFA_F_NODAD);
+        })
+    }
+
+    /// Adds an IPv6 route `dst/prefix` via `gateway` (`::/0` for the default route).
+    pub fn route_add6(&self, dst: [u8; 16], prefix: u8, gateway: Option<[u8; 16]>, oif: i32) -> Result<(), Errno> {
+        self.route_add6_proto(dst, prefix, gateway, oif, 3)
+    }
+
+    pub fn route_add6_proto(&self, dst: [u8; 16], prefix: u8, gateway: Option<[u8; 16]>, oif: i32, proto: u8) -> Result<(), Errno> {
+        self.one(|b| {
+            b.begin(RTM_NEWROUTE, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+            let scope = if gateway.is_some() { 0 } else { 253 };
+            b.raw(&[AF_INET6, prefix, 0, 0, 254, proto, scope, 1, 0, 0, 0, 0]);
+            if prefix > 0 {
+                b.attr(RTA_DST, &dst);
+            }
+            if let Some(gw) = gateway {
+                b.attr(RTA_GATEWAY, &gw);
+            }
+            if oif > 0 {
+                b.attr_u32(RTA_OIF, oif as u32);
+            }
         })
     }
 
@@ -416,6 +457,18 @@ impl Netlink {
     }
 }
 
+impl Netlink {
+    /// `ip -6 route add local <dst>/<prefix> dev <oif> table local` (the IPv6 Service CIDR).
+    pub fn route_add_local6(&self, dst: [u8; 16], prefix: u8, oif: i32) -> Result<(), Errno> {
+        self.one(|b| {
+            b.begin(RTM_NEWROUTE, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+            b.raw(&[AF_INET6, prefix, 0, 0, 255, 3, 254, 2, 0, 0, 0, 0]);
+            b.attr(RTA_DST, &dst);
+            b.attr_u32(RTA_OIF, oif as u32);
+        })
+    }
+}
+
 // ---- VXLAN overlay: link, neighbour (ARP) and FDB entries ----
 
 const RTM_NEWNEIGH: u16 = 28;
@@ -527,6 +580,33 @@ impl Netlink {
     /// Adds (or replaces) a permanent ARP entry `ip` -> `mac` on `ifindex`.
     pub fn neigh_add(&self, ifindex: i32, ip: [u8; 4], mac: [u8; 6]) -> Result<(), Errno> {
         self.transact(&neigh_msg(RTM_NEWNEIGH, false, ifindex, ip, mac))
+    }
+
+    /// Adds (or replaces) a permanent IPv6 neighbour entry `ip` -> `mac` on `ifindex`.
+    pub fn neigh_add6(&self, ifindex: i32, ip: [u8; 16], mac: [u8; 6]) -> Result<(), Errno> {
+        let mut b = NlBuf::new();
+        b.begin(RTM_NEWNEIGH, NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE);
+        let mut h = [0u8; 12];
+        h[0] = AF_INET6;
+        h[4..8].copy_from_slice(&ifindex.to_ne_bytes());
+        h[8..10].copy_from_slice(&NUD_PERMANENT.to_ne_bytes());
+        b.raw(&h);
+        b.attr(NDA_DST, &ip);
+        b.attr(NDA_LLADDR, &mac);
+        b.end();
+        self.transact(&b)
+    }
+
+    /// Adds or replaces an IPv6 route `dst/prefix` via `gateway` on `oif` with RTNH_F_ONLINK
+    /// (the gateway is a VXLAN peer's VTEP address, covered by no connected route).
+    pub fn route_replace6_onlink(&self, dst: [u8; 16], prefix: u8, gateway: [u8; 16], oif: i32, proto: u8) -> Result<(), Errno> {
+        self.one(|b| {
+            b.begin(RTM_NEWROUTE, NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE);
+            b.raw(&[AF_INET6, prefix, 0, 0, 254, proto, 0, 1, RTNH_F_ONLINK, 0, 0, 0]);
+            b.attr(RTA_DST, &dst);
+            b.attr(RTA_GATEWAY, &gateway);
+            b.attr_u32(RTA_OIF, oif as u32);
+        })
     }
 
     pub fn neigh_del(&self, ifindex: i32, ip: [u8; 4], mac: [u8; 6]) -> Result<(), Errno> {

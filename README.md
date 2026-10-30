@@ -140,6 +140,7 @@ Numbers will vary with hardware; the commands to reproduce them are in `tools/te
 **Networking**
 - Built-in bridge and veth pod network with host-local IPAM, no CNI plugins
 - Cross-node VXLAN or host-gw, NAT through nftables over netlink (no `iptables`/`nft` binaries needed)
+- Dual stack: every pod has an IPv6 twin address (`fd00:88:0:N::/64` for the node's `10.88.N.0/24`), Services can be IPv4, IPv6 or both (`ipFamilies`, `ipFamilyPolicy`), with AAAA records and VXLAN across nodes
 - Service proxy for ClusterIP, NodePort and hostPort (with ClientIP affinity), in-process cluster DNS (`cluster.local`, pod and service records, ExternalName)
 
 ## How it is built
@@ -187,7 +188,7 @@ tools/test/conformance.sh results /tmp/out       # failures by area
 
 ## Limitations
 
-- IPv4 only. Rootless pods and `kr ctr run` containers reach the outside through a userspace NAT (about 300 MB/s on loopback-class links; `ping` works when `net.ipv4.ping_group_range` allows it; IP fragments are reassembled and window scaling is negotiated).
+- Dual stack, not IPv6-only: pods, Services, EndpointSlices, the proxy and cluster DNS handle both families, but the API server, node addresses, NodePort/hostPort, `kube-dns` and the host-gw backend are IPv4 only. Rootless pods and `kr ctr run` containers reach the outside through a userspace NAT (about 300 MB/s on loopback-class links; `ping` works when `net.ipv4.ping_group_range` allows it; IP fragments are reassembled and window scaling is negotiated).
 - Watches of aggregated APIs are not supported (the API returns 501).
 - Pod resize has no restart policies and does not model `PodResizePending`.
 - Only ECDSA P-256 keys for pod certificates; RSA is verify-only.
@@ -203,6 +204,9 @@ cargo test --workspace
 tools/test/aarch64.sh         # cross-build and smoke test under qemu-user
 tools/test/two-node.sh up     # server kr1 and agent kr2 in Docker
 tools/test/ha.sh              # three-server Raft cluster
+tools/test/rootless-egress.sh # rootless pod and ctr egress: download, upload, DNS, ping (run as a normal user)
+tools/test/rootless-egress-v6.sh # the same over IPv6 in a throwaway container
+tools/test/dualstack.sh       # dual-stack pods, Services and DNS on a two-node cluster
 ```
 
 Documents: [`docs/PLAN.md`](docs/PLAN.md) (design and budgets), [`docs/DECISIONS.md`](docs/DECISIONS.md) (architecture decision records), [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md), [`docs/CONFORMANCE_KNOWN_ISSUES.md`](docs/CONFORMANCE_KNOWN_ISSUES.md).

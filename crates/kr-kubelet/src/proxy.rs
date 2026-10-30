@@ -25,12 +25,38 @@ use kr_sys::{ns, Errno, Fd};
 
 pub const SERVICE_CIDR: ([u8; 4], u8) = ([10, 96, 0, 0], 16);
 const POD_CIDR: ([u8; 4], u8) = ([10, 88, 0, 0], 16);
+/// The IPv6 twins (dual stack): Service CIDR `fd00:96::/112`, pod networks under `fd00:88::/32`.
+pub const SERVICE_CIDR6: ([u8; 16], u8) = ([0xfd, 0, 0, 0x96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 112);
+const POD_NET6: [u8; 4] = [0xfd, 0, 0, 0x88];
+
+/// Addresses are 16 bytes everywhere in the proxy: IPv4 ones in the mapped form
+/// (`kr_sys::map4`), so one type carries both families.
+type Ip = [u8; 16];
 
 const OP_LISTEN: u8 = 1;
 const OP_CONNECT: u8 = 2;
 const OP_LOCAL_ROUTE: u8 = 3;
 const TCP: u8 = 1;
 const UDP: u8 = 2;
+
+/// Whether a (mapped or real) address is in the pod network of either family.
+fn in_pod_net(ip: Ip) -> bool {
+    match kr_sys::unmap4(ip) {
+        Some(v4) => in_cidr(v4, POD_CIDR),
+        None => ip[..4] == POD_NET6,
+    }
+}
+
+fn ip16(s: &str) -> Option<Ip> {
+    ip4(s).map(kr_sys::map4).or_else(|| kr_net::tcp::parse_ipv6(s))
+}
+
+fn show(ip: Ip) -> String {
+    match kr_sys::unmap4(ip) {
+        Some(a) => alloc::format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]),
+        None => kr_net::tcp::ipv6_string(ip),
+    }
+}
 
 fn in_cidr(ip: [u8; 4], (net, len): ([u8; 4], u8)) -> bool {
     let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
@@ -39,27 +65,46 @@ fn in_cidr(ip: [u8; 4], (net, len): ([u8; 4], u8)) -> bool {
 
 /// Executes a socket operation in the current network namespace. Returns the new socket
 /// (non-blocking, close-on-exec) or None for status-only operations.
-fn local_op(op: u8, proto: u8, ip: [u8; 4], port: u16) -> Result<Option<Fd>, Errno> {
+fn local_op(op: u8, proto: u8, ip: Ip, port: u16) -> Result<Option<Fd>, Errno> {
+    let v4 = kr_sys::unmap4(ip);
     match op {
         OP_LOCAL_ROUTE => {
+            // `port` carries the prefix length.
             let nl = kr_net::netlink::Netlink::route()?;
             let lo = kr_net::netlink::ifindex(b"lo")?;
-            match nl.route_add_local(ip, port as u8, lo) {
+            let r = match v4 {
+                Some(a) => nl.route_add_local(a, port as u8, lo),
+                None => nl.route_add_local6(ip, port as u8, lo),
+            };
+            match r {
                 Ok(()) | Err(Errno(17)) => Ok(None),
                 Err(e) => Err(e),
             }
         }
         OP_LISTEN | OP_CONNECT => {
             let ty = if proto == UDP { 2 } else { kr_sys::SOCK_STREAM };
-            let fd = kr_sys::socket(kr_sys::AF_INET, ty | kr_sys::SOCK_NONBLOCK | kr_sys::SOCK_CLOEXEC, 0)?;
+            let family = if v4.is_some() { kr_sys::AF_INET } else { kr_sys::AF_INET6 };
+            let fd = kr_sys::socket(family, ty | kr_sys::SOCK_NONBLOCK | kr_sys::SOCK_CLOEXEC, 0)?;
             if op == OP_LISTEN {
                 kr_sys::setsockopt(fd.raw(), 1, 2, &1i32.to_ne_bytes())?; // SO_REUSEADDR
-                kr_sys::bind(fd.raw(), &kr_sys::SockaddrIn::new(ip, port))?;
+                match v4 {
+                    Some(a) => kr_sys::bind(fd.raw(), &kr_sys::SockaddrIn::new(a, port))?,
+                    None => {
+                        // The Service CIDR is only a local *route*; IPv6 refuses to bind such an
+                        // address unless IPV6_FREEBIND (78) is set.
+                        kr_sys::setsockopt(fd.raw(), 41, 78, &1i32.to_ne_bytes())?;
+                        kr_sys::bind6(fd.raw(), &kr_sys::SockaddrIn6::new(ip, port))?
+                    }
+                }
                 if proto == TCP {
                     kr_sys::listen(fd.raw(), 4096)?;
                 }
             } else {
-                match kr_sys::connect(fd.raw(), &kr_sys::SockaddrIn::new(ip, port)) {
+                let r = match v4 {
+                    Some(a) => kr_sys::connect(fd.raw(), &kr_sys::SockaddrIn::new(a, port)),
+                    None => kr_sys::connect6(fd.raw(), &kr_sys::SockaddrIn6::new(ip, port)),
+                };
+                match r {
                     Ok(()) | Err(Errno(kr_sys::EINPROGRESS)) => {}
                     Err(e) => return Err(e),
                 }
@@ -85,14 +130,16 @@ impl NodeNet {
         let theirs_raw = theirs.raw();
         let target = infra.target()?;
         let helper = container::in_pod_net(&target, move || {
-            let mut req = [0u8; 8];
+            // Request: op, proto, port (2 bytes), address (16 bytes).
+            let mut req = [0u8; 20];
             loop {
                 match kr_sys::read(theirs_raw, &mut req) {
-                    Ok(8) => {}
+                    Ok(20) => {}
                     _ => return 0, // kr went away
                 }
-                let ip = [req[2], req[3], req[4], req[5]];
-                let port = u16::from_be_bytes([req[6], req[7]]);
+                let mut ip = [0u8; 16];
+                ip.copy_from_slice(&req[4..]);
+                let port = u16::from_be_bytes([req[2], req[3]]);
                 let r = local_op(req[0], req[1], ip, port);
                 let status: i32 = match &r {
                     Ok(_) => 0,
@@ -112,12 +159,15 @@ impl NodeNet {
         Ok(NodeNet::Factory { sock: ours, _helper: helper })
     }
 
-    fn op(&self, op: u8, proto: u8, ip: [u8; 4], port: u16) -> Result<Option<Fd>, Errno> {
+    fn op(&self, op: u8, proto: u8, ip: Ip, port: u16) -> Result<Option<Fd>, Errno> {
         match self {
             NodeNet::Host => local_op(op, proto, ip, port),
             NodeNet::Factory { sock, .. } => {
-                let mut req = [op, proto, ip[0], ip[1], ip[2], ip[3], 0, 0];
-                req[6..].copy_from_slice(&port.to_be_bytes());
+                let mut req = [0u8; 20];
+                req[0] = op;
+                req[1] = proto;
+                req[2..4].copy_from_slice(&port.to_be_bytes());
+                req[4..].copy_from_slice(&ip);
                 kr_sys::write(sock.raw(), &req)?;
                 let mut st = [0u8; 4];
                 let (n, fd) = ns::recv_fd(sock.raw(), &mut st)?;
@@ -134,21 +184,27 @@ impl NodeNet {
 
     /// Makes the Service CIDR locally deliverable in the node namespace.
     pub fn setup(&self) -> Result<(), Errno> {
-        self.op(OP_LOCAL_ROUTE, 0, SERVICE_CIDR.0, SERVICE_CIDR.1 as u16).map(|_| ())
+        self.op(OP_LOCAL_ROUTE, 0, kr_sys::map4(SERVICE_CIDR.0), SERVICE_CIDR.1 as u16)?;
+        // The IPv6 half is best effort (a kernel without IPv6 keeps working single-stack).
+        let _ = self.op(OP_LOCAL_ROUTE, 0, SERVICE_CIDR6.0, SERVICE_CIDR6.1 as u16);
+        Ok(())
     }
 
-    /// proto: 1 = TCP, 2 = UDP.
-    pub fn listen(&self, proto: u8, ip: [u8; 4], port: u16) -> Result<Fd, Errno> {
+    /// proto: 1 = TCP, 2 = UDP. `ip` is a mapped IPv4 or an IPv6 address.
+    pub fn listen(&self, proto: u8, ip: Ip, port: u16) -> Result<Fd, Errno> {
         self.op(OP_LISTEN, proto, ip, port)?.ok_or(Errno(5))
     }
 
     /// Dials a backend; pod-CIDR addresses from the node namespace, others from the host.
-    fn dial(&self, proto: u8, ip: [u8; 4], port: u16) -> Result<Fd, Errno> {
+    fn dial(&self, proto: u8, ip: Ip, port: u16) -> Result<Fd, Errno> {
         // A backend on this host (the API server) is reached over loopback: the connections the
         // proxy closes first leave TIME_WAIT sockets, which the kernel only reuses on loopback
         // (tcp_tw_reuse=2); to the node address ~28k connections exhaust the ephemeral ports.
-        let ip = if proto == TCP && !in_cidr(ip, POD_CIDR) && is_local(ip) { [127, 0, 0, 1] } else { ip };
-        if matches!(self, NodeNet::Factory { .. }) && !in_cidr(ip, POD_CIDR) {
+        let ip = match kr_sys::unmap4(ip) {
+            Some(v4) if proto == TCP && !in_cidr(v4, POD_CIDR) && is_local(v4) => kr_sys::map4([127, 0, 0, 1]),
+            _ => ip,
+        };
+        if matches!(self, NodeNet::Factory { .. }) && !in_pod_net(ip) {
             return local_op(OP_CONNECT, proto, ip, port)?.ok_or(Errno(5));
         }
         self.op(OP_CONNECT, proto, ip, port)?.ok_or(Errno(5))
@@ -174,7 +230,7 @@ fn is_local(ip: [u8; 4]) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Key {
     proto: u8,
-    ip: [u8; 4],
+    ip: Ip,
     port: u16,
     /// NodePort listeners live in the host namespace.
     host: bool,
@@ -182,13 +238,13 @@ struct Key {
 
 #[derive(Default)]
 struct Backends {
-    eps: Vec<([u8; 4], u16)>,
+    eps: Vec<(Ip, u16)>,
     rr: Cell<usize>,
     affinity: bool,
 }
 
 impl Backends {
-    fn pick(&self, client: [u8; 4], attempt: usize) -> Option<([u8; 4], u16)> {
+    fn pick(&self, client: Ip, attempt: usize) -> Option<(Ip, u16)> {
         if self.eps.is_empty() {
             return None;
         }
@@ -268,10 +324,16 @@ impl<C: Client + Clone + 'static> Proxy<C> {
             if s.pointer(&["metadata", "annotations", "kr.io/builtin"]).is_some() {
                 continue; // served by kr itself (cluster DNS)
             }
-            let Some(cip) = s.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).and_then(ip4) else { continue };
+            let cips: Vec<Ip> = s.pointer(&["spec", "clusterIPs"]).and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().and_then(ip16)).collect()).unwrap_or_default();
+            let cips = if cips.is_empty() { s.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).and_then(ip16).into_iter().collect() } else { cips };
+            if cips.is_empty() {
+                continue;
+            }
             let ep = ep_of.get(&by_name(s)).copied();
             let own: &[&Value] = slices_of.get(&by_name(s)).map_or(&[], |v| v.as_slice());
             let affinity = s.pointer(&["spec", "sessionAffinity"]).and_then(Value::as_str) == Some("ClientIP");
+            for cip in cips.iter().copied() {
+            let want6 = kr_sys::unmap4(cip).is_none();
             for p in s.pointer(&["spec", "ports"]).and_then(Value::as_array).unwrap_or(&[]) {
                 let proto = match p.get("protocol").and_then(Value::as_str) {
                     Some("UDP") => UDP,
@@ -290,7 +352,7 @@ impl<C: Client + Clone + 'static> Proxy<C> {
                             continue;
                         }
                         for a in e.get("addresses").and_then(Value::as_array).unwrap_or(&[]) {
-                            if let Some(ip) = a.as_str().and_then(ip4) {
+                            if let Some(ip) = a.as_str().and_then(ip16).filter(|ip| kr_sys::unmap4(*ip).is_none() == want6) {
                                 list.push((ip, tp as u16));
                             }
                         }
@@ -300,16 +362,17 @@ impl<C: Client + Clone + 'static> Proxy<C> {
                     let target = sub.get("ports").and_then(Value::as_array).and_then(|ps| ps.iter().find(|ep| ep.get("name").and_then(Value::as_str).unwrap_or("") == pname)).and_then(|ep| ep.get("port")).and_then(Value::as_u64);
                     let Some(tp) = target else { continue };
                     for a in sub.get("addresses").and_then(Value::as_array).unwrap_or(&[]) {
-                        if let Some(ip) = a.get("ip").and_then(Value::as_str).and_then(ip4) {
+                        if let Some(ip) = a.get("ip").and_then(Value::as_str).and_then(ip16).filter(|ip| kr_sys::unmap4(*ip).is_none() == want6) {
                             list.push((ip, tp as u16));
                         }
                     }
                 }
-                let mk = |eps: &Vec<([u8; 4], u16)>| Backends { eps: eps.clone(), rr: Cell::new(0), affinity };
+                let mk = |eps: &Vec<(Ip, u16)>| Backends { eps: eps.clone(), rr: Cell::new(0), affinity };
                 desired.insert(Key { proto, ip: cip, port: port as u16, host: false }, mk(&list));
-                if let Some(np) = p.get("nodePort").and_then(Value::as_u64) {
-                    desired.insert(Key { proto, ip: [0, 0, 0, 0], port: np as u16, host: true }, mk(&list));
+                if let (false, Some(np)) = (want6, p.get("nodePort").and_then(Value::as_u64)) {
+                    desired.insert(Key { proto, ip: kr_sys::map4([0, 0, 0, 0]), port: np as u16, host: true }, mk(&list));
                 }
+            }
             }
         }
         let q = alloc::format!("fieldSelector=spec.nodeName%3D{}", self.node);
@@ -359,8 +422,8 @@ fn host_port_listeners(pods: &[Value], desired: &mut BTreeMap<Key, Backends>) {
                     Some("TCP") | None => TCP,
                     _ => continue,
                 };
-                let ip = pt.get("hostIP").and_then(Value::as_str).and_then(ip4).unwrap_or([0; 4]);
-                desired.insert(Key { proto, ip, port: hp as u16, host: true }, Backends { eps: alloc::vec![(pip, cp as u16)], rr: Cell::new(0), affinity: false });
+                let ip = kr_sys::map4(pt.get("hostIP").and_then(Value::as_str).and_then(ip4).unwrap_or([0; 4]));
+                desired.insert(Key { proto, ip, port: hp as u16, host: true }, Backends { eps: alloc::vec![(kr_sys::map4(pip), cp as u16)], rr: Cell::new(0), affinity: false });
             }
         }
     }
@@ -381,12 +444,12 @@ async fn tcp_loop(listener: Async<Fd>, backends: Rc<RefCell<Backends>>, net: Rc<
         let (b, n) = (backends.clone(), net.clone());
         kr_rt::exec::spawn(async move {
             // The peer address only matters for ClientIP affinity.
-            let peer = client_ip(&client).unwrap_or([0; 4]);
+            let peer = client_ip(&client).unwrap_or([0; 16]);
             let count = b.borrow().eps.len().max(1);
             for attempt in 0..count.min(3) {
                 let Some((ip, port)) = b.borrow().pick(peer, attempt) else { return };
                 let note = |what: &str| {
-                    let _ = kr_sys::write(2, alloc::format!("kr: proxy dial {}.{}.{}.{}:{port} {what}\n", ip[0], ip[1], ip[2], ip[3]).as_bytes());
+                    let _ = kr_sys::write(2, alloc::format!("kr: proxy dial {}:{port} {what}\n", show(ip)).as_bytes());
                 };
                 let fd = match n.dial(TCP, ip, port) {
                     Ok(fd) => fd,
@@ -411,8 +474,8 @@ async fn tcp_loop(listener: Async<Fd>, backends: Rc<RefCell<Backends>>, net: Rc<
     }
 }
 
-fn client_ip(s: &Async<Fd>) -> Option<[u8; 4]> {
-    ns::peer_ipv4(s.get_ref().raw())
+fn client_ip(s: &Async<Fd>) -> Option<Ip> {
+    ns::peer_addr(s.get_ref().raw())
 }
 
 /// Copies both ways until both directions are closed; EOF on one side half-closes the other.
@@ -446,12 +509,12 @@ struct UdpSession {
 
 async fn udp_loop(listener: Async<Fd>, backends: Rc<RefCell<Backends>>, net: Rc<NodeNet>) {
     let listener = Rc::new(listener);
-    let sessions: Rc<RefCell<BTreeMap<([u8; 4], u16), UdpSession>>> = Rc::new(RefCell::new(BTreeMap::new()));
+    let sessions: Rc<RefCell<BTreeMap<(Ip, u16), UdpSession>>> = Rc::new(RefCell::new(BTreeMap::new()));
     let mut buf = alloc::vec![0u8; 65536];
     loop {
         listener.wait_readable().await;
         loop {
-            let (n, cip, cport) = match ns::recv_from(listener.get_ref().raw(), &mut buf) {
+            let (n, cip, cport) = match ns::recv_from_any(listener.get_ref().raw(), &mut buf) {
                 Ok(r) => r,
                 Err(_) => break, // EAGAIN: wait for the next edge
             };
@@ -471,7 +534,7 @@ async fn udp_loop(listener: Async<Fd>, backends: Rc<RefCell<Backends>>, net: Rc<
                     loop {
                         match kr_rt::exec::timeout(60_000, u.read(&mut rb)).await {
                             Ok(Ok(n)) => {
-                                let _ = ns::send_to(l.get_ref().raw(), &rb[..n], cip, cport);
+                                let _ = ns::send_to_any(l.get_ref().raw(), &rb[..n], cip, cport);
                             }
                             _ => return,
                         }
@@ -503,8 +566,8 @@ mod tests {
         let mut d = BTreeMap::new();
         host_port_listeners(&pods, &mut d);
         assert_eq!(d.len(), 3);
-        let b = &d[&Key { proto: UDP, ip: [0; 4], port: 9090, host: true }];
-        assert_eq!(b.eps, alloc::vec![([10, 1, 0, 5], 8080)]);
-        assert!(d.contains_key(&Key { proto: TCP, ip: [127, 0, 0, 1], port: 9090, host: true }));
+        let b = &d[&Key { proto: UDP, ip: kr_sys::map4([0; 4]), port: 9090, host: true }];
+        assert_eq!(b.eps, alloc::vec![(kr_sys::map4([10, 1, 0, 5]), 8080)]);
+        assert!(d.contains_key(&Key { proto: TCP, ip: kr_sys::map4([127, 0, 0, 1]), port: 9090, host: true }));
     }
 }

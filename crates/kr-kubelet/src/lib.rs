@@ -159,6 +159,8 @@ struct PodRt {
     sandbox: Option<Sandbox>,
     lease: Option<Lease>,
     ip: Option<[u8; 4]>,
+    /// IPv6 twin of `ip` (dual-stack pod network), when the pod got one.
+    ip6: Option<[u8; 16]>,
     /// The node's InternalIP: status.hostIP, and the pod IP of hostNetwork pods.
     node_ip: [u8; 4],
     ctrs: Vec<Ctr>,
@@ -457,6 +459,14 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     let (radd, rdel) = route_diff(&routes, &have_routes);
                     let (nadd, ndel) = set_diff(&neighs, &nl.neighs(idx).unwrap_or_default());
                     let (fadd, fdel) = set_diff(&fdbs, &nl.fdbs(idx).unwrap_or_default());
+                    // IPv6 twins of the pod subnets: one on-link route per peer via its VTEP gateway
+                    // address (idempotent replace; the FDB entries above carry the frames).
+                    for (pn, _, mac) in &peers {
+                        let gw = network::vtep6(pn.subnet);
+                        if nl.neigh_add6(idx, gw, *mac).is_ok() {
+                            let _ = nl.route_replace6_onlink(network::subnet6(pn.subnet), network::POD_PREFIX6, gw, idx, RTPROT_KR);
+                        }
+                    }
                     for (d, p) in rdel {
                         let _ = nl.route_del(d, p, RTPROT_KR);
                     }
@@ -764,7 +774,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         let prio = pod.pointer(&["spec", "priorityClassName"]).and_then(Value::as_str).unwrap_or("");
         let critical = prio.starts_with("system-") && prio.ends_with("-critical") || pod.pointer(&["metadata", "annotations", "kubernetes.io/config.mirror"]).is_some();
-        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, node_ip: self.cfg.node_ip, ctrs, start_time: now(), kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod) }
+        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ip6: None, node_ip: self.cfg.node_ip, ctrs, start_time: now(), kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod) }
     }
 
     fn start_sandbox(&self, uid: &str, pod: &Value) -> Result<(), String> {
@@ -781,7 +791,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         let ip = if host_net { Some(self.cfg.node_ip) } else { lease.as_ref().map(|l: &Lease| l.ip) };
         let pn = self.podnet.get();
-        let net = ip.map(|ip| NetConfig { ip, prefix: pn.prefix, gateway: pn.gateway });
+        let net = ip.map(|ip| NetConfig::dual(ip, &pn));
         // hostNetwork pods report the node's hostname (upstream: unless spec.hostname is set).
         let hostname = if host_net && pod.pointer(&["spec", "hostname"]).and_then(Value::as_str).is_none_or(str::is_empty) {
             String::from_utf8(kr_sys::fs::read_file(b"/proc/sys/kernel/hostname\0", 256).unwrap_or_default()).unwrap_or_default().trim().to_string()
@@ -830,13 +840,14 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             None
         };
         spec::write_etc_hosts(&dir, pod, &hostname, ip).map_err(|_| String::from("cannot write /etc/hosts"))?;
-        spec::write_resolv_conf(&dir, pod).map_err(|_| String::from("cannot write /etc/resolv.conf"))?;
+        spec::write_resolv_conf(&dir, pod, self.infra.borrow().is_some()).map_err(|_| String::from("cannot write /etc/resolv.conf"))?;
         let mut pods = self.pods.borrow_mut();
         let p = pods.get_mut(uid).unwrap();
         p.sandbox = Some(sb);
         p.cg = cg;
         p.lease = lease;
         p.ip = ip;
+        p.ip6 = net.and_then(|n| n.ip6);
         Ok(())
     }
 
@@ -1537,7 +1548,11 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
     }
     if let Some(ip) = ip {
         f.push(("podIP", Value::from(ip.as_str())));
-        f.push(("podIPs", Value::Array(alloc::vec![o(alloc::vec![("ip", Value::from(ip.as_str()))])])));
+        let mut ips = alloc::vec![o(alloc::vec![("ip", Value::from(ip.as_str()))])];
+        if let Some(a) = p.ip6 {
+            ips.push(o(alloc::vec![("ip", Value::from(network::ipv6_string(a).as_str()))]));
+        }
+        f.push(("podIPs", Value::Array(ips)));
     }
     if let Some(msg) = &p.evicted {
         f.push(("message", Value::from(msg.as_str())));
@@ -1590,7 +1605,7 @@ mod status_tests {
         CState::Waiting("ContainerCreating", String::new())
     }
     fn pod(ctrs: Vec<Ctr>) -> PodRt {
-        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, node_ip: [10, 0, 0, 1], ctrs, start_time: 0, kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new() }
+        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ip6: None, node_ip: [10, 0, 0, 1], ctrs, start_time: 0, kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new() }
     }
     fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
         path.iter().try_fold(v, |v, k| match k.parse::<usize>() {

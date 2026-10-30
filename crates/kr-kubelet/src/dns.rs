@@ -21,7 +21,7 @@ struct Snapshot {
     services: Vec<Value>,
     endpoints: Vec<Value>,
     namespaces: Vec<String>,
-    pods: Vec<([u8; 4], String, String)>, // (ip, namespace, name)
+    pods: Vec<([u8; 4], Option<[u8; 16]>, String, String)>, // (ip, ipv6, namespace, name)
 }
 
 #[derive(Default)]
@@ -58,7 +58,10 @@ impl ClusterZone {
         let namespaces = items(c.list("/api/v1/namespaces", "").await).iter().map(|n| meta(n, "name").to_string()).collect();
         let pods = items(c.list("/api/v1/pods", "").await)
             .iter()
-            .filter_map(|p| Some((ip4(p.pointer(&["status", "podIP"])?.as_str()?)?, meta(p, "namespace").to_string(), meta(p, "name").to_string())))
+            .filter_map(|p| {
+                let ip6 = p.pointer(&["status", "podIPs"]).and_then(Value::as_array).and_then(|a| a.iter().filter_map(|x| x.get("ip").and_then(Value::as_str)).find_map(kr_net::tcp::parse_ipv6));
+                Some((ip4(p.pointer(&["status", "podIP"])?.as_str()?)?, ip6, meta(p, "namespace").to_string(), meta(p, "name").to_string()))
+            })
             .collect();
         *self.snap.borrow_mut() = Snapshot { services, endpoints, namespaces, pods };
     }
@@ -75,8 +78,9 @@ impl Zone for ClusterZone {
         if s.pointer(&["spec", "type"]).and_then(Value::as_str) == Some("ExternalName") {
             return None;
         }
-        let cip = s.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).unwrap_or("");
-        Some(ServiceRecord { cluster_ip: ip4(cip), ports: port_records(s.pointer(&["spec", "ports"]).and_then(Value::as_array).unwrap_or(&[])) })
+        let cips: Vec<&str> = s.pointer(&["spec", "clusterIPs"]).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        let cips = if cips.is_empty() { alloc::vec![s.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).unwrap_or("")] } else { cips };
+        Some(ServiceRecord { cluster_ip: cips.iter().find_map(|c| ip4(c)), cluster_ip6: cips.iter().find_map(|c| kr_net::tcp::parse_ipv6(c)), ports: port_records(s.pointer(&["spec", "ports"]).and_then(Value::as_array).unwrap_or(&[])) })
     }
 
     fn endpoints(&self, ns: &str, name: &str) -> Vec<EndpointRecord> {
@@ -87,7 +91,8 @@ impl Zone for ClusterZone {
             let ports = port_records(sub.get("ports").and_then(Value::as_array).unwrap_or(&[]));
             for a in sub.get("addresses").and_then(Value::as_array).unwrap_or(&[]) {
                 if let Some(ip) = a.get("ip").and_then(Value::as_str).and_then(ip4) {
-                    out.push(EndpointRecord { ip, hostname: a.get("hostname").and_then(Value::as_str).map(String::from), ports: ports.clone() });
+                    let ip6 = snap.pods.iter().find(|(p, _, _, _)| *p == ip).and_then(|(_, a6, _, _)| *a6);
+                    out.push(EndpointRecord { ip, ip6, hostname: a.get("hostname").and_then(Value::as_str).map(String::from), ports: ports.clone() });
                 }
             }
         }
@@ -111,7 +116,7 @@ impl Zone for ClusterZone {
                 return Some(alloc::format!("{}.{}.svc.cluster.local", meta(s, "name"), meta(s, "namespace")));
             }
         }
-        snap.pods.iter().find(|(p, _, _)| *p == ip).map(|(_, ns, _)| alloc::format!("{}-{}-{}-{}.{ns}.pod.cluster.local", ip[0], ip[1], ip[2], ip[3]))
+        snap.pods.iter().find(|(p, _, _, _)| *p == ip).map(|(_, _, ns, _)| alloc::format!("{}-{}-{}-{}.{ns}.pod.cluster.local", ip[0], ip[1], ip[2], ip[3]))
     }
 }
 
@@ -126,7 +131,7 @@ pub async fn run<C: Client + Clone + 'static>(c: C, net: Rc<NodeNet>) {
     let zone = Rc::new(ClusterZone::default());
     zone.refresh(&c).await;
     let (udp, tcp) = loop {
-        match (net.listen(2, DNS_IP, 53), net.listen(1, DNS_IP, 53)) {
+        match (net.listen(2, kr_sys::map4(DNS_IP), 53), net.listen(1, kr_sys::map4(DNS_IP), 53)) {
             (Ok(u), Ok(t)) => break (u, t),
             _ => kr_rt::exec::sleep(1000).await, // the service route may not exist yet
         }

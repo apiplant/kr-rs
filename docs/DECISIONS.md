@@ -426,12 +426,26 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 
 **Status:** accepted.
 
-## ADR-030: rootless pod egress through a TUN device and a userspace NAT
+## ADR-031: rootless pod egress through a TUN device and a userspace NAT
 
 **Context:** rootless pods live in an infra user+net namespace that had no route out. The host namespace cannot be reached by veth without privileges, and nftables masquerade needs root.
 **Decision:** the infra namespace gets a TUN device `kr-out` (100.64.255.1/30) as its default route. kr, in the host namespace, receives the descriptor over SCM_RIGHTS and serves it with `kr_net::usernat`, a slirp-style engine (no I/O, unit-tested) that terminates the pod's TCP itself and relays each flow over ordinary host sockets; UDP flows map to host UDP sockets; ICMP echo goes out through an unprivileged ICMP socket (`ping_group_range`). DNS to 100.64.255.2:53 is redirected to the host's first nameserver, which `kr ctr run` writes into resolv.conf. The pod sees the real destination address (transparent), so no rewriting rules exist. Driver: `kr-kubelet/src/egress.rs`.
 - Window scaling is offered when the pod's SYN has it (shift 4, 1 MiB); IP fragments are reassembled and generated. No retransmission timers toward the pod (the TUN is lossless), IPv4 only.
 - Service ClusterIPs and pod-to-pod traffic never reach the TUN (local routes in the infra namespace).
 - `kr ctr run`: the detached infra supervisor runs the same driver on its own executor (`exec::reset_after_fork` drops the inherited reactor state).
+
+**Status:** accepted.
+
+## ADR-032: dual-stack pod network with derived IPv6 addresses
+
+**Context:** the cluster was IPv4 only. Dual stack touches addressing, the node datapath, Services, EndpointSlices, the proxy, DNS and the rootless NAT.
+**Decision:** every node and pod gets an IPv6 twin of its IPv4 address; no second IPAM.
+- **Addressing.** The node pod `/24` `10.88.N.0/24` has the `/64` `fd00:88:0:N::/64` (`network::subnet6`); a pod's IPv6 address ends in its IPv4 host octet; the bridge gateway is `::1`. The API server sets `spec.podCIDRs` to both when it hands out the number `N`. Pods get both addresses (`NetConfig::dual`, no DAD) and report `status.podIPs` with IPv4 first.
+- **Node datapath.** `net.ipv6.conf.all.forwarding=1`, a second nftables table `ip6 kr` masquerading `fd00:88::/32`, and on VXLAN one on-link route per peer `/64` via `fd00:88:ffff::N` with a static neighbour entry to the peer's VTEP MAC (the FDB entry for IPv4 carries the frames). The host-gw backend stays IPv4.
+- **Services.** `spec.ipFamilies`/`ipFamilyPolicy` are honoured: IPv4 ClusterIPs from `10.96.0.0/16`, IPv6 ones from `fd00:96::/112` (from `::b`); a dual-stack Service has both, an IPv6-only one a single IPv6 address. EndpointSlices come per address family (`addressType`), Endpoints carry the primary family.
+- **Proxy.** One 16-byte address type (IPv4 as `::ffff:a.b.c.d`) end to end, including the socket-factory protocol of the rootless mode. IPv6 ClusterIPs are a `local fd00:96::/112` route plus IPV6_FREEBIND binds. The proxy picks backends of the family of the ClusterIP.
+- **DNS.** AAAA answers from `clusterIPs` and from the pods' second `podIPs`; A answers are unchanged. Resolvers still reach the DNS server on its IPv4 ClusterIP.
+- **Rootless.** `usernat` works on 16-byte addresses: IPv6 TCP/UDP, ICMPv6 echo (through an unprivileged ICMPv6 socket) and errors, hop-limit expiry (`traceroute`), with the NAT hop at `fd00:88:ffff:1::2` on a transit `/126` of the TUN. The engine quotes the whole offending packet in errors (busybox `traceroute -6` ignores short quotes).
+- **Not done:** the `kubernetes` and `kube-dns` Services and the API server listener are IPv4 only; NodePort and hostPort listeners are IPv4; node addresses are IPv4; `/etc/hosts` and the downward API `status.podIPs` carry the IPv4 address; no IPv6-only cluster; IPv6 fragments are not handled by the NAT.
 
 **Status:** accepted.

@@ -1,4 +1,4 @@
-//! Rootless pod egress (ADR-030): the infra namespace routes everything it has no local route
+//! Rootless pod egress (ADR-031): the infra namespace routes everything it has no local route
 //! for into a TUN device; this driver, running in the node (host) network namespace, feeds those
 //! packets to `kr_net::usernat` and relays each flow over ordinary host sockets.
 
@@ -9,9 +9,9 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use kr_net::tcp::{self, IpAddr, SocketAddr};
 use kr_runtime::network;
-use kr_net::usernat::{Event, FlowId, Nat};
+use kr_net::usernat::{Addr, Event, FlowId, Nat};
 use kr_rt::exec::{self, now_ms, sleep, Async};
-use kr_sys::{self as sys, Fd};
+use kr_sys::{self as sys, Errno, Fd};
 
 const MTU: usize = 1400;
 /// Host-to-pod bytes buffered per flow before the host socket is no longer read.
@@ -28,11 +28,32 @@ fn host_dns() -> [u8; 4] {
         .unwrap_or([1, 1, 1, 1])
 }
 
-fn dst_for(ip: [u8; 4], port: u16) -> [u8; 4] {
-    if ip == network::EGRESS_DNS && port == 53 {
-        host_dns()
+/// The destination a flow really goes to: DNS to the forwarder address (IPv4) is redirected to
+/// the host's first nameserver.
+fn dst_for(ip: Addr, port: u16) -> Addr {
+    if ip == sys::map4(network::EGRESS_DNS) && port == 53 {
+        sys::map4(host_dns())
     } else {
         ip
+    }
+}
+
+/// A `kr_net` socket address for an IPv4-mapped or IPv6 `Addr`.
+fn sock_addr(ip: Addr, port: u16) -> SocketAddr {
+    SocketAddr { ip: sys::unmap4(ip).map_or(IpAddr::V6(ip), IpAddr::V4), port }
+}
+
+const ENETUNREACH: i32 = 101;
+const EHOSTUNREACH: i32 = 113;
+const ECONNREFUSED: i32 = 111;
+
+/// ICMP Destination Unreachable code for a socket error: 0 net, 1 host, 3 port.
+fn unreach_code(errno: i32) -> Option<u8> {
+    match errno {
+        ENETUNREACH => Some(0),
+        EHOSTUNREACH => Some(1),
+        ECONNREFUSED => Some(3),
+        _ => None,
     }
 }
 
@@ -118,7 +139,7 @@ impl Egress {
             Event::TcpConnect { flow, dst, port } => {
                 let f = Rc::new(TcpFlow { sock: RefCell::new(None), to_host: RefCell::new(VecDeque::new()), shut_wr: Cell::new(false), closed: Cell::new(false), wake: Notify::default(), room: Notify::default(), blocked: Cell::new(false) });
                 self.tcp.borrow_mut().insert(flow, f.clone());
-                exec::spawn(tcp_flow(self.clone(), flow, SocketAddr { ip: IpAddr::V4(dst_for(dst, port)), port }, f));
+                exec::spawn(tcp_flow(self.clone(), flow, sock_addr(dst_for(dst, port), port), f));
             }
             Event::TcpData { flow, data } => {
                 if let Some(f) = self.tcp.borrow().get(&flow) {
@@ -143,14 +164,33 @@ impl Egress {
                 let u = match existing {
                     Some(u) => u,
                     None => {
-                        let Some(sock) = sys::socket(sys::AF_INET, 2 | sys::SOCK_NONBLOCK | sys::SOCK_CLOEXEC, 0).ok().and_then(|fd| Async::new(fd).ok()) else { return };
+                        let target = dst_for(dst, port);
+                        let family = if sys::unmap4(target).is_some() { sys::AF_INET } else { sys::AF_INET6 };
+                        let Some(fd) = sys::socket(family, 2 | sys::SOCK_NONBLOCK | sys::SOCK_CLOEXEC, 0).ok() else {
+                            self.nat.borrow_mut().udp_unreachable(flow, 0);
+                            return;
+                        };
+                        // Connected, so the kernel reports ICMP errors for this destination.
+                        let connected = match sys::unmap4(target) {
+                            Some(a) => sys::connect(fd.raw(), &sys::SockaddrIn::new(a, port)),
+                            None => sys::connect6(fd.raw(), &sys::SockaddrIn6::new(target, port)),
+                        };
+                        if connected.is_err() {
+                            self.nat.borrow_mut().udp_unreachable(flow, 0);
+                            return;
+                        }
+                        let Ok(sock) = Async::new(fd) else { return };
                         let u = Rc::new(UdpFlow { sock });
                         self.udp.borrow_mut().insert(flow, u.clone());
                         exec::spawn(udp_reader(self.clone(), flow, u.clone()));
                         u
                     }
                 };
-                let _ = sys::ns::send_to(u.sock.get_ref().raw(), &data, dst_for(dst, port), port);
+                if let Err(e) = sys::write(u.sock.get_ref().raw(), &data) {
+                    if let Some(code) = unreach_code(e.0) {
+                        self.nat.borrow_mut().udp_unreachable(flow, code);
+                    }
+                }
             }
             Event::IcmpEcho { pod, dst, id, seq, data } => {
                 exec::spawn(ping(self.clone(), pod, dst, id, seq, data));
@@ -164,21 +204,29 @@ impl Egress {
 
 /// One pod `ping`: an unprivileged ICMP socket (needs `net.ipv4.ping_group_range`; without it the
 /// request is dropped) sends the echo and the reply, if any arrives within 3 s, goes back.
-async fn ping(eg: Rc<Egress>, pod: [u8; 4], dst: [u8; 4], id: u16, seq: u16, data: Vec<u8>) {
-    let Some(sock) = sys::socket(sys::AF_INET, 2 | sys::SOCK_NONBLOCK | sys::SOCK_CLOEXEC, 1).ok().and_then(|fd| Async::new(fd).ok()) else { return };
-    // The kernel replaces the identifier; the sequence number and data pass through.
-    let mut m = alloc::vec![8u8, 0, 0, 0, 0, 0];
+async fn ping(eg: Rc<Egress>, pod: Addr, dst: Addr, id: u16, seq: u16, data: Vec<u8>) {
+    // ICMP (IPv4) or ICMPv6 datagram socket: both need `ping_group_range`.
+    let v6 = sys::unmap4(dst).is_none();
+    let (family, proto) = if v6 { (sys::AF_INET6, 58) } else { (sys::AF_INET, 1) };
+    let Some(sock) = sys::socket(family, 2 | sys::SOCK_NONBLOCK | sys::SOCK_CLOEXEC, proto).ok().and_then(|fd| Async::new(fd).ok()) else { return };
+    // The kernel replaces the identifier (and computes the checksum); the sequence number and
+    // data pass through.
+    let mut m = alloc::vec![if v6 { 128u8 } else { 8 }, 0, 0, 0, 0, 0];
     m.extend_from_slice(&seq.to_be_bytes());
     m.extend_from_slice(&data);
-    if sys::ns::send_to(sock.get_ref().raw(), &m, dst, 0).is_err() {
+    if let Err(e) = sys::ns::send_to_any(sock.get_ref().raw(), &m, dst, 0) {
+        if let Some(code) = unreach_code(e.0) {
+            eg.nat.borrow_mut().icmp_unreachable(pod, dst, id, seq, code);
+            eg.pump();
+        }
         return;
     }
     let mut buf = alloc::vec![0u8; 65536];
     let deadline = now_ms() + 3000;
     while now_ms() < deadline {
         let _ = exec::timeout(deadline - now_ms(), sock.wait_readable()).await;
-        if let Ok((n, _, _)) = sys::ns::recv_from(sock.get_ref().raw(), &mut buf) {
-            if n >= 8 && buf[0] == 0 {
+        if let Ok((n, _, _)) = sys::ns::recv_from_any(sock.get_ref().raw(), &mut buf) {
+            if n >= 8 && buf[0] == if v6 { 129 } else { 0 } {
                 eg.nat.borrow_mut().icmp_reply(pod, dst, id, seq, &buf[8..n]);
                 eg.pump();
                 return;
@@ -190,9 +238,12 @@ async fn ping(eg: Rc<Egress>, pod: [u8; 4], dst: [u8; 4], id: u16, seq: u16, dat
 async fn tcp_flow(eg: Rc<Egress>, id: FlowId, dst: SocketAddr, f: Rc<TcpFlow>) {
     let sock = match tcp::connect_addr(dst, 10_000).await {
         Ok(s) => Rc::new(s),
-        Err(_) => {
+        Err(e) => {
             eg.tcp.borrow_mut().remove(&id);
-            eg.nat.borrow_mut().tcp_refused(id);
+            match e {
+                kr_net::Error::Io(Errno(en)) if matches!(en, ENETUNREACH | EHOSTUNREACH) => eg.nat.borrow_mut().tcp_unreachable(id, unreach_code(en).unwrap_or(1)),
+                _ => eg.nat.borrow_mut().tcp_refused(id),
+            }
             eg.pump();
             return;
         }
@@ -258,11 +309,16 @@ async fn tcp_reader(eg: Rc<Egress>, id: FlowId, sock: Rc<Async<Fd>>, f: Rc<TcpFl
 async fn udp_reader(eg: Rc<Egress>, id: FlowId, u: Rc<UdpFlow>) {
     let mut buf = alloc::vec![0u8; 65536];
     loop {
-        let _ = exec::timeout(5000, u.sock.wait_readable()).await;
+        // Drain first: an error or reply may predate the wait (edge-triggered readiness).
         loop {
-            match sys::ns::recv_from(u.sock.get_ref().raw(), &mut buf) {
+            match sys::ns::recv_from_any(u.sock.get_ref().raw(), &mut buf) {
                 Ok((n, _, _)) => {
                     eg.nat.borrow_mut().udp_from_host(id, &buf[..n]);
+                    eg.pump();
+                }
+                // A queued ICMP error for the connected destination.
+                Err(e) if unreach_code(e.0).is_some() => {
+                    eg.nat.borrow_mut().udp_unreachable(id, unreach_code(e.0).unwrap_or(1));
                     eg.pump();
                 }
                 Err(_) => break,
@@ -271,5 +327,6 @@ async fn udp_reader(eg: Rc<Egress>, id: FlowId, u: Rc<UdpFlow>) {
         if !eg.udp.borrow().contains_key(&id) {
             return;
         }
+        let _ = exec::timeout(5000, u.sock.wait_readable()).await;
     }
 }

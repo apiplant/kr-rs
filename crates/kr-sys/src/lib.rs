@@ -476,6 +476,29 @@ pub fn connect(fd: i32, addr: &SockaddrIn) -> Result<()> {
     .map(|_| ())
 }
 
+pub fn bind6(fd: i32, addr: &SockaddrIn6) -> Result<()> {
+    // SAFETY: addr points to a valid repr(C) sockaddr_in6 of the stated size.
+    check(unsafe {
+        syscall3(nr::BIND, fd as usize, addr as *const _ as usize, core::mem::size_of::<SockaddrIn6>())
+    })
+    .map(|_| ())
+}
+
+/// An IPv4 address as the IPv4-mapped IPv6 form `::ffff:a.b.c.d`, the single address type of the
+/// service proxy.
+pub fn map4(a: [u8; 4]) -> [u8; 16] {
+    let mut m = [0u8; 16];
+    m[10] = 0xff;
+    m[11] = 0xff;
+    m[12..].copy_from_slice(&a);
+    m
+}
+
+/// The IPv4 address of an IPv4-mapped address, `None` for a real IPv6 one.
+pub fn unmap4(a: [u8; 16]) -> Option<[u8; 4]> {
+    (a[..10] == [0; 10] && a[10] == 0xff && a[11] == 0xff).then(|| [a[12], a[13], a[14], a[15]])
+}
+
 pub fn connect6(fd: i32, addr: &SockaddrIn6) -> Result<()> {
     // SAFETY: addr points to a valid repr(C) sockaddr_in6 of the stated size.
     check(unsafe {

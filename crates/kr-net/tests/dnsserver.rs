@@ -16,6 +16,9 @@ use std::time::Duration;
 
 static LOCK: Mutex<()> = Mutex::new(());
 
+const WEB6: [u8; 16] = [0xfd, 0, 0, 0x96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a];
+const DB06: [u8; 16] = [0xfd, 0, 0, 0x88, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5];
+
 // ---------- fake zone ----------
 
 fn port(name: &str, proto: &str, p: u16) -> PortRecord {
@@ -29,9 +32,9 @@ impl Zone for Fake {
     }
     fn service(&self, ns: &str, name: &str) -> Option<ServiceRecord> {
         match (ns, name) {
-            ("default", "web") => Some(ServiceRecord { cluster_ip: Some([10, 96, 0, 10]), ports: vec![port("http", "tcp", 80)] }),
-            ("default", "db") | ("default", "big") => Some(ServiceRecord { cluster_ip: None, ports: vec![port("sql", "tcp", 5432)] }),
-            ("default", "ext" | "alias" | "alias2" | "loop") => Some(ServiceRecord { cluster_ip: None, ports: vec![] }),
+            ("default", "web") => Some(ServiceRecord { cluster_ip: Some([10, 96, 0, 10]), cluster_ip6: Some(WEB6), ports: vec![port("http", "tcp", 80)] }),
+            ("default", "db") | ("default", "big") => Some(ServiceRecord { cluster_ip: None, cluster_ip6: None, ports: vec![port("sql", "tcp", 5432)] }),
+            ("default", "ext" | "alias" | "alias2" | "loop") => Some(ServiceRecord { cluster_ip: None, cluster_ip6: None, ports: vec![] }),
             _ => None,
         }
     }
@@ -39,10 +42,10 @@ impl Zone for Fake {
         let ports = vec![port("sql", "tcp", 5432)];
         match (ns, name) {
             ("default", "db") => vec![
-                EndpointRecord { ip: [10, 88, 0, 5], hostname: Some("db-0".into()), ports: ports.clone() },
-                EndpointRecord { ip: [10, 88, 0, 6], hostname: Some("db-1".into()), ports },
+                EndpointRecord { ip: [10, 88, 0, 5], ip6: Some(DB06), hostname: Some("db-0".into()), ports: ports.clone() },
+                EndpointRecord { ip: [10, 88, 0, 6], ip6: None, hostname: Some("db-1".into()), ports },
             ],
-            ("default", "big") => (0..50).map(|i| EndpointRecord { ip: [10, 88, 1, i as u8], hostname: None, ports: ports.clone() }).collect(),
+            ("default", "big") => (0..50).map(|i| EndpointRecord { ip: [10, 88, 1, i as u8], ip6: None, hostname: None, ports: ports.clone() }).collect(),
             _ => vec![],
         }
     }
@@ -187,11 +190,28 @@ fn clusterip_a_and_nodata_for_other_types() {
     assert_eq!(ips(&m.an), [[10, 96, 0, 10]]);
     assert_eq!(m.an[0].ttl, 30);
     assert_eq!(m.raw[0..2], [0x12, 0x34]);
-    for ty in [28u16, 16, 15] {
-        let m = ask("web.default.svc.cluster.local", ty); // AAAA / TXT / MX
+    for ty in [16u16, 15] {
+        let m = ask("web.default.svc.cluster.local", ty); // TXT / MX
         assert_eq!((m.rcode(), m.an.len()), (0, 0), "type {ty}");
         assert_soa(&m);
     }
+}
+
+#[test]
+fn aaaa_for_dual_stack_services_and_headless_endpoints() {
+    let m = ask("web.default.svc.cluster.local", 28);
+    assert_eq!((m.rcode(), m.aa(), m.an.len()), (0, true, 1));
+    assert_eq!((m.an[0].ty, &m.an[0].rdata[..]), (28, &WEB6[..]));
+    // A still answers only the IPv4 address.
+    assert_eq!(ips(&ask("web.default.svc.cluster.local", 1).an), [[10, 96, 0, 10]]);
+    // Headless: only the endpoint that has an IPv6 address; the other gives NODATA-free partial.
+    let m = ask("db.default.svc.cluster.local", 28);
+    assert_eq!(m.an.iter().map(|r| r.rdata.clone()).collect::<Vec<_>>(), vec![DB06.to_vec()]);
+    let m = ask("db-0.db.default.svc.cluster.local", 28);
+    assert_eq!(m.an.len(), 1);
+    let m = ask("db-1.db.default.svc.cluster.local", 28);
+    assert_eq!((m.rcode(), m.an.len()), (0, 0));
+    assert_soa(&m);
 }
 
 #[test]
@@ -223,7 +243,7 @@ fn headless_and_statefulset_hostnames() {
     let m = ask("db-1.db.default.svc.cluster.local", 1);
     assert_eq!(ips(&m.an), [[10, 88, 0, 6]]);
     assert_eq!(ask("db-9.db.default.svc.cluster.local", 1).rcode(), 3);
-    assert_eq!(ask("db-0.db.default.svc.cluster.local", 28).an.len(), 0);
+    assert_eq!(ask("db-0.db.default.svc.cluster.local", 28).an.len(), 1);
     // endpoints without hostname are addressable by dashed IP
     assert_eq!(ips(&ask("10-88-1-7.big.default.svc.cluster.local", 1).an), [[10, 88, 1, 7]]);
 }
@@ -249,9 +269,10 @@ fn externalname_in_cluster_target_is_chased() {
     let m = ask("alias2.default.svc.cluster.local", 1);
     assert_eq!(m.an.iter().map(|r| r.ty).collect::<Vec<_>>(), [5, 5, 1]);
     assert_eq!(ips(&m.an), [[10, 96, 0, 10]]);
-    // Only the alias when the CNAME itself is asked for; AAAA gets the chain and no address.
+    // Only the alias when the CNAME itself is asked for; AAAA gets the chain and the target's
+    // IPv6 ClusterIP.
     assert_eq!(ask("alias.default.svc.cluster.local", 5).an.len(), 1);
-    assert_eq!(ask("alias.default.svc.cluster.local", 28).an.iter().map(|r| r.ty).collect::<Vec<_>>(), [5]);
+    assert_eq!(ask("alias.default.svc.cluster.local", 28).an.iter().map(|r| r.ty).collect::<Vec<_>>(), [5, 28]);
     let m = ask("loop.default.svc.cluster.local", 1);
     assert!(m.an.len() <= 9 && m.an.iter().all(|r| r.ty == 5));
 }

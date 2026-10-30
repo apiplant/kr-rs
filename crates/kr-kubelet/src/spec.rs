@@ -84,17 +84,47 @@ pub fn pod_hostname(pod: &Value) -> String {
     h.chars().take(63).collect::<String>().trim_end_matches(['-', '.']).to_string()
 }
 
-/// /etc/resolv.conf for the pod per `dnsPolicy` (ClusterFirst by default).
-pub fn write_resolv_conf(pod_dir: &str, pod: &Value) -> Result<(), ()> {
+/// The host's resolv.conf for a pod. A rootless pod has its own loopback, so a stub resolver on
+/// the host's (127.0.0.53, 127.0.0.1) is replaced by the egress forwarder, which reaches it from
+/// the host namespace.
+fn host_resolv_conf(rootless_pod: bool) -> String {
+    let text = String::from_utf8(kr_sys::fs::read_file(b"/etc/resolv.conf\0", 64 * 1024).unwrap_or_default()).unwrap_or_default();
+    if !rootless_pod {
+        return text;
+    }
+    let fwd = kr_runtime::network::EGRESS_DNS;
+    let fwd = alloc::format!("nameserver {}.{}.{}.{}", fwd[0], fwd[1], fwd[2], fwd[3]);
+    let mut out = String::new();
+    let mut seen_fwd = false;
+    for l in text.lines() {
+        let loopback = l.trim().strip_prefix("nameserver").is_some_and(|a| a.trim().starts_with("127.") || a.trim() == "::1");
+        if loopback {
+            if !seen_fwd {
+                out.push_str(&fwd);
+                out.push('\n');
+                seen_fwd = true;
+            }
+        } else {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// /etc/resolv.conf for the pod per `dnsPolicy` (ClusterFirst by default). `rootless_pod`: the
+/// pod lives in the rootless pod network (not hostNetwork).
+pub fn write_resolv_conf(pod_dir: &str, pod: &Value, rootless_pod: bool) -> Result<(), ()> {
     let ns = meta(pod, "namespace");
     let policy = pod.pointer(&["spec", "dnsPolicy"]).and_then(Value::as_str).unwrap_or("ClusterFirst");
     let host_net = pod.pointer(&["spec", "hostNetwork"]).and_then(Value::as_bool) == Some(true);
+    let rootless_pod = rootless_pod && !host_net;
     let mut s = match policy {
-        "Default" => String::from_utf8(kr_sys::fs::read_file(b"/etc/resolv.conf\0", 64 * 1024).unwrap_or_default()).unwrap_or_default(),
+        "Default" => host_resolv_conf(rootless_pod),
         "ClusterFirstWithHostNet" | "ClusterFirst" if !(host_net && policy == "ClusterFirst") => {
             alloc::format!("search {ns}.svc.cluster.local svc.cluster.local cluster.local\nnameserver 10.96.0.10\noptions ndots:5\n")
         }
-        "ClusterFirst" => String::from_utf8(kr_sys::fs::read_file(b"/etc/resolv.conf\0", 64 * 1024).unwrap_or_default()).unwrap_or_default(),
+        "ClusterFirst" => host_resolv_conf(rootless_pod),
         _ => String::new(), // "None": only dnsConfig below
     };
     if let Some(cfg) = pod.pointer(&["spec", "dnsConfig"]) {

@@ -2336,7 +2336,6 @@ impl ApiServer {
                 spec.set(k, Value::from(v));
             }
         }
-        spec.set("ipFamilies", Value::Array(alloc::vec![Value::from("IPv4")]));
         let ports = match spec.get_mut("ports") {
             Some(Value::Array(p)) if !p.is_empty() => p,
             _ => return Err(ApiError::invalid("spec.ports: Required value")),
@@ -2355,29 +2354,87 @@ impl ApiServer {
             }
         }
         let old_spec = old.and_then(|o| o.get("spec"));
-        // ClusterIP: immutable once set.
-        let want = o.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).unwrap_or("").to_string();
-        let old_ip = old_spec.and_then(|s| s.get("clusterIP")).and_then(Value::as_str).map(String::from);
-        let ip = match (old_ip, want.as_str()) {
-            (Some(o), "") => o,
-            (Some(o), w) if w != o => return Err(ApiError::invalid("spec.clusterIP: field is immutable")),
-            (Some(o), _) => o,
-            (None, "None") => "None".into(),
-            (None, "") => self.allocate_cluster_ip()?,
-            (None, w) => {
-                let a = crate::object::parse_ipv4(w).ok_or_else(|| ApiError::invalid("spec.clusterIP: must be a valid IPv4 address"))?;
-                if a[0] != 10 || a[1] != 96 {
-                    return Err(ApiError::invalid("spec.clusterIP: not in the service CIDR 10.96.0.0/16"));
+        // ClusterIPs: one per IP family, immutable once set (a SingleStack Service may gain a
+        // second family later). The cluster is always dual-stack (see `network::subnet6`).
+        let strs = |v: Option<&Value>| -> Vec<String> { v.and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default() };
+        let family_of = |ip: &str| if ip.contains(':') { "IPv6" } else { "IPv4" };
+        let mut want = strs(o.pointer(&["spec", "clusterIPs"]));
+        let single = o.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).unwrap_or("").to_string();
+        if want.is_empty() && !single.is_empty() {
+            want.push(single.clone());
+        }
+        if !single.is_empty() && want.first() != Some(&single) {
+            return Err(ApiError::invalid("spec.clusterIPs[0]: Invalid value: must match `clusterIP`"));
+        }
+        let old_ips = strs(old_spec.and_then(|s| s.get("clusterIPs")));
+        let old_ips = if old_ips.is_empty() { strs(old_spec.and_then(|s| s.get("clusterIP")).map(|v| Value::Array(alloc::vec![v.clone()])).as_ref()) } else { old_ips };
+        let policy = o.pointer(&["spec", "ipFamilyPolicy"]).and_then(Value::as_str).unwrap_or("SingleStack").to_string();
+        if !matches!(policy.as_str(), "SingleStack" | "PreferDualStack" | "RequireDualStack") {
+            return Err(ApiError::invalid(alloc::format!("spec.ipFamilyPolicy: Unsupported value: {policy:?}")));
+        }
+        let mut fams = strs(o.pointer(&["spec", "ipFamilies"]));
+        if fams.is_empty() {
+            fams = if !old_ips.is_empty() { old_ips.iter().filter(|i| *i != "None").map(|i| family_of(i).to_string()).collect() } else { want.iter().filter(|i| *i != "None").map(|i| family_of(i).to_string()).collect() };
+        }
+        if fams.is_empty() {
+            fams.push("IPv4".into());
+        }
+        if fams.iter().any(|f| f != "IPv4" && f != "IPv6") || (fams.len() == 2 && fams[0] == fams[1]) || fams.len() > 2 {
+            return Err(ApiError::invalid("spec.ipFamilies: Unsupported value"));
+        }
+        if policy != "SingleStack" && fams.len() == 1 {
+            fams.push(if fams[0] == "IPv4" { "IPv6" } else { "IPv4" }.into());
+        }
+        if policy == "SingleStack" && fams.len() > 1 {
+            return Err(ApiError::invalid("spec.ipFamilies: Invalid value: may not specify more than 1 IP family when ipFamilyPolicy is SingleStack"));
+        }
+        let mut ips: Vec<String> = Vec::new();
+        for (i, fam) in fams.iter().enumerate() {
+            let is6 = fam == "IPv6";
+            let given = want.iter().find(|w| w.as_str() != "None" && w.contains(':') == is6).cloned();
+            let prev = old_ips.iter().find(|w| w.as_str() != "None" && w.contains(':') == is6).cloned();
+            let ip = match (prev, given) {
+                (Some(p), Some(g)) if p != g => return Err(ApiError::invalid("spec.clusterIPs: field is immutable")),
+                (Some(p), _) => p,
+                (None, Some(g)) => {
+                    if is6 {
+                        let a = kr_net::tcp::parse_ipv6(&g).ok_or_else(|| ApiError::invalid("spec.clusterIPs: must be a valid IPv6 address"))?;
+                        if a[..4] != [0xfd, 0, 0, 0x96] || a[4..14] != [0; 10] {
+                            return Err(ApiError::invalid("spec.clusterIPs: not in the service CIDR fd00:96::/112"));
+                        }
+                        if self.cluster_ips_in_use6().contains(&a) {
+                            return Err(ApiError::invalid(alloc::format!("spec.clusterIPs: Invalid value: {g:?}: provided IP is already allocated")));
+                        }
+                        kr_net::tcp::ipv6_string(a)
+                    } else {
+                        if g == "None" {
+                            "None".into()
+                        } else {
+                            let a = crate::object::parse_ipv4(&g).ok_or_else(|| ApiError::invalid("spec.clusterIP: must be a valid IPv4 address"))?;
+                            if a[0] != 10 || a[1] != 96 {
+                                return Err(ApiError::invalid("spec.clusterIP: not in the service CIDR 10.96.0.0/16"));
+                            }
+                            if self.cluster_ips_in_use().contains(&a) {
+                                return Err(ApiError::invalid(alloc::format!("spec.clusterIP: Invalid value: {g:?}: provided IP is already allocated")));
+                            }
+                            g
+                        }
+                    }
                 }
-                if self.cluster_ips_in_use().contains(&a) {
-                    return Err(ApiError::invalid(alloc::format!("spec.clusterIP: Invalid value: {w:?}: provided IP is already allocated")));
-                }
-                w.into()
-            }
-        };
+                (None, None) if i == 0 && want.first().map(String::as_str) == Some("None") => "None".into(),
+                (None, None) => if is6 { self.allocate_cluster_ip6()? } else { self.allocate_cluster_ip()? },
+            };
+            ips.push(ip);
+        }
+        // Headless: a single "None".
+        if ips.iter().any(|i| i == "None") {
+            ips = alloc::vec![String::from("None")];
+        }
         let spec = o.get_mut("spec").unwrap();
-        spec.set("clusterIP", Value::String(ip.clone()));
-        spec.set("clusterIPs", Value::Array(alloc::vec![Value::String(ip)]));
+        spec.set("ipFamilies", Value::Array(fams.iter().map(|f| Value::from(f.as_str())).collect()));
+        spec.set("ipFamilyPolicy", Value::from(policy.as_str()));
+        spec.set("clusterIP", Value::String(ips[0].clone()));
+        spec.set("clusterIPs", Value::Array(ips.into_iter().map(Value::String).collect()));
         if ty == "NodePort" || ty == "LoadBalancer" {
             let mut used = self.node_ports_in_use();
             let old_ports: Vec<Value> = old_spec.and_then(|s| s.get("ports")).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
@@ -2434,7 +2491,11 @@ impl ApiServer {
         let cidr = (0u16..256).map(|i| alloc::format!("10.88.{i}.0/24")).find(|c| !used.contains(c)).ok_or_else(|| ApiError::new(422, "Invalid", "pod CIDR exhausted"))?;
         let spec = o.entry_object("spec");
         spec.set("podCIDR", Value::String(cidr.clone()));
-        spec.set("podCIDRs", Value::Array(alloc::vec![Value::String(cidr)]));
+        // Dual stack: the IPv6 twin of the /24 is `fd00:88:0:<third octet in hex>::/64`
+        // (kr-runtime `network::subnet6`).
+        let third: u32 = cidr.split('.').nth(2).and_then(|n| n.parse().ok()).unwrap_or(0);
+        let cidr6 = if third == 0 { String::from("fd00:88:0::/64") } else { alloc::format!("fd00:88:0:{third:x}::/64") };
+        spec.set("podCIDRs", Value::Array(alloc::vec![Value::String(cidr), Value::String(cidr6)]));
         Ok(())
     }
 
@@ -2528,7 +2589,27 @@ impl ApiServer {
     }
 
     fn cluster_ips_in_use(&self) -> Vec<[u8; 4]> {
-        self.services().iter().filter_map(|s| s.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).and_then(crate::object::parse_ipv4)).collect()
+        self.services().iter().flat_map(|s| s.pointer(&["spec", "clusterIPs"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default()).filter_map(|v| v.as_str().and_then(crate::object::parse_ipv4)).collect()
+    }
+
+    fn cluster_ips_in_use6(&self) -> Vec<[u8; 16]> {
+        self.services().iter().flat_map(|s| s.pointer(&["spec", "clusterIPs"]).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default()).filter_map(|v| v.as_str().and_then(kr_net::tcp::parse_ipv6)).collect()
+    }
+
+    /// Lowest free address in fd00:96::/112 from ::b up (::1 = kubernetes, ::a = DNS).
+    fn allocate_cluster_ip6(&self) -> R<String> {
+        let used = self.cluster_ips_in_use6();
+        (11u32..65535)
+            .map(|n| {
+                let mut a = [0u8; 16];
+                a[..4].copy_from_slice(&[0xfd, 0, 0, 0x96]);
+                a[14] = (n >> 8) as u8;
+                a[15] = n as u8;
+                a
+            })
+            .find(|a| !used.contains(a))
+            .map(kr_net::tcp::ipv6_string)
+            .ok_or_else(|| ApiError::new(422, "Invalid", "service CIDR exhausted"))
     }
 
     fn node_ports_in_use(&self) -> Vec<u16> {

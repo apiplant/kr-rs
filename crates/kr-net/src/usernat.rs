@@ -21,7 +21,7 @@ pub type FlowId = u32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// Pod sent SYN; the driver must connect a host socket.
-    TcpConnect { flow: FlowId, dst: [u8; 4], port: u16 },
+    TcpConnect { flow: FlowId, dst: Addr, port: u16 },
     /// Bytes from the pod to the host socket (in order, deduplicated).
     TcpData { flow: FlowId, data: Vec<u8> },
     /// Pod sent FIN.
@@ -29,12 +29,12 @@ pub enum Event {
     /// Flow is finished / reset / timed out; drop the host socket.
     TcpClose { flow: FlowId },
     /// Datagram from the pod; send via the per-flow host UDP socket.
-    UdpSend { flow: FlowId, dst: [u8; 4], port: u16, data: Vec<u8> },
+    UdpSend { flow: FlowId, dst: Addr, port: u16, data: Vec<u8> },
     /// Idle expiry.
     UdpClose { flow: FlowId },
     /// Pod `ping` (only with [`Nat::forward_icmp`]): send an echo request to `dst` from the host
     /// and answer with [`Nat::icmp_reply`].
-    IcmpEcho { pod: [u8; 4], dst: [u8; 4], id: u16, seq: u16, data: Vec<u8> },
+    IcmpEcho { pod: Addr, dst: Addr, id: u16, seq: u16, data: Vec<u8> },
 }
 
 const FIN: u8 = 0x01;
@@ -46,12 +46,31 @@ const ACK: u8 = 0x10;
 const UDP_IDLE_MS: u64 = 60_000;
 const HANDSHAKE_MS: u64 = 30_000;
 const CLOSED_MS: u64 = 10_000;
+/// Addresses are 16 bytes: IPv4 ones in the mapped form `::ffff:a.b.c.d`, IPv6 ones as is.
+pub type Addr = [u8; 16];
+
+/// The mapped form of an IPv4 address.
+pub const fn m4(a: [u8; 4]) -> Addr {
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, a[0], a[1], a[2], a[3]]
+}
+
+fn is4(a: &Addr) -> bool {
+    a[..10] == [0; 10] && a[10] == 0xff && a[11] == 0xff
+}
+
+fn v4(a: &Addr) -> [u8; 4] {
+    [a[12], a[13], a[14], a[15]]
+}
+
+/// Address the NAT answers from when it generates ICMP errors of its own (IPv4 / IPv6).
+pub const HOP: Addr = m4([100, 64, 255, 2]);
+pub const HOP6: Addr = [0xfd, 0, 0, 0x88, 0xff, 0xff, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2];
 const WND: u16 = 65535;
 /// Our window scale (RFC 7323), offered only when the pod's SYN carried the option: the
 /// advertised 65535 then means 1 MiB.
 const RCV_SHIFT: u8 = 4;
 
-type Key = ([u8; 4], u16, [u8; 4], u16, u8);
+type Key = (Addr, u16, Addr, u16, u8);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -63,9 +82,9 @@ enum State {
 }
 
 struct Tcb {
-    pip: [u8; 4],
+    pip: Addr,
     pport: u16,
-    dip: [u8; 4],
+    dip: Addr,
     dport: u16,
     state: State,
     pod_isn: u32,
@@ -88,11 +107,13 @@ struct Tcb {
 }
 
 struct Udp {
-    pip: [u8; 4],
+    pip: Addr,
     pport: u16,
-    dip: [u8; 4],
+    dip: Addr,
     dport: u16,
     last: u64,
+    /// The latest datagram of the flow (IP header and payload), quoted in ICMP errors.
+    quote: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -113,7 +134,7 @@ pub struct Nat {
     events: Vec<Event>,
     out: Out,
     forward_icmp: bool,
-    frags: BTreeMap<([u8; 4], [u8; 4], u8, u16), Frag>,
+    frags: BTreeMap<(Addr, Addr, u8, u16), Frag>,
 }
 
 const MAX_FRAGS: usize = 32;
@@ -146,14 +167,34 @@ fn fold(mut acc: u32) -> u16 {
 }
 
 /// Transport checksum over pseudo header + segment; 0 when the embedded checksum is valid.
-fn l4_sum(src: [u8; 4], dst: [u8; 4], proto: u8, seg: &[u8]) -> u16 {
-    let mut a = sum(&src, 0);
-    a = sum(&dst, a);
+fn l4_sum(src: Addr, dst: Addr, proto: u8, seg: &[u8]) -> u16 {
+    // The pseudo header of either family: addresses, upper-layer length and next header.
+    let (mut a, s4, d4) = (0, v4(&src), v4(&dst));
+    if is4(&src) && is4(&dst) {
+        a = sum(&s4, a);
+        a = sum(&d4, a);
+    } else {
+        a = sum(&src, a);
+        a = sum(&dst, a);
+    }
     a += proto as u32 + seg.len() as u32;
     !fold(sum(seg, a))
 }
 
-fn ip_packet(out: &mut Out, src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) {
+fn ip_packet(out: &mut Out, src: Addr, dst: Addr, proto: u8, payload: &[u8]) {
+    if !is4(&src) || !is4(&dst) {
+        // IPv6: no fragmentation (senders stay within the MSS / path MTU).
+        let mut p = Vec::with_capacity(40 + payload.len());
+        p.extend_from_slice(&[0x60, 0, 0, 0]);
+        p.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        p.extend_from_slice(&[proto, 64]);
+        p.extend_from_slice(&src);
+        p.extend_from_slice(&dst);
+        p.extend_from_slice(payload);
+        out.pkts.push(p);
+        return;
+    }
+    let (src, dst) = (v4(&src), v4(&dst));
     out.ip_id = out.ip_id.wrapping_add(1);
     let id = out.ip_id;
     let one = |off: usize, chunk: &[u8], more: bool, df: bool| {
@@ -188,9 +229,9 @@ fn ip_packet(out: &mut Out, src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8
 #[allow(clippy::too_many_arguments)]
 fn tcp_pkt(
     out: &mut Out,
-    src: [u8; 4],
+    src: Addr,
     sp: u16,
-    dst: [u8; 4],
+    dst: Addr,
     dp: u16,
     seq: u32,
     ack: u32,
@@ -215,7 +256,7 @@ fn tcp_pkt(
     ip_packet(out, src, dst, 6, &s);
 }
 
-fn udp_pkt(out: &mut Out, src: [u8; 4], sp: u16, dst: [u8; 4], dp: u16, data: &[u8]) {
+fn udp_pkt(out: &mut Out, src: Addr, sp: u16, dst: Addr, dp: u16, data: &[u8]) {
     let mut s = Vec::with_capacity(8 + data.len());
     s.extend_from_slice(&sp.to_be_bytes());
     s.extend_from_slice(&dp.to_be_bytes());
@@ -231,10 +272,13 @@ fn udp_pkt(out: &mut Out, src: [u8; 4], sp: u16, dst: [u8; 4], dp: u16, data: &[
 }
 
 struct Ip<'a> {
-    src: [u8; 4],
-    dst: [u8; 4],
+    src: Addr,
+    dst: Addr,
     proto: u8,
     payload: &'a [u8],
+    /// Header (with options) of the packet, for ICMP errors quoting it.
+    hdr: &'a [u8],
+    ttl: u8,
     id: u16,
     /// Fragment byte offset, and whether more fragments follow.
     off: usize,
@@ -242,6 +286,25 @@ struct Ip<'a> {
 }
 
 fn parse_ip(p: &[u8]) -> Option<Ip<'_>> {
+    if p.len() >= 40 && p[0] >> 4 == 6 {
+        // IPv6: only packets whose next header is the transport (no extension headers, so no
+        // fragments either).
+        let len = u16::from_be_bytes([p[4], p[5]]) as usize;
+        if !matches!(p[6], 6 | 17 | 58) || 40 + len > p.len() {
+            return None;
+        }
+        return Some(Ip {
+            id: 0,
+            off: 0,
+            mf: false,
+            src: p[8..24].try_into().ok()?,
+            dst: p[24..40].try_into().ok()?,
+            proto: p[6],
+            payload: &p[40..40 + len],
+            hdr: &p[..40],
+            ttl: p[7],
+        });
+    }
     if p.len() < 20 || p[0] >> 4 != 4 {
         return None;
     }
@@ -258,10 +321,12 @@ fn parse_ip(p: &[u8]) -> Option<Ip<'_>> {
         id: u16::from_be_bytes([p[4], p[5]]),
         off: (fo & 0x1fff) as usize * 8,
         mf: fo & 0x2000 != 0,
-        src: [p[12], p[13], p[14], p[15]],
-        dst: [p[16], p[17], p[18], p[19]],
+        src: m4([p[12], p[13], p[14], p[15]]),
+        dst: m4([p[16], p[17], p[18], p[19]]),
         proto: p[9],
         payload: &p[ihl..total],
+        hdr: &p[..ihl],
+        ttl: p[8],
     })
 }
 
@@ -468,8 +533,15 @@ impl Nat {
 
     fn deliver(&mut self, ip: &Ip<'_>) {
         let ip = Ip { ..*ip };
+        // The NAT is a router hop: a packet that cannot travel further gets Time Exceeded
+        // (so `traceroute` sees it, from `HOP`).
+        if ip.ttl <= 1 && ip.dst != HOP && ip.dst != HOP6 {
+            let from = if is4(&ip.src) { HOP } else { HOP6 };
+            self.icmp_error(from, 11, 0, ip.src, ip.hdr, ip.payload);
+            return;
+        }
         match ip.proto {
-            1 => self.icmp_in(&ip),
+            1 | 58 => self.icmp_in(&ip),
             6 => {
                 if let Some(seg) = parse_tcp(&ip) {
                     self.tcp_in(ip.src, ip.dst, seg);
@@ -482,7 +554,10 @@ impl Nat {
 
     fn icmp_in(&mut self, ip: &Ip<'_>) {
         let p = ip.payload;
-        if p.len() < 8 || p[0] != 8 || p[1] != 0 || fold(sum(p, 0)) != 0xffff {
+        // Echo request: ICMP type 8 (checksum over the message) or ICMPv6 type 128 (checksum
+        // with the pseudo header).
+        let ok = if ip.proto == 58 { p.len() >= 8 && p[0] == 128 && l4_sum(ip.src, ip.dst, 58, p) == 0 } else { p.len() >= 8 && p[0] == 8 && fold(sum(p, 0)) == 0xffff };
+        if !ok || p[1] != 0 {
             return;
         }
         if self.forward_icmp {
@@ -494,20 +569,111 @@ impl Nat {
         self.icmp_reply(ip.src, ip.dst, u16::from_be_bytes([p[4], p[5]]), u16::from_be_bytes([p[6], p[7]]), &p[8..]);
     }
 
+    /// ICMP error (`ty`/`code`) to `pod`, quoting the offending packet's header and first 8 bytes.
+    fn icmp_error(&mut self, from: Addr, ty: u8, code: u8, pod: Addr, hdr: &[u8], payload: &[u8]) {
+        // The callers speak ICMPv4 (type, code); ICMPv6 has its own numbers.
+        let (proto, ty, code) = if is4(&from) {
+            (1, ty, code)
+        } else {
+            match (ty, code) {
+                (11, _) => (58, 3, 0),            // Time Exceeded
+                (3, 0) => (58, 1, 0),             // no route to destination
+                (3, 1) => (58, 1, 3),             // address unreachable
+                (3, 3) => (58, 1, 4),             // port unreachable
+                _ => (58, 1, 0),
+            }
+        };
+        let mut m = alloc::vec![ty, code, 0, 0, 0, 0, 0, 0];
+        m.extend_from_slice(hdr);
+        // Quote what we were given (Linux quotes the whole packet; some resolvers and
+        // traceroutes compare more than the first 8 bytes), within the minimum MTU.
+        m.extend_from_slice(&payload[..payload.len().min(if proto == 58 { 1232 - 48 } else { 548 - 28 })]);
+        let c = if proto == 58 { l4_sum(from, pod, 58, &m) } else { !fold(sum(&m, 0)) };
+        m[2..4].copy_from_slice(&c.to_be_bytes());
+        ip_packet(&mut self.out, from, pod, proto, &m);
+    }
+
+    /// A stand-in for the offending packet of a flow: IPv4 header plus the first 8 bytes of the
+    /// transport header (ports and, for TCP, the sequence number).
+    fn flow_quote(src: Addr, sp: u16, dst: Addr, dp: u16, proto: u8, seq: u32) -> (Vec<u8>, Vec<u8>) {
+        let mut l4 = Vec::new();
+        l4.extend_from_slice(&sp.to_be_bytes());
+        l4.extend_from_slice(&dp.to_be_bytes());
+        if proto == 6 {
+            l4.extend_from_slice(&seq.to_be_bytes());
+        } else {
+            l4.extend_from_slice(&[0, 8, 0, 0]);
+        }
+        let mut o = Out::default();
+        ip_packet(&mut o, src, dst, proto, &l4);
+        let p = o.pkts.pop().unwrap();
+        let hl = if is4(&src) { 20 } else { 40 };
+        (p[..hl].to_vec(), l4)
+    }
+
+    /// The host could not reach the destination of a TCP flow still connecting: ICMP
+    /// Destination Unreachable (`code` 0 net, 1 host) to the pod instead of a reset.
+    pub fn tcp_unreachable(&mut self, flow: FlowId, code: u8) {
+        let Some(t) = self.tcp.get(&flow) else { return };
+        let (hdr, l4) = Self::flow_quote(t.pip, t.pport, t.dip, t.dport, 6, t.pod_isn);
+        let (pod, from) = (t.pip, t.dip);
+        self.icmp_error(from, 3, code, pod, &hdr, &l4);
+        self.remove_tcp(flow);
+    }
+
+    /// A UDP datagram of `flow` was rejected by the host or network (`code` 0 net, 1 host,
+    /// 3 port): ICMP Destination Unreachable to the pod.
+    pub fn udp_unreachable(&mut self, flow: FlowId, code: u8) {
+        let Some(u) = self.udp.get(&flow) else { return };
+        let hl = if is4(&u.pip) { 20 } else { 40 };
+        let (hdr, l4) = if u.quote.len() > hl { (u.quote[..hl].to_vec(), u.quote[hl..].to_vec()) } else { Self::flow_quote(u.pip, u.pport, u.dip, u.dport, 17, 0) };
+        // A closed port answers from the destination itself (what `traceroute` waits for).
+        let (pod, from) = (u.pip, if code == 3 { u.dip } else if is4(&u.pip) { HOP } else { HOP6 });
+        self.icmp_error(from, 3, code, pod, &hdr, &l4);
+    }
+
+    /// An echo request to `dst` could not be delivered: Destination Unreachable to the pod.
+    pub fn icmp_unreachable(&mut self, pod: Addr, dst: Addr, id: u16, seq: u16, code: u8) {
+        let v6 = !is4(&dst);
+        let mut l4 = alloc::vec![if v6 { 128u8 } else { 8 }, 0, 0, 0];
+        l4.extend_from_slice(&id.to_be_bytes());
+        l4.extend_from_slice(&seq.to_be_bytes());
+        let mut o = Out::default();
+        ip_packet(&mut o, pod, dst, if v6 { 58 } else { 1 }, &l4);
+        let hdr = o.pkts[0][..if v6 { 40 } else { 20 }].to_vec();
+        self.icmp_error(dst, 3, code, pod, &hdr, &l4);
+    }
+
     /// Sends an echo reply from `from` to the pod `pod`.
-    pub fn icmp_reply(&mut self, pod: [u8; 4], from: [u8; 4], id: u16, seq: u16, data: &[u8]) {
+    pub fn icmp_reply(&mut self, pod: Addr, from: Addr, id: u16, seq: u16, data: &[u8]) {
         let mut r = alloc::vec![0u8; 8];
         r[4..6].copy_from_slice(&id.to_be_bytes());
         r[6..8].copy_from_slice(&seq.to_be_bytes());
         r.extend_from_slice(data);
-        let c = !fold(sum(&r, 0));
-        r[2..4].copy_from_slice(&c.to_be_bytes());
-        ip_packet(&mut self.out, from, pod, 1, &r);
+        if is4(&from) {
+            let c = !fold(sum(&r, 0));
+            r[2..4].copy_from_slice(&c.to_be_bytes());
+            ip_packet(&mut self.out, from, pod, 1, &r);
+        } else {
+            r[0] = 129; // ICMPv6 echo reply
+            let c = l4_sum(from, pod, 58, &r);
+            r[2..4].copy_from_slice(&c.to_be_bytes());
+            ip_packet(&mut self.out, from, pod, 58, &r);
+        }
     }
 
     /// Forward pod pings to the host as [`Event::IcmpEcho`] instead of answering them locally.
     pub fn forward_icmp(&mut self, on: bool) {
         self.forward_icmp = on;
+    }
+
+    /// Largest TCP segment toward a pod: the MTU less the IP (20 / 40) and TCP headers.
+    fn mss_for(&self, pod: &Addr) -> usize {
+        if is4(pod) {
+            self.mss
+        } else {
+            self.mss.saturating_sub(20).max(1)
+        }
     }
 
     fn alloc_id(&mut self) -> FlowId {
@@ -537,12 +703,14 @@ impl Nat {
             None => {
                 let id = self.alloc_id();
                 self.index.insert(key, id);
-                self.udp.insert(id, Udp { pip: ip.src, pport: sp, dip: ip.dst, dport: dp, last: self.now });
+                self.udp.insert(id, Udp { pip: ip.src, pport: sp, dip: ip.dst, dport: dp, last: self.now, quote: Vec::new() });
                 id
             }
         };
         if let Some(u) = self.udp.get_mut(&id) {
             u.last = self.now;
+            u.quote = [ip.hdr, ip.payload].concat();
+            u.quote.truncate(1200);
         }
         self.events.push(Event::UdpSend { flow: id, dst: ip.dst, port: dp, data: s[8..].to_vec() });
     }
@@ -560,7 +728,7 @@ impl Nat {
         }
     }
 
-    fn tcp_in(&mut self, src: [u8; 4], dst: [u8; 4], seg: Seg<'_>) {
+    fn tcp_in(&mut self, src: Addr, dst: Addr, seg: Seg<'_>) {
         let key = (src, seg.sp, dst, seg.dp, 6);
         let syn = seg.flags & SYN != 0;
         let rst = seg.flags & RST != 0;
@@ -575,7 +743,7 @@ impl Nat {
                 } else {
                     // Retransmitted SYN: answer once connected, ignore before.
                     if t.state == State::Open && seg.seq == t.pod_isn && t.snd_nxt == t.isn.wrapping_add(1) {
-                        t.synack(&mut self.out, t.mss.min(self.mss));
+                        t.synack(&mut self.out, t.mss);
                     }
                     return;
                 }
@@ -604,7 +772,7 @@ impl Nat {
                         snd_una: isn.wrapping_add(1),
                         snd_nxt: isn.wrapping_add(1),
                         wnd: seg.wnd,
-                        mss: pod_mss.min(self.mss),
+                        mss: pod_mss.min(self.mss_for(&src)),
                         ws: seg.ws.is_some(),
                         snd_shift: seg.ws.unwrap_or(0),
                         buf: VecDeque::new(),
@@ -698,7 +866,7 @@ impl Nat {
             return;
         }
         t.state = State::Open;
-        t.synack(&mut self.out, self.mss);
+        t.synack(&mut self.out, t.mss);
         t.flush(&mut self.out);
     }
 
@@ -775,8 +943,8 @@ impl Nat {
 mod tests {
     use super::*;
 
-    const POD: [u8; 4] = [10, 0, 0, 2];
-    const DST: [u8; 4] = [93, 184, 216, 34];
+    const POD: Addr = m4([10, 0, 0, 2]);
+    const DST: Addr = m4([93, 184, 216, 34]);
     const PP: u16 = 40000;
 
     fn pod_tcp(seq: u32, ack: u32, flags: u8, wnd: u16, mss: Option<u16>, data: &[u8]) -> Vec<u8> {
@@ -1207,6 +1375,151 @@ mod tests {
         assert_eq!((ip.payload[12] >> 4) as usize * 4, 24);
     }
 
+    fn with_ttl(mut p: Vec<u8>, ttl: u8) -> Vec<u8> {
+        p[8] = ttl;
+        p[10] = 0;
+        p[11] = 0;
+        let c = !fold(sum(&p[..20], 0));
+        p[10..12].copy_from_slice(&c.to_be_bytes());
+        p
+    }
+
+    fn icmp_of(p: &[u8]) -> (u8, u8, Vec<u8>) {
+        let ip = parse_ip(p).unwrap();
+        assert_eq!((ip.dst, ip.proto), (POD, 1));
+        assert!(ip.src == HOP || ip.src == DST);
+        assert_eq!(fold(sum(ip.payload, 0)), 0xffff);
+        (ip.payload[0], ip.payload[1], ip.payload[8..].to_vec())
+    }
+
+    #[test]
+    fn expiring_ttl_gets_time_exceeded() {
+        let mut nat = Nat::new(1500);
+        let pkt = with_ttl(pod_udp(b"probe"), 1);
+        nat.packet_from_pod(&pkt, 0);
+        assert!(nat.take_events().is_empty());
+        let (ty, code, quote) = icmp_of(&nat.take_packets()[0]);
+        assert_eq!((ty, code), (11, 0));
+        // The quote is the offending header plus 8 bytes of UDP.
+        assert_eq!(quote, pkt.to_vec());
+    }
+
+    #[test]
+    fn udp_and_tcp_unreachable() {
+        let mut nat = Nat::new(1500);
+        nat.packet_from_pod(&pod_udp(b"x"), 0);
+        let Event::UdpSend { flow, .. } = nat.take_events()[0].clone() else { panic!() };
+        nat.udp_unreachable(flow, 3);
+        let (ty, code, quote) = icmp_of(&nat.take_packets()[0]);
+        assert_eq!((ty, code), (3, 3));
+        assert_eq!(&quote[20..24], &[0x13, 0x88, 0, 53]); // ports 5000 -> 53
+        // TCP: connect fails with "no route": unreachable, flow gone, no RST.
+        nat.packet_from_pod(&pod_tcp(77, 0, SYN, 1000, None, &[]), 0);
+        let Event::TcpConnect { flow, .. } = nat.take_events()[0].clone() else { panic!() };
+        nat.tcp_unreachable(flow, 1);
+        let (ty, code, quote) = icmp_of(&nat.take_packets()[0]);
+        assert_eq!((ty, code), (3, 1));
+        assert_eq!(&quote[24..28], &77u32.to_be_bytes());
+        assert_eq!(nat.take_packets().len(), 0);
+        // Echo to an unreachable host.
+        nat.icmp_unreachable(POD, DST, 9, 1, 1);
+        let (ty, code, _) = icmp_of(&nat.take_packets()[0]);
+        assert_eq!((ty, code), (3, 1));
+    }
+
+    const POD6: Addr = [0xfd, 0, 0, 0x88, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 5];
+    const DST6: Addr = [0x26, 0x06, 0x47, 0, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11];
+
+    fn v6_parse(p: &[u8]) -> (Ip<'_>, Option<Seg<'_>>) {
+        let ip = parse_ip(p).unwrap();
+        let seg = if ip.proto == 6 { parse_tcp(&ip) } else { None };
+        (ip, seg)
+    }
+
+    #[test]
+    fn ipv6_tcp_flow() {
+        let mut nat = Nat::new(1500);
+        let mut o = Out::default();
+        tcp_pkt(&mut o, POD6, PP, DST6, 443, 500, 0, SYN, &[2, 4, 5, 0xa0], &[]);
+        nat.packet_from_pod(&o.pkts[0], 0);
+        let Event::TcpConnect { flow, dst, port } = nat.take_events()[0].clone() else { panic!() };
+        assert_eq!((dst, port), (DST6, 443));
+        nat.tcp_connected(flow);
+        let pk = nat.take_packets();
+        let (ip, seg) = v6_parse(&pk[0]);
+        let seg = seg.unwrap();
+        assert_eq!((ip.src, ip.dst, ip.hdr.len()), (DST6, POD6, 40));
+        assert_eq!(seg.flags, SYN | ACK);
+        assert_eq!(seg.mss, Some(1440)); // MTU less the 40-byte IPv6 and 20-byte TCP headers
+        assert_eq!(l4_sum(ip.src, ip.dst, 6, ip.payload), 0);
+        // Handshake ACK, data both ways.
+        let mut o = Out::default();
+        tcp_pkt(&mut o, POD6, PP, DST6, 443, 501, seg.seq.wrapping_add(1), ACK, &[], b"hello");
+        nat.packet_from_pod(&o.pkts[0], 1);
+        assert_eq!(nat.take_events(), alloc::vec![Event::TcpData { flow, data: b"hello".to_vec() }]);
+        nat.take_packets();
+        nat.tcp_host_data(flow, &[7u8; 3000]);
+        let pk = nat.take_packets();
+        assert!(pk.len() >= 3);
+        let mut total = 0;
+        for p in &pk {
+            let (ip, seg) = v6_parse(p);
+            assert_eq!(l4_sum(ip.src, ip.dst, 6, ip.payload), 0);
+            assert!(ip.payload.len() <= 1440 + 20);
+            total += seg.unwrap().data.len();
+        }
+        assert_eq!(total, 3000);
+    }
+
+    #[test]
+    fn ipv6_udp_icmp_and_errors() {
+        let mut nat = Nat::new(1500);
+        // UDP roundtrip.
+        let mut o = Out::default();
+        udp_pkt(&mut o, POD6, 5000, DST6, 53, b"query");
+        nat.packet_from_pod(&o.pkts[0], 0);
+        let Event::UdpSend { flow, dst, port, data } = nat.take_events()[0].clone() else { panic!() };
+        assert_eq!((dst, port, data), (DST6, 53, b"query".to_vec()));
+        nat.udp_from_host(flow, b"answer");
+        let pk = nat.take_packets();
+        let (ip, _) = v6_parse(&pk[0]);
+        assert_eq!((ip.src, ip.dst, ip.proto), (DST6, POD6, 17));
+        assert_eq!(l4_sum(ip.src, ip.dst, 17, ip.payload), 0);
+        // Port unreachable comes back as ICMPv6 type 1 code 4 from the destination.
+        nat.udp_unreachable(flow, 3);
+        let pk = nat.take_packets();
+        let (ip, _) = v6_parse(&pk[0]);
+        assert_eq!((ip.src, ip.dst, ip.proto), (DST6, POD6, 58));
+        assert_eq!((ip.payload[0], ip.payload[1]), (1, 4));
+        assert_eq!(l4_sum(ip.src, ip.dst, 58, ip.payload), 0);
+        // Echo request answered locally (ICMPv6 type 129).
+        let mut m = alloc::vec![128u8, 0, 0, 0, 0x12, 0x34, 0, 9, b'x'];
+        let c = l4_sum(POD6, DST6, 58, &m);
+        m[2..4].copy_from_slice(&c.to_be_bytes());
+        let mut o = Out::default();
+        ip_packet(&mut o, POD6, DST6, 58, &m);
+        nat.packet_from_pod(&o.pkts[0], 0);
+        let pk = nat.take_packets();
+        let (ip, _) = v6_parse(&pk[0]);
+        assert_eq!((ip.src, ip.dst, ip.payload[0]), (DST6, POD6, 129));
+        assert_eq!(l4_sum(ip.src, ip.dst, 58, ip.payload), 0);
+        // ... or forwarded.
+        nat.forward_icmp(true);
+        nat.packet_from_pod(&o.pkts[0], 0);
+        assert_eq!(nat.take_events(), alloc::vec![Event::IcmpEcho { pod: POD6, dst: DST6, id: 0x1234, seq: 9, data: b"x".to_vec() }]);
+        // Hop limit 1: Time Exceeded (ICMPv6 type 3) from the NAT hop.
+        let mut o = Out::default();
+        udp_pkt(&mut o, POD6, 5001, DST6, 53, b"probe");
+        let mut p = o.pkts.pop().unwrap();
+        p[7] = 1;
+        nat.packet_from_pod(&p, 0);
+        assert!(nat.take_events().is_empty());
+        let pk = nat.take_packets();
+        let (ip, _) = v6_parse(&pk[0]);
+        assert_eq!((ip.src, ip.dst, ip.payload[0]), (HOP6, POD6, 3));
+        assert_eq!(l4_sum(ip.src, ip.dst, 58, ip.payload), 0);
+    }
+
     #[test]
     fn bad_checksums_dropped() {
         let mut nat = Nat::new(1500);
@@ -1251,7 +1564,7 @@ mod tests {
             assert_eq!(p[8], 64);
             assert_eq!(p[6] & 0x40, 0x40);
             assert_eq!(u16::from_be_bytes([p[2], p[3]]) as usize, p.len());
-            assert_eq!(l4_sum([p[12], p[13], p[14], p[15]], [p[16], p[17], p[18], p[19]], p[9], &p[20..]), 0);
+            assert_eq!(l4_sum(m4([p[12], p[13], p[14], p[15]]), m4([p[16], p[17], p[18], p[19]]), p[9], &p[20..]), 0);
         }
     }
 }

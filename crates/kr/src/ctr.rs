@@ -214,7 +214,7 @@ impl CtrNet {
     /// Real root: the container child configures its own netns from this.
     fn root_config(&self) -> Option<NetConfig> {
         let l = self.lease.as_ref().filter(|_| self.sandbox.is_none())?;
-        Some(NetConfig { ip: l.ip, prefix: network::PREFIX, gateway: network::GATEWAY })
+        Some(NetConfig::dual(l.ip, &network::PodNet::default()))
     }
 
     /// Stops the sandbox (its veth goes with the netns) and frees the address.
@@ -246,7 +246,7 @@ fn bridge_network(store: &Store, id: &str, maps: &IdMaps) -> Result<CtrNet, i32>
         return Ok(CtrNet { lease: Some(lease), sandbox: None });
     }
     // The lease comes first so the infra supervisor sees this process as a user.
-    let cfg = NetConfig { ip: lease.ip, prefix: network::PREFIX, gateway: network::GATEWAY };
+    let cfg = NetConfig::dual(lease.ip, &network::PodNet::default());
     let sandbox = rootless_infra(store.root(), maps).and_then(|infra| container::start_sandbox_in(&infra, id.as_bytes(), id.as_bytes(), maps, Some(cfg)).map_err(|e| format!("sandbox: {}: errno {}", e.step, e.errno.0)));
     match sandbox {
         Ok(sb) => Ok(CtrNet { lease: Some(lease), sandbox: Some(sb) }),
@@ -320,7 +320,7 @@ fn infra_supervisor(root: &str, maps: &IdMaps) -> ! {
         infra.stop();
         kr_sys::exit_group(1);
     }
-    // Outbound traffic (ADR-030): the TUN is served below, once the lease loop runs on an executor.
+    // Outbound traffic (ADR-031): the TUN is served below, once the lease loop runs on an executor.
     let egress = network::open_egress(&infra).ok();
     let path = nul(format!("{root}/ctr-net").as_bytes());
     let tmp = nul(format!("{root}/ctr-net.{}", kr_sys::fs::getpid()).as_bytes());

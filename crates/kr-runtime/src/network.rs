@@ -1,7 +1,7 @@
 //! Built-in bridge network (KNOWN_ISSUES #50, ADR-019): replaces the CNI bridge + host-local
 //! plugins. Real root uses the host namespace; rootless, the bridge lives in an infra user+net
 //! namespace (ADR-022); its default route is a TUN device served by a userspace NAT
-//! (`kr_net::usernat`, ADR-030), so rootless pods also reach the outside.
+//! (`kr_net::usernat`, ADR-031), so rootless pods also reach the outside.
 //!
 //! Layout: bridge `kr0` owns the gateway address of a /16; each container gets one address from
 //! a file-based IPAM, a veth pair whose peer is created directly inside the container's netns as
@@ -50,6 +50,45 @@ impl PodNet {
         Some(PodNet { subnet: net.to_be_bytes(), prefix, gateway: (net + 1).to_be_bytes() })
     }
 }
+
+/// Dual stack: every node's IPv4 pod /24 `10.88.N.0/24` has the IPv6 twin `fd00:88:0:N::/64`
+/// (ULA, no extra allocation: the API server hands out one number per node). A pod's IPv6
+/// address ends in the same host octet as its IPv4 one; the bridge gateway is `::1`.
+pub const POD_PREFIX6: u8 = 64;
+
+/// The IPv6 /64 paired with a node's IPv4 pod subnet.
+pub fn subnet6(subnet: [u8; 4]) -> [u8; 16] {
+    let mut a = [0u8; 16];
+    a[..4].copy_from_slice(&[0xfd, 0x00, 0x00, 0x88]);
+    a[7] = subnet[2];
+    a
+}
+
+/// Bridge gateway address of the node's IPv6 pod subnet.
+pub fn gateway6(subnet: [u8; 4]) -> [u8; 16] {
+    let mut a = subnet6(subnet);
+    a[15] = 1;
+    a
+}
+
+/// IPv6 address of the pod whose IPv4 address is `ip` in the node subnet `subnet`.
+pub fn pod_ip6(subnet: [u8; 4], ip: [u8; 4]) -> [u8; 16] {
+    let mut a = subnet6(subnet);
+    a[15] = ip[3];
+    a
+}
+
+/// The IPv6 address of a node's VXLAN gateway (`fd00:88:ffff::<third octet>`): the next hop
+/// other nodes use for that node's pod /64, mapped to its VTEP MAC by a static neighbour entry.
+pub fn vtep6(subnet: [u8; 4]) -> [u8; 16] {
+    let mut a = [0u8; 16];
+    a[..6].copy_from_slice(&[0xfd, 0x00, 0x00, 0x88, 0xff, 0xff]);
+    a[15] = subnet[2];
+    a
+}
+
+pub use kr_net::tcp::ipv6_string;
+
 const NFT_TABLE: &[u8] = b"kr";
 
 /// What the container child configures on its `eth0`.
@@ -58,6 +97,16 @@ pub struct NetConfig {
     pub ip: [u8; 4],
     pub prefix: u8,
     pub gateway: [u8; 4],
+    /// IPv6 twin of `ip` (see [`pod_ip6`]); `None` leaves the pod IPv4-only.
+    pub ip6: Option<[u8; 16]>,
+    pub gateway6: [u8; 16],
+}
+
+impl NetConfig {
+    /// IPv4 address `ip` in the node subnet `pn`, with its dual-stack twin.
+    pub fn dual(ip: [u8; 4], pn: &PodNet) -> NetConfig {
+        NetConfig { ip, prefix: pn.prefix, gateway: pn.gateway, ip6: Some(pod_ip6(pn.subnet, ip)), gateway6: gateway6(pn.subnet) }
+    }
 }
 
 fn exists_ok(r: Result<(), Errno>) -> Result<(), Errno> {
@@ -85,7 +134,14 @@ pub fn setup_host_with(pn: &PodNet) -> Result<(), Errno> {
     nl.link_set_mac(br, gateway_mac(pn.gateway))?;
     nl.link_up(br)?;
     ns::write_file(b"/proc/sys/net/ipv4/ip_forward\0", b"1")?;
-    kr_net::nft::ensure_masquerade(&kr_net::nft::Masquerade { table: NFT_TABLE, cidr: CLUSTER_CIDR.0, prefix: CLUSTER_CIDR.1, bridge: BRIDGE })
+    // IPv6 is best effort: a host with IPv6 disabled keeps working single-stack.
+    if nl.addr_add6(br, gateway6(pn.subnet), POD_PREFIX6).map_or_else(|e| e.0 == 17, |_| true) {
+        let _ = ns::write_file(b"/proc/sys/net/ipv6/conf/all/forwarding\0", b"1");
+    }
+    kr_net::nft::ensure_masquerade(&kr_net::nft::Masquerade { table: NFT_TABLE, cidr: CLUSTER_CIDR.0, prefix: CLUSTER_CIDR.1, bridge: BRIDGE })?;
+    // IPv6 pods (fd00:88::/32) leave NATed too; a host or kernel without IPv6 NAT stays single-stack.
+    let _ = kr_net::nft::ensure_masquerade6(&kr_net::nft::Masquerade6 { table: NFT_TABLE, cidr: subnet6([0; 4]), prefix: 32, bridge: BRIDGE });
+    Ok(())
 }
 
 /// Rootless: run inside the infra namespaces (`container::run_in_net`); creates the bridge with
@@ -104,6 +160,9 @@ pub fn setup_infra_bridge(pn: &PodNet) -> i32 {
         return 3;
     }
     let _ = ns::write_file(b"/proc/sys/net/ipv4/ip_forward\0", b"1");
+    if nl.addr_add6(br, gateway6(pn.subnet), POD_PREFIX6).map_or_else(|e| e.0 == 17, |_| true) {
+        let _ = ns::write_file(b"/proc/sys/net/ipv6/conf/all/forwarding\0", b"1");
+    }
     0
 }
 
@@ -125,6 +184,10 @@ fn setup_infra_egress(sock: i32) -> i32 {
     }
     if exists_ok(nl.route_add([0, 0, 0, 0], 0, None, idx)).is_err() {
         return 5;
+    }
+    // IPv6 egress (best effort): transit /126 whose `::2` is the NAT's own hop address.
+    if nl.addr_add6(idx, [0xfd, 0, 0, 0x88, 0xff, 0xff, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1], 126).is_ok() {
+        let _ = nl.route_add6([0; 16], 0, None, idx);
     }
     match ns::send_fd(sock, b"t", tun.raw()) {
         Ok(_) => 0,
@@ -200,7 +263,14 @@ pub fn configure_child(c: &NetConfig) -> Result<(), Errno> {
     // owner's MAC for a reused address learn the new one at once. Best effort.
     let _ = ns::write_file(b"/proc/sys/net/ipv4/conf/eth0/arp_notify\0", b"1");
     nl.link_up(idx)?;
-    nl.route_add([0; 4], 0, Some(c.gateway), idx)
+    nl.route_add([0; 4], 0, Some(c.gateway), idx)?;
+    // Best effort: without IPv6 in this kernel/namespace the pod stays single-stack.
+    if let Some(ip6) = c.ip6 {
+        if nl.addr_add6(idx, ip6, POD_PREFIX6).is_ok() {
+            let _ = nl.route_add6([0; 16], 0, Some(c.gateway6), idx);
+        }
+    }
+    Ok(())
 }
 
 /// An allocated address; `release` frees it. Leases are files `<dir>/<a.b.c.d>` created with

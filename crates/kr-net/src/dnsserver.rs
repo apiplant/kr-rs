@@ -73,6 +73,7 @@ mod imp {
     use kr_sys::{self as sys, Errno};
 
     const TYPE_A: u16 = 1;
+    const TYPE_AAAA: u16 = 28;
     const TYPE_CNAME: u16 = 5;
     const TYPE_SOA: u16 = 6;
     const TYPE_PTR: u16 = 12;
@@ -109,12 +110,16 @@ mod imp {
     pub struct ServiceRecord {
         /// `None` for a headless service.
         pub cluster_ip: Option<[u8; 4]>,
+        /// The IPv6 ClusterIP of a dual-stack or IPv6 service.
+        pub cluster_ip6: Option<[u8; 16]>,
         pub ports: Vec<PortRecord>,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct EndpointRecord {
         pub ip: [u8; 4],
+        /// The endpoint's IPv6 address, for AAAA answers.
+        pub ip6: Option<[u8; 16]>,
         /// `hostname` of a StatefulSet-style endpoint.
         pub hostname: Option<String>,
         /// Ports of this endpoint (target ports), used for SRV of headless services.
@@ -319,6 +324,7 @@ mod imp {
 
     enum Data {
         A([u8; 4]),
+        Aaaa([u8; 16]),
         /// CNAME / PTR target.
         Name(String),
         Srv { weight: u16, port: u16, target: String },
@@ -388,6 +394,7 @@ mod imp {
             self.buf.extend_from_slice(&[0, 0]);
             match &rr.data {
                 Data::A(ip) => self.buf.extend_from_slice(ip),
+                Data::Aaaa(ip) => self.buf.extend_from_slice(ip),
                 Data::Name(n) => self.name(n, true),
                 Data::Srv { weight, port, target } => {
                     self.buf.extend_from_slice(&0u16.to_be_bytes());
@@ -494,6 +501,14 @@ mod imp {
 
     fn wants_a(qtype: u16) -> bool {
         qtype == TYPE_A || qtype == TYPE_ANY
+    }
+
+    fn wants_aaaa(qtype: u16) -> bool {
+        qtype == TYPE_AAAA || qtype == TYPE_ANY
+    }
+
+    fn aaaa_rr(owner: Option<String>, ip: [u8; 16]) -> Rr {
+        Rr { owner, rtype: TYPE_AAAA, data: Data::Aaaa(ip) }
     }
 
     fn dashed(ip: [u8; 4]) -> String {
@@ -604,13 +619,24 @@ mod imp {
                     return r;
                 }
                 let Some(s) = zone.service(ns, name) else { return nxdomain(dom) };
-                if !wants_a(q.qtype) {
+                if !wants_a(q.qtype) && !wants_aaaa(q.qtype) {
                     return nodata(dom);
                 }
                 let mut r = Reply::new(0);
-                match s.cluster_ip {
-                    Some(ip) => r.answers.push(a_rr(None, ip)),
-                    None => r.answers.extend(zone.endpoints(ns, name).into_iter().map(|e| a_rr(None, e.ip))),
+                let headless = s.cluster_ip.is_none() && s.cluster_ip6.is_none();
+                if wants_a(q.qtype) {
+                    match s.cluster_ip {
+                        Some(ip) => r.answers.push(a_rr(None, ip)),
+                        None if headless => r.answers.extend(zone.endpoints(ns, name).into_iter().map(|e| a_rr(None, e.ip))),
+                        None => {}
+                    }
+                }
+                if wants_aaaa(q.qtype) {
+                    match s.cluster_ip6 {
+                        Some(ip) => r.answers.push(aaaa_rr(None, ip)),
+                        None if headless => r.answers.extend(zone.endpoints(ns, name).into_iter().filter_map(|e| e.ip6).map(|ip| aaaa_rr(None, ip))),
+                        None => {}
+                    }
                 }
                 if r.answers.is_empty() {
                     return nodata(dom);
@@ -619,18 +645,26 @@ mod imp {
             }
             [host, name, ns] => {
                 match zone.service(ns, name) {
-                    Some(ServiceRecord { cluster_ip: None, .. }) if zone.external_name(ns, name).is_none() => {}
+                    Some(ServiceRecord { cluster_ip: None, cluster_ip6: None, .. }) if zone.external_name(ns, name).is_none() => {}
                     _ => return nxdomain(dom),
                 }
                 let hits: Vec<EndpointRecord> = zone.endpoints(ns, name).into_iter().filter(|e| endpoint_label(e) == *host || e.hostname.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(host))).collect();
                 if hits.is_empty() {
                     return nxdomain(dom);
                 }
-                if !wants_a(q.qtype) {
+                if !wants_a(q.qtype) && !wants_aaaa(q.qtype) {
                     return nodata(dom);
                 }
                 let mut r = Reply::new(0);
-                r.answers.extend(hits.iter().map(|e| a_rr(None, e.ip)));
+                if wants_a(q.qtype) {
+                    r.answers.extend(hits.iter().map(|e| a_rr(None, e.ip)));
+                }
+                if wants_aaaa(q.qtype) {
+                    r.answers.extend(hits.iter().filter_map(|e| e.ip6).map(|ip| aaaa_rr(None, ip)));
+                }
+                if r.answers.is_empty() {
+                    return nodata(dom);
+                }
                 r
             }
             [port, proto, name, ns] if port.starts_with('_') && proto.starts_with('_') => srv(q, zone, dom, &port[1..], &proto[1..], name, ns),
