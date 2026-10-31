@@ -1,88 +1,42 @@
 # Known Issues & Potential Problems
 
-Living list, grouped by what still needs doing. Each item: **status**, impact, plan. Numbers are stable (other docs cite them); new items get the next number. When an item is resolved, mark it *fixed* with the commit and run `python3 -I tools/sort_known_issues.py`.
+Only work still to do lives here (open items, things to watch, accepted limits). Numbers are stable (other docs cite them); new items get the next number. When something is fixed, move it to `RESOLVED_ISSUES.md` with the commit.
 
-# Needs work (open or partial)
+## Open
 
-## kr-sys
-11. **aarch64 path is only partly exercised** — *mostly fixed*
-    `tools/test/aarch64.sh` exits 0 (verified 2026-10-24): cross-builds `kr` (aarch64-unknown-linux-gnu, rust-lld shim, no cross gcc) and runs under `qemu-aarch64`: `version`, `sleep-test` and the HTTP `echo` server pass; unit tests of kr-sys, kr-rt, kr-fmt, kr-crypto, kr-archive, kr-store and kr-net pass (aarch64 musl, self-contained): 281 passed, 4 ignored (Wycheproof P-256-sign, RSA-8k, gzip bench, tar sparse), 0 failed. Fixed: missing `getauxval` (compiler_builtins outline atomics) broke linking.
-    Remaining: `kr ctr`/kubelet/apiserver paths (namespaces, cgroups, clone3, mounts) are not run under qemu-user and need a real aarch64 host; no CI job yet.
-
-## kr-runtime: isolation (container.rs, security.rs, cgroup.rs)
-50. **Container networking gaps** — *partly fixed* (ADR-019, ADR-022)
-    Pods get a bridge network as root and rootless (an infra user+net namespace holds the bridge), and ports are published through hostPort/NodePort (userspace proxy).
-    Remaining:
-    - Kubelet pod leases are garbage-collected at startup (`network::gc`; leases owned by pod uids are stale after a kr crash). Fixed: leases of standalone `kr ctr run` containers record the owning process (pid + start time, so reused pids don't count; zombies count as dead) and are collected by the next `kr ctr run` or kubelet start once that process is gone (verified with SIGKILL in a container).
-    - Dual stack (ADR-032): pods have an IPv6 twin address, Services have IPv4 and/or IPv6 ClusterIPs with per-family EndpointSlices, the proxy and cluster DNS (AAAA) serve both, VXLAN carries IPv6 across nodes, rootless NAT handles IPv6. Host side: the API server listens on `[::]`, `kube-dns` is dual stack, the `kubernetes` Service is dual stack when the host has a global IPv6 address, NodePort/hostPort/`/etc/hosts`/`status.podIPs` and the host-gw backend handle both families. Hosts without IPv4 work (`KR_V6_UNDERLAY=1 tools/test/two-node.sh up`, `KR_HA_V6=1 tools/test/ha.sh`): join, Raft, exec/logs and VXLAN run over IPv6. The pod network is IPv4, IPv6 or dual stack (`KR_POD_FAMILIES`, ADR-034; `tools/test/families.sh`). Regression scripts: `tools/test/dualstack.sh` (two-node cluster) and `tools/test/rootless-egress-v6.sh`.
-    - Fixed: rootless `kr ctr run` containers get a bridge address: concurrent runs share one infra user+net namespace (a detached supervisor holds it, published in `<root>/ctr-net`, gone 5 s after the last run) and lease from the same ipam dir as pods. Verified as a non-root user: two containers ping and wget each other, a SIGKILLed run's lease is reclaimed. Like rootless pods they have no egress (the infra namespace has no route out) and no published ports. Also fixed: the nested rootless uid map was written as one extent (`0 0 1+N`) and failed with EPERM whenever the user has a subuid range.
-    - Rootless pods and `kr ctr run` containers have outbound connectivity (TUN default route plus userspace NAT, ADR-031). Verified: host TCP, internet, 40 MB download intact at about 300 MB/s (a 10 ms poll once capped it at 25 MB/s), real `ping` through an unprivileged ICMP socket (an unreachable host no longer answers), name lookups in `kr ctr run` via the forwarder 100.64.255.2 (the host's first nameserver, loopback stubs included). IP fragments are reassembled (pod to host) and produced (host to pod, 3000-byte ping verified both ways) and TCP window scaling is negotiated. Pods with `dnsPolicy: Default` (and non-hostNetwork ClusterFirst fallbacks) get the forwarder instead of a loopback stub nameserver. Regression script: `tools/test/rootless-egress.sh` (ctr and pod: 30 MB download, 20 MB upload, DNS, ping, fragmented ping, unreachable ping; all pass). Root-mode `kr ctr run` resolv.conf checked in a privileged container (host nameservers copied). ICMP errors reach the pod: Time Exceeded from the NAT hop (100.64.255.2), Destination Unreachable for refused UDP ports (from the destination, so `traceroute` finishes), no route (net/host) and failed pings; `traceroute` shows the infra bridge, the NAT hop, then the destination. Real hops beyond the host are not visible.
-
-## Build (cont.)
-53. **Binary size** — *watch*
-    The single binary (server, agent, runtime, TLS/crypto, CRDs, webhooks, aggregation, protobuf tables) is 2.87 MB on x86_64 and 2.32 MB on aarch64 (measured 2026-10-27; it was ~1.8 MB when the 2 MB agent budget in PLAN.md was set, which is now exceeded). Measure before adding large features; avoid `{:?}` on large types, and keep `opt-level = "z"` + LTO + strip.
-
-## kr-crypto / TLS (ADR-020)
-60. **P-256 scalar multiplication is slow** — *watch* (commit: 3440e98)
-    Now a constant-time fixed 4-bit window (masked table scan): ~0.5 ms sign, ~0.95 ms verify (was 0.75 / 1.4 ms), dudect |t| 0.4. A fixed-base comb table would make signing ~4x faster again but costs ~100 KB RAM per process; revisit if handshake rate on the API server matters.
-
-## Control plane (ADR-021)
-63. **No typed schemas or defaulting** — *partly fixed*
-    - Defaulting for core/apps/batch is in (`defaults.rs`, see #86). Fixed: client-sent `status` is dropped on PV/PVC create, so a new volume always starts `Pending` (no `Available` ⇄ `Pending` rewrite).
-    - Fixed: built-in kinds are type-checked against the generated protobuf tables on create/update/patch/apply in every fieldValidation mode (400 `<Kind> in version "v1" cannot be handled as a <Kind>: json: cannot unmarshal string into Go struct field Pod.spec.containers of type []object`). Integral floats (`3.0`) are accepted for integers, unlike Go; Go type names in messages are approximate.
-    - `fieldValidation` is implemented (`fieldval.rs`): unknown fields of built-in kinds are found with the generated protobuf field tables, those of custom resources are what CRD pruning would drop, and duplicate keys are reported. `Strict` answers 400 `strict decoding error: unknown field "spec.containers[0].imagee"`, `Warn` (the default) adds `Warning: 299` headers, `Ignore` is silent. For PATCH the merged object is checked (fields the stored object already had are not reported). In-process clients use `Ignore`. Per-kind *value* validation (enums, formats, cross-field rules) is still minimal.
-    - Plan: generate value validation from the upstream OpenAPI, as the protobuf table does.
-65. **Server-side apply is partial** — *mostly fixed*
-    `metadata.managedFields` (FieldsV1, per manager/operation/subresource) is recorded on create, update, patch and apply (`crates/kr-apiserver/src/ssa.rs`). Apply (`application/apply-patch+yaml|json`, `fieldManager` required) upserts, removes fields the manager dropped (unless co-owned), returns upstream-format 409 conflicts and honours `force=true`. Lists are keyed `k:{...}` from the strategic-merge tables (built-ins) or `x-kubernetes-list-type/map-keys` (CRDs); atomic lists are owned whole, sets use `v:`. Client-sent managedFields are ignored except the `[]`/`[{}]` reset; malformed ones are 422. Verified live with `kubectl apply --server-side` (re-apply, scale conflict, `--force-conflicts`). No-op writes (PUT/patch/apply/subresources that change nothing but timestamps) are skipped like upstream: same resourceVersion, no managedFields time bump, no watch event. CRD `x-kubernetes-map-type: atomic` maps are owned and replaced whole. Remaining: no version conversion of managedFields, built-in atomic structs (`+structType=atomic`, e.g. LabelSelector) are treated as granular, no deduced-type handling for `x-kubernetes-preserve-unknown-fields`, and apply never removes defaulted values it did not set.
-70. **Conformance gaps** — *open; tracked as C1–C9 in PLAN.md*
-    Done since: CRDs (#87), admission webhooks (#88), aggregated discovery, ResourceQuota, hostPort, lifecycle hooks, ephemeral containers, storage (PVC/SC/PV #73).
-    Since: protobuf responses (objects, lists, Status; encoded from the same tables, checked against upstream `protoc` decoding of live responses; watches and Tables stay JSON, which client-go accepts by Content-Type), built-in type checks (#63).
-    Round 19 (2026-10-26, two nodes): **460 of 460**. Round 20 (2026-10-27, one node): 455 passed; the 2 specs that need a second node cannot pass there and 3 specs that call the CRD conversion webhook failed intermittently (#113). Per-round history and causes: `docs/CONFORMANCE_KNOWN_ISSUES.md`.
-    Round 8 (2026-10-26): 460 specs in 23 min, **406 passed, 54 failed**. 34 of the failures are fixed since (#112), 16 are timeouts under the parallel load, 2 need a second node, 2 are open (aggregator sample API server, `kubectl attach` denial by a webhook). Per-test list: `docs/CONFORMANCE_KNOWN_ISSUES.md`.
-    Round 7 (2026-10-25, first complete run since the HA work): 460 specs in 43 min, **308 passed, 152 failed**, no hangs. Biggest groups: pod-level behaviour (subpath expansion, termination messages, hostAliases, preStop, init status, probes, LimitRange defaults, pod generation), workload controllers (rollover/proportional scaling, StatefulSet ordering, adoption, Job success policy, CronJob concurrency, preemption), webhooks (matchCondition validation, timeouts, CRD conversion), field validation (duplicates, invalid values), DNS from musl pods, hostPort, kubectl apply/describe/attach details, chunked lists, missing APIs (PodCertificateRequest, DeviceTaintRule, StorageVersionMigration, ImageVolume). The CTB failures are fixed since (2cc219a). Per-test list by area: `docs/CONFORMANCE_KNOWN_ISSUES.md`.
-    Round 5 (2026-10-25, stopped at ~300/460 specs, 165 failed): pull race gone; fixed since #100, #101. Hangs: ValidatingAdmissionPolicy/MutatingAdmissionPolicy are not enforced, so their tests loop for the full timeout (needs CEL policy evaluation).
-    Round 4 (2026-10-25, in progress when triaged): ~320 failures, almost all from #98 (pull race) and #99 (DeleteOptions groups, names); both fixed, a rerun is needed for the real remainder.
-    Remaining: protobuf watch streams, value validation (#63), and whatever the current Sonobuoy run reports (`tools/test/conformance.sh results`).
-97. **HA (kr-raft, ADR-026) gaps** — *partly fixed*
-    `kr server --cluster-init` starts a Raft-replicated control plane; `kr server --server https://<any server>:6443 --token-file <server-token>` joins one (2-phase: key material, then `POST /kr/add-server` with its own server certificate); `POST /kr/remove-server {"id":N}` (system:masters) removes one. Followers serve reads and watches locally and forward writes (HTTP and in-process) to the leader; controllers and the scheduler run on the leader only. `tools/test/ha.sh` (3 servers + agent: join, forwarding, kill -9 of the leader, controller hand-over, catch-up, identical stores, removal) passes; Raft itself is checked by a chaos simulation (`crates/kr-raft/src/tests.rs`).
-    Remaining:
-    - Fixed: an existing single-server datastore is converted by `kr server --cluster-init` (its image becomes the Raft snapshot at index 1, the old dir is kept as `db.imported`; `tools/test/ha.sh import`). Joining with an existing datastore is refused.
-    - Fixed: a restarted server could not reach its peers when they were needed for quorum (their addresses are in the replicated store, which is behind on restart); known addresses are now kept in `raft/peers`.
-    - Fixed: agents fail over. They follow the `kubernetes` endpoints (every 30 s, saved to `<agent data>/servers` for restarts) and switch to the next server when a request gets no HTTP response; `tools/test/ha.sh` kills the agent's server and restarts the agent while it is down. A write that failed mid-flight is retried on the next server, so it can be applied twice (kubelet writes are idempotent or precondition-guarded). Pods using the `kubernetes` Service already get every server.
-    - A removed server never sees its own removal and keeps pre-campaigning until it is stopped (harmless: pre-vote, and its log is behind). Stop and wipe removed servers.
-    - Fixed: a joining server is first a Raft learner (gets the log, counts for no quorum, never campaigns) and is promoted to voter only once it has every committed entry; a newcomer that dies while catching up no longer stalls the cluster. Membership changes are still one at a time.
-    - Fixed: after an IP change a server reissues its API and Raft certificates at start, and re-registers its address through any reachable server (its own certificate is the identity); outbound links reconnect as soon as an address changes (`tools/test/ha.sh ipchange`). A server whose IP changes while running needs a restart.
-    - Follower reads are as fresh as its applied log (serializable, like etcd's); only the forwarding client gets read-your-writes.
-    - Snapshots are sent whole in one message (512 MB frame limit; a store image is typically a few MB to tens of MB). Plan: chunked InstallSnapshot if images grow.
-104. **Pod behaviour gaps (conformance round 7, 29 tests)** — *mostly fixed*
-    Fixed: sidecar init containers (`restartPolicy: Always`: started, then treated as initialized; restarted on any exit; stopped after the app containers), which the lifecycle-hook tests use to relay hooks; termination messages (file bind-mounted at `terminationMessagePath`, writable by any user, `FallbackToLogsOnError` = last 80 lines / 2 KiB); `activeDeadlineSeconds` (also when updated: phase Failed, reason DeadlineExceeded); `pods/<name>[:port]/proxy` (sent from the transport on non-blocking sockets, one 30 s budget, host-local pod IPs refused); `subPathExpr` (expansion, absolute/`..`/backtick results fail the container); `hostAliases` and the node's /etc/hosts for hostNetwork pods; pod admission (`admit.rs`): sysctl name validation (422), RuntimeClass (403 when missing; overhead, nodeSelector and tolerations merged) and LimitRanger (container defaults, min/max/ratio); pod `generation` (order-insensitive spec comparison, graceful delete bumps it) and `observedGeneration` on status and conditions; real condition transition times; `PodInitializing` for init containers queued behind one that has not finished; gRPC probes (health v1 over h2c); image volumes (`volumes[].image`, read-only); exec websockets with the bare `channel.k8s.io` protocol. Verified with unit and in-process tests and live on throwaway two-node clusters (not yet by the e2e suite).
-    Remaining: sidecars are not stopped when every app container of a Never/OnFailure pod finished; LimitRanger ignores Pod and PVC limit types; unsafe sysctls are not rejected; gRPC probes over TLS; services/proxy; pod proxy cannot reach pod IPs in rootless mode; the termination log fallback can include earlier restarts' output.
-105. **Missing APIs, validation, webhook and CRD gaps (conformance round 7)** — *partly fixed*
-    Fixed (in-process tests, not yet the e2e suite):
-    - TokenReview and SubjectAccessReview / LocalSubjectAccessReview, using the same token verification (signature, expiry, audience, ServiceAccount/pod revocation) and authorizer as requests; both need RBAC `create` (`tests/reviews.rs`). Tokens carry a `jti`, reported as the credential id with pod and node extras.
-    - Newly served: events.k8s.io/v1 Event, apiregistration.k8s.io/v1 APIService (stored only, no aggregation), PodCertificateRequest, DeviceTaintRule, StorageVersionMigration; CSR `spec.signerName` and events.k8s.io field selectors.
-    - `kube-root-ca.crt` is recreated or reset after ConfigMap writes in live namespaces.
-    - List chunking keeps the first page's resourceVersion, reports `remainingItemCount`, and expires continue tokens after 300 s with 410 and an inconsistent continue.
-    - Table requests to review APIs get 406.
-    - Immutable ConfigMaps/Secrets, data key validation, immutable PriorityClass `value`.
-    - Status updates keep label and annotation changes.
-    - Namespace deletion removes pods before anything else.
-    - Webhook configurations with uncompilable matchConditions are rejected (422); webhook calls carry `?timeout=Ns` and report timeouts as upstream does.
-    - Custom resources are defaulted on read; client-written CRD status conditions are kept.
-    - `kubectl logs --timestamps` (times are approximate: the file mtime, or the read time when following).
-    - Field validation messages: unknown and duplicate fields together; server-side apply's "field not declared in schema"; YAML duplicate keys.
-    Remaining: CRD conversion webhooks (and patching a CR in a non-storage version); API aggregation; review APIs in discovery; protobuf tables and spec validation for the new kinds; per-line log timestamps; `kubectl attach` denial message; `kubectl describe service` panic; the Guestbook test.
-106. **Workload controller gaps (conformance round 7)** — *mostly fixed*
-    Fixed (unit tests; most also on a throwaway cluster, none yet by the e2e suite):
-    - Job: `SuccessCriteriaMet`/`CompletionsReached` and `Complete` only after the other pods are gone; `successPolicy` (succeededIndexes, succeededCount); `backoffLimitPerIndex`, `maxFailedIndexes`, `status.failedIndexes`; `podFailurePolicy` (onExitCodes, onPodConditions; FailJob, Ignore, FailIndex, Count); work-queue Jobs keep running pods after the first success.
-    - Adoption and release of orphans by Job, ReplicaSet, ReplicationController and Deployment; `ReplicaFailure` on quota denials.
-    - StatefulSet scale-down halts on an unhealthy pod; kubelet host-port admission (`HostPortConflict`) so evicted StatefulSet pods are recreated; patch-added list items go first (the specs read `containers[0]`).
-    - Garbage collection honours `propagationPolicy` Orphan and Foreground (finalizers on owners).
-    - Scheduler: new pods start `Pending`, `Scheduled`/`FailedScheduling` events, the pod's required node affinity, extended resources, and preemption (lower priority first, `DisruptionTarget`, `nominatedNodeName`).
-    - Priority admission (`spec.priority`, global default, built-in critical classes). The critical classes outside kube-system need a ResourceQuota that covers them, as upstream's default limitedResources. PriorityClass `value` and `preemptionPolicy` are immutable.
-    - Exec probes and hooks get literal and label/annotation fieldRef env; DaemonSet ControllerRevisions carry `controller-revision-hash`.
+63. **Value validation is minimal**
+    Per-kind value validation (enums, formats, cross-field rules) is minimal. Plan: generate it from the upstream OpenAPI, as the protobuf table does.
+65. **Server-side apply gaps**
+    No version conversion of managedFields, built-in atomic structs (`+structType=atomic`, e.g. LabelSelector) are treated as granular, no deduced-type handling for `x-kubernetes-preserve-unknown-fields`, and apply never removes defaulted values it did not set.
+70. **Conformance**
+    Two nodes: 460 of 460 (rounds 22-26); one node: 458 of 460 (the 2 two-node specs cannot pass). Still to do: protobuf watch streams, value validation (#63), timeouts under the parallel load, `kubectl attach` denial by an admission webhook, SelfSubjectRulesReview. History: `docs/CONFORMANCE_KNOWN_ISSUES.md`.
+97. **HA (kr-raft, ADR-026) gaps**
+    - A removed server never sees its own removal and keeps pre-campaigning until it is stopped (harmless: pre-vote). Stop and wipe removed servers.
+    - Membership changes are one at a time; a server whose IP changes while running needs a restart.
+    - Follower reads are as fresh as the applied log (serializable); only the forwarding client gets read-your-writes.
+    - Snapshots are sent whole in one message (512 MB frame limit). Plan: chunked InstallSnapshot if images grow.
+104. **Pod behaviour gaps**
+    Remaining: sidecars are not stopped when every app container of a Never/OnFailure pod finished; LimitRanger ignores Pod and PVC limit types; unsafe sysctls are not rejected; gRPC probes over TLS; pod proxy cannot reach pod IPs in rootless mode; the termination log fallback can include earlier restarts' output.
+105. **API gaps**
+    Protobuf tables and spec validation for the newer kinds; `kubectl attach` denial message; the Guestbook test.
+106. **Workload controller gaps**
     Remaining: the DisruptionTarget condition on surviving victims is unverified; Foreground deletion is unit-tested only; CronJob ReplaceConcurrent and concurrency not checked; DaemonSet rollback needs two nodes.
-
 113. **Intermittent `BadCertificate` calling the CRD conversion webhook** — *open* (round 20)
     The API server's TLS client rejected the webhook pod's certificate for a whole spec (159 consecutive `Tls(Local(BadCertificate))`), failing `CustomResourceConversionWebhook` (x2) and `CustomResourceFieldSelectors` on one node. Not reproduced since: 3000 Go-generated RSA-2048 CA+leaf chains all verify (`crates/kr-crypto/tests/x509_corpus.rs`, ignored test, `KR_CERT_CORPUS`), the focused specs pass, and a full one-node run (2026-10-27) had only the 2 two-node failures (458/460). Diagnostics added: certificate failures now surface as `CertParse`, `CertBadSignature`, `CertUsage`, `CertHostMismatch`, `CertUnsupportedKey` or `CertNoKey` (still alert 42 on the wire), and `kr: webhook NAME call failed (...)` is logged. If it recurs, the log names the check that failed.
+115. **Leftovers of resolved items**
+    - DNS: ExternalName targets outside the cluster are returned as a bare CNAME; the cluster domain is fixed to `cluster.local`.
+    - CRD conversion: objects written earlier keep their stored version (no storage migration); server-side apply through a non-storage version is recorded as an Update; a failed watch batch drops the rest of that chunk.
+    - Streaming: no TTY for `exec -t`; attach is output-only; `logs --previous` returns the current file; `get -o wide` lacks wide columns.
+    - Rootless: the host cannot reach pod IPs directly (use port-forward).
+    - Controllers: namespace deletion conditions are limited to `NamespaceContentRemaining`.
+    - Security: expired bootstrap-token Secrets are not garbage-collected; the server's own certificates (1 year) are not rotated; docker credential helpers are unsupported.
+    - Defaults: rarely used legacy volume-source and alpha-field defaults. HTTP client: no proactive EOF probe before reusing a pooled connection.
+    - Memory: with 4 KB pods the 32 MiB history budget keeps about 4,000 events (watch the `410 Expired` rate); per-pod server growth (about 120 KB at 100 pods) has no per-category breakdown.
+
 # Accepted limitations (by design, or not planned for now)
+11. **aarch64 path is only partly exercised**
+    Remaining: `kr ctr`/kubelet/apiserver paths (namespaces, cgroups, clone3, mounts) are not run under qemu-user and need a real aarch64 host; no CI job yet.
+53. **Binary size** — *watch*
+    The single binary (server, agent, runtime, TLS/crypto, CRDs, webhooks, aggregation, protobuf tables) is 2.87 MB on x86_64 and 2.32 MB on aarch64 (measured 2026-10-27; it was ~1.8 MB when the 2 MB agent budget in PLAN.md was set, which is now exceeded). Measure before adding large features; avoid `{:?}` on large types, and keep `opt-level = "z"` + LTO + strip.
+60. **P-256 scalar multiplication is slow** — *watch*
+    Now a constant-time fixed 4-bit window (masked table scan): ~0.5 ms sign, ~0.95 ms verify (was 0.75 / 1.4 ms), dudect |t| 0.4. A fixed-base comb table would make signing ~4x faster again but costs ~100 KB RAM per process; revisit if handshake rate on the API server matters.

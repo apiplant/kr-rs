@@ -10,7 +10,7 @@ import os
 import re
 
 P = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "KNOWN_ISSUES.md")
-INTRO = ("Living list, grouped by what still needs doing. Each item: **status**, impact, plan. Numbers are "
+INTRO = "Only work still to do lives here. Fixed items move to RESOLVED_ISSUES.md (this script is no longer used)."
          "stable (other docs cite them); new items get the next number. When an item is resolved, mark it "
          "*fixed* with the commit and run `python3 -I tools/sort_known_issues.py`.")
 TITLES = {"work": "Needs work (open or partial)", "accepted": "Accepted limitations (by design, or not planned for now)", "fixed": "Resolved"}
