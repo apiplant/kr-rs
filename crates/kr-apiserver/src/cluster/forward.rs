@@ -69,7 +69,7 @@ impl Cluster {
     /// POSTs `body` to server `to` as this server itself (no forwarded identity); the status.
     pub async fn post_as_self(&self, api: &crate::api::ApiServer, to: kr_raft::NodeId, path: &str, body: &[u8]) -> Option<u16> {
         let a = self.addr_of(api, to)?;
-        let url = alloc::format!("https://{}.{}.{}.{}:{}{}", a.ip[0], a.ip[1], a.ip[2], a.ip[3], a.api_port, path);
+        let url = alloc::format!("https://{}:{}{}", kr_net::tcp::url_host(a.ip), a.api_port, path);
         let http = self.http();
         let mut resp = kr_rt::exec::timeout(10_000, http.request("POST", &url, &[("Content-Type", "application/json")], body)).await.ok()?.ok()?;
         let _ = resp.read_to_end(1 << 20).await;
@@ -80,8 +80,7 @@ impl Cluster {
     #[allow(clippy::too_many_arguments)]
     pub async fn forward(&self, api: &crate::api::ApiServer, leader: kr_raft::NodeId, user: &User, method: &str, path: &str, query: &str, headers: &[(String, String)], body: &[u8]) -> Option<Forwarded> {
         let addr = self.addr_of(api, leader)?;
-        let ip = addr.ip;
-        let mut url = alloc::format!("https://{}.{}.{}.{}:{}{}", ip[0], ip[1], ip[2], ip[3], addr.api_port, path);
+        let mut url = alloc::format!("https://{}:{}{}", kr_net::tcp::url_host(addr.ip), addr.api_port, path);
         if !query.is_empty() {
             url.push('?');
             url.push_str(query);

@@ -74,7 +74,7 @@ fn transport_delivers_and_authenticates() {
         spawn(transport::serve(l, s2.srv.clone(), 2, inbox.clone()));
 
         // 1 -> 2: delivered.
-        let p = Peer::new(([127, 0, 0, 1], port), s1.cli.clone());
+        let p = Peer::new((kr_sys::map4([127, 0, 0, 1]), port), s1.cli.clone());
         p.send(&msg(1, 2, 7));
         for _ in 0..200 {
             if !inbox.msgs.borrow().is_empty() {
@@ -91,7 +91,7 @@ fn transport_delivers_and_authenticates() {
         assert!(inbox.msgs.borrow().iter().all(|m| m.from == 1 && m.term != 8), "spoofed message accepted");
 
         // A certificate outside system:kr-servers delivers nothing.
-        let bad = Peer::new(([127, 0, 0, 1], port), agent.cli.clone());
+        let bad = Peer::new((kr_sys::map4([127, 0, 0, 1]), port), agent.cli.clone());
         bad.send(&msg(1, 2, 10));
         sleep(300).await;
         assert!(inbox.msgs.borrow().iter().all(|m| m.term != 10), "non-server certificate accepted");

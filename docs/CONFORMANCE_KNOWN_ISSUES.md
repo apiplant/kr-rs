@@ -36,6 +36,7 @@ The last three share one cause: all of them call the CRD conversion webhook pod,
 | 19 | 2026-10-26 | **460** (two nodes) | |
 | 20 | 2026-10-27 | 455 (one node) | the two-node specs plus 3 intermittent conversion-webhook certificate failures |
 | 21 | 2026-10-27 | 458 (one node) | only the two-node specs; the conversion-webhook failures did not recur (#113 diagnostics added) |
+| 22 | 2026-10-31 | 460 (two nodes) | with dual stack (IPv6 twin addresses, per-family Services, `[::]` listeners); no regressions |
 
 The causes behind the intermittent failures, for future triage:
 - A burst of new pods used to change the bridge's MAC (a bridge without a fixed address takes the lowest MAC of its ports), so existing pods sent to the old gateway MAC until their ARP entry expired. Fixed by pinning the MAC.

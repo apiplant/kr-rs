@@ -39,7 +39,14 @@ fn log_line(msg: &str) {
 /// as long as its synchronous parts run, which is what clients see as timeouts).
 pub async fn handle(api: &Rc<ApiServer>, req: Request) -> Response {
     let (t0, method, path) = (kr_rt::exec::now_ms(), req.method.clone(), alloc::string::String::from(req.path()));
-    let resp = handle_inner(api, req).await;
+    let pf = core::cell::RefCell::new(None);
+    let mut resp = handle_inner(api, req, &pf).await;
+    if let Some((flow, level)) = pf.into_inner() {
+        resp = resp.with_header("X-Kubernetes-PF-FlowSchema-UID", &flow).with_header("X-Kubernetes-PF-PriorityLevel-UID", &level);
+    }
+    if resp.status == 429 {
+        resp = resp.with_header("Retry-After", "1");
+    }
     let took = kr_rt::exec::now_ms().saturating_sub(t0);
     if took >= 300 && !path.contains("/watch") && resp.status != 101 {
         log_line(&alloc::format!("kr: slow request {method} {path} {} {took}ms\n", resp.status));
@@ -47,7 +54,7 @@ pub async fn handle(api: &Rc<ApiServer>, req: Request) -> Response {
     resp
 }
 
-async fn handle_inner(api: &Rc<ApiServer>, req: Request) -> Response {
+async fn handle_inner(api: &Rc<ApiServer>, req: Request, pf: &core::cell::RefCell<Option<(alloc::string::String, alloc::string::String)>>) -> Response {
     // Another server forwarding a write for one of its clients (ADR-026).
     let peer_cert = req.peer.client_certs.as_deref().and_then(|c| c.first()).map(|c| c.as_slice());
     let forwarded = forward::trusted_identity(peer_cert, req.header(forward::IDENTITY));
@@ -64,6 +71,18 @@ async fn handle_inner(api: &Rc<ApiServer>, req: Request) -> Response {
         headers: &req.headers,
         bearer: req.header("authorization").and_then(|a| a.strip_prefix("Bearer ").or_else(|| a.strip_prefix("bearer "))).map(str::trim),
         authz_verb: None,
+    };
+    // API priority and fairness (a request forwarded by another server was admitted there).
+    let _permit = if is_forwarded {
+        None
+    } else {
+        match crate::apf::admit(api, &r).await {
+            Ok((permit, ids)) => {
+                *pf.borrow_mut() = ids;
+                Some(permit)
+            }
+            Err(e) => return respond(Reply::err(e)),
+        }
     };
     // Raft state of this server, for cluster admins (diagnostics, tools/test/ha.sh).
     if r.method == "GET" && r.path == "/kr/debug/raft" {
@@ -227,6 +246,15 @@ pub async fn run(api: Rc<ApiServer>, addr: [u8; 4], port: u16, tls: Rc<kr_crypto
         }
     });
     let listener = server::listen(addr, port, 4096)?;
+    // Dual stack: pods reach the `kubernetes` Service over IPv6 too (best effort).
+    if addr == [0, 0, 0, 0] {
+        if let Ok(l6) = server::listen6(port, 4096) {
+            let (api, tls) = (api.clone(), tls.clone());
+            kr_rt::exec::spawn(async move {
+                let _ = serve(api, l6, tls).await;
+            });
+        }
+    }
     serve(api, listener, tls).await
 }
 

@@ -49,6 +49,34 @@ check dns-a "$(echo "$DNS" | grep -c '^Address: 10.96.0.11')" 1
 check dns-aaaa "$(echo "$DNS" | grep -c '^Address: fd00:96::b')" 1
 check dns-v6only "$($K exec $P -- sh -c 'wget -qO- -T3 http://v6only.default.svc.cluster.local:80/hostname' | cut -c1-4)" "web-"
 
+
+echo "== pod environment, NodePort, kube-dns"
+$KI apply -f - >/dev/null <<Y
+apiVersion: v1
+kind: Pod
+metadata: {name: envp, labels: {app: envp}}
+spec:
+  containers:
+  - name: c
+    image: $IMG
+    command: [sleep, "3600"]
+    env: [{name: IPS, valueFrom: {fieldRef: {fieldPath: status.podIPs}}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: np}
+spec: {type: NodePort, ipFamilyPolicy: PreferDualStack, selector: {app: web}, ports: [{port: 80, targetPort: 8080, nodePort: 30099}]}
+Y
+$K wait --for=condition=Ready pod/envp --timeout=60s >/dev/null
+check env-podips "$($K exec envp -- sh -c "tr '\\0' '\\n' </proc/1/environ | sed -n s/^IPS=//p" | tr ',' '\n' | grep -c .)" 2
+check hosts-v6 "$($K exec envp -- grep -c "^fd00:88:" /etc/hosts)" 1
+check kube-dns-ips "$($K -n kube-system get svc kube-dns -o jsonpath='{.spec.clusterIPs}')" '["10.96.0.10","fd00:96::a"]'
+check dns-via-v6 "$($K exec envp -- nslookup dual.default.svc.cluster.local fd00:96::a 2>&1 | grep -c '^Address: 10.96.0.11')" 1
+NODE=127.0.0.1
+sleep 3
+check nodeport-v4 "$(docker exec kr1 curl -s -m3 http://$NODE:30099/hostname | cut -c1-4)" "web-"
+check nodeport-v6 "$(docker exec kr1 curl -s -m3 'http://[::1]:30099/hostname' | cut -c1-4)" "web-"
+
 echo "== IPv6 egress (masquerade)"
 docker exec kr1 sh -c 'ip netns add t6 2>/dev/null; ip link add vt0 type veth peer name vt1 netns t6 2>/dev/null; ip addr add fd01::1/64 dev vt0 nodad; ip link set vt0 up; ip -n t6 addr add fd01::2/64 dev vt1 nodad; ip -n t6 link set vt1 up; ip -n t6 link set lo up; mkdir -p /srv6 && echo hi > /srv6/index.html; cd /srv6 && (ip netns exec t6 python3 -m http.server 8000 --bind fd01::2 >/dev/null 2>&1 &)'
 sleep 1

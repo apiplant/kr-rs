@@ -12,6 +12,7 @@
 
 use crate::api::{ApiServer, Reply, Req, User};
 use crate::object::{obj, ApiError};
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
@@ -137,13 +138,15 @@ pub struct Relayed {
     pub body: Vec<u8>,
 }
 
-/// Sends a request to the extension API server behind `apisvc`, as `user`.
-pub async fn forward(api: &ApiServer, apisvc: &Value, method: &str, path_query: &str, headers: &[(&str, &str)], body: &[u8], user: &User, secs: u64) -> Result<Relayed, String> {
+type AggHttp = Http<TlsConnector<crate::webhook::WhResolver>>;
+
+/// An HTTP client for the extension behind `apisvc`, with the base URL and the identity headers.
+fn extension_client(api: &ApiServer, apisvc: &Value, user: &User, secs: u64) -> Result<(AggHttp, String, Vec<(String, String)>), String> {
     let (ns, name, port) = service_of(apisvc).ok_or("APIService has no service")?;
     let svc = api.wh_object("", "v1", "services", Some(&ns), &name).ok_or_else(|| format!("service \"{name}\" not found"))?;
     let ip = svc.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).filter(|i| i.contains('.')).ok_or("service has no cluster IP")?;
     let host = format!("{name}.{ns}.svc");
-    let url = format!("https://{host}:{port}{path_query}");
+    let base = format!("https://{host}:{port}");
     let roots = match apisvc.pointer(&["spec", "caBundle"]).and_then(Value::as_str) {
         Some(b) => x509::pem_decode_all(core::str::from_utf8(&kr_fmt::base64::decode(b).map_err(|_| "invalid caBundle")?).map_err(|_| "invalid caBundle")?, "CERTIFICATE").map_err(|_| "invalid caBundle")?,
         None => Vec::new(),
@@ -153,10 +156,17 @@ pub async fn forward(api: &ApiServer, apisvc: &Value, method: &str, path_query: 
         TlsConnector::new(crate::webhook::WhResolver(HostsResolver::from_contents(&format!("{ip} {host}\n"))), cfg),
         HttpConfig { max_redirects: 0, max_idle: 0, connect_timeout_ms: secs * 1000, head_timeout_ms: secs * 1000, read_timeout_ms: secs * 1000, user_agent: "kube-aggregator".to_string(), ..HttpConfig::default() },
     );
-    let groups: Vec<String> = user.groups.clone();
-    let mut hdrs: Vec<(&str, &str)> = alloc::vec![("X-Remote-User", user.name.as_str())];
-    hdrs.extend(groups.iter().map(|g| ("X-Remote-Group", g.as_str())));
-    hdrs.extend_from_slice(headers);
+    let mut hdrs: Vec<(String, String)> = alloc::vec![(String::from("X-Remote-User"), user.name.clone())];
+    hdrs.extend(user.groups.iter().map(|g| (String::from("X-Remote-Group"), g.clone())));
+    Ok((http, base, hdrs))
+}
+
+/// Sends a request to the extension API server behind `apisvc`, as `user`.
+pub async fn forward(api: &ApiServer, apisvc: &Value, method: &str, path_query: &str, headers: &[(&str, &str)], body: &[u8], user: &User, secs: u64) -> Result<Relayed, String> {
+    let (http, base, mut owned) = extension_client(api, apisvc, user, secs)?;
+    owned.extend(headers.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    let hdrs: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let url = format!("{base}{path_query}");
     let fut = async {
         let mut resp = http.request(method, &url, &hdrs, body).await.map_err(|e| format!("{e:?}"))?;
         let status = resp.status;
@@ -165,6 +175,87 @@ pub async fn forward(api: &ApiServer, apisvc: &Value, method: &str, path_query: 
         Ok::<Relayed, String>(Relayed { status, content_type, body })
     };
     kr_rt::exec::timeout(secs * 1000, fut).await.map_err(|_| String::from("timeout"))?
+}
+
+/// A body fed by a background task (keeps `ResponseStream` poll-based).
+#[derive(Default)]
+struct Pipe {
+    chunks: alloc::collections::VecDeque<Vec<u8>>,
+    done: bool,
+    waker: Option<core::task::Waker>,
+}
+
+struct PipeStream(Rc<core::cell::RefCell<Pipe>>);
+
+impl kr_net::http1::server::ResponseStream for PipeStream {
+    fn poll_next(&mut self, cx: &mut core::task::Context<'_>) -> core::task::Poll<Option<Vec<u8>>> {
+        let mut p = self.0.borrow_mut();
+        if let Some(c) = p.chunks.pop_front() {
+            return core::task::Poll::Ready(Some(c));
+        }
+        if p.done {
+            return core::task::Poll::Ready(None);
+        }
+        p.waker = Some(cx.waker().clone());
+        core::task::Poll::Pending
+    }
+}
+
+impl Drop for PipeStream {
+    fn drop(&mut self) {
+        // The client went away: the relay task notices and stops.
+        self.0.borrow_mut().done = true;
+    }
+}
+
+fn push(p: &Rc<core::cell::RefCell<Pipe>>, chunk: Option<Vec<u8>>) -> bool {
+    let mut g = p.borrow_mut();
+    if g.done && chunk.is_some() {
+        return false; // the consumer is gone
+    }
+    match chunk {
+        Some(c) => g.chunks.push_back(c),
+        None => g.done = true,
+    }
+    if let Some(w) = g.waker.take() {
+        w.wake();
+    }
+    true
+}
+
+/// Opens a streaming request (a watch): the status and content type once the head arrives, then
+/// the body is relayed chunk by chunk until either side ends it.
+async fn forward_stream(api: &ApiServer, apisvc: &Value, path_query: &str, headers: &[(&str, &str)], user: &User) -> Result<Response, String> {
+    let (http, base, mut owned) = extension_client(api, apisvc, user, 30)?;
+    owned.extend(headers.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    let url = format!("{base}{path_query}");
+    let resp = kr_rt::exec::timeout(30_000, async {
+        let hdrs: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        http.request("GET", &url, &hdrs, b"").await.map_err(|e| format!("{e:?}"))
+    })
+    .await
+    .map_err(|_| String::from("timeout"))??;
+    let (status, content_type) = (resp.status, resp.header("content-type").unwrap_or("application/json").to_string());
+    let pipe = Rc::new(core::cell::RefCell::new(Pipe::default()));
+    let p = pipe.clone();
+    kr_rt::exec::spawn(async move {
+        let _keep = http; // the client outlives the response it produced
+        let mut resp = resp;
+        let mut buf = alloc::vec![0u8; 16384];
+        loop {
+            // Idle watches are legitimate: a long (1 h) read timeout bounds the task only.
+            match kr_rt::exec::timeout(3_600_000, resp.read_chunk(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    if !push(&p, Some(buf[..n].to_vec())) {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        push(&p, None);
+    });
+    Ok(Response { status, headers: alloc::vec![(String::from("Content-Type"), content_type)], body: kr_net::http1::server::Body::Stream(Box::new(PipeStream(pipe))) })
 }
 
 fn unavailable(msg: String) -> Reply {
@@ -185,9 +276,6 @@ pub async fn proxy(api: &ApiServer, req: &Req<'_>) -> Option<Reply> {
         Ok(u) => u,
         Err(e) => return Some(Reply::err(e)),
     };
-    if req.query.split('&').any(|p| p == "watch=true" || p == "watch=1") {
-        return Some(Reply::err(ApiError::new(501, "NotImplemented", "watches of aggregated APIs are not supported")));
-    }
     let available = apisvc.pointer(&["status", "conditions"]).and_then(Value::as_array).is_some_and(|c| c.iter().any(|x| x.get("type").and_then(Value::as_str) == Some("Available") && x.get("status").and_then(Value::as_str) == Some("True")));
     if !available {
         return Some(Reply::err(ApiError::new(503, "ServiceUnavailable", format!("the server is currently unable to handle the request (APIService {version}.{group} is not available)"))));
@@ -196,6 +284,12 @@ pub async fn proxy(api: &ApiServer, req: &Req<'_>) -> Option<Reply> {
     let mut hdrs: Vec<(&str, &str)> = Vec::new();
     if let Some(a) = req.accept {
         hdrs.push(("Accept", a));
+    }
+    if req.method == "GET" && req.query.split('&').any(|p| p == "watch=true" || p == "watch=1" || p == "watch") {
+        return Some(match forward_stream(api, &apisvc, &pq, &hdrs, &user).await {
+            Ok(r) => Reply::Http(r),
+            Err(e) => unavailable(e),
+        });
     }
     if let Some(c) = req.content_type {
         hdrs.push(("Content-Type", c));

@@ -69,10 +69,16 @@ fn issue(dir: &str, file: &str, ca: &(Name, x509::SigningKey, Vec<u8>), subject:
 
 /// Drops `<file>.pem/.key` if the certificate does not cover `ip` (this machine's address
 /// changed), so that it is issued again with the new address.
-fn drop_if_ip_changed(pki_dir: &str, file: &str, ip: [u8; 4]) {
+/// The node's primary address: IPv4 if the host has a route out, else IPv6 (`KR_PREFER_IPV6=1`
+/// picks IPv6 even on a dual-stack host: how the IPv6 underlay is tested).
+pub(crate) fn primary_addr() -> [u8; 16] {
+    kr_sys::ns::route_source_any(kr_runtime::store::env_var("KR_PREFER_IPV6").is_some_and(|v| !v.is_empty() && v != "0"))
+}
+
+fn drop_if_ip_changed(pki_dir: &str, file: &str, ip: [u8; 16]) {
     let Ok(b) = fs::read_file(&pki::path(pki_dir, &format!("{file}.pem")), 1 << 20) else { return };
     let Some(der) = core::str::from_utf8(&b).ok().and_then(|p| x509::pem_decode_all(p, "CERTIFICATE").ok()).and_then(|mut v| (!v.is_empty()).then(|| v.remove(0))) else { return };
-    let host = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+    let host = kr_net::tcp::fmt_ip16(ip);
     if x509::Certificate::parse(&der).is_ok_and(|c| !c.matches_host(host.as_bytes())) {
         eprint(format!("kr server: {file}.pem does not cover {host}; issuing a new one\n").as_bytes());
         for ext in ["pem", "key"] {
@@ -85,7 +91,8 @@ fn drop_if_ip_changed(pki_dir: &str, file: &str, ip: [u8; 4]) {
 fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
     let pki_dir = format!("{data}/pki");
     mkdir_p(&pki_dir)?;
-    if let Ok(adv) = kr_sys::ns::route_source([1, 1, 1, 1]) {
+    let adv = primary_addr();
+    if adv != kr_sys::map4([127, 0, 0, 1]) {
         drop_if_ip_changed(&pki_dir, "apiserver", adv);
         drop_if_ip_changed(&pki_dir, "server", adv);
     }
@@ -101,8 +108,15 @@ fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
         }
         let name = Name { common_name: "kube-apiserver".into(), organizations: Vec::new() };
         let mut ips = alloc::vec![alloc::vec![127, 0, 0, 1], alloc::vec![10, 96, 0, 1]];
-        if let Ok(adv) = kr_sys::ns::route_source([1, 1, 1, 1]) {
-            ips.push(adv.to_vec());
+        let adv = primary_addr();
+        if adv != kr_sys::map4([127, 0, 0, 1]) {
+            ips.push(kr_net::tcp::ip_bytes16(adv));
+        }
+        // IPv6: loopback, the kubernetes Service's IPv6 ClusterIP and the host's global address.
+        ips.push(kr_net::tcp::parse_ipv6("::1").unwrap().to_vec());
+        ips.push(kr_net::tcp::parse_ipv6("fd00:96::1").unwrap().to_vec());
+        if let Some(h6) = kr_apiserver::api::host_ip6() {
+            ips.push(h6.to_vec());
         }
         issue(&pki_dir, "apiserver", &ca, name, true, false, dns, ips)?;
     }
@@ -162,7 +176,7 @@ fn rng(b: &mut [u8]) {
 /// HA mode (ADR-026): this server's Raft id (`server-id`, created once) and its
 /// `system:kr-server:<id>` certificate (`pki/server.pem`), used for the Raft transport and for
 /// forwarding writes to the leader.
-fn server_identity(data: &str, advertise: [u8; 4]) -> Result<u64, String> {
+fn server_identity(data: &str, advertise: [u8; 16]) -> Result<u64, String> {
     let id_path = pki::path(data, "server-id");
     let id = match fs::read_file(&id_path, 64).ok().and_then(|b| String::from_utf8(b).ok()).and_then(|s| s.trim().parse::<u64>().ok()) {
         Some(id) => id,
@@ -179,7 +193,7 @@ fn server_identity(data: &str, advertise: [u8; 4]) -> Result<u64, String> {
     if !exists(&pki::path(&pki_dir, "server.pem")) {
         let ca = pki::load_ca(&pki_dir)?;
         let name = Name { common_name: kr_apiserver::cluster::transport::cert_cn(id), organizations: alloc::vec![kr_apiserver::cluster::transport::ORG.into()] };
-        issue(&pki_dir, "server", &ca, name, true, true, Vec::new(), alloc::vec![alloc::vec![127, 0, 0, 1], advertise.to_vec()])?;
+        issue(&pki_dir, "server", &ca, name, true, true, Vec::new(), alloc::vec![alloc::vec![127, 0, 0, 1], kr_net::tcp::ip_bytes16(advertise)])?;
     }
     Ok(id)
 }
@@ -241,7 +255,7 @@ async fn join_cluster(server: &str, token: &str, data: &str) -> Result<Vec<(u64,
     Ok(servers
         .iter()
         .filter_map(|s| {
-            let ip = kr_apiserver::object::parse_ipv4(s.get("ip")?.as_str()?)?;
+            let ip = kr_net::tcp::parse_ip16(s.get("ip")?.as_str()?)?;
             Some((s.get("id")?.as_u64()?, kr_apiserver::cluster::ServerAddr { ip, raft_port: s.get("raftPort")?.as_u64()? as u16, api_port: s.get("apiPort")?.as_u64()? as u16 }))
         })
         .collect())
@@ -257,8 +271,7 @@ async fn become_voter(c: Rc<kr_apiserver::cluster::Cluster>, server: String, pki
             return;
         }
     };
-    let ip = me.ip;
-    let body = format!(r#"{{"ip":"{}.{}.{}.{}","raftPort":{},"apiPort":{}}}"#, ip[0], ip[1], ip[2], ip[3], me.raft_port, me.api_port);
+    let body = me.to_json();
     let body = kr_fmt::json::parse(body.as_bytes()).unwrap();
     use kr_apiserver::client::Client;
     while !c.voters().contains(&c.id) {
@@ -345,7 +358,7 @@ pub fn main(mut args: Args) -> i32 {
         return fail(&e);
     }
     // The address pods, agents and other servers use to reach this API server.
-    let advertise = kr_sys::ns::route_source([1, 1, 1, 1]).unwrap_or([127, 0, 0, 1]);
+    let advertise = primary_addr();
     // An existing single-server datastore: imported on --cluster-init, never thrown away by a join.
     let import_db = ha && raft_fresh && exists(&pki::path(&format!("{data}/db"), "log"));
     if import_db && join_url.is_some() {
@@ -465,6 +478,9 @@ pub fn main(mut args: Args) -> i32 {
         let cfg = kr_controllers::Config { now: pki::now, ..kr_controllers::Config::default() };
         match ha_tasks {
             Some((c, l, srv_tls, id)) => {
+                if let Ok(l6) = kr_net::http1::server::listen6(kr_apiserver::cluster::transport::PORT, 64) {
+                    kr_rt::exec::spawn(kr_apiserver::cluster::transport::serve(l6, srv_tls.clone(), id, c.inbox.clone()));
+                }
                 kr_rt::exec::spawn(kr_apiserver::cluster::transport::serve(l, srv_tls, id, c.inbox.clone()));
                 kr_rt::exec::spawn(c.clone().run(api.clone()));
                 kr_rt::exec::spawn(c.clone().keep_registered(api.clone()));
@@ -520,7 +536,7 @@ fn start_kubelet(api: &Rc<kr_apiserver::api::ApiServer>) -> Result<Rc<kr_kubelet
     let store = kr_runtime::store::Store::open(None).map_err(|_| String::from("cannot open the image store"))?;
     let name = node_name();
     let cgroups = cgroups_available();
-    let node_ip = kr_sys::ns::route_source([1, 1, 1, 1]).unwrap_or([127, 0, 0, 1]);
+    let node_ip = primary_addr();
     let cfg = kr_kubelet::Config { node_name: name, root: String::from(store.root()), network: ns::getuid() == 0, cgroups, node_ip, vxlan: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() != Some("host-gw"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env() };
     let client = kr_apiserver::client::InProcess::new(api.clone(), "kubelet");
     Ok(kr_kubelet::Kubelet::new(client, cfg, store))

@@ -134,7 +134,7 @@ pub struct Nat {
     events: Vec<Event>,
     out: Out,
     forward_icmp: bool,
-    frags: BTreeMap<(Addr, Addr, u8, u16), Frag>,
+    frags: BTreeMap<(Addr, Addr, u8, u32), Frag>,
 }
 
 const MAX_FRAGS: usize = 32;
@@ -183,15 +183,36 @@ fn l4_sum(src: Addr, dst: Addr, proto: u8, seg: &[u8]) -> u16 {
 
 fn ip_packet(out: &mut Out, src: Addr, dst: Addr, proto: u8, payload: &[u8]) {
     if !is4(&src) || !is4(&dst) {
-        // IPv6: no fragmentation (senders stay within the MSS / path MTU).
-        let mut p = Vec::with_capacity(40 + payload.len());
-        p.extend_from_slice(&[0x60, 0, 0, 0]);
-        p.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        p.extend_from_slice(&[proto, 64]);
-        p.extend_from_slice(&src);
-        p.extend_from_slice(&dst);
-        p.extend_from_slice(payload);
-        out.pkts.push(p);
+        // Packets over the MTU leave as fragments (Fragment extension header, RFC 8200).
+        out.ip_id = out.ip_id.wrapping_add(1);
+        let id = out.ip_id as u32;
+        let one = |off: usize, chunk: &[u8], more: bool, frag: bool| {
+            let ext = if frag { 8 } else { 0 };
+            let mut p = Vec::with_capacity(40 + ext + chunk.len());
+            p.extend_from_slice(&[0x60, 0, 0, 0]);
+            p.extend_from_slice(&((ext + chunk.len()) as u16).to_be_bytes());
+            p.extend_from_slice(&[if frag { 44 } else { proto }, 64]);
+            p.extend_from_slice(&src);
+            p.extend_from_slice(&dst);
+            if frag {
+                p.extend_from_slice(&[proto, 0]);
+                p.extend_from_slice(&((off as u16 & 0xfff8) | more as u16).to_be_bytes());
+                p.extend_from_slice(&id.to_be_bytes());
+            }
+            p.extend_from_slice(chunk);
+            p
+        };
+        if out.mtu == 0 || 40 + payload.len() <= out.mtu {
+            out.pkts.push(one(0, payload, false, false));
+            return;
+        }
+        let step = (out.mtu.saturating_sub(48) / 8 * 8).max(8);
+        let mut off = 0;
+        while off < payload.len() {
+            let end = (off + step).min(payload.len());
+            out.pkts.push(one(off, &payload[off..end], end < payload.len(), true));
+            off = end;
+        }
         return;
     }
     let (src, dst) = (v4(&src), v4(&dst));
@@ -279,7 +300,7 @@ struct Ip<'a> {
     /// Header (with options) of the packet, for ICMP errors quoting it.
     hdr: &'a [u8],
     ttl: u8,
-    id: u16,
+    id: u32,
     /// Fragment byte offset, and whether more fragments follow.
     off: usize,
     mf: bool,
@@ -290,17 +311,30 @@ fn parse_ip(p: &[u8]) -> Option<Ip<'_>> {
         // IPv6: only packets whose next header is the transport (no extension headers, so no
         // fragments either).
         let len = u16::from_be_bytes([p[4], p[5]]) as usize;
-        if !matches!(p[6], 6 | 17 | 58) || 40 + len > p.len() {
+        if 40 + len > p.len() {
+            return None;
+        }
+        // A Fragment header (next header 44) is the one extension header understood.
+        let (proto, hl, id, off, mf) = if p[6] == 44 {
+            if len < 8 {
+                return None;
+            }
+            let fo = u16::from_be_bytes([p[42], p[43]]);
+            (p[40], 8, u32::from_be_bytes([p[44], p[45], p[46], p[47]]), (fo & 0xfff8) as usize, fo & 1 != 0)
+        } else {
+            (p[6], 0, 0, 0, false)
+        };
+        if !matches!(proto, 6 | 17 | 58) {
             return None;
         }
         return Some(Ip {
-            id: 0,
-            off: 0,
-            mf: false,
+            id,
+            off,
+            mf,
             src: p[8..24].try_into().ok()?,
             dst: p[24..40].try_into().ok()?,
-            proto: p[6],
-            payload: &p[40..40 + len],
+            proto,
+            payload: &p[40 + hl..40 + len],
             hdr: &p[..40],
             ttl: p[7],
         });
@@ -318,7 +352,7 @@ fn parse_ip(p: &[u8]) -> Option<Ip<'_>> {
     }
     let fo = u16::from_be_bytes([p[6], p[7]]);
     Some(Ip {
-        id: u16::from_be_bytes([p[4], p[5]]),
+        id: u16::from_be_bytes([p[4], p[5]]) as u32,
         off: (fo & 0x1fff) as usize * 8,
         mf: fo & 0x2000 != 0,
         src: m4([p[12], p[13], p[14], p[15]]),
@@ -1275,6 +1309,30 @@ mod tests {
         }
         let ev = nat.take_events();
         assert_eq!(ev.len(), 1);
+        let Event::UdpSend { data: got, port, .. } = &ev[0] else { panic!() };
+        assert_eq!((got, *port), (&data, 53));
+    }
+
+    #[test]
+    fn ipv6_fragments_roundtrip() {
+        let (src, dst) = ([0xfd, 0, 0, 0x88, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2], [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+        let data: Vec<u8> = (0..3000u32).map(|i| (i * 5) as u8).collect();
+        let mut seg = Vec::new();
+        seg.extend_from_slice(&1234u16.to_be_bytes());
+        seg.extend_from_slice(&53u16.to_be_bytes());
+        seg.extend_from_slice(&((8 + data.len()) as u16).to_be_bytes());
+        seg.extend_from_slice(&[0, 0]);
+        seg.extend_from_slice(&data);
+        let c = match l4_sum(src, dst, 17, &seg) { 0 => 0xffff, c => c };
+        seg[6..8].copy_from_slice(&c.to_be_bytes());
+        let mut o = Out { mtu: 600, ..Out::default() };
+        ip_packet(&mut o, src, dst, 17, &seg);
+        assert!(o.pkts.len() > 4 && o.pkts.iter().all(|p| p.len() <= 600 && p[6] == 44));
+        let mut nat = Nat::new(1500);
+        for f in o.pkts.iter().rev() {
+            nat.packet_from_pod(f, 0);
+        }
+        let ev = nat.take_events();
         let Event::UdpSend { data: got, port, .. } = &ev[0] else { panic!() };
         assert_eq!((got, *port), (&data, 53));
     }

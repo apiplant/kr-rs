@@ -93,6 +93,8 @@ fn local_op(op: u8, proto: u8, ip: Ip, port: u16) -> Result<Option<Fd>, Errno> {
                         // The Service CIDR is only a local *route*; IPv6 refuses to bind such an
                         // address unless IPV6_FREEBIND (78) is set.
                         kr_sys::setsockopt(fd.raw(), 41, 78, &1i32.to_ne_bytes())?;
+                        // A wildcard (NodePort/hostPort) must not shadow the IPv4 one.
+                        kr_sys::setsockopt(fd.raw(), 41, 26, &1i32.to_ne_bytes())?; // IPV6_V6ONLY
                         kr_sys::bind6(fd.raw(), &kr_sys::SockaddrIn6::new(ip, port))?
                     }
                 }
@@ -334,6 +336,9 @@ impl<C: Client + Clone + 'static> Proxy<C> {
             let affinity = s.pointer(&["spec", "sessionAffinity"]).and_then(Value::as_str) == Some("ClientIP");
             for cip in cips.iter().copied() {
             let want6 = kr_sys::unmap4(cip).is_none();
+            // The API server may listen on one family only (IPv6-only hosts): its Service is
+            // reached through whichever family its endpoints have.
+            let any_family = kr_apiserver::client::meta(s, "namespace") == "default" && kr_apiserver::client::meta(s, "name") == "kubernetes";
             for p in s.pointer(&["spec", "ports"]).and_then(Value::as_array).unwrap_or(&[]) {
                 let proto = match p.get("protocol").and_then(Value::as_str) {
                     Some("UDP") => UDP,
@@ -352,7 +357,7 @@ impl<C: Client + Clone + 'static> Proxy<C> {
                             continue;
                         }
                         for a in e.get("addresses").and_then(Value::as_array).unwrap_or(&[]) {
-                            if let Some(ip) = a.as_str().and_then(ip16).filter(|ip| kr_sys::unmap4(*ip).is_none() == want6) {
+                            if let Some(ip) = a.as_str().and_then(ip16).filter(|ip| any_family || kr_sys::unmap4(*ip).is_none() == want6) {
                                 list.push((ip, tp as u16));
                             }
                         }
@@ -362,7 +367,7 @@ impl<C: Client + Clone + 'static> Proxy<C> {
                     let target = sub.get("ports").and_then(Value::as_array).and_then(|ps| ps.iter().find(|ep| ep.get("name").and_then(Value::as_str).unwrap_or("") == pname)).and_then(|ep| ep.get("port")).and_then(Value::as_u64);
                     let Some(tp) = target else { continue };
                     for a in sub.get("addresses").and_then(Value::as_array).unwrap_or(&[]) {
-                        if let Some(ip) = a.get("ip").and_then(Value::as_str).and_then(ip16).filter(|ip| kr_sys::unmap4(*ip).is_none() == want6) {
+                        if let Some(ip) = a.get("ip").and_then(Value::as_str).and_then(ip16).filter(|ip| any_family || kr_sys::unmap4(*ip).is_none() == want6) {
                             list.push((ip, tp as u16));
                         }
                     }
@@ -371,6 +376,9 @@ impl<C: Client + Clone + 'static> Proxy<C> {
                 desired.insert(Key { proto, ip: cip, port: port as u16, host: false }, mk(&list));
                 if let (false, Some(np)) = (want6, p.get("nodePort").and_then(Value::as_u64)) {
                     desired.insert(Key { proto, ip: kr_sys::map4([0, 0, 0, 0]), port: np as u16, host: true }, mk(&list));
+                }
+                if let (true, Some(np)) = (want6, p.get("nodePort").and_then(Value::as_u64)) {
+                    desired.insert(Key { proto, ip: [0; 16], port: np as u16, host: true }, mk(&list));
                 }
             }
             }
@@ -411,6 +419,7 @@ fn host_port_listeners(pods: &[Value], desired: &mut BTreeMap<Key, Backends>) {
             continue;
         }
         let Some(pip) = p.pointer(&["status", "podIP"]).and_then(Value::as_str).and_then(ip4) else { continue };
+        let pip6 = p.pointer(&["status", "podIPs"]).and_then(Value::as_array).and_then(|a| a.iter().filter_map(|x| x.get("ip").and_then(Value::as_str)).find_map(kr_net::tcp::parse_ipv6));
         for c in p.pointer(&["spec", "containers"]).and_then(Value::as_array).unwrap_or(&[]) {
             for pt in c.get("ports").and_then(Value::as_array).unwrap_or(&[]) {
                 let (Some(hp), Some(cp)) = (pt.get("hostPort").and_then(Value::as_u64), pt.get("containerPort").and_then(Value::as_u64)) else { continue };
@@ -422,8 +431,18 @@ fn host_port_listeners(pods: &[Value], desired: &mut BTreeMap<Key, Backends>) {
                     Some("TCP") | None => TCP,
                     _ => continue,
                 };
-                let ip = kr_sys::map4(pt.get("hostIP").and_then(Value::as_str).and_then(ip4).unwrap_or([0; 4]));
-                desired.insert(Key { proto, ip, port: hp as u16, host: true }, Backends { eps: alloc::vec![(kr_sys::map4(pip), cp as u16)], rr: Cell::new(0), affinity: false });
+                let host_ip = pt.get("hostIP").and_then(Value::as_str).filter(|s| !s.is_empty());
+                let v6_host = host_ip.and_then(kr_net::tcp::parse_ipv6);
+                // An IPv6 hostIP is served by the pod's IPv6 address, anything else by IPv4.
+                if v6_host.is_none() {
+                    let ip = kr_sys::map4(host_ip.and_then(ip4).unwrap_or([0; 4]));
+                    desired.insert(Key { proto, ip, port: hp as u16, host: true }, Backends { eps: alloc::vec![(kr_sys::map4(pip), cp as u16)], rr: Cell::new(0), affinity: false });
+                }
+                if let Some(p6) = pip6 {
+                    if host_ip.is_none() || v6_host.is_some() {
+                        desired.insert(Key { proto, ip: v6_host.unwrap_or([0; 16]), port: hp as u16, host: true }, Backends { eps: alloc::vec![(p6, cp as u16)], rr: Cell::new(0), affinity: false });
+                    }
+                }
             }
         }
     }

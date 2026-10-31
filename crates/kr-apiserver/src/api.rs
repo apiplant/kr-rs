@@ -61,7 +61,7 @@ pub struct Req<'a> {
 pub trait NodeProxy {
     /// `node`/`node_ip`: where the pod runs (from `spec.nodeName` and the Node's InternalIP).
     #[allow(clippy::too_many_arguments)]
-    fn pod_subresource(&self, sub: &str, namespace: &str, pod: &str, node: &str, node_ip: Option<[u8; 4]>, query: &str, headers: &[(String, String)]) -> Result<kr_net::http1::server::Response, ApiError>;
+    fn pod_subresource(&self, sub: &str, namespace: &str, pod: &str, node: &str, node_ip: Option<[u8; 16]>, query: &str, headers: &[(String, String)]) -> Result<kr_net::http1::server::Response, ApiError>;
 }
 
 pub enum Reply {
@@ -124,7 +124,8 @@ pub struct ApiServer {
     cluster: RefCell<Option<alloc::rc::Rc<crate::cluster::Cluster>>>,
     /// Bootstrap parameters, re-applied by every new leader ([`ApiServer::bootstrap_all`]).
     boot_token: RefCell<Option<(String, String)>>,
-    boot_services: core::cell::Cell<Option<([u8; 4], u16)>>,
+    boot_services: core::cell::Cell<Option<([u8; 16], u16)>>,
+    pub(crate) apf: crate::apf::Apf,
     /// `fieldValidation` of the request being handled (`Ignore` outside `handle`).
     fv_mode: core::cell::Cell<crate::fieldval::Mode>,
     /// Warnings for the response of the request being handled.
@@ -224,6 +225,11 @@ fn is_masters(u: &User) -> bool {
     u.groups.iter().any(|g| g == "system:masters")
 }
 
+/// The node's global (non link-local) IPv6 address, if the host has an IPv6 route.
+pub fn host_ip6() -> Option<[u8; 16]> {
+    kr_sys::ns::route_source6([0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88])
+}
+
 impl ApiServer {
     pub fn new(mut store: Store, now: fn() -> i64, rng: fn(&mut [u8]), server_address: String) -> Result<ApiServer, ApiError> {
         let ns = resources::find("", "v1", "namespaces").unwrap();
@@ -241,7 +247,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()) };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()) };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -469,7 +475,7 @@ impl ApiServer {
             }
         };
         let (client_key, serving_key) = (key("clientKey")?, key("servingKey")?);
-        let ips: Vec<Vec<u8>> = b.get("addresses").and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_str).filter_map(object::parse_ipv4).map(|a| a.to_vec()).collect();
+        let ips: Vec<Vec<u8>> = b.get("addresses").and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_str).filter_map(kr_net::tcp::parse_ip16).map(kr_net::tcp::ip_bytes16).collect();
         let guard = self.ca.borrow();
         let (ca_name, ca_key, ca_der) = guard.as_ref().ok_or_else(|| ApiError::new(503, "ServiceUnavailable", "node joining is not enabled"))?;
         let now = (self.now)();
@@ -535,16 +541,10 @@ impl ApiServer {
             self.bootstrap_object(pcr, None, name, "PriorityClass", &body);
         }
         // The default ServiceCIDR (the allocator's range) and the mandatory API priority and
-        // fairness objects; kr does not enforce APF, these exist for API clients.
+        // fairness objects ([`crate::apf`]).
         let scr = resources::find("networking.k8s.io", "v1", "servicecidrs").unwrap();
         self.bootstrap_object(scr, None, "kubernetes", "ServiceCIDR", r#"{"metadata":{"name":"kubernetes"},"spec":{"cidrs":["10.96.0.0/16"]},"status":{"conditions":[{"type":"Ready","status":"True","reason":"","message":"Kubernetes Service CIDR is ready","lastTransitionTime":"1970-01-01T00:00:00Z"}]}}"#);
-        let plr = resources::find("flowcontrol.apiserver.k8s.io", "v1", "prioritylevelconfigurations").unwrap();
-        let fsr = resources::find("flowcontrol.apiserver.k8s.io", "v1", "flowschemas").unwrap();
-        let mandatory = r#"{"apf.kubernetes.io/autoupdate-spec":"true"}"#;
-        self.bootstrap_object(plr, None, "exempt", "PriorityLevelConfiguration", &alloc::format!(r#"{{"metadata":{{"name":"exempt","annotations":{mandatory}}},"spec":{{"type":"Exempt","exempt":{{"nominalConcurrencyShares":0,"lendablePercent":0}}}}}}"#));
-        self.bootstrap_object(plr, None, "catch-all", "PriorityLevelConfiguration", &alloc::format!(r#"{{"metadata":{{"name":"catch-all","annotations":{mandatory}}},"spec":{{"type":"Limited","limited":{{"nominalConcurrencyShares":5,"lendablePercent":0,"limitResponse":{{"type":"Reject"}}}}}}}}"#));
-        self.bootstrap_object(fsr, None, "exempt", "FlowSchema", &alloc::format!(r#"{{"metadata":{{"name":"exempt","annotations":{mandatory}}},"spec":{{"priorityLevelConfiguration":{{"name":"exempt"}},"matchingPrecedence":1,"rules":[{{"subjects":[{{"kind":"Group","group":{{"name":"system:masters"}}}}],"resourceRules":[{{"verbs":["*"],"apiGroups":["*"],"resources":["*"],"clusterScope":true,"namespaces":["*"]}}],"nonResourceRules":[{{"verbs":["*"],"nonResourceURLs":["*"]}}]}}]}}}}"#));
-        self.bootstrap_object(fsr, None, "catch-all", "FlowSchema", &alloc::format!(r#"{{"metadata":{{"name":"catch-all","annotations":{mandatory}}},"spec":{{"priorityLevelConfiguration":{{"name":"catch-all"}},"matchingPrecedence":10000,"distinguisherMethod":{{"type":"ByUser"}},"rules":[{{"subjects":[{{"kind":"Group","group":{{"name":"system:unauthenticated"}}}},{{"kind":"Group","group":{{"name":"system:authenticated"}}}}],"resourceRules":[{{"verbs":["*"],"apiGroups":["*"],"resources":["*"],"clusterScope":true,"namespaces":["*"]}}],"nonResourceRules":[{{"verbs":["*"],"nonResourceURLs":["*"]}}]}}]}}}}"#));
+        crate::apf::seed(self);
         let scr = resources::find("storage.k8s.io", "v1", "storageclasses").unwrap();
         self.bootstrap_object(scr, None, "local-path", "StorageClass", r#"{"metadata":{"name":"local-path","annotations":{"storageclass.kubernetes.io/is-default-class":"true"}},"provisioner":"kr.io/local-path","reclaimPolicy":"Delete","volumeBindingMode":"WaitForFirstConsumer"}"#);
         let nsr = resources::find("", "v1", "namespaces").unwrap();
@@ -557,7 +557,7 @@ impl ApiServer {
     }
 
     /// Creates an object if missing (bootstrap data; never overwrites user changes).
-    fn bootstrap_object(&self, res: &Resource, ns: Option<&str>, name: &str, kind: &str, body: &str) {
+    pub(crate) fn bootstrap_object(&self, res: &Resource, ns: Option<&str>, name: &str, kind: &str, body: &str) {
         if !self.writable() {
             return; // HA follower: the leader bootstraps
         }
@@ -1295,7 +1295,7 @@ impl ApiServer {
                     .and_then(|r| self.store.borrow().get(&r.key(None, &node)))
                     .and_then(|kv| json::parse(&kv.value).ok())
                     .and_then(|v| {
-                        v.pointer(&["status", "addresses"])?.as_array()?.iter().find(|a| a.get("type").and_then(Value::as_str) == Some("InternalIP"))?.get("address")?.as_str().and_then(object::parse_ipv4)
+                        v.pointer(&["status", "addresses"])?.as_array()?.iter().filter(|a| a.get("type").and_then(Value::as_str) == Some("InternalIP")).find_map(|a| a.get("address")?.as_str().and_then(kr_net::tcp::parse_ip16))
                     });
                 let proxy = self.node_proxy.borrow().clone().ok_or_else(|| ApiError::new(503, "ServiceUnavailable", "no node agent to serve this request"))?;
                 let ns = rt.namespace.clone().unwrap_or_default();
@@ -2638,7 +2638,7 @@ impl ApiServer {
         }
     }
 
-    pub fn ensure_builtin_services(&self, advertise: [u8; 4], port: u16) -> Result<(), ApiError> {
+    pub fn ensure_builtin_services(&self, advertise: [u8; 16], port: u16) -> Result<(), ApiError> {
         self.boot_services.set(Some((advertise, port)));
         if !self.writable() {
             return Ok(());
@@ -2646,14 +2646,23 @@ impl ApiServer {
         let svc = resources::find("", "v1", "services").unwrap();
         let ep = resources::find("", "v1", "endpoints").unwrap();
         // HA: every server is an endpoint of the kubernetes Service.
-        let mut addrs: Vec<([u8; 4], u16)> = self.cluster().map(|c| c.servers(self)).unwrap_or_default().into_iter().map(|(_, a)| (a.ip, a.api_port)).collect();
+        let mut addrs: Vec<([u8; 16], u16)> = self.cluster().map(|c| c.servers(self)).unwrap_or_default().into_iter().map(|(_, a)| (a.ip, a.api_port)).collect();
         if addrs.is_empty() {
             addrs.push((advertise, port));
         }
         let port = addrs[0].1;
-        let ips: Vec<String> = addrs.iter().map(|(a, _)| alloc::format!(r#"{{"ip":"{}.{}.{}.{}"}}"#, a[0], a[1], a[2], a[3])).collect();
+        let host6 = crate::api::host_ip6();
+        // A dual-stack host also offers its IPv6 address (when the servers are IPv4 only).
+        if let Some(h6) = host6 {
+            if !addrs.iter().any(|(a, _)| kr_sys::unmap4(*a).is_none()) {
+                addrs.push((h6, port));
+            }
+        }
+        let ips: Vec<String> = addrs.iter().map(|(a, _)| alloc::format!(r#"{{"ip":"{}"}}"#, kr_net::tcp::fmt_ip16(*a))).collect();
         let ips = ips.join(",");
-        self.bootstrap_object(svc, Some("default"), "kubernetes", "Service", r#"{"metadata":{"name":"kubernetes","labels":{"component":"apiserver","provider":"kubernetes"}},"spec":{"type":"ClusterIP","clusterIP":"10.96.0.1","clusterIPs":["10.96.0.1"],"ipFamilies":["IPv4"],"ipFamilyPolicy":"SingleStack","sessionAffinity":"None","internalTrafficPolicy":"Cluster","ports":[{"name":"https","port":443,"protocol":"TCP","targetPort":6443}]}}"#);
+        let kube = r#"{"metadata":{"name":"kubernetes","labels":{"component":"apiserver","provider":"kubernetes"}},"spec":{"type":"ClusterIP","clusterIP":"10.96.0.1","clusterIPs":["10.96.0.1"],"ipFamilies":["IPv4"],"ipFamilyPolicy":"SingleStack","sessionAffinity":"None","internalTrafficPolicy":"Cluster","ports":[{"name":"https","port":443,"protocol":"TCP","targetPort":6443}]}}"#;
+        let kube = if host6.is_some() { kube.replace(r#""clusterIPs":["10.96.0.1"],"ipFamilies":["IPv4"],"ipFamilyPolicy":"SingleStack""#, r#""clusterIPs":["10.96.0.1","fd00:96::1"],"ipFamilies":["IPv4","IPv6"],"ipFamilyPolicy":"PreferDualStack""#) } else { String::from(kube) };
+        self.bootstrap_object(svc, Some("default"), "kubernetes", "Service", &kube);
         // The endpoints follow the API server's current address (re-written on every start).
         let body = alloc::format!(r#"{{"metadata":{{"name":"kubernetes","labels":{{"endpointslice.kubernetes.io/skip-mirror":"true"}}}},"subsets":[{{"addresses":[{ips}],"ports":[{{"name":"https","port":{port},"protocol":"TCP"}}]}}]}}"#);
         let key = ep.key(Some("default"), "kubernetes");
@@ -2661,12 +2670,19 @@ impl ApiServer {
         self.bootstrap_object(ep, Some("default"), "kubernetes", "Endpoints", &body);
         // The same addresses as an EndpointSlice (no controller owns the Service's endpoints).
         let eps = resources::find("discovery.k8s.io", "v1", "endpointslices").unwrap();
-        let endpoints: Vec<String> = addrs.iter().map(|(a, _)| alloc::format!(r#"{{"addresses":["{}.{}.{}.{}"],"conditions":{{"ready":true,"serving":true,"terminating":false}}}}"#, a[0], a[1], a[2], a[3])).collect();
-        let body = alloc::format!(r#"{{"metadata":{{"name":"kubernetes","labels":{{"kubernetes.io/service-name":"kubernetes"}}}},"addressType":"IPv4","endpoints":[{}],"ports":[{{"name":"https","port":{port},"protocol":"TCP"}}]}}"#, endpoints.join(","));
-        let key = eps.key(Some("default"), "kubernetes");
-        let _ = self.store.borrow_mut().delete(&key, None);
-        self.bootstrap_object(eps, Some("default"), "kubernetes", "EndpointSlice", &body);
-        self.bootstrap_object(svc, Some("kube-system"), "kube-dns", "Service", r#"{"metadata":{"name":"kube-dns","labels":{"k8s-app":"kube-dns","kubernetes.io/name":"CoreDNS"},"annotations":{"kr.io/builtin":"dns"}},"spec":{"type":"ClusterIP","clusterIP":"10.96.0.10","clusterIPs":["10.96.0.10"],"ipFamilies":["IPv4"],"ipFamilyPolicy":"SingleStack","sessionAffinity":"None","internalTrafficPolicy":"Cluster","ports":[{"name":"dns","port":53,"protocol":"UDP","targetPort":53},{"name":"dns-tcp","port":53,"protocol":"TCP","targetPort":53}]}}"#);
+        // One EndpointSlice per address family that has servers (none for a family with none).
+        for (name, v6) in [("kubernetes", false), ("kubernetes-v6", true)] {
+            let list: Vec<String> = addrs.iter().filter(|(a, _)| kr_sys::unmap4(*a).is_none() == v6).map(|(a, _)| alloc::format!(r#"{{"addresses":["{}"],"conditions":{{"ready":true,"serving":true,"terminating":false}}}}"#, kr_net::tcp::fmt_ip16(*a))).collect();
+            let key = eps.key(Some("default"), name);
+            let _ = self.store.borrow_mut().delete(&key, None);
+            if list.is_empty() {
+                continue;
+            }
+            let ty = if v6 { "IPv6" } else { "IPv4" };
+            let body = alloc::format!(r#"{{"metadata":{{"name":"{name}","labels":{{"kubernetes.io/service-name":"kubernetes"}}}},"addressType":"{ty}","endpoints":[{}],"ports":[{{"name":"https","port":{port},"protocol":"TCP"}}]}}"#, list.join(","));
+            self.bootstrap_object(eps, Some("default"), name, "EndpointSlice", &body);
+        }
+        self.bootstrap_object(svc, Some("kube-system"), "kube-dns", "Service", r#"{"metadata":{"name":"kube-dns","labels":{"k8s-app":"kube-dns","kubernetes.io/name":"CoreDNS"},"annotations":{"kr.io/builtin":"dns"}},"spec":{"type":"ClusterIP","clusterIP":"10.96.0.10","clusterIPs":["10.96.0.10","fd00:96::a"],"ipFamilies":["IPv4","IPv6"],"ipFamilyPolicy":"PreferDualStack","sessionAffinity":"None","internalTrafficPolicy":"Cluster","ports":[{"name":"dns","port":53,"protocol":"UDP","targetPort":53},{"name":"dns-tcp","port":53,"protocol":"TCP","targetPort":53}]}}"#);
         self.sync()
     }
 

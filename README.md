@@ -123,7 +123,8 @@ Numbers will vary with hardware; the commands to reproduce them are in `tools/te
 - Admission: validating and mutating webhooks, ValidatingAdmissionPolicy and MutatingAdmissionPolicy (CEL), Pod Security admission, ResourceQuota, LimitRange, priority classes, ServiceAccount
 - Authentication: client certificates, bootstrap tokens, signed ServiceAccount tokens (TokenRequest, projected, audience-bound), TokenReview, impersonation
 - Authorization: RBAC, Node authorizer, SubjectAccessReview and the self-service review APIs
-- API aggregation: APIServices backed by a Service, with front-proxy authentication
+- API aggregation: APIServices backed by a Service, with front-proxy authentication (watches are relayed as streams)
+- API priority and fairness: FlowSchemas classify requests into priority levels with concurrency limits, per-flow fair queues and 429 + `Retry-After` when full
 - Pod certificates (`PodCertificateRequest` and projected `podCertificate` volumes) and ClusterTrustBundles
 
 **Controllers and scheduler**
@@ -188,11 +189,8 @@ tools/test/conformance.sh results /tmp/out       # failures by area
 
 ## Limitations
 
-- Dual stack, not IPv6-only: pods, Services, EndpointSlices, the proxy and cluster DNS handle both families, but the API server, node addresses, NodePort/hostPort, `kube-dns` and the host-gw backend are IPv4 only. Rootless pods and `kr ctr run` containers reach the outside through a userspace NAT (about 300 MB/s on loopback-class links; `ping` works when `net.ipv4.ping_group_range` allows it; IP fragments are reassembled and window scaling is negotiated).
-- Watches of aggregated APIs are not supported (the API returns 501).
-- Pod resize has no restart policies and does not model `PodResizePending`.
+- Dual stack: pods always have both families; hosts may have IPv4, IPv6 or both (node join, Raft, kubelet, VXLAN work over an IPv6 underlay). There is no IPv4-free *pod* network.
 - Only ECDSA P-256 keys for pod certificates; RSA is verify-only.
-- API priority and fairness objects exist but are not enforced.
 - Not certified by the CNCF: the suite passes, but the certification process has not been run.
 - The full list is in [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
 
@@ -207,6 +205,7 @@ tools/test/ha.sh              # three-server Raft cluster
 tools/test/rootless-egress.sh # rootless pod and ctr egress: download, upload, DNS, ping (run as a normal user)
 tools/test/rootless-egress-v6.sh # the same over IPv6 in a throwaway container
 tools/test/dualstack.sh       # dual-stack pods, Services and DNS on a two-node cluster
+tools/test/aggregated-watch.sh   # a watch through an aggregated API (extension server in a pod)
 ```
 
 Documents: [`docs/PLAN.md`](docs/PLAN.md) (design and budgets), [`docs/DECISIONS.md`](docs/DECISIONS.md) (architecture decision records), [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md), [`docs/CONFORMANCE_KNOWN_ISSUES.md`](docs/CONFORMANCE_KNOWN_ISSUES.md).

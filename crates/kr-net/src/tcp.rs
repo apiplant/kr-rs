@@ -90,6 +90,43 @@ pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     (n == 4).then_some(out)
 }
 
+/// Either family as the 16-byte form (IPv4 mapped to `::ffff:a.b.c.d`).
+pub fn parse_ip16(s: &str) -> Option<[u8; 16]> {
+    parse_ipv4(s).map(kr_sys::map4).or_else(|| parse_ipv6(s))
+}
+
+/// Text form of a 16-byte address: dotted for a mapped IPv4, RFC 5952-ish for IPv6.
+pub fn fmt_ip16(a: [u8; 16]) -> String {
+    match kr_sys::unmap4(a) {
+        Some(v) => alloc::format!("{}.{}.{}.{}", v[0], v[1], v[2], v[3]),
+        None => ipv6_string(a),
+    }
+}
+
+/// Host part for a URL or `host:port`: IPv6 in brackets.
+pub fn url_host(a: [u8; 16]) -> String {
+    match kr_sys::unmap4(a) {
+        Some(_) => fmt_ip16(a),
+        None => alloc::format!("[{}]", ipv6_string(a)),
+    }
+}
+
+/// `IpAddr` for a 16-byte address (mapped IPv4 becomes `V4`).
+pub fn ip_addr16(a: [u8; 16]) -> IpAddr {
+    match kr_sys::unmap4(a) {
+        Some(v) => IpAddr::V4(v),
+        None => IpAddr::V6(a),
+    }
+}
+
+/// Certificate SAN / raw bytes of an address: 4 bytes for IPv4, 16 for IPv6.
+pub fn ip_bytes16(a: [u8; 16]) -> Vec<u8> {
+    match kr_sys::unmap4(a) {
+        Some(v) => v.to_vec(),
+        None => a.to_vec(),
+    }
+}
+
 /// RFC 4291 text form, including `::` compression and an embedded IPv4 tail.
 pub fn parse_ipv6(s: &str) -> Option<[u8; 16]> {
     let (head, tail) = match s.find("::") {

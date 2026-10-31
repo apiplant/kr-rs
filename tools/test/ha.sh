@@ -12,10 +12,12 @@ REPO=$(cd "$(dirname "$0")/../.." && pwd)
 SERVERS="krs1 krs2 krs3"
 KC="-e KUBECONFIG=/var/tmp/srv/admin.kubeconfig"
 k() { local n=$1; shift; docker exec $KC "$n" kubectl "$@"; }
-ip() { docker inspect -f '{{.NetworkSettings.Networks.krha.IPAddress}}' "$1"; }
+# KR_HA_V6=1: servers and the agent talk over IPv6 only (fd07::N on eth0; IPv4 stays for image pulls).
+V6=${KR_HA_V6:+KR_PREFER_IPV6=1}
+ip() { if [ -n "${KR_HA_V6:-}" ]; then case $1 in krs[0-9]) echo "[fd07::${1#krs}]";; *) echo "[fd07::10]";; esac; return; fi; docker inspect -f '{{.NetworkSettings.Networks.krha.IPAddress}}' "$1"; }
 start() { # name, extra args
   local n=$1; shift
-  docker exec -d "$n" sh -c "KR_REGISTRY_MIRRORS=$("$REPO/tools/test/registry-cache.sh" env krha) KR_ROOT=/store /krbin/kr server --data /var/tmp/srv $* >> /tmp/srv.log 2>&1"
+  docker exec -d "$n" sh -c "$V6 KR_REGISTRY_MIRRORS=$("$REPO/tools/test/registry-cache.sh" env krha) KR_ROOT=/store /krbin/kr server --data /var/tmp/srv $* >> /tmp/srv.log 2>&1"
 }
 wait_api() { for _ in $(seq 60); do k "$1" get --raw /healthz >/dev/null 2>&1 && return 0; sleep 1; done; echo "API on $1 not up"; return 1; }
 fail() { echo "FAIL: $*"; for n in $SERVERS; do echo "== $n"; docker exec "$n" tail -20 /tmp/srv.log || true; done; exit 1; }
@@ -33,6 +35,10 @@ up() {
     docker run -d --name $n --hostname $n --network krha --privileged --tmpfs /store:exec,size=2g \
       -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" \
       archlinux:base-devel sleep infinity >/dev/null
+    if [ -n "${KR_HA_V6:-}" ]; then
+      a=$(ip "$n"); a=${a#[}; a=${a%]}
+      docker exec "$n" sh -c "sysctl -qw net.ipv6.conf.eth0.disable_ipv6=0; ip -6 addr add ${a#}/64 dev eth0 nodad; ip -6 route add default dev eth0 metric 1024"
+    fi
   done
   start krs1 --cluster-init
   wait_api krs1
@@ -46,7 +52,7 @@ up() {
   done
   NTOKEN=$(docker exec krs1 cat /var/tmp/srv/node-token)
   docker exec kra1 sh -c "umask 077; echo '$NTOKEN' > /root/kr-token"
-  docker exec -d kra1 sh -c "KR_REGISTRY_MIRRORS=$("$REPO/tools/test/registry-cache.sh" env krha) KR_ROOT=/store /krbin/kr agent --server https://$(ip krs2):6443 --token-file /root/kr-token > /tmp/agent.log 2>&1"
+  docker exec -d kra1 sh -c "$V6 KR_REGISTRY_MIRRORS=$("$REPO/tools/test/registry-cache.sh" env krha) KR_ROOT=/store /krbin/kr agent --server https://$(ip krs2):6443 --token-file /root/kr-token > /tmp/agent.log 2>&1"
   for _ in $(seq 90); do
     [ "$(k krs1 get nodes --no-headers 2>/dev/null | grep -c ' Ready')" = 4 ] && break; sleep 1
   done
@@ -110,7 +116,7 @@ test_() {
   echo "agent failed over: lease $R0 -> $R1"
   # ...and restarts while its --server is still down (saved server list).
   docker exec kra1 pkill -9 -x kr; sleep 1
-  docker exec -d kra1 sh -c "KR_REGISTRY_MIRRORS=$("$REPO/tools/test/registry-cache.sh" env krha) KR_ROOT=/store /krbin/kr agent --server https://$(ip krs2):6443 >> /tmp/agent.log 2>&1"
+  docker exec -d kra1 sh -c "$V6 KR_REGISTRY_MIRRORS=$("$REPO/tools/test/registry-cache.sh" env krha) KR_ROOT=/store /krbin/kr agent --server https://$(ip krs2):6443 >> /tmp/agent.log 2>&1"
   sleep 40
   R2=$(k krs1 get lease -n kube-node-lease kra1 -o jsonpath='{.spec.renewTime}')
   [ "$R2" != "$R1" ] || fail "restarted agent did not reach another server"

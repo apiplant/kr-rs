@@ -38,9 +38,9 @@ fn header<'a>(h: &'a [(String, String)], name: &str) -> Option<&'a str> {
     h.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
 }
 
-async fn connect(tls: Rc<ClientConfig>, ip: [u8; 4]) -> Option<TlsStream<kr_rt::exec::Async<kr_sys::Fd>>> {
-    let sock = kr_net::tcp::connect_addr(kr_net::tcp::SocketAddr { ip: kr_net::tcp::IpAddr::V4(ip), port: KUBELET_PORT }, 5000).await.ok()?;
-    let name = alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+async fn connect(tls: Rc<ClientConfig>, ip: [u8; 16]) -> Option<TlsStream<kr_rt::exec::Async<kr_sys::Fd>>> {
+    let sock = kr_net::tcp::connect_addr(kr_net::tcp::SocketAddr { ip: kr_net::tcp::ip_addr16(ip), port: KUBELET_PORT }, 5000).await.ok()?;
+    let name = kr_net::tcp::fmt_ip16(ip);
     kr_rt::exec::timeout(5000, TlsStream::connect(sock, tls, &name)).await.ok()?.ok()
 }
 
@@ -102,7 +102,7 @@ fn push(p: &Rc<RefCell<Pipe>>, chunk: Option<Vec<u8>>) {
 }
 
 impl NodeProxy for Router {
-    fn pod_subresource(&self, sub: &str, ns: &str, pod: &str, node: &str, node_ip: Option<[u8; 4]>, query: &str, headers: &[(String, String)]) -> Result<Response, ApiError> {
+    fn pod_subresource(&self, sub: &str, ns: &str, pod: &str, node: &str, node_ip: Option<[u8; 16]>, query: &str, headers: &[(String, String)]) -> Result<Response, ApiError> {
         if node == self.local_node {
             let l = self.local.as_ref().ok_or_else(|| ApiError::new(503, "ServiceUnavailable", "no local kubelet"))?;
             return l.pod_subresource(sub, ns, pod, node, node_ip, query, headers);
@@ -120,7 +120,7 @@ impl NodeProxy for Router {
                     push(&p, Some(b"error: cannot reach the node's kubelet\n".to_vec()));
                     return push(&p, None);
                 };
-                let req = alloc::format!("GET {target} HTTP/1.1\r\nHost: {}.{}.{}.{}\r\nConnection: close\r\n\r\n", ip[0], ip[1], ip[2], ip[3]);
+                let req = alloc::format!("GET {target} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", kr_net::tcp::url_host(ip));
                 if t.write_all(req.as_bytes()).await.is_err() {
                     return push(&p, None);
                 }
@@ -154,8 +154,8 @@ impl NodeProxy for Router {
             Box::pin(async move {
                 let Some(mut t) = connect(tls, ip).await else { return };
                 let req = alloc::format!(
-                    "GET {target} HTTP/1.1\r\nHost: {}.{}.{}.{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Protocol: {proto}\r\n\r\n",
-                    ip[0], ip[1], ip[2], ip[3]
+                    "GET {target} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Protocol: {proto}\r\n\r\n",
+                    kr_net::tcp::url_host(ip)
                 );
                 if t.write_all(req.as_bytes()).await.is_err() {
                     return;
@@ -303,5 +303,10 @@ pub async fn serve(proxy: Rc<dyn NodeProxy>, node: String, tls: Rc<core::cell::R
         })();
         Box::pin(async move { resp })
     };
-    server::serve(listener, cfg, Rc::new(handler)).await
+    let handler: Rc<dyn server::Handler> = Rc::new(handler);
+    // The same endpoint on IPv6 (best effort: hosts without IPv6 just skip it).
+    if let Ok(l6) = server::listen6(KUBELET_PORT, 128) {
+        kr_rt::exec::spawn(server::serve(l6, cfg.clone(), handler.clone()));
+    }
+    server::serve(listener, cfg, handler).await
 }

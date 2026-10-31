@@ -188,7 +188,7 @@ async fn service_env<C: Client>(c: &C, pod: &Value) -> Vec<(String, String)> {
 
 /// The pod's /etc/hosts: kubelet-managed (localhost, the pod's own name, `hostAliases`), or for
 /// hostNetwork pods a copy of the node's file, which upstream does not manage either.
-pub fn write_etc_hosts(pod_dir: &str, pod: &Value, hostname: &str, ip: Option<[u8; 4]>) -> Result<(), ()> {
+pub fn write_etc_hosts(pod_dir: &str, pod: &Value, hostname: &str, ip: Option<[u8; 4]>, ip6: Option<[u8; 16]>) -> Result<(), ()> {
     let host_net = pod.pointer(&["spec", "hostNetwork"]).and_then(Value::as_bool) == Some(true);
     let mut s = if host_net {
         String::from_utf8(kr_sys::fs::read_file(b"/etc/hosts\0", 1024 * 1024).unwrap_or_default()).unwrap_or_default()
@@ -203,6 +203,14 @@ pub fn write_etc_hosts(pod_dir: &str, pod: &Value, hostname: &str, ip: Option<[u
                 None => String::from(hostname),
             };
             s.push_str(&alloc::format!("{}.{}.{}.{}\t{names}\n", a[0], a[1], a[2], a[3]));
+        }
+        if let Some(a6) = ip6 {
+            let sub = pod.pointer(&["spec", "subdomain"]).and_then(Value::as_str).filter(|s| !s.is_empty());
+            let names = match sub {
+                Some(sub) => alloc::format!("{hostname}.{sub}.{}.svc.cluster.local\t{hostname}", meta(pod, "namespace")),
+                None => String::from(hostname),
+            };
+            s.push_str(&alloc::format!("{}\t{names}\n", kr_net::tcp::ipv6_string(a6)));
         }
         s
     };
@@ -274,12 +282,18 @@ async fn key_ref<C: Client>(c: &C, ns: &str, kind: &str, r: &Value) -> Result<Op
     }
 }
 
-fn field_ref(pod: &Value, path: &str, ip: Option<[u8; 4]>, node: &str, host_ip: &str) -> Option<String> {
+fn field_ref(pod: &Value, path: &str, ip: Option<[u8; 4]>, ip6: Option<[u8; 16]>, node: &str, host_ip: &str) -> Option<String> {
     Some(match path {
         "metadata.name" | "metadata.namespace" | "metadata.uid" => meta(pod, &path[9..]).to_string(),
         "spec.nodeName" => node.to_string(),
         "spec.serviceAccountName" => pod.pointer(&["spec", "serviceAccountName"]).and_then(Value::as_str).unwrap_or("default").to_string(),
-        "status.podIP" | "status.podIPs" => ip.map(|a| alloc::format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3])).unwrap_or_default(),
+        "status.podIP" | "status.podIPs" => {
+            let mut v: Vec<String> = ip.map(|a| alloc::format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3])).into_iter().collect();
+            if path == "status.podIPs" {
+                v.extend(ip6.map(kr_net::tcp::ipv6_string));
+            }
+            v.join(",")
+        }
         "status.hostIP" | "status.hostIPs" => host_ip.to_string(),
         p if p.starts_with("metadata.labels['") || p.starts_with("metadata.annotations['") => {
             let (field, rest) = p.split_once("['")?;
@@ -339,6 +353,24 @@ pub(crate) fn pod_resources(pod: &Value) -> (Limits, u64) {
     total.cpu_milli = total.cpu_milli.map(|m| m.saturating_add(oh_cpu));
     let request = apps.iter().map(|c| mem(c, "requests").or_else(|| mem(c, "limits")).unwrap_or(0)).sum::<u64>().saturating_add(oh_mem);
     (total, request)
+}
+
+/// The pod's summed CPU request in millicores (a missing request falls back to the limit).
+pub(crate) fn cpu_request(pod: &Value) -> u64 {
+    let milli = |c: &Value, kind: &str| quantity(c.pointer(&["resources", kind, "cpu"])).and_then(|q| q.milli_value()).and_then(|v| u64::try_from(v).ok());
+    pod.pointer(&["spec", "containers"]).and_then(Value::as_array).map(|a| a.iter().map(|c| milli(c, "requests").or_else(|| milli(c, "limits")).unwrap_or(0)).sum()).unwrap_or(0)
+}
+
+/// Whether changing a container's `resources` from `old` to `new` (JSON) needs a restart: some
+/// resource whose requests or limits differ has `resizePolicy[].restartPolicy: RestartContainer`.
+pub(crate) fn resize_needs_restart(ctr: &Value, old: &str, new: &str) -> bool {
+    let parse = |s: &str| kr_fmt::json::parse(s.as_bytes()).unwrap_or(Value::Null);
+    let (o, n) = (parse(old), parse(new));
+    let policies = ctr.get("resizePolicy").and_then(Value::as_array).unwrap_or(&[]);
+    ["cpu", "memory"].iter().any(|res| {
+        let differs = ["requests", "limits"].iter().any(|k| o.pointer(&[k, res]) != n.pointer(&[k, res]));
+        differs && policies.iter().any(|p| p.get("resourceName").and_then(Value::as_str) == Some(res) && p.get("restartPolicy").and_then(Value::as_str) == Some("RestartContainer"))
+    })
 }
 
 /// Writes a configMap/secret volume's files into `dir`.
@@ -409,7 +441,7 @@ fn downward(pod: &Value, d: &Value, dir: &str, default_mode: u32) -> Result<(), 
                     let m = pod.pointer(&["metadata", &fp[9..]]).and_then(Value::as_object).unwrap_or(&[]);
                     m.iter().map(|(k, v)| alloc::format!("{k}=\"{}\"\n", v.as_str().unwrap_or(""))).collect::<String>()
                 }
-                other => field_ref(pod, other, None, "", pod.pointer(&["status", "hostIP"]).and_then(Value::as_str).unwrap_or("")).unwrap_or_default(),
+                other => field_ref(pod, other, None, None, "", pod.pointer(&["status", "hostIP"]).and_then(Value::as_str).unwrap_or("")).unwrap_or_default(),
             }
         } else if let Some(rf) = it.get("resourceFieldRef") {
             resource_field_ref(pod, None, rf).ok_or_else(|| alloc::format!("downwardAPI {path}: unsupported resourceFieldRef"))?
@@ -891,7 +923,7 @@ async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str
     }
 }
 
-pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig, pod_dir: &str, ip: Option<[u8; 4]>, node: &str, host_ip: &str, store: &kr_runtime::store::Store) -> Result<Built, String> {
+pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig, pod_dir: &str, ip: Option<[u8; 4]>, ip6: Option<[u8; 16]>, node: &str, host_ip: &str, store: &kr_runtime::store::Store) -> Result<Built, String> {
     let ns = meta(pod, "namespace");
     // env: image env, then container env (later wins), with $(VAR) expansion.
     let mut env: Vec<(String, String)> = img.env.iter().filter_map(|e| e.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect();
@@ -924,7 +956,7 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
             Some(expand(v, &env))
         } else if let Some(vf) = e.get("valueFrom") {
             if let Some(f) = vf.get("fieldRef") {
-                field_ref(pod, f.get("fieldPath").and_then(Value::as_str).unwrap_or(""), ip, node, host_ip)
+                field_ref(pod, f.get("fieldPath").and_then(Value::as_str).unwrap_or(""), ip, ip6, node, host_ip)
             } else if let Some(r) = vf.get("configMapKeyRef") {
                 key_ref(c, ns, "configmaps", r).await?
             } else if let Some(r) = vf.get("secretKeyRef") {
@@ -1100,6 +1132,16 @@ mod resource_field_tests {
 #[cfg(test)]
 mod pem_tests {
     use super::pem_certs;
+
+    #[test]
+    fn resize_restart_follows_resize_policy() {
+        let ctr = kr_fmt::json::parse(br#"{"name":"c","resizePolicy":[{"resourceName":"cpu","restartPolicy":"NotRequired"},{"resourceName":"memory","restartPolicy":"RestartContainer"}]}"#).unwrap();
+        let (a, b) = (r#"{"requests":{"cpu":"100m","memory":"64Mi"}}"#, r#"{"requests":{"cpu":"200m","memory":"64Mi"}}"#);
+        assert!(!super::resize_needs_restart(&ctr, a, b)); // cpu only: in place
+        assert!(super::resize_needs_restart(&ctr, a, r#"{"requests":{"cpu":"100m","memory":"128Mi"}}"#)); // memory: restart
+        assert!(super::resize_needs_restart(&ctr, a, r#"{"requests":{"cpu":"100m","memory":"64Mi"},"limits":{"memory":"1Gi"}}"#));
+        assert!(!super::resize_needs_restart(&kr_fmt::json::parse(br#"{"name":"c"}"#).unwrap(), a, r#"{"requests":{"memory":"1Gi"}}"#)); // default NotRequired
+    }
 
     #[test]
     fn blocks_keep_their_line_structure() {

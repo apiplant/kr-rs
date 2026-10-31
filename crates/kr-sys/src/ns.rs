@@ -600,6 +600,42 @@ pub fn route_source(dst: [u8; 4]) -> Result<[u8; 4]> {
     Ok([addr[4], addr[5], addr[6], addr[7]])
 }
 
+/// The node's primary address: the IPv4 source towards the internet if there is one, else the
+/// global IPv6 source, else loopback. IPv4 comes back mapped (`::ffff:a.b.c.d`).
+pub fn route_source_any(prefer6: bool) -> [u8; 16] {
+    let v6 = || route_source6([0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88]);
+    if prefer6 {
+        if let Some(a) = v6() {
+            return a;
+        }
+    }
+    if let Ok(a) = route_source([1, 1, 1, 1]) {
+        if a != [0; 4] {
+            return super::map4(a);
+        }
+    }
+    v6().unwrap_or_else(|| super::map4([127, 0, 0, 1]))
+}
+
+/// IPv6 variant of [`route_source`]: the source address the kernel would pick towards `dst`
+/// (None without an IPv6 route). Link-local and loopback results are not usable as node addresses.
+pub fn route_source6(dst: [u8; 16]) -> Option<[u8; 16]> {
+    #[cfg(target_arch = "x86_64")]
+    const GETSOCKNAME: usize = 51;
+    #[cfg(target_arch = "aarch64")]
+    const GETSOCKNAME: usize = 204;
+    let sock = super::socket(super::AF_INET6, 2 | super::O_CLOEXEC, 0).ok()?;
+    super::connect6(sock.raw(), &super::SockaddrIn6::new(dst, 53)).ok()?;
+    let mut addr = [0u8; 28];
+    let mut len: u32 = 28;
+    // SAFETY: addr/len describe a writable sockaddr_in6 buffer.
+    check(unsafe { syscall3(GETSOCKNAME, sock.raw() as usize, addr.as_mut_ptr() as usize, &mut len as *mut u32 as usize) }).ok()?;
+    let mut ip = [0u8; 16];
+    ip.copy_from_slice(&addr[8..24]);
+    let link_local = ip[0] == 0xfe && ip[1] & 0xc0 == 0x80;
+    (!link_local && ip != [0; 16] && ip[..15] != [0; 15]).then_some(ip)
+}
+
 #[cfg(target_arch = "x86_64")]
 mod sock_nr {
     pub const SENDTO: usize = 44;

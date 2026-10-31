@@ -136,12 +136,12 @@ pub async fn serve(listener: Async<Fd>, tls: Rc<ServerConfig>, me: NodeId, inbox
 pub struct Peer {
     queue: Rc<RefCell<VecDeque<Vec<u8>>>>,
     wake: Rc<Notify>,
-    addr: Rc<RefCell<([u8; 4], u16)>>,
+    addr: Rc<RefCell<([u8; 16], u16)>>,
     _task: JoinHandle<()>,
 }
 
 impl Peer {
-    pub fn new(addr: ([u8; 4], u16), tls: Rc<ClientConfig>) -> Peer {
+    pub fn new(addr: ([u8; 16], u16), tls: Rc<ClientConfig>) -> Peer {
         let queue: Rc<RefCell<VecDeque<Vec<u8>>>> = Rc::default();
         let wake: Rc<Notify> = Rc::default();
         let addr = Rc::new(RefCell::new(addr));
@@ -151,7 +151,7 @@ impl Peer {
 
     /// A changed address takes effect at once: the open connection is dropped (one to a dead
     /// address can accept writes for minutes before TCP gives up).
-    pub fn set_addr(&self, addr: ([u8; 4], u16)) {
+    pub fn set_addr(&self, addr: ([u8; 16], u16)) {
         if *self.addr.borrow() != addr {
             *self.addr.borrow_mut() = addr;
             self.wake.notify();
@@ -179,11 +179,11 @@ impl Drop for Peer {
     }
 }
 
-async fn sender(queue: Rc<RefCell<VecDeque<Vec<u8>>>>, wake: Rc<Notify>, addr: Rc<RefCell<([u8; 4], u16)>>, tls: Rc<ClientConfig>) {
+async fn sender(queue: Rc<RefCell<VecDeque<Vec<u8>>>>, wake: Rc<Notify>, addr: Rc<RefCell<([u8; 16], u16)>>, tls: Rc<ClientConfig>) {
     let mut backoff = 100;
     loop {
         let (ip, port) = *addr.borrow();
-        let sock = match kr_net::tcp::connect_addr(kr_net::tcp::SocketAddr { ip: kr_net::tcp::IpAddr::V4(ip), port }, 3000).await {
+        let sock = match kr_net::tcp::connect_addr(kr_net::tcp::SocketAddr { ip: kr_net::tcp::ip_addr16(ip), port }, 3000).await {
             Ok(s) => s,
             Err(_) => {
                 // Messages queued for a dead peer are stale by the time it returns.
@@ -193,7 +193,7 @@ async fn sender(queue: Rc<RefCell<VecDeque<Vec<u8>>>>, wake: Rc<Notify>, addr: R
                 continue;
             }
         };
-        let name = alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+        let name = kr_net::tcp::fmt_ip16(ip);
         let mut s = match timeout(10_000, TlsStream::connect(sock, tls.clone(), &name)).await {
             Ok(Ok(s)) => s,
             _ => {

@@ -15,6 +15,8 @@ use kr_net::tcp::{IpAddr, SocketAddr};
 use kr_rt::exec::Async;
 
 pub const DNS_IP: [u8; 4] = [10, 96, 0, 10];
+/// The `kube-dns` Service's IPv6 ClusterIP (`fd00:96::a`).
+pub const DNS_IP6: [u8; 16] = [0xfd, 0, 0, 0x96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a];
 
 #[derive(Default)]
 struct Snapshot {
@@ -139,7 +141,21 @@ pub async fn run<C: Client + Clone + 'static>(c: C, net: Rc<NodeNet>) {
     let (Ok(udp), Ok(tcp)) = (Async::new(udp), Async::new(tcp)) else { return };
     let z: Rc<dyn Zone> = zone.clone();
     kr_rt::exec::spawn(dnsserver::serve_udp(udp, z.clone(), upstream.clone()));
-    kr_rt::exec::spawn(dnsserver::serve_tcp(tcp, z, upstream));
+    kr_rt::exec::spawn(dnsserver::serve_tcp(tcp, z.clone(), upstream.clone()));
+    // The same server on the Service's IPv6 address (best effort: the v6 service route may lag).
+    let (net6, z6, up6) = (net.clone(), z.clone(), upstream.clone());
+    kr_rt::exec::spawn(async move {
+        for _ in 0..60 {
+            if let (Ok(u), Ok(t)) = (net6.listen(2, DNS_IP6, 53), net6.listen(1, DNS_IP6, 53)) {
+                if let (Ok(u), Ok(t)) = (Async::new(u), Async::new(t)) {
+                    kr_rt::exec::spawn(dnsserver::serve_udp(u, z6.clone(), up6.clone()));
+                    kr_rt::exec::spawn(dnsserver::serve_tcp(t, z6, up6));
+                }
+                return;
+            }
+            kr_rt::exec::sleep(1000).await;
+        }
+    });
     loop {
         kr_rt::exec::sleep(1000).await;
         zone.refresh(&c).await;

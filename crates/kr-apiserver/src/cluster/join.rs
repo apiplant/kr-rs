@@ -86,7 +86,7 @@ impl Cluster {
                 let servers = Value::Array(
                     self.servers(api)
                         .into_iter()
-                        .map(|(id, a)| obj(alloc::vec![("id", Value::from(id as i64)), ("ip", Value::from(alloc::format!("{}.{}.{}.{}", a.ip[0], a.ip[1], a.ip[2], a.ip[3]).as_str())), ("raftPort", Value::from(a.raft_port as i64)), ("apiPort", Value::from(a.api_port as i64))]))
+                        .map(|(id, a)| obj(alloc::vec![("id", Value::from(id as i64)), ("ip", Value::from(kr_net::tcp::fmt_ip16(a.ip).as_str())), ("raftPort", Value::from(a.raft_port as i64)), ("apiPort", Value::from(a.api_port as i64))]))
                         .collect(),
                 );
                 Ok(ok(obj(alloc::vec![("files", files), ("servers", servers)])))
@@ -94,7 +94,7 @@ impl Cluster {
             "/kr/add-server" => {
                 let user = api.authenticate(req)?;
                 let id = server_id(&user).ok_or_else(|| ApiError::new(403, "Forbidden", "only server certificates may join as servers"))?;
-                let ip = body.get("ip").and_then(Value::as_str).and_then(crate::object::parse_ipv4).ok_or_else(|| ApiError::bad_request("ip is required"))?;
+                let ip = body.get("ip").and_then(Value::as_str).and_then(kr_net::tcp::parse_ip16).ok_or_else(|| ApiError::bad_request("ip is required"))?;
                 let port = |f: &str| body.get(f).and_then(Value::as_u64).filter(|p| (1..=65535).contains(p)).map(|p| p as u16).ok_or_else(|| ApiError::bad_request(alloc::format!("{f} is required")));
                 let addr = ServerAddr { ip, raft_port: port("raftPort")?, api_port: port("apiPort")? };
                 // The address first (so the leader can reach the new voter), then membership.

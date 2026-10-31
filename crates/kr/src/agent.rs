@@ -64,7 +64,7 @@ pub(crate) async fn fetch_ca(server: &str, pin: [u8; 32]) -> Result<Vec<u8>, Str
     Ok(der)
 }
 
-async fn join(server: &str, token: &str, pki_dir: &str, name: &str, ip: [u8; 4]) -> Result<(), String> {
+async fn join(server: &str, token: &str, pki_dir: &str, name: &str, ip: [u8; 16]) -> Result<(), String> {
     let (hash, secret) = token.trim().strip_prefix("K10").and_then(|t| t.split_once("::")).ok_or("token must look like K10<hash>::<id>.<secret>")?;
     let pin = unhex32(hash).ok_or("bad CA hash in token")?;
     let ca = fetch_ca(server, pin).await?;
@@ -81,18 +81,15 @@ async fn join(server: &str, token: &str, pki_dir: &str, name: &str, ip: [u8; 4])
 
 /// New client and serving keys, certified by `POST /kr/join` (first join with the bootstrap
 /// token, rotation with the current node certificate). Returns (file, PEM, mode).
-async fn request_certs(remote: &Remote, name: &str, ip: [u8; 4]) -> Result<[(&'static str, String, u32); 4], String> {
+async fn request_certs(remote: &Remote, name: &str, ip: [u8; 16]) -> Result<[(&'static str, String, u32); 4], String> {
     let client_key = pki::new_key();
     let serving_key = pki::new_key();
     let b64 = |k: &SigningKey| kr_fmt::base64::encode(&k.public().spki());
     let body = format!(
-        r#"{{"nodeName":"{name}","clientKey":"{}","servingKey":"{}","addresses":["{}.{}.{}.{}"]}}"#,
+        r#"{{"nodeName":"{name}","clientKey":"{}","servingKey":"{}","addresses":["{}"]}}"#,
         b64(&client_key),
         b64(&serving_key),
-        ip[0],
-        ip[1],
-        ip[2],
-        ip[3]
+        kr_net::tcp::fmt_ip16(ip)
     );
     let req = kr_fmt::json::parse(body.as_bytes()).map_err(|_| String::from("internal: bad join request"))?;
     let r = remote.create("/kr/join", &req).await.map_err(|e| format!("join refused: {} {}", e.code, e.message))?;
@@ -117,7 +114,7 @@ fn serving_config(pki_dir: &str) -> Result<Rc<kr_crypto::tls::ServerConfig>, Str
 
 /// Renews the node certificates at 2/3 of their lifetime (KNOWN_ISSUES #82): new keys via
 /// `/kr/join`, files replaced atomically, then the API client and the kubelet server switch.
-async fn rotate(remote: Remote, pki_dir: String, name: String, ip: [u8; 4], serving: Rc<core::cell::RefCell<Rc<kr_crypto::tls::ServerConfig>>>) {
+async fn rotate(remote: Remote, pki_dir: String, name: String, ip: [u8; 16], serving: Rc<core::cell::RefCell<Rc<kr_crypto::tls::ServerConfig>>>) {
     loop {
         let (nb, na) = validity(&pki_dir, "node.pem").unwrap_or((0, 0));
         let due = nb + (na - nb) * 2 / 3;
@@ -144,7 +141,7 @@ async fn rotate(remote: Remote, pki_dir: String, name: String, ip: [u8; 4], serv
     }
 }
 
-async fn renew(remote: &Remote, pki_dir: &str, name: &str, ip: [u8; 4]) -> Result<(), String> {
+async fn renew(remote: &Remote, pki_dir: &str, name: &str, ip: [u8; 16]) -> Result<(), String> {
     let files = request_certs(remote, name, ip).await?;
     for (file, data, mode) in &files {
         let tmp = format!("{file}.new");
@@ -167,8 +164,8 @@ async fn track_servers(remote: Remote, file: String) {
             for sub in ep.get("subsets").and_then(kr_fmt::json::Value::as_array).map(|a| a.to_vec()).unwrap_or_default() {
                 let port = sub.pointer(&["ports"]).and_then(kr_fmt::json::Value::as_array).and_then(|p| p.first()).and_then(|p| p.get("port")).and_then(kr_fmt::json::Value::as_u64).unwrap_or(6443);
                 for a in sub.get("addresses").and_then(kr_fmt::json::Value::as_array).map(|a| a.to_vec()).unwrap_or_default() {
-                    if let Some(ip) = a.get("ip").and_then(kr_fmt::json::Value::as_str).and_then(kr_apiserver::object::parse_ipv4) {
-                        urls.push(format!("https://{}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]));
+                    if let Some(ip) = a.get("ip").and_then(kr_fmt::json::Value::as_str).and_then(kr_net::tcp::parse_ip16) {
+                        urls.push(format!("https://{}:{port}", kr_net::tcp::url_host(ip)));
                     }
                 }
             }
@@ -217,8 +214,17 @@ pub fn main(mut args: Args) -> i32 {
     let pki_dir = format!("{data}/pki");
     let name = node_name();
     // Our address as seen on the path to the server.
-    let host = server.trim_start_matches("https://").split(':').next().unwrap_or("");
-    let ip = kr_apiserver::object::parse_ipv4(host).and_then(|a| ns::route_source(a).ok()).or_else(|| ns::route_source([1, 1, 1, 1]).ok()).unwrap_or([127, 0, 0, 1]);
+    let rest = server.trim_start_matches("https://");
+    let host = match rest.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => rest.split(':').next().unwrap_or(""),
+    };
+    let ip = kr_net::tcp::parse_ip16(host)
+        .and_then(|d| match kr_sys::unmap4(d) {
+            Some(v4) => ns::route_source(v4).ok().map(kr_sys::map4),
+            None => ns::route_source6(d),
+        })
+        .unwrap_or_else(crate::server::primary_addr);
     let joined = ns::open(&pki::path(&pki_dir, "node.pem"), ns::O_RDONLY, 0).is_ok();
     if !joined {
         let token = match (token, token_file) {
@@ -263,7 +269,7 @@ pub fn main(mut args: Args) -> i32 {
     let rotation = (remote.clone(), pki_dir.clone(), name.clone(), ip, tls.clone());
     let tracker = remote.clone();
     let kubelet = kr_kubelet::Kubelet::new(remote, cfg, store);
-    print(format!("kr agent: node {name} ({}.{}.{}.{}) -> {server}\n", ip[0], ip[1], ip[2], ip[3]).as_bytes());
+    print(format!("kr agent: node {name} ({}) -> {server}\n", kr_net::tcp::fmt_ip16(ip)).as_bytes());
     kr_rt::exec::block_on(async move {
         let proxy: Rc<dyn kr_apiserver::api::NodeProxy> = Rc::new(kr_kubelet::stream::Proxy(kubelet.clone()));
         kr_rt::exec::spawn(kr_kubelet::remote::serve(proxy, name, tls));

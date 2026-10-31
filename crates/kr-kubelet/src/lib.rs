@@ -52,7 +52,7 @@ pub struct Config {
     /// cgroup limits are applied only when kr runs in a delegated cgroup.
     pub cgroups: bool,
     /// The node's InternalIP (reported in Node status; peers route pod subnets to it).
-    pub node_ip: [u8; 4],
+    pub node_ip: [u8; 16],
     /// Pod network backend: VXLAN overlay (true) or host-gw routes (false, needs one L2 segment).
     pub vxlan: bool,
     /// Hard eviction: MemAvailable (bytes) below which the node is under memory pressure.
@@ -150,6 +150,10 @@ struct Ctr {
     /// The container's `resources` as last applied (JSON; "" when unset): reported in the status,
     /// and compared with the spec to resize a running container in place.
     res: String,
+    /// Being restarted because a resource with `resizePolicy: RestartContainer` changed.
+    resize_restart: bool,
+    /// When the restart for a resize escalates from SIGTERM to SIGKILL (ms).
+    resize_kill_at: u64,
 }
 
 struct PodRt {
@@ -162,7 +166,7 @@ struct PodRt {
     /// IPv6 twin of `ip` (dual-stack pod network), when the pod got one.
     ip6: Option<[u8; 16]>,
     /// The node's InternalIP: status.hostIP, and the pod IP of hostNetwork pods.
-    node_ip: [u8; 4],
+    node_ip: [u8; 16],
     ctrs: Vec<Ctr>,
     start_time: i64,
     /// Kill deadline (ms) once termination started.
@@ -180,6 +184,10 @@ struct PodRt {
     qos: &'static str,
     /// Summed memory requests (plus overhead), the eviction baseline.
     mem_request: u64,
+    /// Summed CPU request (millicores), for resize feasibility.
+    cpu_request: u64,
+    /// `PodResizePending`: why the last resize was not applied (`Infeasible` / `Deferred`) and the message.
+    resize_pending: Option<(&'static str, String)>,
     /// system-node-critical / system-cluster-critical or a static pod: never evicted.
     critical: bool,
     /// Set once evicted for memory pressure: containers are killed and never restarted.
@@ -421,7 +429,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     async fn vxlan_loop(&self) {
         use kr_net::netlink::{self, mac_string, parse_mac, vtep_mac, RTPROT_KR};
         let my_mac = mac_string(vtep_mac(self.cfg.node_ip));
-        let my_ip = fmt_ip(self.cfg.node_ip);
+        let my_ip = kr_net::tcp::fmt_ip16(self.cfg.node_ip);
         loop {
             if let (Ok(list), Ok(nl)) = (self.c.list("/api/v1/nodes", "").await, netlink::Netlink::route()) {
                 let mut mine = None;
@@ -435,7 +443,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                         mine = Some(pn);
                         continue;
                     }
-                    let ip = n.pointer(&["status", "addresses"]).and_then(Value::as_array).and_then(|a| a.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("InternalIP"))).and_then(|x| x.get("address")).and_then(Value::as_str).and_then(kr_apiserver::object::parse_ipv4);
+                    let ip = internal_ip(n, kr_sys::unmap4(self.cfg.node_ip).is_none());
                     if let Some(theirs) = backend_mismatch("vxlan", n.pointer(&["metadata", "annotations", BACKEND_KEY]).and_then(Value::as_str)) {
                         self.warn_backend(&meta(n, "name"), "vxlan", theirs);
                         continue;
@@ -543,9 +551,18 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                         continue;
                     }
                     let Some(pn) = n.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).and_then(network::PodNet::parse) else { continue };
-                    let ip = n.pointer(&["status", "addresses"]).and_then(Value::as_array).and_then(|a| a.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("InternalIP"))).and_then(|x| x.get("address")).and_then(Value::as_str).and_then(kr_apiserver::object::parse_ipv4);
+                    let ip = internal_ip(n, false).and_then(kr_sys::unmap4);
                     if let Some(gw) = ip {
                         want.push((pn.subnet, pn.prefix, gw));
+                    }
+                    // IPv6: the peer's pod /64 via its global IPv6 address (needs one on both ends;
+                    // existing routes answer EEXIST, stale ones are left for the next restart).
+                    let cidr6 = n.pointer(&["spec", "podCIDRs"]).and_then(Value::as_array).and_then(|a| a.iter().filter_map(Value::as_str).find(|c| c.contains(':')));
+                    let gw6 = internal_ip(n, true);
+                    if let (Some((net6, len)), Some(gw6)) = (cidr6.and_then(|c| c.split_once('/')), gw6) {
+                        if let (Some(d), Ok(l)) = (kr_net::tcp::parse_ipv6(net6), len.parse::<u8>()) {
+                            let _ = nl.route_add6_proto(d, l, Some(gw6), 0, RTPROT_KR);
+                        }
                     }
                 }
                 let have = nl.routes_by_proto(RTPROT_KR).unwrap_or_default();
@@ -632,6 +649,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         // CrashLoopBackOff: every restart after an exit waits 10 s, doubling up to 5 min.
         c.backoff_ms = if c.backoff_ms == 0 { BACKOFF_START_MS } else { (c.backoff_ms * 2).min(BACKOFF_MAX_MS) };
         c.not_before = now_ms() + c.backoff_ms;
+        if c.resize_restart {
+            // A resize restart is not a crash: no backoff.
+            c.backoff_ms = 0;
+            c.not_before = 0;
+        }
     }
 
     async fn sync_pod(self: &Rc<Self>, uid: &str, pod: &Value) {
@@ -718,7 +740,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let start = match &state {
                 CState::Waiting(..) => true,
                 CState::Running { .. } => false,
-                CState::Terminated(t) => policy == "Always" || (policy == "OnFailure" && t.exit_code != 0),
+                CState::Terminated(t) => self.pods.borrow()[uid].ctrs[i].resize_restart || policy == "Always" || (policy == "OnFailure" && t.exit_code != 0),
             };
             if start {
                 self.maybe_start(uid, pod, i).await;
@@ -733,7 +755,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 match p.ctrs.iter().position(|c| c.name == name) {
                     Some(i) => i,
                     None => {
-                        p.ctrs.push(Ctr { name: name.into(), image: e.get("image").and_then(Value::as_str).unwrap_or("").into(), init: false, sidecar: false, eph: true, restart_count: 0, state: CState::Waiting("ContainerCreating", String::new()), last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: false, ready: false, res: String::new() });
+                        p.ctrs.push(Ctr { name: name.into(), image: e.get("image").and_then(Value::as_str).unwrap_or("").into(), init: false, sidecar: false, eph: true, restart_count: 0, state: CState::Waiting("ContainerCreating", String::new()), last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: false, ready: false, res: String::new(), resize_restart: false, resize_kill_at: 0 });
                         p.ctrs.len() - 1
                     }
                 }
@@ -769,12 +791,14 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     started: false,
                     ready: false,
                     res: c.get("resources").map(json::to_string).unwrap_or_default(),
+                    resize_restart: false,
+                    resize_kill_at: 0,
                 });
             }
         }
         let prio = pod.pointer(&["spec", "priorityClassName"]).and_then(Value::as_str).unwrap_or("");
         let critical = prio.starts_with("system-") && prio.ends_with("-critical") || pod.pointer(&["metadata", "annotations", "kubernetes.io/config.mirror"]).is_some();
-        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ip6: None, node_ip: self.cfg.node_ip, ctrs, start_time: now(), kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod) }
+        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ip6: None, node_ip: self.cfg.node_ip, ctrs, start_time: now(), kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, cpu_request: spec::cpu_request(pod), resize_pending: None, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod) }
     }
 
     fn start_sandbox(&self, uid: &str, pod: &Value) -> Result<(), String> {
@@ -789,9 +813,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let _ = kr_runtime::store::mkdir_p(&ipam, 0o700);
             lease = network::allocate_in(ipam.as_bytes(), uid.as_bytes(), &self.podnet.get()).ok();
         }
-        let ip = if host_net { Some(self.cfg.node_ip) } else { lease.as_ref().map(|l: &Lease| l.ip) };
+        let ip = if host_net { kr_sys::unmap4(self.cfg.node_ip) } else { lease.as_ref().map(|l: &Lease| l.ip) };
         let pn = self.podnet.get();
-        let net = ip.map(|ip| NetConfig::dual(ip, &pn));
+        let net = ip.filter(|_| !host_net).map(|ip| NetConfig::dual(ip, &pn));
         // hostNetwork pods report the node's hostname (upstream: unless spec.hostname is set).
         let hostname = if host_net && pod.pointer(&["spec", "hostname"]).and_then(Value::as_str).is_none_or(str::is_empty) {
             String::from_utf8(kr_sys::fs::read_file(b"/proc/sys/kernel/hostname\0", 256).unwrap_or_default()).unwrap_or_default().trim().to_string()
@@ -839,7 +863,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         } else {
             None
         };
-        spec::write_etc_hosts(&dir, pod, &hostname, ip).map_err(|_| String::from("cannot write /etc/hosts"))?;
+        spec::write_etc_hosts(&dir, pod, &hostname, ip, net.and_then(|n| n.ip6)).map_err(|_| String::from("cannot write /etc/hosts"))?;
         spec::write_resolv_conf(&dir, pod, self.infra.borrow().is_some()).map_err(|_| String::from("cannot write /etc/resolv.conf"))?;
         let mut pods = self.pods.borrow_mut();
         let p = pods.get_mut(uid).unwrap();
@@ -847,7 +871,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         p.cg = cg;
         p.lease = lease;
         p.ip = ip;
-        p.ip6 = net.and_then(|n| n.ip6);
+        p.ip6 = if host_net { Some(self.cfg.node_ip).filter(|a| kr_sys::unmap4(*a).is_none()) } else { net.and_then(|n| n.ip6) };
         Ok(())
     }
 
@@ -897,9 +921,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         rootfs.pop();
         // Copy out first: RefCell guards in the match scrutinee would live across the await
         // and through the arms (which borrow mutably).
-        let (pod_dir, pod_ip) = {
+        let (pod_dir, pod_ip, pod_ip6) = {
             let pods = self.pods.borrow();
-            (pods[uid].dir.clone(), pods[uid].ip)
+            (pods[uid].dir.clone(), pods[uid].ip, pods[uid].ip6)
         };
         // Image volumes (`volumes[].image`) need their image pulled first.
         let first = self.pods.borrow()[uid].ctrs[i].seq == 0;
@@ -927,7 +951,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 return;
             }
         }
-        let built = match spec::build(&self.c, pod, cspec.unwrap_or(&Value::Null), &img, &pod_dir, pod_ip, &self.cfg.node_name, &fmt_ip(self.cfg.node_ip), &self.store).await {
+        let built = match spec::build(&self.c, pod, cspec.unwrap_or(&Value::Null), &img, &pod_dir, pod_ip, pod_ip6, &self.cfg.node_name, &kr_net::tcp::fmt_ip16(self.cfg.node_ip), &self.store).await {
             Ok(b) => b,
             Err(msg) => {
                 // A claim that is not bound yet is the pod waiting for its volume, not a config error.
@@ -987,6 +1011,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     if c.seq > 0 {
                         c.restart_count += 1;
                     }
+                    c.resize_restart = false;
                     c.seq = seq;
                     c.signaller = Some(running.signaller());
                     c.target = Some(running.target());
@@ -1196,11 +1221,47 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
     }
 
-    /// In-place resize: containers whose `resources` changed in the spec get their cgroup limits
-    /// updated (and the pod cgroup the new sum); the status then reports the new values.
+    /// In-place resize. A changed `resources` is checked against the node first: bigger than the
+    /// node makes it `Infeasible`, not fitting next to the other pods `Deferred` (both reported as
+    /// the `PodResizePending` condition, retried every sync). Otherwise a container whose changed
+    /// resource has `resizePolicy: RestartContainer` is restarted with the new values and the rest
+    /// get their cgroup limits updated live; the status then reports the new values.
     fn apply_resize(&self, uid: &str, pod: &Value) {
         let mut pods = self.pods.borrow_mut();
+        let others: (u64, u64) = pods.iter().filter(|(u, p)| u.as_str() != uid && p.failed_setup.is_none() && p.evicted.is_none() && p.sandbox.is_some()).fold((0, 0), |a, (_, p)| (a.0 + p.cpu_request, a.1 + p.mem_request));
         let Some(p) = pods.get_mut(uid) else { return };
+        // A container restarting for a resize that ignores SIGTERM is killed at the grace period.
+        for c in p.ctrs.iter().filter(|c| c.resize_restart && c.resize_kill_at > 0 && now_ms() >= c.resize_kill_at) {
+            if let Some(s) = &c.signaller {
+                let _ = s.send(9);
+            }
+        }
+        let mut diff = false;
+        for key in ["initContainers", "containers"] {
+            for c in pod.pointer(&["spec", key]).and_then(Value::as_array).unwrap_or(&[]) {
+                let name = c.get("name").and_then(Value::as_str).unwrap_or("");
+                let want = c.get("resources").map(json::to_string).unwrap_or_default();
+                diff |= p.ctrs.iter().any(|x| x.name == name && !x.eph && x.res != want);
+            }
+        }
+        if !diff {
+            p.resize_pending = None;
+            return;
+        }
+        // Feasibility against the node (capacity is also what is allocatable here).
+        let (cap_cpu, cap_mem) = (node::cpus() as u64 * 1000, node::memory_ki() * 1024);
+        let (want_cpu, want_mem) = (spec::cpu_request(pod), spec::pod_resources(pod).1);
+        if want_cpu > cap_cpu || want_mem > cap_mem {
+            let msg = alloc::format!("Node didn't have enough capacity: {}, requested: {}, capacity: {}", if want_cpu > cap_cpu { "cpu" } else { "memory" }, if want_cpu > cap_cpu { want_cpu } else { want_mem }, if want_cpu > cap_cpu { cap_cpu } else { cap_mem });
+            p.resize_pending = Some(("Infeasible", msg));
+            return;
+        }
+        if others.0 + want_cpu > cap_cpu || others.1 + want_mem > cap_mem {
+            let msg = alloc::format!("Node didn't have enough resource: {}, requested: {}, used: {}, capacity: {}", if others.0 + want_cpu > cap_cpu { "cpu" } else { "memory" }, if others.0 + want_cpu > cap_cpu { want_cpu } else { want_mem }, if others.0 + want_cpu > cap_cpu { others.0 } else { others.1 }, if others.0 + want_cpu > cap_cpu { cap_cpu } else { cap_mem });
+            p.resize_pending = Some(("Deferred", msg));
+            return;
+        }
+        p.resize_pending = None;
         let mut changed = false;
         for key in ["initContainers", "containers"] {
             for c in pod.pointer(&["spec", key]).and_then(Value::as_array).unwrap_or(&[]) {
@@ -1211,13 +1272,26 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 if ctr.res == want {
                     continue;
                 }
+                let restart = spec::resize_needs_restart(c, &ctr.res, &want);
                 if let (CState::Running { id, .. }, Some(rel)) = (&ctr.state, rel) {
-                    let _ = kr_runtime::cgroup::update_container(&rel, id.as_bytes(), &spec::container_limits(pod, c));
+                    if !restart {
+                        let _ = kr_runtime::cgroup::update_container(&rel, id.as_bytes(), &spec::container_limits(pod, c));
+                    }
+                }
+                if restart && matches!(ctr.state, CState::Running { .. }) {
+                    if let Some(s) = ctr.signaller.clone() {
+                        ctr.resize_restart = true;
+                        let grace = pod.pointer(&["spec", "terminationGracePeriodSeconds"]).and_then(Value::as_u64).unwrap_or(30);
+                        ctr.resize_kill_at = now_ms() + grace * 1000;
+                        let _ = s.send(kr_sys::ns::SIGTERM);
+                    }
                 }
                 ctr.res = want;
                 changed = true;
             }
         }
+        p.cpu_request = want_cpu;
+        p.mem_request = want_mem;
         if let (true, Some(cg)) = (changed, &p.cg) {
             let _ = cg.update(&spec::pod_resources(pod).0);
         }
@@ -1408,7 +1482,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
 /// Conditions other components set on the pod (`DisruptionTarget` from the scheduler or the
 /// eviction API, ...) survive the kubelet's status writes, which replace the whole list.
 fn keep_foreign_conditions(pod: &Value, status: &mut Value) {
-    const OWNED: [&str; 6] = ["PodScheduled", "Initialized", "ContainersReady", "Ready", "PodReadyToStartContainers", "PodResizeInProgress"];
+    const OWNED: [&str; 7] = ["PodScheduled", "Initialized", "ContainersReady", "Ready", "PodReadyToStartContainers", "PodResizeInProgress", "PodResizePending"];
     let old: Vec<Value> = pod.pointer(&["status", "conditions"]).and_then(Value::as_array).map(|a| a.iter().filter(|c| !OWNED.contains(&c.get("type").and_then(Value::as_str).unwrap_or(""))).cloned().collect()).unwrap_or_default();
     if old.is_empty() {
         return;
@@ -1529,10 +1603,16 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
         if n.is_empty() { String::new() } else { alloc::format!("containers with unready status: [{}]", n.join(" ")) }
     }));
     let ip = p.ip.map(|a| alloc::format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]));
-    let host_ip = fmt_ip(p.node_ip);
+    let host_ip = kr_net::tcp::fmt_ip16(p.node_ip);
+    let mut conditions = alloc::vec![cond("PodScheduled", true, None), cond("Initialized", inits_done, init_why), cond("Ready", all_running, notready()), cond("ContainersReady", all_running, notready())];
+    if let Some((reason, msg)) = &p.resize_pending {
+        conditions.push(o(alloc::vec![("type", Value::from("PodResizePending")), ("status", Value::from("True")), ("lastTransitionTime", t(p.start_time)), ("reason", Value::from(*reason)), ("message", Value::from(msg.as_str()))]));
+    } else if p.ctrs.iter().any(|c| c.resize_restart) {
+        conditions.push(o(alloc::vec![("type", Value::from("PodResizeInProgress")), ("status", Value::from("True")), ("lastTransitionTime", t(p.start_time))]));
+    }
     let mut f = alloc::vec![
         ("phase", Value::from(phase)),
-        ("conditions", Value::Array(alloc::vec![cond("PodScheduled", true, None), cond("Initialized", inits_done, init_why), cond("Ready", all_running, notready()), cond("ContainersReady", all_running, notready())])),
+        ("conditions", Value::Array(conditions)),
         ("hostIP", Value::from(host_ip.as_str())),
         ("hostIPs", Value::Array(alloc::vec![o(alloc::vec![("ip", Value::from(host_ip.as_str()))])])),
         ("startTime", t(p.start_time)),
@@ -1593,7 +1673,7 @@ mod status_tests {
     use alloc::vec;
 
     fn ctr(name: &str, init: bool, eph: bool, state: CState) -> Ctr {
-        Ctr { name: name.into(), image: "img".into(), init, sidecar: false, eph, restart_count: 0, state, last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: true, ready: true, res: String::new() }
+        Ctr { name: name.into(), image: "img".into(), init, sidecar: false, eph, restart_count: 0, state, last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: true, ready: true, res: String::new(), resize_restart: false, resize_kill_at: 0 }
     }
     fn done(code: i32) -> CState {
         CState::Terminated(Term { exit_code: code, reason: if code == 0 { "Completed" } else { "Error" }, started_at: 1, finished_at: 2, message: String::new() })
@@ -1605,7 +1685,7 @@ mod status_tests {
         CState::Waiting("ContainerCreating", String::new())
     }
     fn pod(ctrs: Vec<Ctr>) -> PodRt {
-        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ip6: None, node_ip: [10, 0, 0, 1], ctrs, start_time: 0, kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new() }
+        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ip6: None, node_ip: kr_sys::map4([10, 0, 0, 1]), ctrs, start_time: 0, kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, cpu_request: 0, resize_pending: None, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new() }
     }
     fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
         path.iter().try_fold(v, |v, k| match k.parse::<usize>() {
@@ -1719,8 +1799,9 @@ fn backend_mismatch<'a>(mine: &str, theirs: Option<&'a str>) -> Option<&'a str> 
     theirs.filter(|t| *t != mine)
 }
 
-fn fmt_ip(ip: [u8; 4]) -> String {
-    alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+/// The Node's first `InternalIP` of the wanted family (IPv6 when `v6`), 16-byte form.
+fn internal_ip(n: &Value, v6: bool) -> Option<[u8; 16]> {
+    n.pointer(&["status", "addresses"]).and_then(Value::as_array)?.iter().filter(|x| x.get("type").and_then(Value::as_str) == Some("InternalIP")).filter_map(|x| x.get("address").and_then(Value::as_str).and_then(kr_net::tcp::parse_ip16)).find(|a| kr_sys::unmap4(*a).is_none() == v6)
 }
 
 /// MTU of the interface carrying the default route (1500 when unknown).

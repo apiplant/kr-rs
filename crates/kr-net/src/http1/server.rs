@@ -200,6 +200,17 @@ pub fn listen(addr: [u8; 4], port: u16, backlog: i32) -> Result<Async<Fd>> {
     Ok(Async::new(fd)?)
 }
 
+/// A listening IPv6 socket on `[::]` that accepts IPv6 only (`IPV6_V6ONLY`), so it can sit beside
+/// the IPv4 listener on the same port. Fails where the host has IPv6 disabled.
+pub fn listen6(port: u16, backlog: i32) -> Result<Async<Fd>> {
+    let fd = sys::socket(sys::AF_INET6, sys::SOCK_STREAM | sys::SOCK_NONBLOCK | sys::SOCK_CLOEXEC, 0)?;
+    sys::setsockopt(fd.raw(), sys::SOL_SOCKET, sys::SO_REUSEADDR, &1i32.to_ne_bytes())?;
+    sys::setsockopt(fd.raw(), 41, 26, &1i32.to_ne_bytes())?; // IPV6_V6ONLY
+    sys::bind6(fd.raw(), &sys::SockaddrIn6::new([0; 16], port))?;
+    sys::listen(fd.raw(), backlog)?;
+    Ok(Async::new(fd)?)
+}
+
 /// The bound local address of a listener (useful after binding port 0).
 pub fn local_addr(l: &Async<Fd>) -> Option<([u8; 4], u16)> {
     sockname(NR_GETSOCKNAME, l.get_ref().raw())

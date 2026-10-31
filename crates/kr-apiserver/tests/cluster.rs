@@ -126,7 +126,7 @@ fn three_servers_replicate_and_fail_over() {
             let cluster = Cluster::open(&api, id, dir.to_str().unwrap(), ids.to_vec(), cli_tls, id * 7919).unwrap();
             for (j, other) in ids.iter().enumerate() {
                 if *other != id {
-                    cluster.add_seed(*other, ServerAddr { ip: [127, 0, 0, 1], raft_port: ports[j], api_port: api_ports[j] });
+                    cluster.add_seed(*other, ServerAddr { ip: kr_sys::map4([127, 0, 0, 1]), raft_port: ports[j], api_port: api_ports[j] });
                 }
             }
             api.set_cluster(cluster.clone());
@@ -228,7 +228,7 @@ fn three_servers_replicate_and_fail_over() {
         let cluster = Cluster::open(&api, dead, base.join(format!("n{dead}")).to_str().unwrap(), Vec::new(), cli_tls, 99).unwrap();
         for (j, o) in ids.iter().enumerate() {
             if *o != dead {
-                cluster.add_seed(*o, ServerAddr { ip: [127, 0, 0, 1], raft_port: ports[j], api_port: 0 });
+                cluster.add_seed(*o, ServerAddr { ip: kr_sys::map4([127, 0, 0, 1]), raft_port: ports[j], api_port: 0 });
             }
         }
         api.set_cluster(cluster.clone());

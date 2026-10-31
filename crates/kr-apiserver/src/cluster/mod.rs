@@ -51,20 +51,20 @@ pub enum WriteError {
 /// The address of a server, as stored under [`SERVERS_PREFIX`]`<id>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerAddr {
-    pub ip: [u8; 4],
+    /// IPv4 mapped (`::ffff:a.b.c.d`) or IPv6.
+    pub ip: [u8; 16],
     pub raft_port: u16,
     pub api_port: u16,
 }
 
 impl ServerAddr {
     pub fn to_json(&self) -> String {
-        let ip = self.ip;
-        alloc::format!(r#"{{"ip":"{}.{}.{}.{}","raftPort":{},"apiPort":{}}}"#, ip[0], ip[1], ip[2], ip[3], self.raft_port, self.api_port)
+        alloc::format!(r#"{{"ip":"{}","raftPort":{},"apiPort":{}}}"#, kr_net::tcp::fmt_ip16(self.ip), self.raft_port, self.api_port)
     }
 
     pub fn from_json(b: &[u8]) -> Option<ServerAddr> {
         let v = kr_fmt::json::parse(b).ok()?;
-        let ip = crate::object::parse_ipv4(v.get("ip")?.as_str()?)?;
+        let ip = kr_net::tcp::parse_ip16(v.get("ip")?.as_str()?)?;
         Some(ServerAddr { ip, raft_port: v.get("raftPort")?.as_u64()? as u16, api_port: v.get("apiPort")?.as_u64()? as u16 })
     }
 }
@@ -340,8 +340,7 @@ impl Cluster {
             // be unknown here: try it first, then everyone else.
             let mut targets: Vec<NodeId> = self.leader().into_iter().collect();
             targets.extend(self.voters().into_iter().filter(|v| *v != self.id && Some(*v) != self.leader()));
-            let ip = me.ip;
-            let body = alloc::format!(r#"{{"ip":"{}.{}.{}.{}","raftPort":{},"apiPort":{}}}"#, ip[0], ip[1], ip[2], ip[3], me.raft_port, me.api_port);
+            let body = me.to_json();
             for t in targets {
                 if self.post_as_self(&api, t, "/kr/add-server", body.as_bytes()).await == Some(200) {
                     kr_rt::eprint(b"kr server: re-registered this server's address\n");
