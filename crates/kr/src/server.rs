@@ -387,6 +387,15 @@ pub fn main(mut args: Args) -> i32 {
         Ok(a) => Rc::new(a),
         Err(e) => return fail(&e.message),
     };
+    // KR_POD_FAMILIES=4 | 6 | 4,6 (default): which address families pods and Services have. Set the
+    // same on every server of an HA cluster; nodes follow from the podCIDRs they are given.
+    match kr_runtime::store::env_var("KR_POD_FAMILIES").filter(|v| !v.is_empty()) {
+        Some(v) => match kr_net::tcp::Families::parse(&v) {
+            Some(f) => api.set_pod_families(f),
+            None => return fail("KR_POD_FAMILIES must be 4, 6 or 4,6"),
+        },
+        None => {}
+    }
     // HA: the Raft driver must be attached before any bootstrap write (only a ready leader
     // writes; everything else arrives through the log).
     let mut ha_tasks = None;

@@ -141,7 +141,7 @@ Numbers will vary with hardware; the commands to reproduce them are in `tools/te
 **Networking**
 - Built-in bridge and veth pod network with host-local IPAM, no CNI plugins
 - Cross-node VXLAN or host-gw, NAT through nftables over netlink (no `iptables`/`nft` binaries needed)
-- Dual stack: every pod has an IPv6 twin address (`fd00:88:0:N::/64` for the node's `10.88.N.0/24`), Services can be IPv4, IPv6 or both (`ipFamilies`, `ipFamilyPolicy`), with AAAA records and VXLAN across nodes
+- IPv4, IPv6 or dual stack (`KR_POD_FAMILIES=4`, `6` or `4,6`, default `4,6` on the server): pods get an address in each configured family (`10.88.N.0/24`, `fd00:88:0:N::/64` per node), Services get ClusterIPs from `10.96.0.0/16` and/or `fd00:96::/112` (`ipFamilies`, `ipFamilyPolicy`), with AAAA records, per-family EndpointSlices and VXLAN across nodes. Hosts may be IPv4, IPv6 or both (join, Raft, kubelet and VXLAN run over an IPv6 underlay), and rootless NAT handles both
 - Service proxy for ClusterIP, NodePort and hostPort (with ClientIP affinity), in-process cluster DNS (`cluster.local`, pod and service records, ExternalName)
 
 ## How it is built
@@ -189,7 +189,6 @@ tools/test/conformance.sh results /tmp/out       # failures by area
 
 ## Limitations
 
-- Dual stack: pods always have both families; hosts may have IPv4, IPv6 or both (node join, Raft, kubelet, VXLAN work over an IPv6 underlay). There is no IPv4-free *pod* network.
 - Only ECDSA P-256 keys for pod certificates; RSA is verify-only.
 - Not certified by the CNCF: the suite passes, but the certification process has not been run.
 - The full list is in [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
@@ -206,6 +205,9 @@ tools/test/rootless-egress.sh # rootless pod and ctr egress: download, upload, D
 tools/test/rootless-egress-v6.sh # the same over IPv6 in a throwaway container
 tools/test/dualstack.sh       # dual-stack pods, Services and DNS on a two-node cluster
 tools/test/aggregated-watch.sh   # a watch through an aggregated API (extension server in a pod)
+tools/test/families.sh 6        # pod network families: 4, 6 or 4,6 on a two-node cluster
+tools/test/families-change.sh   # restart an existing cluster with other families
+tools/test/rootless-families.sh 6   # rootless kr ctr and pods per family
 ```
 
 Documents: [`docs/PLAN.md`](docs/PLAN.md) (design and budgets), [`docs/DECISIONS.md`](docs/DECISIONS.md) (architecture decision records), [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md), [`docs/CONFORMANCE_KNOWN_ISSUES.md`](docs/CONFORMANCE_KNOWN_ISSUES.md).

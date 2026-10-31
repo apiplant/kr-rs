@@ -17,22 +17,22 @@ const MTU: usize = 1400;
 /// Host-to-pod bytes buffered per flow before the host socket is no longer read.
 const MAX_PENDING: usize = 256 << 10;
 
-/// The host's first IPv4 nameserver (what `EGRESS_DNS` is forwarded to).
-fn host_dns() -> [u8; 4] {
+/// The host's first nameserver, either family (what `EGRESS_DNS` / `EGRESS_DNS6` are forwarded to).
+fn host_dns() -> Addr {
     let text = kr_sys::fs::read_file(b"/etc/resolv.conf\0", 16384).unwrap_or_default();
     core::str::from_utf8(&text)
         .unwrap_or("")
         .lines()
         .filter_map(|l| l.trim().strip_prefix("nameserver"))
-        .find_map(|a| tcp::parse_ipv4(a.trim()))
-        .unwrap_or([1, 1, 1, 1])
+        .find_map(|a| tcp::parse_ip16(a.trim()))
+        .unwrap_or(sys::map4([1, 1, 1, 1]))
 }
 
-/// The destination a flow really goes to: DNS to the forwarder address (IPv4) is redirected to
-/// the host's first nameserver.
+/// The destination a flow really goes to: DNS to the forwarder addresses (IPv4 or IPv6) is
+/// redirected to the host's first nameserver.
 fn dst_for(ip: Addr, port: u16) -> Addr {
-    if ip == sys::map4(network::EGRESS_DNS) && port == 53 {
-        sys::map4(host_dns())
+    if (ip == sys::map4(network::EGRESS_DNS) || ip == network::EGRESS_DNS6) && port == 53 {
+        host_dns()
     } else {
         ip
     }

@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use kr_crypto::tls::ClientConfig;
 use kr_net::http1::server::Response;
 use kr_net::http1::Transport;
-use kr_net::tcp::{IpAddr, SocketAddr};
+use kr_net::tcp::SocketAddr;
 
 /// Whole-exchange budget: connect, send and read the full reply.
 const TIMEOUT_MS: u64 = 30_000;
@@ -19,7 +19,8 @@ const MAX_BODY: usize = 64 << 20;
 /// the pod lookup), sent by the transport with [`forward`] so the event loop never blocks.
 pub struct Target {
     pub method: String,
-    pub ip: [u8; 4],
+    /// IPv4 mapped (`::ffff:a.b.c.d`) or IPv6.
+    pub ip: [u8; 16],
     pub port: u16,
     /// Speak TLS to the backend, without verifying its certificate.
     pub tls: bool,
@@ -38,10 +39,18 @@ pub fn proxyable(ip: [u8; 4]) -> bool {
     !(ip[0] == 127 || ip == [0, 0, 0, 0] || (ip[0] == 169 && ip[1] == 254) || ip[0] >= 224)
 }
 
+/// [`proxyable`] for either family: IPv6 loopback, unspecified, link-local and multicast are refused.
+pub fn proxyable16(ip: [u8; 16]) -> bool {
+    match kr_sys::unmap4(ip) {
+        Some(v4) => proxyable(v4),
+        None => !(ip == [0; 16] || ip[..15] == [0; 15] && ip[15] == 1 || (ip[0] == 0xfe && ip[1] & 0xc0 == 0x80) || ip[0] == 0xff),
+    }
+}
+
 /// Relays one request; connection failures are 503, malformed or late replies 502/504.
 pub async fn forward(t: Target) -> Response {
     let fail = |code: u16, msg: &str| Response::new(code, msg.as_bytes().to_vec());
-    if !proxyable(t.ip) {
+    if !proxyable16(t.ip) {
         return fail(400, "address not allowed");
     }
     match kr_rt::exec::timeout(TIMEOUT_MS, exchange(&t)).await {
@@ -52,10 +61,10 @@ pub async fn forward(t: Target) -> Response {
 }
 
 async fn exchange(t: &Target) -> Result<Vec<u8>, &'static str> {
-    let sock = kr_net::tcp::connect_addr(SocketAddr { ip: IpAddr::V4(t.ip), port: t.port }, TIMEOUT_MS).await.map_err(|_| "error trying to reach the pod")?;
+    let sock = kr_net::tcp::connect_addr(SocketAddr { ip: kr_net::tcp::ip_addr16(t.ip), port: t.port }, TIMEOUT_MS).await.map_err(|_| "error trying to reach the pod")?;
     if t.tls {
         let cfg = Rc::new(ClientConfig { roots: Vec::new(), pinned_ca: None, client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
-        let host = alloc::format!("{}.{}.{}.{}", t.ip[0], t.ip[1], t.ip[2], t.ip[3]);
+        let host = kr_net::tcp::fmt_ip16(t.ip);
         let tls = kr_net::tls::TlsStream::connect_insecure(sock, cfg, &host).await.map_err(|_| "error establishing TLS with the pod")?;
         return roundtrip(tls, t).await;
     }
@@ -65,7 +74,7 @@ async fn exchange(t: &Target) -> Result<Vec<u8>, &'static str> {
 async fn roundtrip<T: Transport>(mut sock: T, t: &Target) -> Result<Vec<u8>, &'static str> {
     let (ip, port) = (t.ip, t.port);
     let target = if t.query.is_empty() { t.path.clone() } else { alloc::format!("{}?{}", t.path, t.query) };
-    let mut req = alloc::format!("{} {target} HTTP/1.1\r\nHost: {}.{}.{}.{}:{port}\r\nConnection: close\r\nUser-Agent: kr-apiserver\r\n", t.method, ip[0], ip[1], ip[2], ip[3]);
+    let mut req = alloc::format!("{} {target} HTTP/1.1\r\nHost: {}:{port}\r\nConnection: close\r\nUser-Agent: kr-apiserver\r\n", t.method, kr_net::tcp::url_host(ip));
     if let Some(ct) = &t.content_type {
         req.push_str(&alloc::format!("Content-Type: {ct}\r\n"));
     }
@@ -189,5 +198,10 @@ mod tests {
             assert!(!proxyable(ip), "{ip:?}");
         }
         assert!(proxyable([10, 88, 0, 7]) && proxyable([172, 17, 0, 3]));
+        let v6 = |s: &str| kr_net::tcp::parse_ipv6(s).unwrap();
+        for ip in ["::", "::1", "fe80::1", "ff02::1"] {
+            assert!(!proxyable16(v6(ip)), "{ip}");
+        }
+        assert!(proxyable16(v6("fd00:88::5")) && !proxyable16(kr_sys::map4([127, 0, 0, 1])) && proxyable16(kr_sys::map4([10, 88, 0, 7])));
     }
 }

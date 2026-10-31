@@ -226,6 +226,10 @@ pub struct Kubelet<C: Client> {
     infra: RefCell<Option<Sandbox>>,
     /// This node's pod subnet (from `spec.podCIDR`).
     podnet: Cell<network::PodNet>,
+    /// Address families of the pod network (from `spec.podCIDRs`).
+    fam: Cell<network::Families>,
+    /// The changed-families warning was logged.
+    warned_families: Cell<bool>,
     /// Peer/backend pairs already reported as a backend mismatch.
     warned_backend: RefCell<alloc::collections::BTreeSet<String>>,
     /// Container log path -> `(file size, sec, nsec)` samples: the log file keeps no per-line
@@ -249,7 +253,7 @@ const BACKOFF_MAX_MS: u64 = 300_000;
 
 impl<C: Client + Clone + 'static> Kubelet<C> {
     pub fn new(c: C, cfg: Config, store: Store) -> Rc<Self> {
-        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()) })
+        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()) })
     }
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
@@ -269,8 +273,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         // The API server assigns the pod subnet at registration.
         for _ in 0..30 {
             if let Ok(n) = self.c.get(&alloc::format!("/api/v1/nodes/{}", self.cfg.node_name)).await {
-                if let Some(pn) = n.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).and_then(network::PodNet::parse) {
+                if let Some((pn, fam)) = node_podnet(&n) {
                     self.podnet.set(pn);
+                    self.fam.set(fam);
                     break;
                 }
             }
@@ -278,7 +283,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         let pn = self.podnet.get();
         if self.cfg.network {
-            if let Err(e) = network::setup_host_with(&pn) {
+            if let Err(e) = network::setup_host_with(&pn, self.fam.get()) {
                 kr_rt::eprint(alloc::format!("kubelet: network setup failed (errno {}); pods get no IP\n", e.0).as_bytes());
             }
         } else {
@@ -286,7 +291,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 Ok(infra) => {
                     // ip_forward + bridge inside the infra namespaces; egress is set up
                     // separately and optional.
-                    let ok = container::run_in_net(&infra, || network::setup_infra_bridge(&pn));
+                    let fam = self.fam.get();
+                    let ok = container::run_in_net(&infra, || network::setup_infra_bridge(&pn, fam));
                     match ok {
                         Ok(0) => {
                             // Outbound traffic: a TUN default route served by the userspace NAT.
@@ -317,7 +323,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             Some(net) => {
                 let net = Rc::new(net);
                 kr_rt::exec::spawn(proxy::Proxy::new(self.c.clone(), net.clone(), self.cfg.node_name.clone()).run());
-                kr_rt::exec::spawn(dns::run(self.c.clone(), net));
+                kr_rt::exec::spawn(dns::run(self.c.clone(), net, self.fam.get()));
             }
             None => kr_rt::eprint(b"kubelet: no node network; Services are not proxied\n"),
         }
@@ -436,8 +442,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 let mut peers = Vec::new();
                 let mut annotated = false;
                 for n in list.get("items").and_then(Value::as_array).unwrap_or(&[]) {
-                    let Some(pn) = n.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).and_then(network::PodNet::parse) else { continue };
+                    let Some((pn, nfam)) = node_podnet(n) else { continue };
                     if meta(n, "name") == self.cfg.node_name {
+                        self.check_families(nfam);
                         let ann = |k| n.pointer(&["metadata", "annotations", k]).and_then(Value::as_str);
                         annotated = ann(VTEP_MAC_KEY) == Some(my_mac.as_str()) && ann(VTEP_IP_KEY) == Some(my_ip.as_str()) && ann(BACKEND_KEY) == Some("vxlan");
                         mine = Some(pn);
@@ -450,7 +457,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     }
                     let mac = n.pointer(&["metadata", "annotations", VTEP_MAC_KEY]).and_then(Value::as_str).and_then(parse_mac);
                     if let (Some(ip), Some(mac)) = (ip, mac) {
-                        peers.push((pn, ip, mac));
+                        peers.push((pn, ip, mac, nfam));
                     }
                 }
                 if !annotated && mine.is_some() {
@@ -460,16 +467,18 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     }
                 }
                 if let Some(idx) = mine.and_then(|pn| self.ensure_vxlan(&nl, pn.subnet)) {
-                    let routes: Vec<_> = peers.iter().map(|(pn, _, _)| (pn.subnet, pn.prefix, pn.subnet)).collect();
-                    let neighs: Vec<_> = peers.iter().map(|(pn, _, mac)| (pn.subnet, *mac)).collect();
-                    let fdbs: Vec<_> = peers.iter().map(|(_, ip, mac)| (*mac, *ip)).collect();
+                    let fam = self.fam.get();
+                    // Without IPv4 pods there are no IPv4 routes or ARP entries to program.
+                    let routes: Vec<_> = peers.iter().filter(|p| fam.v4 && p.3.v4).map(|(pn, _, _, _)| (pn.subnet, pn.prefix, pn.subnet)).collect();
+                    let neighs: Vec<_> = peers.iter().filter(|p| fam.v4 && p.3.v4).map(|(pn, _, mac, _)| (pn.subnet, *mac)).collect();
+                    let fdbs: Vec<_> = peers.iter().map(|(_, ip, mac, _)| (*mac, *ip)).collect();
                     let have_routes: Vec<_> = nl.routes_by_proto(RTPROT_KR).unwrap_or_default();
                     let (radd, rdel) = route_diff(&routes, &have_routes);
                     let (nadd, ndel) = set_diff(&neighs, &nl.neighs(idx).unwrap_or_default());
                     let (fadd, fdel) = set_diff(&fdbs, &nl.fdbs(idx).unwrap_or_default());
                     // IPv6 twins of the pod subnets: one on-link route per peer via its VTEP gateway
                     // address (idempotent replace; the FDB entries above carry the frames).
-                    for (pn, _, mac) in &peers {
+                    for (pn, _, mac, _) in peers.iter().filter(|p| fam.v6 && p.3.v6) {
                         let gw = network::vtep6(pn.subnet);
                         if nl.neigh_add6(idx, gw, *mac).is_ok() {
                             let _ = nl.route_replace6_onlink(network::subnet6(pn.subnet), network::POD_PREFIX6, gw, idx, RTPROT_KR);
@@ -499,6 +508,14 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
     }
 
+    /// The cluster's families for this node changed since the kubelet started (the API server was
+    /// restarted with another `KR_POD_FAMILIES`): pods keep the old addresses until this kr restarts.
+    fn check_families(&self, now: network::Families) {
+        if now != self.fam.get() && !self.warned_families.replace(true) {
+            kr_rt::eprint(alloc::format!("kubelet: the pod network families changed ({} -> {}); restart kr to apply them\n", self.fam.get().text(), now.text()).as_bytes());
+        }
+    }
+
     /// Logs a backend mismatch with a peer (once per peer and backend pair).
     fn warn_backend(&self, peer: &str, mine: &str, theirs: &str) {
         let key = alloc::format!("{peer}/{theirs}");
@@ -519,7 +536,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 kr_net::netlink::ifindex(name).ok()?
             }
         };
-        let _ = nl.addr_add(idx, subnet, 32);
+        if self.fam.get().v4 {
+            let _ = nl.addr_add(idx, subnet, 32);
+        }
         nl.link_up(idx).ok()?;
         Some(idx)
     }
@@ -537,6 +556,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 let mut want = Vec::new();
                 for n in list.get("items").and_then(Value::as_array).unwrap_or(&[]) {
                     if meta(n, "name") == self.cfg.node_name {
+                        if let Some((_, nfam)) = node_podnet(n) {
+                            self.check_families(nfam);
+                        }
                         let ann = n.pointer(&["metadata", "annotations", BACKEND_KEY]).and_then(Value::as_str);
                         if ann != Some("host-gw") && !announced {
                             let p = alloc::format!(r#"{{"metadata":{{"annotations":{{"{BACKEND_KEY}":"host-gw"}}}}}}"#);
@@ -550,15 +572,15 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                         self.warn_backend(&meta(n, "name"), "host-gw", theirs);
                         continue;
                     }
-                    let Some(pn) = n.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).and_then(network::PodNet::parse) else { continue };
+                    let Some((pn, nfam)) = node_podnet(n) else { continue };
                     let ip = internal_ip(n, false).and_then(kr_sys::unmap4);
-                    if let Some(gw) = ip {
+                    if let Some(gw) = ip.filter(|_| self.fam.get().v4 && nfam.v4) {
                         want.push((pn.subnet, pn.prefix, gw));
                     }
                     // IPv6: the peer's pod /64 via its global IPv6 address (needs one on both ends;
                     // existing routes answer EEXIST, stale ones are left for the next restart).
                     let cidr6 = n.pointer(&["spec", "podCIDRs"]).and_then(Value::as_array).and_then(|a| a.iter().filter_map(Value::as_str).find(|c| c.contains(':')));
-                    let gw6 = internal_ip(n, true);
+                    let gw6 = internal_ip(n, true).filter(|_| self.fam.get().v6 && nfam.v6);
                     if let (Some((net6, len)), Some(gw6)) = (cidr6.and_then(|c| c.split_once('/')), gw6) {
                         if let (Some(d), Ok(l)) = (kr_net::tcp::parse_ipv6(net6), len.parse::<u8>()) {
                             let _ = nl.route_add6_proto(d, l, Some(gw6), 0, RTPROT_KR);
@@ -815,7 +837,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         let ip = if host_net { kr_sys::unmap4(self.cfg.node_ip) } else { lease.as_ref().map(|l: &Lease| l.ip) };
         let pn = self.podnet.get();
-        let net = ip.filter(|_| !host_net).map(|ip| NetConfig::dual(ip, &pn));
+        let net = ip.filter(|_| !host_net).map(|ip| NetConfig::with(ip, &pn, self.fam.get()));
         // hostNetwork pods report the node's hostname (upstream: unless spec.hostname is set).
         let hostname = if host_net && pod.pointer(&["spec", "hostname"]).and_then(Value::as_str).is_none_or(str::is_empty) {
             String::from_utf8(kr_sys::fs::read_file(b"/proc/sys/kernel/hostname\0", 256).unwrap_or_default()).unwrap_or_default().trim().to_string()
@@ -864,13 +886,13 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             None
         };
         spec::write_etc_hosts(&dir, pod, &hostname, ip, net.and_then(|n| n.ip6)).map_err(|_| String::from("cannot write /etc/hosts"))?;
-        spec::write_resolv_conf(&dir, pod, self.infra.borrow().is_some()).map_err(|_| String::from("cannot write /etc/resolv.conf"))?;
+        spec::write_resolv_conf(&dir, pod, self.infra.borrow().is_some(), self.fam.get()).map_err(|_| String::from("cannot write /etc/resolv.conf"))?;
         let mut pods = self.pods.borrow_mut();
         let p = pods.get_mut(uid).unwrap();
         p.sandbox = Some(sb);
         p.cg = cg;
         p.lease = lease;
-        p.ip = ip;
+        p.ip = ip.filter(|_| host_net || self.fam.get().v4);
         p.ip6 = if host_net { Some(self.cfg.node_ip).filter(|a| kr_sys::unmap4(*a).is_none()) } else { net.and_then(|n| n.ip6) };
         Ok(())
     }
@@ -1626,12 +1648,11 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
     if !ephs.is_empty() {
         f.push(("ephemeralContainerStatuses", Value::Array(ephs)));
     }
-    if let Some(ip) = ip {
-        f.push(("podIP", Value::from(ip.as_str())));
-        let mut ips = alloc::vec![o(alloc::vec![("ip", Value::from(ip.as_str()))])];
-        if let Some(a) = p.ip6 {
-            ips.push(o(alloc::vec![("ip", Value::from(network::ipv6_string(a).as_str()))]));
-        }
+    // podIP is the primary address: IPv4 when the pod has one, else its IPv6 (IPv6-only network).
+    let ip6 = p.ip6.map(|a| network::ipv6_string(a));
+    if let Some(primary) = ip.as_ref().or(ip6.as_ref()) {
+        f.push(("podIP", Value::from(primary.as_str())));
+        let ips: Vec<Value> = ip.iter().chain(ip6.iter()).map(|a| o(alloc::vec![("ip", Value::from(a.as_str()))])).collect();
         f.push(("podIPs", Value::Array(ips)));
     }
     if let Some(msg) = &p.evicted {
@@ -1800,6 +1821,15 @@ fn backend_mismatch<'a>(mine: &str, theirs: Option<&'a str>) -> Option<&'a str> 
 }
 
 /// The Node's first `InternalIP` of the wanted family (IPv6 when `v6`), 16-byte form.
+/// A Node's pod subnet and address families from `spec.podCIDRs` (falling back to `podCIDR`).
+fn node_podnet(n: &Value) -> Option<(network::PodNet, network::Families)> {
+    let list: Vec<&str> = n.pointer(&["spec", "podCIDRs"]).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    if list.is_empty() {
+        return n.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).and_then(|c| network::PodNet::from_cidrs([c]));
+    }
+    network::PodNet::from_cidrs(list)
+}
+
 fn internal_ip(n: &Value, v6: bool) -> Option<[u8; 16]> {
     n.pointer(&["status", "addresses"]).and_then(Value::as_array)?.iter().filter(|x| x.get("type").and_then(Value::as_str) == Some("InternalIP")).filter_map(|x| x.get("address").and_then(Value::as_str).and_then(kr_net::tcp::parse_ip16)).find(|a| kr_sys::unmap4(*a).is_none() == v6)
 }

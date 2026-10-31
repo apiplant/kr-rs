@@ -418,8 +418,12 @@ fn host_port_listeners(pods: &[Value], desired: &mut BTreeMap<Key, Backends>) {
         {
             continue;
         }
-        let Some(pip) = p.pointer(&["status", "podIP"]).and_then(Value::as_str).and_then(ip4) else { continue };
-        let pip6 = p.pointer(&["status", "podIPs"]).and_then(Value::as_array).and_then(|a| a.iter().filter_map(|x| x.get("ip").and_then(Value::as_str)).find_map(kr_net::tcp::parse_ipv6));
+        let pod_ips: Vec<&str> = p.pointer(&["status", "podIPs"]).and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.get("ip").and_then(Value::as_str)).collect()).unwrap_or_default();
+        let pip = pod_ips.iter().copied().find_map(ip4).or_else(|| p.pointer(&["status", "podIP"]).and_then(Value::as_str).and_then(ip4));
+        let pip6 = pod_ips.iter().copied().find_map(kr_net::tcp::parse_ipv6);
+        if pip.is_none() && pip6.is_none() {
+            continue;
+        }
         for c in p.pointer(&["spec", "containers"]).and_then(Value::as_array).unwrap_or(&[]) {
             for pt in c.get("ports").and_then(Value::as_array).unwrap_or(&[]) {
                 let (Some(hp), Some(cp)) = (pt.get("hostPort").and_then(Value::as_u64), pt.get("containerPort").and_then(Value::as_u64)) else { continue };
@@ -434,7 +438,7 @@ fn host_port_listeners(pods: &[Value], desired: &mut BTreeMap<Key, Backends>) {
                 let host_ip = pt.get("hostIP").and_then(Value::as_str).filter(|s| !s.is_empty());
                 let v6_host = host_ip.and_then(kr_net::tcp::parse_ipv6);
                 // An IPv6 hostIP is served by the pod's IPv6 address, anything else by IPv4.
-                if v6_host.is_none() {
+                if let (None, Some(pip)) = (v6_host, pip) {
                     let ip = kr_sys::map4(host_ip.and_then(ip4).unwrap_or([0; 4]));
                     desired.insert(Key { proto, ip, port: hp as u16, host: true }, Backends { eps: alloc::vec![(kr_sys::map4(pip), cp as u16)], rr: Cell::new(0), affinity: false });
                 }

@@ -117,7 +117,8 @@ mod imp {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct EndpointRecord {
-        pub ip: [u8; 4],
+        /// The endpoint's IPv4 address (None for a pod in an IPv6-only network).
+        pub ip: Option<[u8; 4]>,
         /// The endpoint's IPv6 address, for AAAA answers.
         pub ip6: Option<[u8; 16]>,
         /// `hostname` of a StatefulSet-style endpoint.
@@ -515,6 +516,11 @@ mod imp {
         alloc::format!("{}-{}-{}-{}", ip[0], ip[1], ip[2], ip[3])
     }
 
+    /// Label for an IPv6-only endpoint: the address with `-` for `:`.
+    fn dashed6(ip: [u8; 16]) -> String {
+        crate::tcp::ipv6_string(ip).replace(':', "-")
+    }
+
     fn a_rr(owner: Option<String>, ip: [u8; 4]) -> Rr {
         Rr { owner, rtype: TYPE_A, data: Data::A(ip) }
     }
@@ -627,7 +633,7 @@ mod imp {
                 if wants_a(q.qtype) {
                     match s.cluster_ip {
                         Some(ip) => r.answers.push(a_rr(None, ip)),
-                        None if headless => r.answers.extend(zone.endpoints(ns, name).into_iter().map(|e| a_rr(None, e.ip))),
+                        None if headless => r.answers.extend(zone.endpoints(ns, name).into_iter().filter_map(|e| e.ip).map(|ip| a_rr(None, ip))),
                         None => {}
                     }
                 }
@@ -657,7 +663,7 @@ mod imp {
                 }
                 let mut r = Reply::new(0);
                 if wants_a(q.qtype) {
-                    r.answers.extend(hits.iter().map(|e| a_rr(None, e.ip)));
+                    r.answers.extend(hits.iter().filter_map(|e| e.ip).map(|ip| a_rr(None, ip)));
                 }
                 if wants_aaaa(q.qtype) {
                     r.answers.extend(hits.iter().filter_map(|e| e.ip6).map(|ip| aaaa_rr(None, ip)));
@@ -704,7 +710,7 @@ mod imp {
     fn endpoint_label(e: &EndpointRecord) -> String {
         match &e.hostname {
             Some(h) => h.to_ascii_lowercase(),
-            None => dashed(e.ip),
+            None => e.ip.map(dashed).or_else(|| e.ip6.map(dashed6)).unwrap_or_default(),
         }
     }
 
@@ -715,18 +721,15 @@ mod imp {
         }
         let matches = |p: &PortRecord| p.name.eq_ignore_ascii_case(port) && p.proto.eq_ignore_ascii_case(proto);
         // (target name, ip, port)
-        let mut targets: Vec<(String, [u8; 4], u16)> = Vec::new();
-        match s.cluster_ip {
-            Some(ip) => {
-                if let Some(p) = s.ports.iter().find(|p| matches(p)) {
-                    targets.push((alloc::format!("{name}.{ns}.svc.{dom}"), ip, p.port));
-                }
+        let mut targets: Vec<(String, Option<[u8; 4]>, Option<[u8; 16]>, u16)> = Vec::new();
+        if s.cluster_ip.is_some() || s.cluster_ip6.is_some() {
+            if let Some(p) = s.ports.iter().find(|p| matches(p)) {
+                targets.push((alloc::format!("{name}.{ns}.svc.{dom}"), s.cluster_ip, s.cluster_ip6, p.port));
             }
-            None => {
-                for e in zone.endpoints(ns, name) {
-                    if let Some(p) = e.ports.iter().find(|p| matches(p)) {
-                        targets.push((alloc::format!("{}.{name}.{ns}.svc.{dom}", endpoint_label(&e)), e.ip, p.port));
-                    }
+        } else {
+            for e in zone.endpoints(ns, name) {
+                if let Some(p) = e.ports.iter().find(|p| matches(p)) {
+                    targets.push((alloc::format!("{}.{name}.{ns}.svc.{dom}", endpoint_label(&e)), e.ip, e.ip6, p.port));
                 }
             }
         }
@@ -738,8 +741,13 @@ mod imp {
         }
         let weight = (100 / targets.len() as u16).max(1);
         let mut r = Reply::new(0);
-        for (target, ip, port) in targets {
-            r.additional.push(a_rr(Some(target.clone()), ip));
+        for (target, ip, ip6, port) in targets {
+            if let Some(ip) = ip {
+                r.additional.push(a_rr(Some(target.clone()), ip));
+            }
+            if let Some(ip6) = ip6 {
+                r.additional.push(aaaa_rr(Some(target.clone()), ip6));
+            }
             r.answers.push(Rr { owner: None, rtype: TYPE_SRV, data: Data::Srv { weight, port, target } });
         }
         r

@@ -126,6 +126,10 @@ pub struct ApiServer {
     boot_token: RefCell<Option<(String, String)>>,
     boot_services: core::cell::Cell<Option<([u8; 16], u16)>>,
     pub(crate) apf: crate::apf::Apf,
+    /// Address families of the pod network and of Services (`KR_POD_FAMILIES`).
+    pod_families: core::cell::Cell<kr_net::tcp::Families>,
+    /// `set_pod_families` was called (the environment names the families): it wins over the stored value.
+    families_explicit: core::cell::Cell<bool>,
     /// `fieldValidation` of the request being handled (`Ignore` outside `handle`).
     fv_mode: core::cell::Cell<crate::fieldval::Mode>,
     /// Warnings for the response of the request being handled.
@@ -225,6 +229,16 @@ fn is_masters(u: &User) -> bool {
     u.groups.iter().any(|g| g == "system:masters")
 }
 
+const FAMILIES_KEY: &str = "/kr/pod-families";
+
+/// Pod network number of a node pod CIDR (`10.88.N.0/24` or `fd00:88:0:N::/64`).
+fn pod_net_index(c: &str) -> Option<u32> {
+    match c.strip_prefix("fd00:88:0:") {
+        Some(rest) => u32::from_str_radix(rest.split(':').next().filter(|s| !s.is_empty()).unwrap_or("0"), 16).ok(),
+        None => c.strip_prefix("10.88.")?.split('.').next()?.parse().ok(),
+    }
+}
+
 /// The node's global (non link-local) IPv6 address, if the host has an IPv6 route.
 pub fn host_ip6() -> Option<[u8; 16]> {
     kr_sys::ns::route_source6([0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88])
@@ -247,7 +261,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()) };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()) };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -1208,7 +1222,7 @@ impl ApiServer {
         let (scheme, pod_name, port) = proxy_name(name)?;
         let port = (!port.is_empty()).then_some(port);
         let (_, pod) = self.get_value(rt, pod_name)?;
-        let ip = pod.pointer(&["status", "podIP"]).and_then(Value::as_str).and_then(object::parse_ipv4).ok_or_else(|| ApiError::bad_request(alloc::format!("pod {pod_name} does not have an IP yet")))?;
+        let ip = pod.pointer(&["status", "podIP"]).and_then(Value::as_str).and_then(kr_net::tcp::parse_ip16).ok_or_else(|| ApiError::bad_request(alloc::format!("pod {pod_name} does not have an IP yet")))?;
         let port = match port {
             Some(p) => p.parse::<u16>().ok(),
             None => pod.pointer(&["spec", "containers"]).and_then(Value::as_array).and_then(|cs| cs.iter().find_map(|c| c.get("ports")?.as_array()?.first()?.get("containerPort")?.as_u64())).map(|p| p as u16).or(Some(80)),
@@ -1219,12 +1233,12 @@ impl ApiServer {
 
     /// `scheme` is "https" to speak TLS to the backend (certificates are not verified, like
     /// upstream's proxy transport).
-    fn proxy_reply(&self, req: &Req, scheme: &str, ip: [u8; 4], port: u16, what: &str) -> R<Reply> {
+    fn proxy_reply(&self, req: &Req, scheme: &str, ip: [u8; 16], port: u16, what: &str) -> R<Reply> {
         // /api/v1/namespaces/<ns>/<pods|services>/<name>/proxy[/<path>]
         let segs: Vec<&str> = req.path.splitn(9, '/').collect();
         let prefix = segs[..segs.len().min(8)].join("/");
         let path = alloc::format!("/{}", segs.get(8).copied().unwrap_or(""));
-        if !crate::podproxy::proxyable(ip) {
+        if !crate::podproxy::proxyable16(ip) {
             return Err(ApiError::bad_request(alloc::format!("address not allowed: {what} reports a host-local IP")));
         }
         Ok(Reply::Proxy(crate::podproxy::Target {
@@ -1254,11 +1268,11 @@ impl ApiServer {
         let pname = sport.get("name").and_then(Value::as_str).unwrap_or("");
         let ert = Route { res: resources::find("", "v1", "endpoints").unwrap(), namespace: rt.namespace.clone(), name: None, sub: None };
         let (_, ep) = self.get_value(&ert, svc_name).map_err(|_| ApiError::new(503, "ServiceUnavailable", alloc::format!("no endpoints available for service \"{svc_name}\"")))?;
-        let mut targets: Vec<([u8; 4], u16)> = Vec::new();
+        let mut targets: Vec<([u8; 16], u16)> = Vec::new();
         for sub in ep.get("subsets").and_then(Value::as_array).unwrap_or(&[]) {
             let Some(tp) = sub.get("ports").and_then(Value::as_array).and_then(|ps| ps.iter().find(|p| p.get("name").and_then(Value::as_str).unwrap_or("") == pname)).and_then(|p| p.get("port")).and_then(Value::as_u64) else { continue };
             for a in sub.get("addresses").and_then(Value::as_array).unwrap_or(&[]) {
-                if let Some(ip) = a.get("ip").and_then(Value::as_str).and_then(object::parse_ipv4) {
+                if let Some(ip) = a.get("ip").and_then(Value::as_str).and_then(kr_net::tcp::parse_ip16) {
                     targets.push((ip, tp as u16));
                 }
             }
@@ -2376,14 +2390,26 @@ impl ApiServer {
         if fams.is_empty() {
             fams = if !old_ips.is_empty() { old_ips.iter().filter(|i| *i != "None").map(|i| family_of(i).to_string()).collect() } else { want.iter().filter(|i| *i != "None").map(|i| family_of(i).to_string()).collect() };
         }
+        // The families this cluster has (`KR_POD_FAMILIES`): a Service defaults to the first one.
+        let enabled = |f: &str| if f == "IPv4" { self.pod_families().v4 } else { self.pod_families().v6 };
         if fams.is_empty() {
-            fams.push("IPv4".into());
+            fams.push(if enabled("IPv4") { "IPv4" } else { "IPv6" }.into());
         }
         if fams.iter().any(|f| f != "IPv4" && f != "IPv6") || (fams.len() == 2 && fams[0] == fams[1]) || fams.len() > 2 {
             return Err(ApiError::invalid("spec.ipFamilies: Unsupported value"));
         }
+        if old_ips.is_empty() {
+            if let Some(f) = fams.iter().find(|f| !enabled(f)) {
+                return Err(ApiError::invalid(alloc::format!("spec.ipFamilies: Invalid value: {f:?}: not configured on this cluster")));
+            }
+        }
         if policy != "SingleStack" && fams.len() == 1 {
-            fams.push(if fams[0] == "IPv4" { "IPv6" } else { "IPv4" }.into());
+            let other = if fams[0] == "IPv4" { "IPv6" } else { "IPv4" };
+            if enabled(other) {
+                fams.push(other.into());
+            } else if policy == "RequireDualStack" {
+                return Err(ApiError::invalid("spec.ipFamilyPolicy: Invalid value: \"RequireDualStack\": this cluster is not dual stack"));
+            }
         }
         if policy == "SingleStack" && fams.len() > 1 {
             return Err(ApiError::invalid("spec.ipFamilies: Invalid value: may not specify more than 1 IP family when ipFamilyPolicy is SingleStack"));
@@ -2487,15 +2513,22 @@ impl ApiServer {
         }
         let r = resources::find("", "v1", "nodes").unwrap();
         let (items, _) = self.store.borrow().list(&r.prefix(), None, 0);
-        let used: Vec<String> = items.iter().filter_map(|kv| json::parse(&kv.value).ok()).filter_map(|n| n.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).map(String::from)).collect();
-        let cidr = (0u16..256).map(|i| alloc::format!("10.88.{i}.0/24")).find(|c| !used.contains(c)).ok_or_else(|| ApiError::new(422, "Invalid", "pod CIDR exhausted"))?;
+        // Pod network number N: IPv4 `10.88.N.0/24`, IPv6 `fd00:88:0:N::/64` (kr-runtime `network::subnet6`).
+        let used: Vec<u32> = items
+            .iter()
+            .filter_map(|kv| json::parse(&kv.value).ok())
+            .flat_map(|n| {
+                let mut v: Vec<String> = n.pointer(&["spec", "podCIDRs"]).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+                v.extend(n.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).map(String::from));
+                v
+            })
+            .filter_map(|c| pod_net_index(&c))
+            .collect();
+        let n = (0u32..256).find(|i| !used.contains(i)).ok_or_else(|| ApiError::new(422, "Invalid", "pod CIDR exhausted"))?;
+        let cidrs = self.node_cidrs(n);
         let spec = o.entry_object("spec");
-        spec.set("podCIDR", Value::String(cidr.clone()));
-        // Dual stack: the IPv6 twin of the /24 is `fd00:88:0:<third octet in hex>::/64`
-        // (kr-runtime `network::subnet6`).
-        let third: u32 = cidr.split('.').nth(2).and_then(|n| n.parse().ok()).unwrap_or(0);
-        let cidr6 = if third == 0 { String::from("fd00:88:0::/64") } else { alloc::format!("fd00:88:0:{third:x}::/64") };
-        spec.set("podCIDRs", Value::Array(alloc::vec![Value::String(cidr), Value::String(cidr6)]));
+        spec.set("podCIDR", Value::String(cidrs[0].clone()));
+        spec.set("podCIDRs", Value::Array(cidrs.into_iter().map(Value::String).collect()));
         Ok(())
     }
 
@@ -2638,11 +2671,85 @@ impl ApiServer {
         }
     }
 
+    /// Sets the pod network's address families (default: dual stack). Call before nodes register
+    /// and before [`ApiServer::ensure_builtin_services`].
+    pub fn set_pod_families(&self, f: kr_net::tcp::Families) {
+        self.pod_families.set(f);
+        self.families_explicit.set(true);
+    }
+
+    /// The cluster's families: the setting of this server if it has one, else the one a server
+    /// with a setting stored (so HA leaders and restarts without the variable agree), else dual stack.
+    pub fn pod_families(&self) -> kr_net::tcp::Families {
+        if self.families_explicit.get() {
+            return self.pod_families.get();
+        }
+        self.store.borrow().get(FAMILIES_KEY).and_then(|kv| core::str::from_utf8(&kv.value).ok().and_then(kr_net::tcp::Families::parse)).unwrap_or(self.pod_families.get())
+    }
+
+    /// Stores an explicit setting, moves every Node's `podCIDRs` to it (keeping its pod network
+    /// number) and returns the nodes changed. Called by the bootstrap of a writable server, so a
+    /// node that registered under other families follows on the next start.
+    fn apply_pod_families(&self) {
+        if !self.families_explicit.get() {
+            return;
+        }
+        let text = self.pod_families.get().text();
+        let stored = self.store.borrow().get(FAMILIES_KEY).map(|kv| kv.value.clone());
+        // Under other families the built-in Services have the wrong ClusterIPs: recreate them.
+        let before = stored.as_deref().and_then(|v| core::str::from_utf8(v).ok()).and_then(kr_net::tcp::Families::parse).unwrap_or(kr_net::tcp::Families::DUAL);
+        if before != self.pod_families.get() {
+            for (ns, name) in [("default", "kubernetes"), ("kube-system", "kube-dns")] {
+                if let Some(r) = resources::find("", "v1", "services") {
+                    let _ = self.store.borrow_mut().delete(&r.key(Some(ns), name), None);
+                }
+            }
+        }
+        match stored {
+            Some(v) if &*v == text.as_bytes() => {}
+            Some(_) => {
+                let _ = self.store.borrow_mut().update(FAMILIES_KEY, text.as_bytes().to_vec(), None);
+            }
+            None => {
+                let _ = self.store.borrow_mut().create(FAMILIES_KEY, text.as_bytes().to_vec());
+            }
+        }
+        let nodes = self.wh_list("", "v1", "nodes");
+        for n in nodes {
+            let Some(name) = n.pointer(&["metadata", "name"]).and_then(Value::as_str) else { continue };
+            let have: Vec<String> = n.pointer(&["spec", "podCIDRs"]).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+            let Some(idx) = have.iter().chain(n.pointer(&["spec", "podCIDR"]).and_then(Value::as_str).map(String::from).as_ref()).find_map(|c| pod_net_index(c)) else { continue };
+            let want = self.node_cidrs(idx);
+            if have.iter().map(String::as_str).eq(want.iter().map(String::as_str)) {
+                continue;
+            }
+            let patch = alloc::format!(r#"{{"spec":{{"podCIDR":"{}","podCIDRs":[{}]}}}}"#, want[0], want.iter().map(|c| alloc::format!("\"{c}\"")).collect::<Vec<_>>().join(","));
+            let path = alloc::format!("/api/v1/nodes/{name}");
+            let sys = User { name: "system:kr-bootstrap".into(), groups: alloc::vec!["system:masters".into()] };
+            let r = Req { method: "PATCH", path: &path, query: "", content_type: Some("application/merge-patch+json"), accept: None, body: patch.as_bytes(), user: Some(sys), bearer: None, headers: &[], authz_verb: None };
+            let _ = self.handle(&r);
+        }
+    }
+
+    /// `spec.podCIDRs` of pod network number `n` for the cluster's families.
+    fn node_cidrs(&self, n: u32) -> Vec<String> {
+        let fam = self.pod_families();
+        let mut v = Vec::new();
+        if fam.v4 {
+            v.push(alloc::format!("10.88.{n}.0/24"));
+        }
+        if fam.v6 {
+            v.push(if n == 0 { String::from("fd00:88:0::/64") } else { alloc::format!("fd00:88:0:{n:x}::/64") });
+        }
+        v
+    }
+
     pub fn ensure_builtin_services(&self, advertise: [u8; 16], port: u16) -> Result<(), ApiError> {
         self.boot_services.set(Some((advertise, port)));
         if !self.writable() {
             return Ok(());
         }
+        self.apply_pod_families();
         let svc = resources::find("", "v1", "services").unwrap();
         let ep = resources::find("", "v1", "endpoints").unwrap();
         // HA: every server is an endpoint of the kubernetes Service.
@@ -2653,7 +2760,7 @@ impl ApiServer {
         let port = addrs[0].1;
         let host6 = crate::api::host_ip6();
         // A dual-stack host also offers its IPv6 address (when the servers are IPv4 only).
-        if let Some(h6) = host6 {
+        if let Some(h6) = host6.filter(|_| self.pod_families().v6) {
             if !addrs.iter().any(|(a, _)| kr_sys::unmap4(*a).is_none()) {
                 addrs.push((h6, port));
             }
@@ -2661,7 +2768,17 @@ impl ApiServer {
         let ips: Vec<String> = addrs.iter().map(|(a, _)| alloc::format!(r#"{{"ip":"{}"}}"#, kr_net::tcp::fmt_ip16(*a))).collect();
         let ips = ips.join(",");
         let kube = r#"{"metadata":{"name":"kubernetes","labels":{"component":"apiserver","provider":"kubernetes"}},"spec":{"type":"ClusterIP","clusterIP":"10.96.0.1","clusterIPs":["10.96.0.1"],"ipFamilies":["IPv4"],"ipFamilyPolicy":"SingleStack","sessionAffinity":"None","internalTrafficPolicy":"Cluster","ports":[{"name":"https","port":443,"protocol":"TCP","targetPort":6443}]}}"#;
-        let kube = if host6.is_some() { kube.replace(r#""clusterIPs":["10.96.0.1"],"ipFamilies":["IPv4"],"ipFamilyPolicy":"SingleStack""#, r#""clusterIPs":["10.96.0.1","fd00:96::1"],"ipFamilies":["IPv4","IPv6"],"ipFamilyPolicy":"PreferDualStack""#) } else { String::from(kube) };
+        let fam = self.pod_families();
+        let single4 = r#""clusterIPs":["10.96.0.1"],"ipFamilies":["IPv4"],"ipFamilyPolicy":"SingleStack""#;
+        // Dual stack needs the host's IPv6 address for the endpoint; an IPv6-only pod network
+        // always has the IPv6 ClusterIP (the proxy dials the endpoint in whatever family it has).
+        let kube = if !fam.v4 {
+            kube.replace(single4, r#""clusterIPs":["fd00:96::1"],"ipFamilies":["IPv6"],"ipFamilyPolicy":"SingleStack""#).replace(r#""clusterIP":"10.96.0.1""#, r#""clusterIP":"fd00:96::1""#)
+        } else if host6.is_some() && fam.v6 {
+            kube.replace(single4, r#""clusterIPs":["10.96.0.1","fd00:96::1"],"ipFamilies":["IPv4","IPv6"],"ipFamilyPolicy":"PreferDualStack""#)
+        } else {
+            String::from(kube)
+        };
         self.bootstrap_object(svc, Some("default"), "kubernetes", "Service", &kube);
         // The endpoints follow the API server's current address (re-written on every start).
         let body = alloc::format!(r#"{{"metadata":{{"name":"kubernetes","labels":{{"endpointslice.kubernetes.io/skip-mirror":"true"}}}},"subsets":[{{"addresses":[{ips}],"ports":[{{"name":"https","port":{port},"protocol":"TCP"}}]}}]}}"#);
@@ -2682,7 +2799,15 @@ impl ApiServer {
             let body = alloc::format!(r#"{{"metadata":{{"name":"{name}","labels":{{"kubernetes.io/service-name":"kubernetes"}}}},"addressType":"{ty}","endpoints":[{}],"ports":[{{"name":"https","port":{port},"protocol":"TCP"}}]}}"#, list.join(","));
             self.bootstrap_object(eps, Some("default"), name, "EndpointSlice", &body);
         }
-        self.bootstrap_object(svc, Some("kube-system"), "kube-dns", "Service", r#"{"metadata":{"name":"kube-dns","labels":{"k8s-app":"kube-dns","kubernetes.io/name":"CoreDNS"},"annotations":{"kr.io/builtin":"dns"}},"spec":{"type":"ClusterIP","clusterIP":"10.96.0.10","clusterIPs":["10.96.0.10","fd00:96::a"],"ipFamilies":["IPv4","IPv6"],"ipFamilyPolicy":"PreferDualStack","sessionAffinity":"None","internalTrafficPolicy":"Cluster","ports":[{"name":"dns","port":53,"protocol":"UDP","targetPort":53},{"name":"dns-tcp","port":53,"protocol":"TCP","targetPort":53}]}}"#);
+        let dns = r#"{"metadata":{"name":"kube-dns","labels":{"k8s-app":"kube-dns","kubernetes.io/name":"CoreDNS"},"annotations":{"kr.io/builtin":"dns"}},"spec":{"type":"ClusterIP","clusterIP":"10.96.0.10","clusterIPs":["10.96.0.10","fd00:96::a"],"ipFamilies":["IPv4","IPv6"],"ipFamilyPolicy":"PreferDualStack","sessionAffinity":"None","internalTrafficPolicy":"Cluster","ports":[{"name":"dns","port":53,"protocol":"UDP","targetPort":53},{"name":"dns-tcp","port":53,"protocol":"TCP","targetPort":53}]}}"#;
+        let dns = if !fam.v4 {
+            dns.replace(r#""clusterIP":"10.96.0.10","clusterIPs":["10.96.0.10","fd00:96::a"],"ipFamilies":["IPv4","IPv6"],"ipFamilyPolicy":"PreferDualStack""#, r#""clusterIP":"fd00:96::a","clusterIPs":["fd00:96::a"],"ipFamilies":["IPv6"],"ipFamilyPolicy":"SingleStack""#)
+        } else if !fam.v6 {
+            dns.replace(r#""clusterIPs":["10.96.0.10","fd00:96::a"],"ipFamilies":["IPv4","IPv6"],"ipFamilyPolicy":"PreferDualStack""#, r#""clusterIPs":["10.96.0.10"],"ipFamilies":["IPv4"],"ipFamilyPolicy":"SingleStack""#)
+        } else {
+            String::from(dns)
+        };
+        self.bootstrap_object(svc, Some("kube-system"), "kube-dns", "Service", &dns);
         self.sync()
     }
 

@@ -87,18 +87,30 @@ pub fn pod_hostname(pod: &Value) -> String {
 /// The host's resolv.conf for a pod. A rootless pod has its own loopback, so a stub resolver on
 /// the host's (127.0.0.53, 127.0.0.1) is replaced by the egress forwarder, which reaches it from
 /// the host namespace.
-fn host_resolv_conf(rootless_pod: bool) -> String {
+fn host_resolv_conf(rootless_pod: bool, fam: kr_net::tcp::Families) -> String {
     let text = String::from_utf8(kr_sys::fs::read_file(b"/etc/resolv.conf\0", 64 * 1024).unwrap_or_default()).unwrap_or_default();
-    if !rootless_pod {
+    if !rootless_pod && fam.v4 {
         return text;
     }
-    let fwd = kr_runtime::network::EGRESS_DNS;
-    let fwd = alloc::format!("nameserver {}.{}.{}.{}", fwd[0], fwd[1], fwd[2], fwd[3]);
+    // The replacement for nameservers the pod cannot use: in a rootless pod the egress forwarder
+    // (it reaches the host's resolver from the host namespace), in an IPv6-only pod network with
+    // IPv4 resolvers the cluster DNS, which forwards to the host's.
+    let fwd = if !fam.v4 && !rootless_pod {
+        alloc::format!("nameserver {}", kr_net::tcp::ipv6_string(crate::dns::DNS_IP6))
+    } else if fam.v4 {
+        let f = kr_runtime::network::EGRESS_DNS;
+        alloc::format!("nameserver {}.{}.{}.{}", f[0], f[1], f[2], f[3])
+    } else {
+        alloc::format!("nameserver {}", kr_net::tcp::ipv6_string(kr_runtime::network::EGRESS_DNS6))
+    };
     let mut out = String::new();
     let mut seen_fwd = false;
     for l in text.lines() {
-        let loopback = l.trim().strip_prefix("nameserver").is_some_and(|a| a.trim().starts_with("127.") || a.trim() == "::1");
-        if loopback {
+        let addr = l.trim().strip_prefix("nameserver").map(str::trim);
+        let loopback = addr.is_some_and(|a| a.starts_with("127.") || a == "::1");
+        // IPv6-only pods have no IPv4 route: every IPv4 resolver is replaced too.
+        let unusable = !fam.v4 && addr.is_some_and(|a| kr_net::tcp::parse_ipv4(a).is_some());
+        if (rootless_pod && loopback) || unusable || (!rootless_pod && !fam.v4 && loopback) {
             if !seen_fwd {
                 out.push_str(&fwd);
                 out.push('\n');
@@ -114,17 +126,20 @@ fn host_resolv_conf(rootless_pod: bool) -> String {
 
 /// /etc/resolv.conf for the pod per `dnsPolicy` (ClusterFirst by default). `rootless_pod`: the
 /// pod lives in the rootless pod network (not hostNetwork).
-pub fn write_resolv_conf(pod_dir: &str, pod: &Value, rootless_pod: bool) -> Result<(), ()> {
+pub fn write_resolv_conf(pod_dir: &str, pod: &Value, rootless_pod: bool, fam: kr_net::tcp::Families) -> Result<(), ()> {
     let ns = meta(pod, "namespace");
     let policy = pod.pointer(&["spec", "dnsPolicy"]).and_then(Value::as_str).unwrap_or("ClusterFirst");
     let host_net = pod.pointer(&["spec", "hostNetwork"]).and_then(Value::as_bool) == Some(true);
     let rootless_pod = rootless_pod && !host_net;
     let mut s = match policy {
-        "Default" => host_resolv_conf(rootless_pod),
+        "Default" => host_resolv_conf(rootless_pod, fam),
         "ClusterFirstWithHostNet" | "ClusterFirst" if !(host_net && policy == "ClusterFirst") => {
-            alloc::format!("search {ns}.svc.cluster.local svc.cluster.local cluster.local\nnameserver 10.96.0.10\noptions ndots:5\n")
+            {
+                let ns_ip = if fam.v4 { String::from("10.96.0.10") } else { kr_net::tcp::ipv6_string(crate::dns::DNS_IP6) };
+                alloc::format!("search {ns}.svc.cluster.local svc.cluster.local cluster.local\nnameserver {ns_ip}\noptions ndots:5\n")
+            }
         }
-        "ClusterFirst" => host_resolv_conf(rootless_pod),
+        "ClusterFirst" => host_resolv_conf(rootless_pod, fam),
         _ => String::new(), // "None": only dnsConfig below
     };
     if let Some(cfg) = pod.pointer(&["spec", "dnsConfig"]) {
@@ -169,15 +184,16 @@ async fn service_env<C: Client>(c: &C, pod: &Value) -> Vec<(String, String)> {
         let port = |p: &Value| p.get("port").and_then(Value::as_u64).unwrap_or(0);
         let proto = |p: &Value| p.get("protocol").and_then(Value::as_str).unwrap_or("TCP").to_string();
         out.push((alloc::format!("{name}_SERVICE_HOST"), ip.to_string()));
+        let hostp = if ip.contains(':') { alloc::format!("[{ip}]") } else { ip.to_string() };
         out.push((alloc::format!("{name}_SERVICE_PORT"), port(first).to_string()));
-        out.push((alloc::format!("{name}_PORT"), alloc::format!("{}://{ip}:{}", proto(first).to_ascii_lowercase(), port(first))));
+        out.push((alloc::format!("{name}_PORT"), alloc::format!("{}://{hostp}:{}", proto(first).to_ascii_lowercase(), port(first))));
         for p in ports {
             let pr = proto(p);
             let base = alloc::format!("{name}_PORT_{}_{}", port(p), pr);
             if let Some(pn) = p.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()) {
                 out.push((alloc::format!("{name}_SERVICE_PORT_{}", pn.replace('-', "_").to_ascii_uppercase()), port(p).to_string()));
             }
-            out.push((base.clone(), alloc::format!("{}://{ip}:{}", pr.to_ascii_lowercase(), port(p))));
+            out.push((base.clone(), alloc::format!("{}://{hostp}:{}", pr.to_ascii_lowercase(), port(p))));
             out.push((alloc::format!("{base}_PROTO"), pr.to_ascii_lowercase()));
             out.push((alloc::format!("{base}_PORT"), port(p).to_string()));
             out.push((alloc::format!("{base}_ADDR"), ip.to_string()));
@@ -289,8 +305,11 @@ fn field_ref(pod: &Value, path: &str, ip: Option<[u8; 4]>, ip6: Option<[u8; 16]>
         "spec.serviceAccountName" => pod.pointer(&["spec", "serviceAccountName"]).and_then(Value::as_str).unwrap_or("default").to_string(),
         "status.podIP" | "status.podIPs" => {
             let mut v: Vec<String> = ip.map(|a| alloc::format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3])).into_iter().collect();
-            if path == "status.podIPs" {
+            if path == "status.podIPs" || v.is_empty() {
                 v.extend(ip6.map(kr_net::tcp::ipv6_string));
+            }
+            if path == "status.podIP" {
+                v.truncate(1);
             }
             v.join(",")
         }

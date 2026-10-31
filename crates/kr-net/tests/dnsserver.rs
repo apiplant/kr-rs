@@ -42,10 +42,10 @@ impl Zone for Fake {
         let ports = vec![port("sql", "tcp", 5432)];
         match (ns, name) {
             ("default", "db") => vec![
-                EndpointRecord { ip: [10, 88, 0, 5], ip6: Some(DB06), hostname: Some("db-0".into()), ports: ports.clone() },
-                EndpointRecord { ip: [10, 88, 0, 6], ip6: None, hostname: Some("db-1".into()), ports },
+                EndpointRecord { ip: Some([10, 88, 0, 5]), ip6: Some(DB06), hostname: Some("db-0".into()), ports: ports.clone() },
+                EndpointRecord { ip: Some([10, 88, 0, 6]), ip6: None, hostname: Some("db-1".into()), ports },
             ],
-            ("default", "big") => (0..50).map(|i| EndpointRecord { ip: [10, 88, 1, i as u8], ip6: None, hostname: None, ports: ports.clone() }).collect(),
+            ("default", "big") => (0..50).map(|i| EndpointRecord { ip: Some([10, 88, 1, i as u8]), ip6: None, hostname: None, ports: ports.clone() }).collect(),
             _ => vec![],
         }
     }
@@ -285,13 +285,15 @@ fn srv_with_additional_a() {
     assert_eq!(r.ty, 33);
     assert_eq!(u16::from_be_bytes([r.rdata[4], r.rdata[5]]), 80);
     assert_eq!(m.rdname(r, 6), "web.default.svc.cluster.local");
-    assert_eq!(m.ar.len(), 1);
-    assert_eq!((m.ar[0].name.as_str(), m.ar[0].rdata.clone()), ("web.default.svc.cluster.local", vec![10, 96, 0, 10]));
+    // The target's A and AAAA records (the Service is dual stack).
+    let a: Vec<_> = m.ar.iter().filter(|r| r.ty == 1).collect();
+    assert_eq!((a.len(), a[0].name.as_str(), a[0].rdata.clone()), (1, "web.default.svc.cluster.local", vec![10, 96, 0, 10]));
+    assert!(m.ar.iter().any(|r| r.ty == 28));
     // headless: one SRV per endpoint, targets resolvable through the additional section
     let m = ask("_sql._tcp.db.default.svc.cluster.local", 33);
     assert_eq!(m.an.len(), 2);
     assert_eq!(m.rdname(&m.an[0], 6), "db-0.db.default.svc.cluster.local");
-    assert_eq!(ips(&m.ar), [[10, 88, 0, 5], [10, 88, 0, 6]]);
+    assert_eq!(ips(&m.ar.iter().filter(|r| r.ty == 1).cloned().collect::<Vec<_>>()), [[10, 88, 0, 5], [10, 88, 0, 6]]);
     let t = ask(&m.rdname(&m.an[1], 6), 1);
     assert_eq!(ips(&t.an), [[10, 88, 0, 6]]);
     // other type on an SRV name: NODATA

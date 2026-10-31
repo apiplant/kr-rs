@@ -186,7 +186,9 @@ fn run(mut args: Args) -> i32 {
     };
     if let Some(l) = &net.lease {
         let ip = l.ip;
-        eprint(format!("kr ctr: {id} at {}.{}.{}.{}\n", ip[0], ip[1], ip[2], ip[3]).as_bytes());
+        let f = fam();
+        let at = if f.v4 { format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]) } else { network::ipv6_string(network::pod_ip6(network::PodNet::default().subnet, ip)) };
+        eprint(format!("kr ctr: {id} at {at}\n").as_bytes());
     }
     let code = supervise(&spec);
     net.release();
@@ -203,6 +205,12 @@ fn run(mut args: Args) -> i32 {
     code
 }
 
+/// The address families of standalone containers: `KR_POD_FAMILIES` (`4`, `6`, `4,6`; default both),
+/// as for a cluster. The rootless bridge is shared, so the first `kr ctr run` decides for it.
+fn fam() -> network::Families {
+    kr_runtime::store::env_var("KR_POD_FAMILIES").and_then(|v| network::Families::parse(&v)).unwrap_or(network::Families::DUAL)
+}
+
 /// The network of a standalone container: an address on the bridge and, rootless, the sandbox
 /// (a child of the shared infra namespace) that owns the netns the veth peer lives in.
 struct CtrNet {
@@ -214,7 +222,7 @@ impl CtrNet {
     /// Real root: the container child configures its own netns from this.
     fn root_config(&self) -> Option<NetConfig> {
         let l = self.lease.as_ref().filter(|_| self.sandbox.is_none())?;
-        Some(NetConfig::dual(l.ip, &network::PodNet::default()))
+        Some(NetConfig::with(l.ip, &network::PodNet::default(), fam()))
     }
 
     /// Stops the sandbox (its veth goes with the netns) and frees the address.
@@ -233,7 +241,7 @@ impl CtrNet {
 fn bridge_network(store: &Store, id: &str, maps: &IdMaps) -> Result<CtrNet, i32> {
     let root = ns::getuid() == 0;
     if root {
-        network::setup_host().map_err(|e| fail(&format!("network setup: errno {}", e.0)))?;
+        network::setup_host_with(&network::PodNet::default(), fam()).map_err(|e| fail(&format!("network setup: errno {}", e.0)))?;
     }
     let dir = format!("{}/ipam", store.root());
     match ns::mkdir(&nul(dir.as_bytes()), 0o700) {
@@ -246,7 +254,7 @@ fn bridge_network(store: &Store, id: &str, maps: &IdMaps) -> Result<CtrNet, i32>
         return Ok(CtrNet { lease: Some(lease), sandbox: None });
     }
     // The lease comes first so the infra supervisor sees this process as a user.
-    let cfg = NetConfig::dual(lease.ip, &network::PodNet::default());
+    let cfg = NetConfig::with(lease.ip, &network::PodNet::default(), fam());
     let sandbox = rootless_infra(store.root(), maps).and_then(|infra| container::start_sandbox_in(&infra, id.as_bytes(), id.as_bytes(), maps, Some(cfg)).map_err(|e| format!("sandbox: {}: errno {}", e.step, e.errno.0)));
     match sandbox {
         Ok(sb) => Ok(CtrNet { lease: Some(lease), sandbox: Some(sb) }),
@@ -261,13 +269,17 @@ fn bridge_network(store: &Store, id: &str, maps: &IdMaps) -> Result<CtrNet, i32>
 /// host's resolver even when that is a loopback stub); as root, the host's non-loopback
 /// nameservers, or a public one when it only has a stub.
 fn resolv_conf(rootless: bool) -> String {
+    let fam = fam();
     if rootless {
+        if !fam.v4 {
+            return format!("nameserver {}\n", kr_net::tcp::ipv6_string(network::EGRESS_DNS6));
+        }
         return format!("nameserver {}.{}.{}.{}\n", network::EGRESS_DNS[0], network::EGRESS_DNS[1], network::EGRESS_DNS[2], network::EGRESS_DNS[3]);
     }
     let host = String::from_utf8(kr_sys::fs::read_file(b"/etc/resolv.conf\0", 16384).unwrap_or_default()).unwrap_or_default();
-    let mut out: String = host.lines().filter(|l| l.trim().strip_prefix("nameserver").map(|a| !a.trim().starts_with("127.") && a.trim() != "::1").unwrap_or(false)).map(|l| format!("{l}\n")).collect();
+    let mut out: String = host.lines().filter(|l| l.trim().strip_prefix("nameserver").map(|a| !a.trim().starts_with("127.") && a.trim() != "::1" && (fam.v4 || a.contains(':'))).unwrap_or(false)).map(|l| format!("{l}\n")).collect();
     if out.is_empty() {
-        out.push_str("nameserver 1.1.1.1\n");
+        out.push_str(if fam.v4 { "nameserver 1.1.1.1\n" } else { "nameserver 2606:4700:4700::1111\n" });
     }
     out
 }
@@ -316,7 +328,7 @@ fn infra_supervisor(root: &str, maps: &IdMaps) -> ! {
     ns::close_from(3);
     let Ok(infra) = container::start_sandbox(b"kr-ctr-network", b"", maps, None) else { kr_sys::exit_group(1) };
     let pn = network::PodNet::default();
-    if !matches!(container::run_in_net(&infra, || network::setup_infra_bridge(&pn)), Ok(0)) {
+    if !matches!(container::run_in_net(&infra, || network::setup_infra_bridge(&pn, fam())), Ok(0)) {
         infra.stop();
         kr_sys::exit_group(1);
     }

@@ -90,6 +90,51 @@ pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     (n == 4).then_some(out)
 }
 
+/// Which address families the pod network carries (`KR_POD_FAMILIES`: `4`, `6` or `4,6`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Families {
+    pub v4: bool,
+    pub v6: bool,
+}
+
+impl Families {
+    pub const DUAL: Families = Families { v4: true, v6: true };
+    pub const V4: Families = Families { v4: true, v6: false };
+    pub const V6: Families = Families { v4: false, v6: true };
+
+    /// "4", "6", "4,6" / "6,4", also "ipv4", "ipv6", "dual" (None when unrecognised).
+    pub fn parse(s: &str) -> Option<Families> {
+        let (mut v4, mut v6) = (false, false);
+        for p in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            match p {
+                "4" | "ipv4" | "IPv4" => v4 = true,
+                "6" | "ipv6" | "IPv6" => v6 = true,
+                "dual" | "4,6" => {
+                    v4 = true;
+                    v6 = true;
+                }
+                _ => return None,
+            }
+        }
+        (v4 || v6).then_some(Families { v4, v6 })
+    }
+
+    /// `podCIDRs`-style text: "4", "6" or "4,6".
+    pub fn text(self) -> &'static str {
+        match (self.v4, self.v6) {
+            (true, true) => "4,6",
+            (true, false) => "4",
+            _ => "6",
+        }
+    }
+}
+
+impl Default for Families {
+    fn default() -> Self {
+        Families::DUAL
+    }
+}
+
 /// Either family as the 16-byte form (IPv4 mapped to `::ffff:a.b.c.d`).
 pub fn parse_ip16(s: &str) -> Option<[u8; 16]> {
     parse_ipv4(s).map(kr_sys::map4).or_else(|| parse_ipv6(s))

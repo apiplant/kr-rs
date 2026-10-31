@@ -18,6 +18,8 @@ for n in kr1 kr2; do
 done
 # KR_HOST_V6=1: give the nodes a global IPv6 address on the shared network, so they report an
 # IPv6 InternalIP and the kubernetes Service becomes dual stack (host-gw v6 routes etc.).
+# KR_POD_FAMILIES=4|6|4,6: address families of pods and Services (the server's setting; nodes follow).
+if [ -n "${KR_POD_FAMILIES:-}" ]; then KR_SERVER_ENV="KR_POD_FAMILIES=$KR_POD_FAMILIES ${KR_SERVER_ENV:-}"; fi
 # KR_V6_UNDERLAY=1: nodes use their IPv6 addresses for everything (join, Raft, kubelet, VXLAN).
 if [ -n "${KR_V6_UNDERLAY:-}" ]; then
   KR_HOST_V6=1; KR_SERVER_ENV="KR_PREFER_IPV6=1 ${KR_SERVER_ENV:-}"; KR_AGENT_ENV="KR_PREFER_IPV6=1 ${KR_AGENT_ENV:-}"

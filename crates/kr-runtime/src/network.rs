@@ -13,6 +13,8 @@ use kr_net::netlink::{self, Netlink};
 use kr_sys::ns;
 use kr_sys::Errno;
 
+pub use kr_net::tcp::Families;
+
 pub const BRIDGE: &[u8] = b"kr0";
 /// The cluster pod network; each node gets a /24 of it (`spec.podCIDR`).
 pub const CLUSTER_CIDR: ([u8; 4], u8) = ([10, 88, 0, 0], 16);
@@ -48,6 +50,35 @@ impl PodNet {
         let mask = u32::MAX << (32 - prefix);
         let net = u32::from_be_bytes(a) & mask;
         Some(PodNet { subnet: net.to_be_bytes(), prefix, gateway: (net + 1).to_be_bytes() })
+    }
+}
+
+impl PodNet {
+    /// The node subnet for pod-network number `n` (`10.88.N.0/24`, whose IPv6 twin is `fd00:88:0:N::/64`).
+    pub fn for_index(n: u8) -> PodNet {
+        PodNet { subnet: [10, 88, n, 0], prefix: PREFIX, gateway: [10, 88, n, 1] }
+    }
+
+    /// From a Node's `spec.podCIDRs`: the node's subnet and the families the pod network carries.
+    /// An IPv6 `fd00:88:0:N::/64` alone (an IPv6-only cluster) still yields the subnet number N:
+    /// the IPv4 `/24` is then only the allocator's address space, never configured on pods.
+    pub fn from_cidrs<'a>(cidrs: impl IntoIterator<Item = &'a str>) -> Option<(PodNet, Families)> {
+        let (mut v4, mut v6) = (None, None);
+        for c in cidrs {
+            if c.contains(':') {
+                let (ip, len) = c.split_once('/')?;
+                let a = kr_net::tcp::parse_ipv6(ip)?;
+                if len != "64" || a[..4] != [0xfd, 0, 0, 0x88] {
+                    return None;
+                }
+                v6 = Some(a[7]);
+            } else {
+                v4 = PodNet::parse(c);
+            }
+        }
+        let fam = Families { v4: v4.is_some(), v6: v6.is_some() };
+        let pn = v4.or_else(|| v6.map(PodNet::for_index))?;
+        Some((pn, fam))
     }
 }
 
@@ -94,7 +125,10 @@ const NFT_TABLE: &[u8] = b"kr";
 /// What the container child configures on its `eth0`.
 #[derive(Clone, Copy, Debug)]
 pub struct NetConfig {
+    /// The pod's slot in the node subnet. It is configured on `eth0` only when `v4` is set.
     pub ip: [u8; 4],
+    /// Configure the IPv4 address and default route (false in an IPv6-only pod network).
+    pub v4: bool,
     pub prefix: u8,
     pub gateway: [u8; 4],
     /// IPv6 twin of `ip` (see [`pod_ip6`]); `None` leaves the pod IPv4-only.
@@ -105,7 +139,12 @@ pub struct NetConfig {
 impl NetConfig {
     /// IPv4 address `ip` in the node subnet `pn`, with its dual-stack twin.
     pub fn dual(ip: [u8; 4], pn: &PodNet) -> NetConfig {
-        NetConfig { ip, prefix: pn.prefix, gateway: pn.gateway, ip6: Some(pod_ip6(pn.subnet, ip)), gateway6: gateway6(pn.subnet) }
+        NetConfig::with(ip, pn, Families::DUAL)
+    }
+
+    /// The address(es) of `fam` for slot `ip` in the node subnet `pn`.
+    pub fn with(ip: [u8; 4], pn: &PodNet, fam: Families) -> NetConfig {
+        NetConfig { ip, v4: fam.v4, prefix: pn.prefix, gateway: pn.gateway, ip6: fam.v6.then(|| pod_ip6(pn.subnet, ip)), gateway6: gateway6(pn.subnet) }
     }
 }
 
@@ -123,44 +162,63 @@ fn gateway_mac(gw: [u8; 4]) -> [u8; 6] {
 
 /// Creates (idempotently) the bridge, its gateway address, IPv4 forwarding and the NAT table.
 pub fn setup_host() -> Result<(), Errno> {
-    setup_host_with(&PodNet::default())
+    setup_host_with(&PodNet::default(), Families::DUAL)
 }
 
-pub fn setup_host_with(pn: &PodNet) -> Result<(), Errno> {
+pub fn setup_host_with(pn: &PodNet, fam: Families) -> Result<(), Errno> {
     let nl = Netlink::route()?;
     exists_ok(nl.bridge_add(BRIDGE))?;
     let br = netlink::ifindex(BRIDGE)?;
-    exists_ok(nl.addr_add(br, pn.gateway, pn.prefix))?;
+    if fam.v4 {
+        exists_ok(nl.addr_add(br, pn.gateway, pn.prefix))?;
+    }
     nl.link_set_mac(br, gateway_mac(pn.gateway))?;
     nl.link_up(br)?;
-    ns::write_file(b"/proc/sys/net/ipv4/ip_forward\0", b"1")?;
-    // IPv6 is best effort: a host with IPv6 disabled keeps working single-stack.
-    if nl.addr_add6(br, gateway6(pn.subnet), POD_PREFIX6).map_or_else(|e| e.0 == 17, |_| true) {
-        let _ = ns::write_file(b"/proc/sys/net/ipv6/conf/all/forwarding\0", b"1");
+    if fam.v4 {
+        ns::write_file(b"/proc/sys/net/ipv4/ip_forward\0", b"1")?;
     }
-    kr_net::nft::ensure_masquerade(&kr_net::nft::Masquerade { table: NFT_TABLE, cidr: CLUSTER_CIDR.0, prefix: CLUSTER_CIDR.1, bridge: BRIDGE })?;
+    // IPv6 is best effort when dual stack (a host with IPv6 disabled keeps working single-stack),
+    // required in an IPv6-only pod network.
+    if fam.v6 {
+        let ok = nl.addr_add6(br, gateway6(pn.subnet), POD_PREFIX6).map_or_else(|e| e.0 == 17, |_| true);
+        if ok {
+            let _ = ns::write_file(b"/proc/sys/net/ipv6/conf/all/forwarding\0", b"1");
+        } else if !fam.v4 {
+            return Err(Errno(97)); // EAFNOSUPPORT: the host has no IPv6
+        }
+    }
+    if fam.v4 {
+        kr_net::nft::ensure_masquerade(&kr_net::nft::Masquerade { table: NFT_TABLE, cidr: CLUSTER_CIDR.0, prefix: CLUSTER_CIDR.1, bridge: BRIDGE })?;
+    }
     // IPv6 pods (fd00:88::/32) leave NATed too; a host or kernel without IPv6 NAT stays single-stack.
-    let _ = kr_net::nft::ensure_masquerade6(&kr_net::nft::Masquerade6 { table: NFT_TABLE, cidr: subnet6([0; 4]), prefix: 32, bridge: BRIDGE });
+    if fam.v6 {
+        let r = kr_net::nft::ensure_masquerade6(&kr_net::nft::Masquerade6 { table: NFT_TABLE, cidr: subnet6([0; 4]), prefix: 32, bridge: BRIDGE });
+        if !fam.v4 {
+            r?;
+        }
+    }
     Ok(())
 }
 
 /// Rootless: run inside the infra namespaces (`container::run_in_net`); creates the bridge with
 /// its gateway address and enables forwarding. Returns an exit code (0 = ok). No NAT: the
 /// infra namespace has no route out.
-pub fn setup_infra_bridge(pn: &PodNet) -> i32 {
+pub fn setup_infra_bridge(pn: &PodNet, fam: Families) -> i32 {
     let nl = match Netlink::route() {
         Ok(n) => n,
         Err(_) => return 1,
     };
     let _ = nl.bridge_add(BRIDGE);
     let Ok(br) = netlink::ifindex(BRIDGE) else { return 2 };
-    let _ = nl.addr_add(br, pn.gateway, pn.prefix);
+    if fam.v4 {
+        let _ = nl.addr_add(br, pn.gateway, pn.prefix);
+    }
     let _ = nl.link_set_mac(br, gateway_mac(pn.gateway));
     if nl.link_up(br).is_err() {
         return 3;
     }
     let _ = ns::write_file(b"/proc/sys/net/ipv4/ip_forward\0", b"1");
-    if nl.addr_add6(br, gateway6(pn.subnet), POD_PREFIX6).map_or_else(|e| e.0 == 17, |_| true) {
+    if fam.v6 && nl.addr_add6(br, gateway6(pn.subnet), POD_PREFIX6).map_or_else(|e| e.0 == 17, |_| true) {
         let _ = ns::write_file(b"/proc/sys/net/ipv6/conf/all/forwarding\0", b"1");
     }
     0
@@ -171,6 +229,8 @@ pub const EGRESS_DEV: &[u8] = b"kr-out";
 /// Rootless: DNS queries (UDP/TCP 53) to this address leave through the egress driver to the
 /// host's first nameserver, even when that one is a loopback stub the pod cannot reach itself.
 pub const EGRESS_DNS: [u8; 4] = [100, 64, 255, 2];
+/// The same forwarder for IPv6-only pods (the NAT's IPv6 hop address, `fd00:88:ffff:1::2`).
+pub const EGRESS_DNS6: [u8; 16] = [0xfd, 0, 0, 0x88, 0xff, 0xff, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2];
 
 /// Runs inside the infra namespaces: creates the TUN `kr-out`, gives it an address, makes it the
 /// default route and sends its descriptor over `sock` (SCM_RIGHTS). Returns an exit code.
@@ -258,14 +318,21 @@ pub fn forget_neighbour(ip: [u8; 4]) {
 pub fn configure_child(c: &NetConfig) -> Result<(), Errno> {
     let nl = Netlink::route()?;
     let idx = netlink::ifindex(b"eth0")?;
-    nl.addr_add(idx, c.ip, c.prefix)?;
-    // Announce the address (gratuitous ARP) when the link comes up, so peers holding the previous
-    // owner's MAC for a reused address learn the new one at once. Best effort.
-    let _ = ns::write_file(b"/proc/sys/net/ipv4/conf/eth0/arp_notify\0", b"1");
+    if c.v4 {
+        nl.addr_add(idx, c.ip, c.prefix)?;
+        // Announce the address (gratuitous ARP) when the link comes up, so peers holding the previous
+        // owner's MAC for a reused address learn the new one at once. Best effort.
+        let _ = ns::write_file(b"/proc/sys/net/ipv4/conf/eth0/arp_notify\0", b"1");
+    }
     nl.link_up(idx)?;
-    nl.route_add([0; 4], 0, Some(c.gateway), idx)?;
+    if c.v4 {
+        nl.route_add([0; 4], 0, Some(c.gateway), idx)?;
+    }
     // Best effort: without IPv6 in this kernel/namespace the pod stays single-stack.
     if let Some(ip6) = c.ip6 {
+        // Unsolicited neighbour advertisements when the address appears, so a reused address does
+        // not keep its previous owner's MAC in peers' caches (the IPv6 twin of arp_notify).
+        let _ = ns::write_file(b"/proc/sys/net/ipv6/conf/eth0/ndisc_notify\0", b"1");
         if nl.addr_add6(idx, ip6, POD_PREFIX6).is_ok() {
             let _ = nl.route_add6([0; 16], 0, Some(c.gateway6), idx);
         }
@@ -484,5 +551,41 @@ mod tests {
     fn dotted_quad() {
         assert_eq!(dotted([10, 88, 0, 2]), b"10.88.0.2");
         assert_eq!(dotted([255, 0, 100, 9]), b"255.0.100.9");
+    }
+}
+
+#[cfg(test)]
+mod families_tests {
+    use super::*;
+
+    #[test]
+    fn pod_cidrs_give_subnet_and_families() {
+        let (pn, f) = PodNet::from_cidrs(["10.88.3.0/24", "fd00:88:0:3::/64"]).unwrap();
+        assert_eq!((pn.subnet, f), ([10, 88, 3, 0], Families::DUAL));
+        let (pn, f) = PodNet::from_cidrs(["fd00:88:0:a::/64"]).unwrap();
+        assert_eq!((pn.subnet, pn.gateway, f), ([10, 88, 10, 0], [10, 88, 10, 1], Families::V6));
+        let (pn, f) = PodNet::from_cidrs(["fd00:88:0::/64"]).unwrap();
+        assert_eq!((pn.subnet, f), ([10, 88, 0, 0], Families::V6));
+        let (pn, f) = PodNet::from_cidrs(["10.88.2.0/24"]).unwrap();
+        assert_eq!((pn.subnet, f), ([10, 88, 2, 0], Families::V4));
+        assert!(PodNet::from_cidrs(["fd01::/64"]).is_none() && PodNet::from_cidrs([]).is_none());
+    }
+
+    #[test]
+    fn netconfig_follows_families() {
+        let pn = PodNet::for_index(1);
+        let v6 = NetConfig::with([10, 88, 1, 9], &pn, Families::V6);
+        assert!(!v6.v4 && v6.ip6 == Some(pod_ip6(pn.subnet, [10, 88, 1, 9])));
+        let v4 = NetConfig::with([10, 88, 1, 9], &pn, Families::V4);
+        assert!(v4.v4 && v4.ip6.is_none());
+    }
+
+    #[test]
+    fn families_parse() {
+        assert_eq!(Families::parse("6"), Some(Families::V6));
+        assert_eq!(Families::parse("4,6"), Some(Families::DUAL));
+        assert_eq!(Families::parse("ipv4"), Some(Families::V4));
+        assert_eq!(Families::parse("x"), None);
+        assert_eq!(Families::parse(""), None);
     }
 }

@@ -85,19 +85,25 @@ fn port(p: &Value, ctr: &Value) -> Option<u16> {
 
 /// Blocking TCP connect (and optional HTTP GET) with timeouts; runs in the pod netns child.
 /// Returns the process exit code: 0 success, 1 failure.
-fn net_check(host: [u8; 4], port: u16, http_path: Option<&str>, timeout_ms: u64) -> i32 {
-    let Ok(fd) = kr_sys::socket(kr_sys::AF_INET, kr_sys::SOCK_STREAM | kr_sys::SOCK_CLOEXEC, 0) else { return 1 };
+fn net_check(host: [u8; 16], port: u16, http_path: Option<&str>, timeout_ms: u64) -> i32 {
+    let v4 = kr_sys::unmap4(host);
+    let family = if v4.is_some() { kr_sys::AF_INET } else { kr_sys::AF_INET6 };
+    let Ok(fd) = kr_sys::socket(family, kr_sys::SOCK_STREAM | kr_sys::SOCK_CLOEXEC, 0) else { return 1 };
     // struct timeval { tv_sec, tv_usec }: bounds connect (SO_SNDTIMEO) and reads.
     let mut tv = [0u8; 16];
     tv[..8].copy_from_slice(&((timeout_ms / 1000) as i64).to_ne_bytes());
     tv[8..].copy_from_slice(&(((timeout_ms % 1000) * 1000) as i64).to_ne_bytes());
     let _ = kr_sys::setsockopt(fd.raw(), 1, 20, &tv); // SO_RCVTIMEO
     let _ = kr_sys::setsockopt(fd.raw(), 1, 21, &tv); // SO_SNDTIMEO
-    if kr_sys::connect(fd.raw(), &kr_sys::SockaddrIn::new(host, port)).is_err() {
+    let connected = match v4 {
+        Some(a) => kr_sys::connect(fd.raw(), &kr_sys::SockaddrIn::new(a, port)),
+        None => kr_sys::connect6(fd.raw(), &kr_sys::SockaddrIn6::new(host, port)),
+    };
+    if connected.is_err() {
         return 1;
     }
     let Some(path) = http_path else { return 0 };
-    let req = alloc::format!("GET {path} HTTP/1.1\r\nHost: {}.{}.{}.{}:{port}\r\nUser-Agent: kube-probe/1.37\r\nAccept: */*\r\nConnection: close\r\n\r\n", host[0], host[1], host[2], host[3]);
+    let req = alloc::format!("GET {path} HTTP/1.1\r\nHost: {}:{port}\r\nUser-Agent: kube-probe/1.37\r\nAccept: */*\r\nConnection: close\r\n\r\n", kr_net::tcp::url_host(host));
     if kr_sys::write(fd.raw(), req.as_bytes()).is_err() {
         return 1;
     }
@@ -224,15 +230,6 @@ fn grpc_check(port: u16, service: &str, timeout_ms: u64) -> i32 {
     }
 }
 
-fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
-    let mut out = [0u8; 4];
-    let mut it = s.split('.');
-    for o in out.iter_mut() {
-        *o = it.next()?.parse().ok()?;
-    }
-    it.next().is_none().then_some(out)
-}
-
 /// The environment of an exec probe or hook: PATH plus the container's literal and
 /// `fieldRef` (`metadata.labels`/`annotations`) variables, so commands see what the container sees.
 fn exec_env(pod: &Value, ctr: &Value) -> Vec<Vec<u8>> {
@@ -293,7 +290,7 @@ pub async fn run(spec: &Value, pod: &Value, ctr: &Value, ctr_target: &ExecTarget
         let Some(p) = port(net, ctr) else { return false };
         let path = if https { None } else { path };
         // `host` (an IP) defaults to the pod itself.
-        let host = net.get("host").and_then(Value::as_str).and_then(parse_ipv4).unwrap_or([127, 0, 0, 1]);
+        let host = net.get("host").and_then(Value::as_str).and_then(kr_net::tcp::parse_ip16).unwrap_or(kr_sys::map4([127, 0, 0, 1]));
         container::in_pod_net(target, move || net_check(host, p, path.as_deref(), timeout_ms))
     };
     let Ok(running) = started else { return false };
