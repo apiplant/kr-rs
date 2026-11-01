@@ -93,6 +93,25 @@ async fn handle_inner(api: &Rc<ApiServer>, req: Request, pf: &core::cell::RefCel
             None => respond(Reply::err(crate::object::ApiError::new(404, "NotFound", "not an HA server"))),
         };
     }
+    // The read-index answer other servers use (peers only: a server certificate).
+    if r.method == "GET" && r.path == forward::READ_INDEX {
+        let peer_ok = peer_cert.is_some_and(|c| crate::cluster::transport::peer_id(c).is_some());
+        return match (peer_ok, api.cluster().and_then(|c| c.read_index_rev())) {
+            (true, Some(rev)) => Response::new(200, format!("{rev}").into_bytes()),
+            (true, None) => Response::new(503, b"not the leader\n".to_vec()),
+            _ => Response::new(403, b"forbidden\n".to_vec()),
+        };
+    }
+    // Reads that must be current (no resourceVersion, not a watch) wait for a read barrier on
+    // HA servers, so a client sees every write acknowledged before its read, on any server.
+    if let Some(c) = api.cluster().filter(|_| r.method == "GET" && !is_forwarded && (r.path.starts_with("/api") || r.path.starts_with("/apis"))) {
+        let q = r.query;
+        let has = |k: &str| q.split('&').any(|p| p.split('=').next() == Some(k) && p.split_once('=').is_some_and(|(_, v)| !v.is_empty()));
+        let watching = q.split('&').any(|p| matches!(p, "watch=true" | "watch=1" | "watch"));
+        if !watching && !has("resourceVersion") && !c.read_barrier(api).await {
+            return respond(Reply::err(crate::object::ApiError::new(503, "ServiceUnavailable", "no leader to confirm a consistent read")));
+        }
+    }
     if let Some(c) = api.cluster().filter(|_| ApiServer::mutates(&r)) {
         match c.route(5_000).await {
             Ok(None) => {

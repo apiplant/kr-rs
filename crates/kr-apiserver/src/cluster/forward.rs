@@ -58,7 +58,50 @@ pub struct Forwarded {
     pub warnings: Vec<String>,
 }
 
+/// Path of the leader's read-index endpoint (servers only).
+pub const READ_INDEX: &str = "/kr/readindex";
+
 impl Cluster {
+    /// Linearizable read barrier (ReadIndex by leader lease): returns once this server's state
+    /// includes every write acknowledged before the call. The leader checks its lease; a follower
+    /// asks the leader for its committed revision and waits to apply it. `false`: no leader.
+    pub async fn read_barrier(&self, api: &crate::api::ApiServer) -> bool {
+        let deadline = kr_rt::exec::now_ms() + 3_000;
+        loop {
+            if self.is_leader() {
+                if self.raft.borrow().read_index().is_some() {
+                    return true;
+                }
+            } else if let Some(l) = self.leader() {
+                if let Some(rev) = self.leader_read_rev(api, l).await {
+                    let _ = kr_rt::exec::timeout(CATCH_UP_MS, self.wait_applied(rev)).await;
+                    return true;
+                }
+            }
+            if kr_rt::exec::now_ms() >= deadline {
+                return false;
+            }
+            kr_rt::exec::sleep(50).await;
+        }
+    }
+
+    /// Answer for `GET /kr/readindex`: the committed store revision, if this server is a leader
+    /// holding its lease.
+    pub fn read_index_rev(&self) -> Option<u64> {
+        if !self.is_leader() {
+            return None;
+        }
+        self.raft.borrow().read_index().map(|_| self.committed_rev())
+    }
+
+    async fn leader_read_rev(&self, api: &crate::api::ApiServer, leader: kr_raft::NodeId) -> Option<u64> {
+        let a = self.addr_of(api, leader)?;
+        let url = alloc::format!("https://{}:{}{READ_INDEX}", kr_net::tcp::url_host(a.ip), a.api_port);
+        let mut resp = kr_rt::exec::timeout(3_000, self.http().request("GET", &url, &[], b"")).await.ok()?.ok()?;
+        let body = resp.read_to_end(4096).await.ok()?;
+        (resp.status == 200).then(|| core::str::from_utf8(&body).ok()?.trim().parse().ok())?
+    }
+
     fn http(&self) -> Rc<Http<TlsConnector>> {
         self.forwarder
             .borrow_mut()

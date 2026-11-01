@@ -602,6 +602,27 @@ pub fn set_nonblocking(fd: i32) -> Result<()> {
     check(unsafe { syscall3(FCNTL, fd as usize, 4, flags | 0o4000) }).map(|_| ())
 }
 
+/// A duplicate of `fd` (same open file description), close-on-exec.
+pub fn dup_cloexec(fd: i32) -> Result<Fd> {
+    #[cfg(target_arch = "x86_64")]
+    const FCNTL: usize = 72;
+    #[cfg(target_arch = "aarch64")]
+    const FCNTL: usize = 25;
+    // SAFETY: plain integer arguments (F_DUPFD_CLOEXEC = 1030).
+    check(unsafe { syscall3(FCNTL, fd as usize, 1030, 0) }).map(|n| Fd(n as i32))
+}
+
+/// Clears `O_NONBLOCK` on `fd`.
+pub fn set_blocking(fd: i32) -> Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    const FCNTL: usize = 72;
+    #[cfg(target_arch = "aarch64")]
+    const FCNTL: usize = 25;
+    // SAFETY: plain integer arguments (F_GETFL = 3, F_SETFL = 4).
+    let flags = check(unsafe { syscall3(FCNTL, fd as usize, 3, 0) })?;
+    check(unsafe { syscall3(FCNTL, fd as usize, 4, flags & !0o4000) }).map(|_| ())
+}
+
 /// A connected AF_UNIX stream socket pair (close-on-exec).
 pub fn socketpair() -> Result<(Fd, Fd)> {
     #[cfg(target_arch = "x86_64")]

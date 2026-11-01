@@ -207,6 +207,8 @@ struct Progress {
     active: bool,
     /// Heartbeats since the snapshot was sent (resent after an election timeout).
     snap_wait: u32,
+    /// Logical tick at which this peer last answered the leader.
+    last_ack: u64,
 }
 
 pub struct Raft {
@@ -234,6 +236,8 @@ pub struct Raft {
     // timers
     elapsed: u32,
     removed: bool,
+    /// Logical clock: ticks since start.
+    ticks: u64,
     timeout: u32,
     heartbeat_elapsed: u32,
     // candidate
@@ -296,6 +300,7 @@ impl Raft {
             pending_conf: 0,
             elapsed: 0,
             removed: false,
+            ticks: 0,
             timeout: 0,
             heartbeat_elapsed: 0,
             votes: BTreeMap::new(),
@@ -323,6 +328,20 @@ impl Raft {
     pub fn leader(&self) -> Option<NodeId> {
         self.leader
     }
+    /// ReadIndex by leader lease: `Some(commit index)` when this node is the leader, has
+    /// committed an entry of its own term, and a quorum answered it within the last half
+    /// election timeout. Followers refuse votes for a full election timeout after hearing from
+    /// a leader (stickiness), so no other leader can have been elected in that window, and
+    /// serving a read after applying up to the index is linearizable.
+    pub fn read_index(&self) -> Option<u64> {
+        if self.role != Role::Leader || self.term_at(self.commit) != Some(self.term) {
+            return None;
+        }
+        let window = (self.cfg.election_ticks / 2).max(1) as u64;
+        let fresh = self.voters.iter().filter(|id| **id == self.cfg.id || self.progress.get(id).is_some_and(|p| p.last_ack > 0 && self.ticks.saturating_sub(p.last_ack) <= window)).count();
+        (fresh >= self.quorum()).then_some(self.commit)
+    }
+
     /// True once a leader told this node it is no longer a member: it should stop.
     pub fn removed(&self) -> bool {
         self.removed
@@ -448,7 +467,7 @@ impl Raft {
             let next = self.last_index() + 1;
             for id in ids {
                 if id != self.cfg.id {
-                    self.progress.entry(id).or_insert(Progress { matched: 0, next, state: ProgressState::Probe, inflight: Vec::new(), active: true, snap_wait: 0 });
+                    self.progress.entry(id).or_insert(Progress { matched: 0, next, state: ProgressState::Probe, inflight: Vec::new(), active: true, snap_wait: 0, last_ack: 0 });
                 }
             }
             let members = self.members();
@@ -534,6 +553,7 @@ impl Raft {
 
     /// One logical clock tick.
     pub fn tick(&mut self) {
+        self.ticks += 1;
         self.elapsed += 1;
         match self.role {
             Role::Leader => {
@@ -841,8 +861,10 @@ impl Raft {
             return;
         }
         let last = self.last_index();
+        let ticks = self.ticks;
         let Some(p) = self.progress.get_mut(&from) else { return };
         p.active = true;
+        p.last_ack = ticks;
         if success {
             if index > p.matched {
                 p.matched = index;

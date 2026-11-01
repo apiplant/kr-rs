@@ -74,6 +74,13 @@ test_() {
   for n in $SERVERS; do
     for m in $SERVERS; do k "$n" get configmap "from-$m" >/dev/null || fail "$n lacks from-$m"; done
   done
+  # Linearizable reads (ReadIndex): a write acknowledged on one server is visible at once on every
+  # server, with no retry.
+  for i in 1 2 3 4 5 6; do
+    w=$(echo "$SERVERS" | tr ' ' '\n' | sed -n "$(( (i % 3) + 1 ))p")
+    k "$w" create configmap "ryw-$i" --from-literal=a=b >/dev/null || fail "ryw write on $w"
+    for n in $SERVERS; do k "$n" get configmap "ryw-$i" >/dev/null || fail "$n did not see ryw-$i right after the write on $w"; done
+  done
   # The kubernetes Service has all three servers as endpoints.
   [ "$(k krs1 get endpoints kubernetes -o jsonpath='{.subsets[0].addresses[*].ip}' | wc -w)" = 3 ] || fail "endpoints"
   # Workloads run (controllers + scheduler on the leader only).

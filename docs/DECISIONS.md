@@ -475,3 +475,6 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **Not done:** IPv6-only pods on a host without IPv6 (bridge setup fails and pods get no address).
 **Status:** accepted.
 
+
+## ADR-035: Linearizable follower reads by leader lease (ReadIndex)
+**Context:** HA servers served reads from their local applied state, so a client could read stale data right after a write acknowledged elsewhere (kubectl through a load balancer). **Decision:** reads without a `resourceVersion` (and not watches) pass a barrier. The leader answers if `Raft::read_index()` holds: it has committed an entry of its own term and a quorum acknowledged it within `election_ticks / 2`; followers refuse votes for a full election timeout after hearing from a leader, so no other leader can exist in that window. A follower asks the leader (`GET /kr/readindex`, server certificate) for its committed store revision and waits until it has applied it. **Consequences:** one leader round trip per such read on a follower, no log writes; correctness needs bounded clock drift between servers (as any lease). No quorum means a 503 after 3 s rather than a stale answer.

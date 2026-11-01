@@ -52,6 +52,7 @@ pub mod quota;
 pub mod replicaset;
 pub mod scheduler;
 pub mod statefulset;
+pub mod svm;
 pub mod util;
 
 use kr_apiserver::client::Client;
@@ -110,6 +111,7 @@ pub async fn run_all_with<C: Client + Clone + 'static>(c: C, cfg: Config) {
         spawn(disruption::run(c.clone(), cfg)),
         spawn(namespace::run(c.clone(), cfg)),
         spawn(crd::run(c.clone(), cfg)),
+        spawn(svm::run(c.clone(), cfg)),
         spawn(pvc::run(c.clone(), cfg)),
         spawn(gc::run(c, cfg)),
     ]);

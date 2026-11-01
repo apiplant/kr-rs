@@ -637,3 +637,31 @@ fn removed_follower_is_told_to_stop() {
     assert!(s.nodes[&f].raft.removed(), "a removed server is told to stop");
     assert!(!s.nodes[&l].raft.removed());
 }
+
+#[test]
+fn read_index_needs_a_fresh_quorum() {
+    let mut s = Sim::new(31, 3);
+    for _ in 0..100 {
+        s.step_time();
+    }
+    let l = s.leader().unwrap();
+    assert!(s.nodes[&l].raft.read_index().is_some(), "a leader with a live quorum can serve reads");
+    for (id, n) in &s.nodes {
+        if *id != l {
+            assert!(n.raft.read_index().is_none(), "followers cannot");
+        }
+    }
+    // Both followers go away: the lease runs out well before the leader steps down.
+    for id in (1..=3).filter(|id| *id != l) {
+        s.crash(id);
+    }
+    let mut lost = false;
+    for _ in 0..40 {
+        s.step_time();
+        if s.nodes[&l].raft.read_index().is_none() {
+            lost = true;
+            break;
+        }
+    }
+    assert!(lost, "no quorum, no linearizable reads");
+}

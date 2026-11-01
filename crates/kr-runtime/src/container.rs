@@ -56,6 +56,11 @@ pub struct RunSpec<'a> {
     pub mounts: &'a [Mount],
     /// If set, stdout and stderr go to this fd and stdin is /dev/null (else inherited).
     pub log_fd: Option<i32>,
+    /// With `log_fd`: this descriptor becomes stdin (a FIFO fed by `attach -i`) instead of /dev/null.
+    pub stdin_fd: Option<i32>,
+    /// With `log_fd`: the slave of a pseudo-terminal that becomes stdin, stdout and stderr and the
+    /// controlling terminal of the container's init (`tty: true`); output is then read from the master.
+    pub tty_fd: Option<i32>,
     /// Supplementary groups added to the user's (pod fsGroup / supplementalGroups).
     pub extra_groups: &'a [u32],
     /// `readOnlyRootFilesystem`: the root mount becomes read-only (volumes stay as mounted).
@@ -1065,13 +1070,21 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
     }
     // The supervisor blocks signals it reads through a signalfd; the mask would survive execve.
     let _ = ns::sigmask_reset();
-    if let Some(fd) = spec.log_fd {
+    if let Some(t) = spec.tty_fd {
+        for dst in 0..3 {
+            if let Err(e) = ns::dup_to(t, dst) {
+                return (26, e);
+            }
+        }
+        let _ = ns::setsid();
+        let _ = ns::set_ctty(0);
+    } else if let Some(fd) = spec.log_fd {
         // Opened before pivot_root: /dev/null of the host.
         let null = match ns::open(b"/dev/null\0", ns::O_RDONLY, 0) {
             Ok(n) => n,
             Err(e) => return (26, e),
         };
-        for (src, dst) in [(null.raw(), 0), (fd, 1), (fd, 2)] {
+        for (src, dst) in [(spec.stdin_fd.unwrap_or(null.raw()), 0), (fd, 1), (fd, 2)] {
             if let Err(e) = ns::dup_to(src, dst) {
                 return (26, e);
             }

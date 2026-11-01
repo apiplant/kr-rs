@@ -181,6 +181,8 @@ fn run(mut args: Args) -> i32 {
         sandbox: net.sandbox.as_ref(),
         mounts: &mounts,
         log_fd: None,
+        stdin_fd: None,
+        tty_fd: None,
         extra_groups: &[],
         readonly_root: false,
     };
@@ -479,6 +481,8 @@ fn run_dir(mut args: Args) -> i32 {
         sandbox: None,
         mounts: &[],
         log_fd: None,
+        stdin_fd: None,
+        tty_fd: None,
         extra_groups: &[],
         readonly_root: false,
     };
@@ -551,6 +555,8 @@ fn pod_demo(mut args: Args) -> i32 {
             sandbox: Some(&sb),
             mounts: &mounts,
             log_fd: None,
+        stdin_fd: None,
+        tty_fd: None,
             extra_groups: &[],
             readonly_root: false,
         };

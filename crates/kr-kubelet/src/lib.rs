@@ -243,6 +243,10 @@ pub struct Kubelet<C: Client> {
     /// Container log path -> `(file size, sec, nsec)` samples: the log file keeps no per-line
     /// times, so `since*` and `timestamps` of `kubectl logs` use when the size was last seen grow.
     log_marks: RefCell<BTreeMap<String, Vec<(u64, i64, i64)>>>,
+    /// Our end of the stdin socket of containers with `stdin: true`, keyed `<pod dir>/<name>`, and
+    /// whether `stdinOnce` applies and whether it is a terminal master (`tty: true`). `attach -i`
+    /// writes to it; shutting a socket down is EOF.
+    stdin_keep: RefCell<BTreeMap<String, (Rc<kr_sys::Fd>, bool, bool)>>,
 }
 
 enum PullGate {
@@ -261,7 +265,7 @@ const BACKOFF_MAX_MS: u64 = 300_000;
 
 impl<C: Client + Clone + 'static> Kubelet<C> {
     pub fn new(c: C, cfg: Config, store: Store) -> Rc<Self> {
-        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()) })
+        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()) })
     }
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
@@ -1045,6 +1049,13 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             self.log_marks.borrow_mut().remove(cur);
         }
         let log = kr_sys::ns::open(log_path.as_bytes(), kr_sys::ns::O_WRONLY | kr_sys::ns::O_CREAT | 0o2000 /* O_APPEND */, 0o640).ok();
+        // `stdin: true`: the container reads one end of a socketpair that `kubectl attach -i`
+        // feeds through ours; no attach is no input, not EOF. `tty: true`: a pseudo-terminal
+        // instead, whose master we read into the log and `attach` writes to.
+        let want_tty = cspec.and_then(|c| c.get("tty")).and_then(Value::as_bool) == Some(true);
+        let tty_pair = if want_tty { kr_sys::ns::openpty().ok() } else { None };
+        let stdin_pair = if !want_tty && cspec.and_then(|c| c.get("stdin")).and_then(Value::as_bool) == Some(true) { kr_sys::ns::socketpair().ok() } else { None };
+        let stdin_read = stdin_pair.as_ref().map(|(_, c)| c);
         let limits = if self.cfg.cgroups { built.limits } else { Default::default() };
         let pods = self.pods.borrow();
         let p = &pods[uid];
@@ -1066,12 +1077,40 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             sandbox: p.sandbox.as_ref(),
             mounts: &built.mounts,
             log_fd: log.as_ref().map(|f| f.raw()),
+            stdin_fd: stdin_read.map(|f| f.raw()),
+            tty_fd: tty_pair.as_ref().map(|(_, sl)| sl.raw()),
             extra_groups: &built.extra_groups,
             readonly_root: cspec.and_then(|c| c.pointer(&["securityContext", "readOnlyRootFilesystem"])).and_then(Value::as_bool).unwrap_or(false),
         };
         let r = container::start(&run);
         drop(pods);
         drop(log);
+        if r.is_ok() {
+            let key = alloc::format!("{pod_dir}/{name}");
+            let once = cspec.and_then(|c| c.get("stdinOnce")).and_then(Value::as_bool) == Some(true);
+            if let Some((ours, _)) = stdin_pair {
+                if kr_sys::ns::set_nonblocking(ours.raw()).is_ok() {
+                    self.stdin_keep.borrow_mut().insert(key, (Rc::new(ours), once, false));
+                }
+            } else if let Some((master, _)) = tty_pair {
+                // Terminal output goes to the log file, like a pipe's would.
+                if kr_sys::ns::set_nonblocking(master.raw()).is_ok() {
+                    if let Some(rd) = kr_sys::ns::dup_cloexec(master.raw()).ok().and_then(|d| kr_rt::exec::Async::new(d).ok()) {
+                        let log_path = alloc::format!("{pod_dir}/{name}.log\0");
+                        kr_rt::exec::spawn(async move {
+                            let Ok(out) = kr_sys::ns::open(log_path.as_bytes(), kr_sys::ns::O_WRONLY | kr_sys::ns::O_CREAT | 0o2000, 0o640) else { return };
+                            let mut buf = [0u8; 8192];
+                            while let Ok(n) = rd.read(&mut buf).await {
+                                if n == 0 || kr_sys::write(out.raw(), &buf[..n]).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    self.stdin_keep.borrow_mut().insert(key, (Rc::new(master), once, true));
+                }
+            }
+        }
         match r {
             Ok(running) => {
                 let started = now();
@@ -1474,6 +1513,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
 
     fn cleanup(&self, uid: &str) {
         let Some(p) = self.pods.borrow_mut().remove(uid) else { return };
+        self.stdin_keep.borrow_mut().retain(|k, _| !k.starts_with(&alloc::format!("{}/", p.dir)));
         if let Some(sb) = &p.sandbox {
             sb.stop();
         }

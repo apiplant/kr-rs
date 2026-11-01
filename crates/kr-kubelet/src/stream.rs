@@ -178,13 +178,50 @@ impl<C: Client + Clone + 'static> NodeProxy for Proxy<C> {
                 Ok(hs.into_response(Box::new(handler)))
             }
             "attach" => {
-                let hs = websocket::handshake(&ws_request("/attach", headers), &channel::EXEC_PROTOCOLS).map_err(|_| ApiError::bad_request("attach requires a WebSocket upgrade"))?;
-                let proto = hs.protocol.as_deref().and_then(Protocol::from_token).ok_or_else(|| ApiError::bad_request("no supported streaming protocol"))?;
                 let path = alloc::format!("{}/{}.log", v.dir, v.container);
                 let me = self.0.clone();
                 let (ns, pod, ctr) = (ns.to_string(), pod.to_string(), v.container.clone());
+                // `attach -i`: input goes to the container's stdin socket or terminal master
+                // (containers with `stdin: true` / `tty: true`).
+                let key = alloc::format!("{}/{}", v.dir, v.container);
+                let sock = if q.flag("stdin") { self.0.stdin_keep.borrow().get(&key).map(|(f, once, tty)| (f.clone(), *once, *tty)) } else { None };
+                let writer = sock.as_ref().map(|(f, _, _)| f.clone());
+                let writer2 = writer.clone();
+                let (once, is_tty) = sock.map(|(_, o, t)| (o, t)).unwrap_or((false, false));
+                let detach = move || {
+                    // stdinOnce: the first attach's end is the container's EOF.
+                    if once {
+                        if let Some(f) = &writer2 {
+                            // A terminal gets Ctrl-D, a socket a shutdown.
+                            if is_tty {
+                                let _ = kr_sys::write(f.raw(), &[4]);
+                            } else {
+                                let _ = kr_sys::shutdown(f.raw(), kr_sys::SHUT_WR);
+                            }
+                        }
+                    }
+                };
+                let hdr = |n: &str| headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(n)).flat_map(|(_, v)| v.split(',')).map(str::trim).collect::<Vec<_>>();
+                if !hdr("upgrade").iter().any(|t| t.eq_ignore_ascii_case("websocket")) && hdr("upgrade").iter().any(|t| t.eq_ignore_ascii_case("SPDY/3.1")) {
+                    // client-go remotecommand over SPDY (sonobuoy, kubectl with websockets off): v4.
+                    if !hdr("x-stream-protocol-version").contains(&"v4.channel.k8s.io") {
+                        return Err(ApiError::bad_request("SPDY attach requires X-Stream-Protocol-Version v4.channel.k8s.io"));
+                    }
+                    let tty = q.flag("tty");
+                    let want = (q.flag("stdin"), q.flag("stdout"), q.flag("stderr") && !tty, tty);
+                    let handler = move |conn: Box<dyn Conn>| -> Pin<Box<dyn Future<Output = ()>>> {
+                        Box::pin(spdy_attach(PfIo::Raw { conn, wbuf: Vec::new() }, path, writer, is_tty, want, detach, move || Proxy(me.clone()).container_running(&ns, &pod, &ctr)))
+                    };
+                    return Ok(Response {
+                        status: 101,
+                        headers: alloc::vec![("Upgrade".into(), "SPDY/3.1".into()), ("X-Stream-Protocol-Version".into(), "v4.channel.k8s.io".into())],
+                        body: Body::Upgrade(Box::new(handler)),
+                    });
+                }
+                let hs = websocket::handshake(&ws_request("/attach", headers), &channel::EXEC_PROTOCOLS).map_err(|_| ApiError::bad_request("attach requires a WebSocket or SPDY/3.1 upgrade"))?;
+                let proto = hs.protocol.as_deref().and_then(Protocol::from_token).ok_or_else(|| ApiError::bad_request("no supported streaming protocol"))?;
                 let handler = move |conn: Box<dyn Conn>| -> Pin<Box<dyn Future<Output = ()>>> {
-                    Box::pin(attach_session(conn, proto, path, move || Proxy(me.clone()).container_running(&ns, &pod, &ctr)))
+                    Box::pin(attach_session(conn, proto, path, writer, is_tty, detach, move || Proxy(me.clone()).container_running(&ns, &pod, &ctr)))
                 };
                 Ok(hs.into_response(Box::new(handler)))
             }
@@ -555,8 +592,7 @@ async fn exec_session(conn: Box<dyn Conn>, proto: Protocol, target: ExecTarget, 
     }
 }
 
-async fn attach_session(conn: Box<dyn Conn>, proto: Protocol, path: String, running: impl Fn() -> bool + 'static) {
-    let _ = proto;
+async fn attach_session(conn: Box<dyn Conn>, proto: Protocol, path: String, stdin: Option<Rc<Fd>>, tty: bool, on_detach: impl Fn(), running: impl Fn() -> bool + 'static) {
     let mut ws = WebSocket::new(conn, WsConfig::default());
     let Ok(fd) = ns::open(alloc::format!("{path}\0").as_bytes(), ns::O_RDONLY, 0) else {
         let _ = ws.close(1011, "no log").await;
@@ -566,20 +602,62 @@ async fn attach_session(conn: Box<dyn Conn>, proto: Protocol, path: String, runn
     let mut buf = [0u8; 16384];
     while matches!(kr_sys::read(fd.raw(), &mut buf), Ok(n) if n > 0) {}
     let mut f = Follow { fd, pos: 0, first: None, stamp: false, timer: None, running: Box::new(running) };
+    let mut stdin = stdin;
+    enum A {
+        Msg(Option<Vec<u8>>),
+        Out(Option<Vec<u8>>),
+    }
     loop {
         let next = poll_fn(|cx| {
-            if let Poll::Ready(Ok(Message::Close { .. }) | Err(_)) = ws.poll_recv(cx) {
-                return Poll::Ready(None);
+            match ws.poll_recv(cx) {
+                Poll::Ready(Ok(Message::Close { .. }) | Err(_)) => return Poll::Ready(A::Msg(None)),
+                Poll::Ready(Ok(Message::Binary(m))) => return Poll::Ready(A::Msg(Some(m))),
+                _ => {}
             }
             let _ = ws.poll_flush(cx);
-            f.poll_next(cx).map(Some)
+            f.poll_next(cx).map(A::Out)
         })
         .await;
         match next {
-            Some(Some(d)) => {
+            A::Msg(Some(m)) => match channel::decode_client(proto, &m) {
+                Ok(ClientMsg::Stdin(d)) => {
+                    if let Some(w) = &stdin {
+                        let (mut off, mut tries) = (0, 0);
+                        while off < d.len() && tries < 400 {
+                            match kr_sys::write(w.raw(), &d[off..]) {
+                                Ok(n) => off += n,
+                                Err(e) if e.0 == 11 => {
+                                    tries += 1;
+                                    kr_rt::exec::sleep(5).await;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+                Ok(ClientMsg::Resize(sz)) => {
+                    if let (true, Some(m)) = (tty, &stdin) {
+                        let _ = ns::set_winsize(m.raw(), sz.width, sz.height);
+                    }
+                }
+                Ok(ClientMsg::CloseStream(channel::STDIN)) => {
+                    // The client closed its stdin (Ctrl-D): EOF for a stdinOnce container.
+                    stdin = None;
+                    on_detach();
+                }
+                _ => {}
+            },
+            A::Msg(None) => {
+                drop(stdin);
+                on_detach();
+                return;
+            }
+            A::Out(Some(d)) => {
                 let _ = ws.queue_binary(&channel::stdout_frame(&d));
             }
-            _ => {
+            A::Out(None) => {
+                drop(stdin);
+                on_detach();
                 let _ = ws.send_binary(&channel::error_frame(&channel::status_success())).await;
                 let _ = ws.close(1000, "").await;
                 return;
@@ -1029,15 +1107,33 @@ async fn spdy_exec(mut io: PfIo, target: ExecTarget, argv: Vec<Vec<u8>>, maps: k
     sess.set_flow_control_enforced(false);
     let expected = 1 + want_stdin as usize + want_stdout as usize + want_stderr as usize;
     let (mut err_s, mut in_s, mut out_s, mut errout_s) = (None::<u32>, None::<u32>, None::<u32>, None::<u32>);
+    let mut resize_s = None::<u32>;
     let mut got = 0usize;
     // Phase 1: collect streams (bounded wait).
     let deadline = kr_rt::exec::now_ms() + 30_000;
-    while got < expected {
+    // With a terminal, client-go opens the resize stream right after the others; the process
+    // must not finish (and the connection close) before it has, so wait a moment for it.
+    let mut resize_until = None::<u64>;
+    loop {
+        let mut left_limit = deadline;
+        if got >= expected {
+            if !tty || resize_s.is_some() {
+                break;
+            }
+            let until = *resize_until.get_or_insert(kr_rt::exec::now_ms() + 3000);
+            if kr_rt::exec::now_ms() >= until {
+                break;
+            }
+            left_limit = until;
+        }
         if sess.has_output() {
             io.queue(&sess.take_output());
         }
-        let left = deadline.saturating_sub(kr_rt::exec::now_ms());
+        let left = left_limit.saturating_sub(kr_rt::exec::now_ms());
         if left == 0 {
+            if got >= expected {
+                break;
+            }
             io.finish().await;
             return;
         }
@@ -1047,6 +1143,9 @@ async fn spdy_exec(mut io: PfIo, target: ExecTarget, argv: Vec<Vec<u8>>, maps: k
         }))
         .await;
         let Ok(Some(bytes)) = r else {
+            if got >= expected && r.is_err() {
+                break; // no resize stream came: carry on without it
+            }
             io.finish().await;
             return;
         };
@@ -1063,7 +1162,10 @@ async fn spdy_exec(mut io: PfIo, target: ExecTarget, argv: Vec<Vec<u8>>, maps: k
                     Some("stdin") => &mut in_s,
                     Some("stdout") => &mut out_s,
                     Some("stderr") => &mut errout_s,
-                    Some("resize") => continue,
+                    Some("resize") => {
+                        resize_s = Some(id);
+                        continue;
+                    }
                     _ => {
                         sess.reset_with(id, spdy::status::PROTOCOL_ERROR);
                         continue;
@@ -1150,6 +1252,9 @@ async fn spdy_exec(mut io: PfIo, target: ExecTarget, argv: Vec<Vec<u8>>, maps: k
         }
         let gated = io.backlogged();
         let ev = poll_fn(|cx| {
+            // Replies and data go out even while other events keep the loop busy: a client that
+            // waits for a stream reply before creating the next (the resize stream) needs them.
+            let _ = io.poll_flush(cx);
             if let Poll::Ready(r) = io.poll_read(cx) {
                 return Poll::Ready(SxEv::Io(r));
             }
@@ -1190,6 +1295,11 @@ async fn spdy_exec(mut io: PfIo, target: ExecTarget, argv: Vec<Vec<u8>>, maps: k
                     match e {
                         SpdyEvent::Data { id, bytes, fin } => {
                             sess.consume(id, bytes.len());
+                            if Some(id) == resize_s {
+                                if let (Some(m), Ok(sz)) = (master_raw, channel::parse_resize(&bytes)) {
+                                    let _ = ns::set_winsize(m, sz.width, sz.height);
+                                }
+                            }
                             if Some(id) == in_s {
                                 if let Some(wfd) = stdin_w.as_ref().map(|w| w.raw()).or(master_raw) {
                                     let mut off = 0;
@@ -1205,7 +1315,12 @@ async fn spdy_exec(mut io: PfIo, target: ExecTarget, argv: Vec<Vec<u8>>, maps: k
                                 }
                             }
                         }
-                        SpdyEvent::StreamOpened { id, .. } => sess.reply(id, &[]),
+                        SpdyEvent::StreamOpened { id, headers, .. } => {
+                            if header_of(&headers, "streamtype") == Some("resize") {
+                                resize_s = Some(id);
+                            }
+                            sess.reply(id, &[]);
+                        }
                         SpdyEvent::Reset { id, .. } if Some(id) == in_s => stdin_w = None,
                         SpdyEvent::Reset { .. } => {}
                         SpdyEvent::GoAway { .. } => {
@@ -1224,7 +1339,186 @@ async fn spdy_exec(mut io: PfIo, target: ExecTarget, argv: Vec<Vec<u8>>, maps: k
                     r.2 = Some(Box::pin(read_chunk(r.1.clone())));
                 }
             }
-            SxEv::Exit(c) => exit = Some(c),
+            SxEv::Exit(c) => {
+                exit = Some(c)
+            }
+        }
+    }
+}
+
+/// Attach over SPDY/3.1 (client-go `remotecommand` v4): new output of the container's log goes
+/// to the `stdout` stream; the `stdin` stream feeds the container's input (and, for a terminal,
+/// `resize` sets its size). Ends, with a success status, when the container is gone.
+async fn spdy_attach(mut io: PfIo, path: String, stdin: Option<Rc<Fd>>, tty_container: bool, want: (bool, bool, bool, bool), on_detach: impl Fn(), running: impl Fn() -> bool + 'static) {
+    let (want_stdin, want_stdout, want_stderr, tty) = want;
+    let mut sess = Session::new();
+    sess.set_flow_control_enforced(false);
+    let expected = 1 + want_stdin as usize + want_stdout as usize + want_stderr as usize;
+    let (mut err_s, mut in_s, mut out_s, mut errout_s, mut resize_s) = (None::<u32>, None::<u32>, None::<u32>, None::<u32>, None::<u32>);
+    let mut got = 0usize;
+    let deadline = kr_rt::exec::now_ms() + 30_000;
+    let mut resize_until = None::<u64>;
+    loop {
+        let mut limit = deadline;
+        if got >= expected {
+            if !tty || resize_s.is_some() {
+                break;
+            }
+            let until = *resize_until.get_or_insert(kr_rt::exec::now_ms() + 3000);
+            if kr_rt::exec::now_ms() >= until {
+                break;
+            }
+            limit = until;
+        }
+        if sess.has_output() {
+            io.queue(&sess.take_output());
+        }
+        let left = limit.saturating_sub(kr_rt::exec::now_ms());
+        if left == 0 {
+            if got >= expected {
+                break;
+            }
+            io.finish().await;
+            return;
+        }
+        let r = kr_rt::exec::timeout(left, poll_fn(|cx| {
+            let _ = io.poll_flush(cx);
+            io.poll_read(cx)
+        }))
+        .await;
+        let Ok(Some(bytes)) = r else {
+            if got >= expected && r.is_err() {
+                break;
+            }
+            io.finish().await;
+            return;
+        };
+        if sess.feed(&bytes).is_err() {
+            io.queue(&sess.take_output());
+            io.finish().await;
+            return;
+        }
+        while let Some(e) = sess.poll_event() {
+            if let SpdyEvent::StreamOpened { id, headers, .. } = e {
+                sess.reply(id, &[]);
+                let slot = match header_of(&headers, "streamtype") {
+                    Some("error") => &mut err_s,
+                    Some("stdin") => &mut in_s,
+                    Some("stdout") => &mut out_s,
+                    Some("stderr") => &mut errout_s,
+                    Some("resize") => {
+                        resize_s = Some(id);
+                        continue;
+                    }
+                    _ => {
+                        sess.reset_with(id, spdy::status::PROTOCOL_ERROR);
+                        continue;
+                    }
+                };
+                if slot.is_none() {
+                    *slot = Some(id);
+                    got += 1;
+                }
+            }
+        }
+    }
+    let Ok(fd) = ns::open(alloc::format!("{path}\0").as_bytes(), ns::O_RDONLY, 0) else {
+        io.finish().await;
+        return;
+    };
+    // New output only.
+    let mut buf = [0u8; 16384];
+    while matches!(kr_sys::read(fd.raw(), &mut buf), Ok(n) if n > 0) {}
+    let mut f = Follow { fd, pos: 0, first: None, stamp: false, timer: None, running: Box::new(running) };
+    let mut stdin = stdin;
+    enum E {
+        Io(Option<Vec<u8>>),
+        Out(Option<Vec<u8>>),
+    }
+    loop {
+        if sess.has_output() {
+            io.queue(&sess.take_output());
+        }
+        let ev = poll_fn(|cx| {
+            let _ = io.poll_flush(cx);
+            if let Poll::Ready(r) = io.poll_read(cx) {
+                return Poll::Ready(E::Io(r));
+            }
+            f.poll_next(cx).map(E::Out)
+        })
+        .await;
+        match ev {
+            E::Io(None) => {
+                on_detach();
+                return;
+            }
+            E::Io(Some(bytes)) => {
+                if sess.feed(&bytes).is_err() {
+                    on_detach();
+                    return;
+                }
+                while let Some(e) = sess.poll_event() {
+                    match e {
+                        SpdyEvent::Data { id, bytes, fin } => {
+                            sess.consume(id, bytes.len());
+                            if Some(id) == resize_s {
+                                if let (true, Some(m), Ok(sz)) = (tty_container, &stdin, channel::parse_resize(&bytes)) {
+                                    let _ = ns::set_winsize(m.raw(), sz.width, sz.height);
+                                }
+                            } else if Some(id) == in_s {
+                                if let Some(w) = &stdin {
+                                    let (mut off, mut tries) = (0, 0);
+                                    while off < bytes.len() && tries < 400 {
+                                        match kr_sys::write(w.raw(), &bytes[off..]) {
+                                            Ok(n) => off += n,
+                                            Err(e) if e.0 == 11 => {
+                                                tries += 1;
+                                                kr_rt::exec::sleep(5).await;
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                }
+                                if fin {
+                                    stdin = None;
+                                    on_detach();
+                                }
+                            }
+                        }
+                        SpdyEvent::StreamOpened { id, headers, .. } => {
+                            if header_of(&headers, "streamtype") == Some("resize") {
+                                resize_s = Some(id);
+                            }
+                            sess.reply(id, &[]);
+                        }
+                        SpdyEvent::Reset { id, .. } if Some(id) == in_s => stdin = None,
+                        SpdyEvent::Reset { .. } => {}
+                        SpdyEvent::GoAway { .. } => {
+                            on_detach();
+                            return;
+                        }
+                    }
+                }
+            }
+            E::Out(Some(d)) => {
+                if let Some(id) = out_s {
+                    sess.data(id, &d, false);
+                }
+            }
+            E::Out(None) => {
+                on_detach();
+                if let Some(id) = out_s {
+                    sess.data(id, b"", true);
+                }
+                if let Some(id) = errout_s {
+                    sess.data(id, b"", true);
+                }
+                let st = channel::status_success();
+                sess.data(err_s.unwrap_or(0), st.as_bytes(), true);
+                io.queue(&sess.take_output());
+                io.finish().await;
+                return;
+            }
         }
     }
 }

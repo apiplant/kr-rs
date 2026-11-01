@@ -573,6 +573,13 @@ mod value_tests {
         for want in ["must be less than or equal to cpu limit", "ports[0].name: Invalid value", "maxSkew: Invalid value: 0", "value must be empty when `operator` is 'Exists'", "nameservers[0]: Invalid value", "hostAliases[0].ip: Invalid value"] {
             assert!(e.iter().any(|x| x.contains(want)), "{want}: {e:?}");
         }
+        let sec = kr_fmt::json::parse_str(r#"{"type":"kubernetes.io/tls","data":{"bad key":"x"}}"#).unwrap();
+        let e = value_errors("v1", "Secret", &sec).unwrap();
+        assert!(e.iter().any(|x| x.contains("data[tls.crt]: Required value")) && e.iter().any(|x| x.contains("a valid config key")), "{e:?}");
+        let pdb = kr_fmt::json::parse_str(r#"{"spec":{"minAvailable":1,"maxUnavailable":1}}"#).unwrap();
+        assert!(!value_errors("policy/v1", "PodDisruptionBudget", &pdb).unwrap().is_empty());
+        let ing = kr_fmt::json::parse_str(r#"{"spec":{"rules":[{"http":{"paths":[{"path":"x","pathType":"Prefix"}]}}]}}"#).unwrap();
+        assert!(value_errors("networking.k8s.io/v1", "Ingress", &ing).unwrap().iter().any(|x| x.contains("absolute path")));
         let dep = kr_fmt::json::parse_str(r#"{"spec":{"selector":{"matchLabels":{"a":"b"},"matchExpressions":[{"key":"k","operator":"In"}]},"template":{"metadata":{"labels":{"a":"c"}}}}}"#).unwrap();
         let e = value_errors("apps/v1", "Deployment", &dep).unwrap();
         assert!(e.iter().any(|x| x.contains("`selector` does not match template `labels`")) && e.iter().any(|x| x.contains("matchExpressions[0].values: Required value")), "{e:?}");
@@ -789,19 +796,95 @@ fn selector_errors(sel: &Value, path: &str, out: &mut Vec<String>) {
 /// Rules that look at several fields: workload selectors against template labels, selector
 /// expressions, Service port naming, a pod's containers.
 fn cross_field(api_version: &str, kind: &str, v: &Value, out: &mut Vec<String>) {
-    let Some(spec) = v.get("spec") else { return };
+    let spec = v.get("spec").unwrap_or(&Value::Null);
     match (api_version, kind) {
         ("apps/v1", "Deployment" | "ReplicaSet" | "StatefulSet" | "DaemonSet") => {
             match spec.get("selector") {
                 None | Some(Value::Null) => out.push(String::from("spec.selector: Required value")),
                 Some(sel) => {
                     selector_errors(sel, "spec.selector", out);
+                    if kind == "Deployment" {
+                        let ru = spec.pointer(&["strategy", "rollingUpdate"]);
+                        let zero = |f: &str| ru.and_then(|r| r.get(f)).is_some_and(|x| x.as_i64() == Some(0) || x.as_str() == Some("0") || x.as_str() == Some("0%"));
+                        if spec.pointer(&["strategy", "type"]).and_then(Value::as_str).is_none_or(|t| t == "RollingUpdate") && zero("maxSurge") && zero("maxUnavailable") {
+                            out.push(String::from("spec.strategy.rollingUpdate.maxUnavailable: Invalid value: may not be 0 when `maxSurge` is 0"));
+                        }
+                    }
                     let empty = sel.get("matchLabels").and_then(Value::as_object).is_none_or(|m| m.is_empty()) && sel.get("matchExpressions").and_then(Value::as_array).is_none_or(|m| m.is_empty());
                     if empty {
                         out.push(String::from("spec.selector: Invalid value: empty selector is invalid for this kind"));
                     } else if !label_match(sel, spec.pointer(&["template", "metadata", "labels"]).unwrap_or(&Value::Null)) {
                         out.push(format!("spec.template.metadata.labels: Invalid value: {}: `selector` does not match template `labels`", kr_fmt::json::to_string(spec.pointer(&["template", "metadata", "labels"]).unwrap_or(&Value::Null))));
                     }
+                }
+            }
+        }
+        ("policy/v1", "PodDisruptionBudget") => {
+            if spec.get("minAvailable").is_some_and(|x| !x.is_null()) && spec.get("maxUnavailable").is_some_and(|x| !x.is_null()) {
+                out.push(String::from("spec: Invalid value: minAvailable and maxUnavailable cannot be both set"));
+            }
+        }
+        ("autoscaling/v1" | "autoscaling/v2", "HorizontalPodAutoscaler") => {
+            let (min, max) = (spec.get("minReplicas").and_then(Value::as_i64).unwrap_or(1), spec.get("maxReplicas").and_then(Value::as_i64));
+            match max {
+                None => out.push(String::from("spec.maxReplicas: Required value: must be greater than 0")),
+                Some(m) if m < 1 => out.push(format!("spec.maxReplicas: Invalid value: {m}: must be greater than 0")),
+                Some(m) if m < min => out.push(format!("spec.maxReplicas: Invalid value: {m}: must be greater than or equal to `minReplicas`")),
+                _ => {}
+            }
+        }
+        ("rbac.authorization.k8s.io/v1", "RoleBinding" | "ClusterRoleBinding") => {
+            for (i, sub) in v.get("subjects").and_then(Value::as_array).unwrap_or(&[]).iter().enumerate() {
+                let k = sub.get("kind").and_then(Value::as_str).unwrap_or("");
+                match k {
+                    "User" | "Group" => {}
+                    "ServiceAccount" => {
+                        if sub.get("namespace").and_then(Value::as_str).is_none_or(str::is_empty) && kind == "ClusterRoleBinding" {
+                            out.push(format!("subjects[{i}].namespace: Required value"));
+                        }
+                    }
+                    "" => {}
+                    _ => out.push(format!("subjects[{i}].kind: Unsupported value: \"{k}\": supported values: \"ServiceAccount\", \"User\", \"Group\"")),
+                }
+            }
+        }
+        ("networking.k8s.io/v1", "Ingress") => {
+            for (i, r) in spec.get("rules").and_then(Value::as_array).unwrap_or(&[]).iter().enumerate() {
+                for (j, p) in r.pointer(&["http", "paths"]).and_then(Value::as_array).unwrap_or(&[]).iter().enumerate() {
+                    let (ty, path) = (p.get("pathType").and_then(Value::as_str).unwrap_or(""), p.get("path").and_then(Value::as_str).unwrap_or(""));
+                    let loc = format!("spec.rules[{i}].http.paths[{j}]");
+                    if !matches!(ty, "Exact" | "Prefix" | "ImplementationSpecific") {
+                        out.push(if ty.is_empty() { format!("{loc}.pathType: Required value: pathType must be specified") } else { format!("{loc}.pathType: Unsupported value: \"{ty}\": supported values: \"Exact\", \"Prefix\", \"ImplementationSpecific\"") });
+                    } else if ty != "ImplementationSpecific" && !path.starts_with('/') {
+                        out.push(format!("{loc}.path: Invalid value: \"{path}\": must be an absolute path"));
+                    }
+                }
+            }
+        }
+        ("v1", "ConfigMap" | "Secret") => {
+            for field in ["data", "binaryData", "stringData"] {
+                for (k, _) in v.get(field).and_then(Value::as_object).unwrap_or(&[]) {
+                    if k.is_empty() || k.len() > 253 || k == "." || k == ".." || !k.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')) {
+                        out.push(format!("{field}[{k}]: Invalid value: \"{k}\": a valid config key must consist of alphanumeric characters, '-', '_' or '.'"));
+                    }
+                }
+            }
+            if kind == "Secret" {
+                let has = |k: &str| v.get("data").and_then(|d| d.get(k)).is_some() || v.get("stringData").and_then(|d| d.get(k)).is_some();
+                let need: &[&str] = match v.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "kubernetes.io/tls" => &["tls.crt", "tls.key"],
+                    "kubernetes.io/dockerconfigjson" => &[".dockerconfigjson"],
+                    "kubernetes.io/dockercfg" => &[".dockercfg"],
+                    "kubernetes.io/ssh-auth" => &["ssh-privatekey"],
+                    _ => &[],
+                };
+                for k in need {
+                    if !has(k) {
+                        out.push(format!("data[{k}]: Required value"));
+                    }
+                }
+                if v.get("type").and_then(Value::as_str) == Some("kubernetes.io/basic-auth") && !has("username") && !has("password") {
+                    out.push(String::from("data[username]: Required value: username or password required"));
                 }
             }
         }

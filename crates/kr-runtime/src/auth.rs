@@ -61,7 +61,7 @@ pub fn lookup<'a>(creds: &'a [Cred], registry: &str, repository: &str) -> Option
 }
 
 /// Docker client config for `kr ctr pull`: `$DOCKER_CONFIG/config.json`, else
-/// `~/.docker/config.json`. Credential helpers (`credsStore`/`credHelpers`) are not run.
+/// `~/.docker/config.json`, plus what its `credHelpers`/`credsStore` helpers return.
 pub fn docker_config(env: &dyn Fn(&str) -> Option<String>) -> Vec<Cred> {
     let path = match (env("DOCKER_CONFIG"), env("HOME")) {
         (Some(d), _) if !d.is_empty() => alloc::format!("{d}/config.json"),
@@ -69,7 +69,105 @@ pub fn docker_config(env: &dyn Fn(&str) -> Option<String>) -> Vec<Cred> {
         _ => return Vec::new(),
     };
     let Ok(data) = kr_sys::fs::read_file(alloc::format!("{path}\0").as_bytes(), 1 << 20) else { return Vec::new() };
-    parse_dockerconfig(&data).unwrap_or_default()
+    let mut creds = parse_dockerconfig(&data).unwrap_or_default();
+    // Credential helpers (`docker-credential-*` programs), as `docker pull` runs them.
+    if let Ok(cfg) = kr_fmt::json::parse(&data) {
+        creds.extend(helper_creds(&cfg, env));
+    }
+    creds
+}
+
+/// Runs `docker-credential-<helper> <cmd>` with `input` on stdin; its stdout on success. The
+/// helper is looked up in `$PATH`. Blocking (used by `kr ctr pull` only).
+fn run_helper(helper: &str, cmd: &str, input: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    use kr_sys::ns;
+    if helper.is_empty() || !helper.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')) {
+        return None;
+    }
+    let name = alloc::format!("docker-credential-{helper}");
+    let path_var = env("PATH").unwrap_or_else(|| String::from("/usr/local/bin:/usr/bin:/bin"));
+    let exe = path_var.split(':').filter(|d| !d.is_empty()).map(|d| alloc::format!("{d}/{name}")).find(|p| ns::open(alloc::format!("{p}\0").as_bytes(), ns::O_RDONLY, 0).is_ok())?;
+    let (in_r, in_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).ok()?;
+    let (out_r, out_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).ok()?;
+    let exe0 = alloc::format!("{exe}\0");
+    let cmd0 = alloc::format!("{cmd}\0");
+    let envs: Vec<String> = ["PATH", "HOME", "DOCKER_CONFIG", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"].iter().filter_map(|k| env(k).map(|v| alloc::format!("{k}={v}\0"))).collect();
+    let mut args = ns::CloneArgs { exit_signal: ns::SIGCHLD as u64, ..Default::default() };
+    // SAFETY: fork-style clone; the child only dup2s, execs or exits.
+    match unsafe { ns::clone3(&mut args) }.ok()? {
+        0 => {
+            let _ = ns::sigmask_reset();
+            if ns::dup_to(in_r.raw(), 0).is_err() || ns::dup_to(out_w.raw(), 1).is_err() {
+                kr_sys::exit_group(126);
+            }
+            let argv = [exe0.as_ptr(), cmd0.as_ptr(), core::ptr::null()];
+            let mut envp: Vec<*const u8> = envs.iter().map(|e| e.as_ptr()).collect();
+            envp.push(core::ptr::null());
+            let _ = ns::execve(exe0.as_bytes(), &argv, &envp);
+            kr_sys::exit_group(127);
+        }
+        pid => {
+            drop(in_r);
+            drop(out_w);
+            let mut off = 0;
+            let data = input.as_bytes();
+            while off < data.len() {
+                match kr_sys::write(in_w.raw(), &data[off..]) {
+                    Ok(n) => off += n,
+                    Err(_) => break,
+                }
+            }
+            drop(in_w);
+            let mut out = Vec::new();
+            let mut buf = [0u8; 4096];
+            while out.len() < (1 << 20) {
+                match kr_sys::read(out_r.raw(), &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                }
+            }
+            drop(out_r);
+            let code = ns::wait4(pid).ok()?;
+            (code == 0).then(|| String::from_utf8(out).ok())?
+        }
+    }
+}
+
+/// A credential from a helper's `get` answer `{"ServerURL","Username","Secret"}`; the username
+/// `<token>` marks an identity token.
+fn helper_cred(server: &str, answer: &str) -> Option<Cred> {
+    let v = kr_fmt::json::parse(answer.as_bytes()).ok()?;
+    let (user, secret) = (v.get("Username").and_then(Value::as_str).unwrap_or(""), v.get("Secret").and_then(Value::as_str).unwrap_or(""));
+    let mut cred = Credential::default();
+    if user == "<token>" {
+        cred.identity_token = Some(secret.to_string());
+    } else if !user.is_empty() {
+        cred.username = user.to_string();
+        cred.password = secret.to_string();
+    } else {
+        return None;
+    }
+    Some(Cred { registry: registry_key(server), cred })
+}
+
+/// Credentials the config delegates to helpers: `credHelpers` per registry, and `credsStore`
+/// for every registry the store lists.
+fn helper_creds(config: &Value, env: &dyn Fn(&str) -> Option<String>) -> Vec<Cred> {
+    let mut out = Vec::new();
+    for (server, helper) in config.get("credHelpers").and_then(Value::as_object).unwrap_or(&[]) {
+        if let Some(c) = helper.as_str().and_then(|h| run_helper(h, "get", server, env)).and_then(|a| helper_cred(server, &a)) {
+            out.push(c);
+        }
+    }
+    if let Some(store) = config.get("credsStore").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        let list = run_helper(store, "list", "", env).and_then(|l| kr_fmt::json::parse(l.as_bytes()).ok());
+        for (server, _) in list.as_ref().and_then(Value::as_object).unwrap_or(&[]) {
+            if let Some(c) = run_helper(store, "get", server, env).and_then(|a| helper_cred(server, &a)) {
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
 fn entry(host: &str, v: &Value) -> Option<Cred> {

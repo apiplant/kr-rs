@@ -112,6 +112,30 @@ impl NodeProxy for Router {
         let ip = node_ip.ok_or_else(|| ApiError::new(503, "ServiceUnavailable", alloc::format!("node {node} has no InternalIP")))?;
         let target = if query.is_empty() { alloc::format!("/pods/{ns}/{pod}/{sub}") } else { alloc::format!("/pods/{ns}/{pod}/{sub}?{query}") };
         let tls = self.tls.clone();
+        // SPDY/3.1 (client-go remotecommand / spdystream): pass the upgrade through to the node.
+        if header(headers, "upgrade").is_some_and(|u| u.split(',').any(|t| t.trim().eq_ignore_ascii_case("SPDY/3.1"))) {
+            let protos: Vec<String> = headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("x-stream-protocol-version")).flat_map(|(_, v)| v.split(',')).map(|t| t.trim().to_string()).collect();
+            let handler = move |conn: Box<dyn Conn>| -> Pin<Box<dyn Future<Output = ()>>> {
+                Box::pin(async move {
+                    let Some(mut t) = connect(tls, ip).await else { return };
+                    let mut req = alloc::format!("POST {target} HTTP/1.1\r\nHost: {}\r\nUpgrade: SPDY/3.1\r\nConnection: Upgrade\r\n", kr_net::tcp::url_host(ip));
+                    for p in &protos {
+                        req.push_str(&alloc::format!("X-Stream-Protocol-Version: {p}\r\n"));
+                    }
+                    req.push_str("\r\n");
+                    if t.write_all(req.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let Some((101, _, rest)) = read_head(&mut t).await else { return };
+                    pump(conn, t, rest).await;
+                })
+            };
+            return Ok(Response {
+                status: 101,
+                headers: alloc::vec![("Upgrade".into(), "SPDY/3.1".into()), ("X-Stream-Protocol-Version".into(), "v4.channel.k8s.io".into())],
+                body: Body::Upgrade(Box::new(handler)),
+            });
+        }
         let upgrade = header(headers, "upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
         if !upgrade {
             // Plain (logs, logs -f): stream the node's response body through.
