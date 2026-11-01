@@ -136,7 +136,10 @@ pub fn write_resolv_conf(pod_dir: &str, pod: &Value, rootless_pod: bool, fam: kr
         "ClusterFirstWithHostNet" | "ClusterFirst" if !(host_net && policy == "ClusterFirst") => {
             {
                 let ns_ip = if fam.v4 { String::from("10.96.0.10") } else { kr_net::tcp::ipv6_string(crate::dns::DNS_IP6) };
-                alloc::format!("search {ns}.svc.cluster.local svc.cluster.local cluster.local\nnameserver {ns_ip}\noptions ndots:5\n")
+                {
+                    let d = crate::cluster_domain();
+                    alloc::format!("search {ns}.svc.{d} svc.{d} {d}\nnameserver {ns_ip}\noptions ndots:5\n")
+                }
             }
         }
         "ClusterFirst" => host_resolv_conf(rootless_pod, fam),
@@ -215,7 +218,7 @@ pub fn write_etc_hosts(pod_dir: &str, pod: &Value, hostname: &str, ip: Option<[u
             // listed first as upstream's kubelet does (getent / `hostname -f` read it).
             let sub = pod.pointer(&["spec", "subdomain"]).and_then(Value::as_str).filter(|s| !s.is_empty());
             let names = match sub {
-                Some(sub) => alloc::format!("{hostname}.{sub}.{}.svc.cluster.local\t{hostname}", meta(pod, "namespace")),
+                Some(sub) => alloc::format!("{hostname}.{sub}.{}.svc.{}\t{hostname}", meta(pod, "namespace"), crate::cluster_domain()),
                 None => String::from(hostname),
             };
             s.push_str(&alloc::format!("{}.{}.{}.{}\t{names}\n", a[0], a[1], a[2], a[3]));
@@ -223,7 +226,7 @@ pub fn write_etc_hosts(pod_dir: &str, pod: &Value, hostname: &str, ip: Option<[u
         if let Some(a6) = ip6 {
             let sub = pod.pointer(&["spec", "subdomain"]).and_then(Value::as_str).filter(|s| !s.is_empty());
             let names = match sub {
-                Some(sub) => alloc::format!("{hostname}.{sub}.{}.svc.cluster.local\t{hostname}", meta(pod, "namespace")),
+                Some(sub) => alloc::format!("{hostname}.{sub}.{}.svc.{}\t{hostname}", meta(pod, "namespace"), crate::cluster_domain()),
                 None => String::from(hostname),
             };
             s.push_str(&alloc::format!("{}\t{names}\n", kr_net::tcp::ipv6_string(a6)));

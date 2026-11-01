@@ -28,9 +28,17 @@ pub trait Transport {
     /// Reads at least one byte, or returns `Ok(0)` at EOF.
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
     async fn write_all(&mut self, buf: &[u8]) -> Result<()>;
+    /// An idle connection the peer has already closed (or that carries stray data): not fit for
+    /// reuse. Transports that cannot tell say false.
+    fn peer_gone(&self) -> bool {
+        false
+    }
 }
 
 impl Transport for Async<Fd> {
+    fn peer_gone(&self) -> bool {
+        crate::tcp::peer_gone(self.get_ref().raw())
+    }
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         Async::read(self, buf).await.map_err(Error::Io)
     }

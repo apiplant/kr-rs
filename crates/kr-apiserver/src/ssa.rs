@@ -22,9 +22,21 @@ pub enum ListKind {
 /// Looks up the kind of the list at a field-name path (the list's own name is last).
 pub type Lists<'a> = &'a dyn Fn(&[&str]) -> ListKind;
 
+/// Fields of the built-in types that are atomic structs or maps (`+structType=atomic`,
+/// `+mapType=atomic`): LabelSelector and NodeSelector values, object references, the env
+/// source selectors, a Service's `selector`, a pod's `nodeSelector`. Owned and replaced as one.
+const ATOMIC_STRUCTS: &[&str] = &[
+    "selector", "labelSelector", "namespaceSelector", "podSelector", "objectSelector", "nodeSelector", "preference",
+    "fieldRef", "resourceFieldRef", "secretKeyRef", "configMapKeyRef", "fileKeyRef",
+    "scaleTargetRef", "claimRef", "dataSource", "dataSourceRef", "involvedObject", "regarding", "related",
+];
+
 /// List kinds of the built-in types, from the strategic merge patch tables.
 pub fn builtin_lists(path: &[&str]) -> ListKind {
     let Some((field, parent)) = path.split_last() else { return ListKind::Atomic };
+    if ATOMIC_STRUCTS.contains(field) {
+        return ListKind::AtomicMap;
+    }
     if let Some(k) = crate::patch::merge_key(parent, field) {
         let mut keys = alloc::vec![k.to_string()];
         if *field == "ports" {
@@ -673,6 +685,15 @@ mod tests {
     #[test]
     fn maps_and_scalars() {
         assert_eq!(f(r#"{"metadata":{"name":"x","labels":{"app":"a"}},"spec":{"replicas":2}}"#), r#"{"f:metadata":{"f:labels":{"f:app":{}}},"f:spec":{"f:replicas":{}}}"#);
+    }
+
+    #[test]
+    fn builtin_atomic_structs() {
+        assert_eq!(builtin_lists(&["spec", "selector"]), ListKind::AtomicMap);
+        assert_eq!(builtin_lists(&["spec", "template", "spec", "containers", "env", "valueFrom", "secretKeyRef"]), ListKind::AtomicMap);
+        let a = j(r#"{"spec":{"selector":{"matchLabels":{"a":"1"}}}}"#);
+        let fs = fields(&a, None, &builtin_lists, Scope::All);
+        assert_eq!(json::to_string(&fs), r#"{"f:spec":{"f:selector":{}}}"#);
     }
 
     #[test]

@@ -28,6 +28,7 @@ struct Snapshot {
 
 #[derive(Default)]
 pub struct ClusterZone {
+    domain: String,
     snap: RefCell<Snapshot>,
 }
 
@@ -73,7 +74,7 @@ impl ClusterZone {
 
 impl Zone for ClusterZone {
     fn domain(&self) -> &str {
-        "cluster.local"
+        &self.domain
     }
 
     fn service(&self, ns: &str, name: &str) -> Option<ServiceRecord> {
@@ -122,10 +123,10 @@ impl Zone for ClusterZone {
         let snap = self.snap.borrow();
         for s in &snap.services {
             if s.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).and_then(ip4) == Some(ip) {
-                return Some(alloc::format!("{}.{}.svc.cluster.local", meta(s, "name"), meta(s, "namespace")));
+                return Some(alloc::format!("{}.{}.svc.{}", meta(s, "name"), meta(s, "namespace"), self.domain));
             }
         }
-        snap.pods.iter().find(|(p, _, _, _)| *p == Some(ip)).map(|(_, _, ns, _)| alloc::format!("{}-{}-{}-{}.{ns}.pod.cluster.local", ip[0], ip[1], ip[2], ip[3]))
+        snap.pods.iter().find(|(p, _, _, _)| *p == Some(ip)).map(|(_, _, ns, _)| alloc::format!("{}-{}-{}-{}.{ns}.pod.{}", ip[0], ip[1], ip[2], ip[3], self.domain))
     }
 }
 
@@ -138,7 +139,7 @@ pub async fn run<C: Client + Clone + 'static>(c: C, net: Rc<NodeNet>, fam: kr_ne
         .filter(|ip| !matches!(ip, IpAddr::V4(a) if *a == DNS_IP) && !matches!(ip, IpAddr::V6(a) if *a == DNS_IP6))
         .map(|ip| SocketAddr { ip, port: 53 })
         .collect();
-    let zone = Rc::new(ClusterZone::default());
+    let zone = Rc::new(ClusterZone { domain: crate::cluster_domain(), ..Default::default() });
     zone.refresh(&c).await;
     let z: Rc<dyn Zone> = zone.clone();
     if fam.v4 {

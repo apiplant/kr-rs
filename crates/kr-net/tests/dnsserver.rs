@@ -250,10 +250,12 @@ fn headless_and_statefulset_hostnames() {
 
 #[test]
 fn externalname_cname() {
-    for ty in [1u16, 28, 5] {
-        let m = ask("ext.default.svc.cluster.local", ty);
-        assert_eq!((m.rcode(), m.an.len(), m.an[0].ty), (0, 1, 5), "type {ty}");
-        assert_eq!(m.rdname(&m.an[0], 0), "example.com");
+    // Only the alias for the CNAME type; address queries are completed from the upstream.
+    let m = ask("ext.default.svc.cluster.local", 5);
+    assert_eq!((m.rcode(), m.an.len(), m.an[0].ty), (0, 1, 5));
+    assert_eq!(m.rdname(&m.an[0], 0), "example.com");
+    for ty in [1u16, 28] {
+        assert!(matches!(handle(&query("ext.default.svc.cluster.local", ty), &Fake, false), Answer::Chase(_)), "type {ty}");
     }
 }
 

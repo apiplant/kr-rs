@@ -424,6 +424,21 @@ fn send_nosignal(fd: i32, buf: &[u8]) -> core::result::Result<usize, Errno> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+const SYS_RECVFROM: usize = 45;
+#[cfg(target_arch = "aarch64")]
+const SYS_RECVFROM: usize = 207;
+
+/// True when the peer of a stream socket has closed it (or it failed) while it sat idle: a
+/// non-blocking `MSG_PEEK` reads EOF or an error. Pending data or `EAGAIN` mean it is alive
+/// (stray data on an idle HTTP connection also makes it unfit for reuse).
+pub fn peer_gone(fd: i32) -> bool {
+    let mut b = [0u8; 1];
+    // SAFETY: recvfrom(fd, b, 1, MSG_PEEK|MSG_DONTWAIT, NULL, NULL) writes at most one byte into `b`.
+    let r = unsafe { sys::syscall6(SYS_RECVFROM, fd as usize, b.as_mut_ptr() as usize, 1, 0x2 | 0x40, 0, 0) };
+    r >= 0 || r != -11
+}
+
 /// Writes all of `buf` to a non-blocking stream socket (e.g. one end of a socketpair), never
 /// raising SIGPIPE. `Err` once the peer is gone or the socket failed.
 pub async fn write_all_nosignal(sock: &Async<Fd>, mut buf: &[u8]) -> core::result::Result<(), Errno> {

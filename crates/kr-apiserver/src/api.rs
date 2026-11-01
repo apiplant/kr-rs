@@ -112,6 +112,7 @@ pub struct ApiServer {
     /// ServiceAccount token signer and the cluster CA PEM (for kube-root-ca.crt).
     sa: RefCell<Option<(crate::tokens::Signer, String)>>,
     node_proxy: RefCell<Option<alloc::rc::Rc<dyn NodeProxy>>>,
+    pod_dialer: RefCell<Option<alloc::rc::Rc<dyn crate::podproxy::PodDialer>>>,
     /// Cluster CA (name, key, DER) for issuing node certificates at join.
     ca: RefCell<Option<(kr_crypto::x509::Name, kr_crypto::x509::SigningKey, Vec<u8>)>>,
     /// Lifetime of issued node certificates, seconds (agents renew at 2/3).
@@ -261,7 +262,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()) };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()) };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -514,6 +515,10 @@ impl ApiServer {
         json::write_str(&pem(ca_der), &mut out);
         out.push('}');
         Ok(Reply::Json(200, out))
+    }
+
+    pub fn set_pod_dialer(&self, d: alloc::rc::Rc<dyn crate::podproxy::PodDialer>) {
+        *self.pod_dialer.borrow_mut() = Some(d);
     }
 
     pub fn set_node_proxy(&self, p: alloc::rc::Rc<dyn NodeProxy>) {
@@ -961,6 +966,22 @@ impl ApiServer {
         }
     }
 
+    /// Enum and required-field violations of a built-in kind's object; on update only the ones
+    /// `old` did not already have.
+    fn check_values(&self, rt: &Route, new: &Value, old: Option<&Value>) -> R<()> {
+        let gv = rt.res.group_version();
+        let Some(mut errs) = crate::fieldval::value_errors(&gv, rt.res.kind, new) else { return Ok(()) };
+        if let Some(o) = old.and_then(|o| crate::fieldval::value_errors(&gv, rt.res.kind, o)) {
+            errs.retain(|e| !o.contains(e));
+        }
+        if errs.is_empty() {
+            return Ok(());
+        }
+        let name = new.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("");
+        let group = if rt.res.group.is_empty() { String::new() } else { alloc::format!(".{}", rt.res.group) };
+        Err(ApiError::invalid(alloc::format!("{}{group} \"{name}\" is invalid: {}", rt.res.kind, errs.join(", "))))
+    }
+
     /// Unknown fields of a built-in kind's object (those `old` already had are not reported).
     fn fv_builtin(&self, rt: &Route, new: &Value, old: Option<&Value>) -> R<()> {
         let gv = rt.res.group_version();
@@ -1228,7 +1249,15 @@ impl ApiServer {
             None => pod.pointer(&["spec", "containers"]).and_then(Value::as_array).and_then(|cs| cs.iter().find_map(|c| c.get("ports")?.as_array()?.first()?.get("containerPort")?.as_u64())).map(|p| p as u16).or(Some(80)),
         }
         .ok_or_else(|| ApiError::bad_request("invalid port"))?;
-        self.proxy_reply(req, scheme, ip, port, pod_name)
+        let node = pod.pointer(&["spec", "nodeName"]).and_then(Value::as_str).unwrap_or("").to_string();
+        let nobj = resources::find("", "v1", "nodes").filter(|_| !node.is_empty()).and_then(|r| self.store.borrow().get(&r.key(None, &node))).and_then(|kv| json::parse(&kv.value).ok());
+        let private_net = nobj.as_ref().and_then(|n| n.pointer(&["metadata", "annotations", "kr.io/rootless"])).and_then(Value::as_str) == Some("true");
+        let node_ip = nobj.as_ref().and_then(|v| v.pointer(&["status", "addresses"])?.as_array()?.iter().filter(|a| a.get("type").and_then(Value::as_str) == Some("InternalIP")).find_map(|a| a.get("address")?.as_str().and_then(kr_net::tcp::parse_ip16)));
+        let mut reply = self.proxy_reply(req, scheme, ip, port, pod_name)?;
+        if let Reply::Proxy(t) = &mut reply {
+            t.pod = Some(crate::podproxy::PodWhere { namespace: rt.namespace.clone().unwrap_or_default(), name: pod_name.to_string(), node, node_ip, private_net });
+        }
+        Ok(reply)
     }
 
     /// `scheme` is "https" to speak TLS to the backend (certificates are not verified, like
@@ -1252,6 +1281,8 @@ impl ApiServer {
             content_type: req.content_type.map(Into::into),
             accept: req.accept.map(Into::into),
             body: req.body.to_vec(),
+            dial: self.pod_dialer.borrow().clone(),
+            pod: None,
         }))
     }
 
@@ -1544,6 +1575,10 @@ impl ApiServer {
             cols.push(col(n, "string", "", "", 0));
         }
         cols.push(col("Age", "string", "", "CreationTimestamp", 0));
+        let wide = crate::printers::wide_columns(res.kind);
+        for (n, _) in wide {
+            cols.push(col(n, "string", "", "", 1));
+        }
         let rows: Vec<Value> = items
             .iter()
             .filter_map(|kv| json::parse(&kv.value).ok())
@@ -1556,6 +1591,9 @@ impl ApiServer {
                 }
                 let created = meta.get("creationTimestamp").and_then(Value::as_str).and_then(crate::printers::parse_rfc3339);
                 cells.push(Value::String(created.map(|c| crate::printers::human_duration(now - c)).unwrap_or_else(|| "<unknown>".into())));
+                for (_, f) in wide {
+                    cells.push(Value::String(f(&o)));
+                }
                 let partial = obj(alloc::vec![("kind", Value::from("PartialObjectMetadata")), ("apiVersion", Value::from("meta.k8s.io/v1")), ("metadata", meta)]);
                 obj(alloc::vec![("cells", Value::Array(cells)), ("object", partial)])
             })
@@ -1825,6 +1863,7 @@ impl ApiServer {
             let st = crate::policy::type_check_status(self, o);
             o.set("status", st);
         }
+        self.check_values(rt, o, None)?;
         Self::check_webhook_config(rt, o)?;
         self.admit_custom(rt, o, None, false)?;
         if rt.res.plural == "pods" {
@@ -1848,6 +1887,10 @@ impl ApiServer {
         }
         if rt.res.plural == "persistentvolumeclaims" {
             self.default_storage_class(o);
+            let lr = resources::find("", "v1", "limitranges").unwrap();
+            let ns = rt.namespace.clone().unwrap_or_default();
+            let ranges: Vec<Value> = self.store.borrow().list(&alloc::format!("{}{ns}/", lr.prefix()), None, 0).0.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect();
+            crate::admit::limit_ranger_pvc(o, &ranges).map_err(|e| ApiError::new(403, "Forbidden", alloc::format!("persistentvolumeclaims \"{name}\" is forbidden: {e}")))?;
         }
         if rt.res.plural == "namespaces" {
             o.entry_object("spec").set("finalizers", Value::Array(alloc::vec![Value::from("kubernetes")]));
@@ -1931,6 +1974,9 @@ impl ApiServer {
         if rt.res.plural == "validatingadmissionpolicies" && !status && new.get("spec") != old.get("spec") {
             let st = crate::policy::type_check_status(self, &new);
             new.set("status", st);
+        }
+        if !status {
+            self.check_values(rt, &new, Some(&old))?;
         }
         Self::check_webhook_config(rt, &new)?;
         self.admit_custom(rt, &mut new, Some(&old), status)?;

@@ -127,11 +127,31 @@ fn nano(q: &Quantity) -> i128 {
     q.scaled_value(-9).unwrap_or(0)
 }
 
+/// LimitRanger for a PersistentVolumeClaim: `PersistentVolumeClaim` limits bound the storage request.
+pub fn limit_ranger_pvc(pvc: &Value, ranges: &[Value]) -> Result<(), String> {
+    let Some(req) = qty(pvc.pointer(&["spec", "resources", "requests", "storage"])) else { return Ok(()) };
+    let mut errs = Vec::new();
+    for it in ranges.iter().flat_map(|r| r.pointer(&["spec", "limits"]).and_then(Value::as_array).unwrap_or(&[])).filter(|i| i.get("type").and_then(Value::as_str) == Some("PersistentVolumeClaim")) {
+        if let Some(min) = qty(it.pointer(&["min", "storage"])).filter(|m| req < *m) {
+            errs.push(format!("minimum storage usage per PersistentVolumeClaim is {}, but request is {}", min.to_canonical_string(), req.to_canonical_string()));
+        }
+        if let Some(max) = qty(it.pointer(&["max", "storage"])).filter(|m| req > *m) {
+            errs.push(format!("maximum storage usage per PersistentVolumeClaim is {}, but request is {}", max.to_canonical_string(), req.to_canonical_string()));
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join(", "))
+    }
+}
+
 /// LimitRanger for one pod: defaults every container's missing requests and limits from the
 /// namespace's `Container` limits, then checks min, max and the limit/request ratio.
 pub fn limit_ranger(spec: &mut Value, ranges: &[Value]) -> Result<(), String> {
     let items: Vec<&Value> = ranges.iter().flat_map(|r| r.pointer(&["spec", "limits"]).and_then(Value::as_array).unwrap_or(&[])).filter(|i| i.get("type").and_then(Value::as_str) == Some("Container")).collect();
-    if items.is_empty() {
+    let pod_items: Vec<&Value> = ranges.iter().flat_map(|r| r.pointer(&["spec", "limits"]).and_then(Value::as_array).unwrap_or(&[])).filter(|i| i.get("type").and_then(Value::as_str) == Some("Pod")).collect();
+    if items.is_empty() && pod_items.is_empty() {
         return Ok(());
     }
     let mut errs = Vec::new();
@@ -185,6 +205,48 @@ pub fn limit_ranger(spec: &mut Value, ranges: &[Value]) -> Result<(), String> {
             }
         }
     }
+    // Pod type: the pod's total (sum of the app containers, or the largest init container when
+    // that is bigger) against min, max and the limit/request ratio.
+    if !pod_items.is_empty() {
+        let total = |kind: &str, k: &str| -> Option<i128> {
+            let of = |c: &Value| qty(c.pointer(&["resources", kind, k])).map(|q| nano(&q));
+            let apps: Vec<&Value> = spec.get("containers").and_then(Value::as_array).unwrap_or(&[]).iter().collect();
+            let sum: i128 = apps.iter().filter_map(|c| of(c)).sum();
+            let init = spec.get("initContainers").and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(of).max().unwrap_or(0);
+            let t = sum.max(init);
+            (apps.iter().any(|c| of(c).is_some()) || init > 0).then_some(t)
+        };
+        let fmt = |n: i128, f: kr_fmt::quantity::Format| Quantity::new(n, -9, f).to_canonical_string();
+        for it in &pod_items {
+            for (k, v) in it.get("min").and_then(Value::as_object).unwrap_or(&[]) {
+                let Some(mq) = qty(Some(v)) else { continue };
+                let (min, f) = (nano(&mq), mq.format());
+                for (kind, word) in [("requests", "request"), ("limits", "limit")] {
+                    if let Some(x) = total(kind, k).filter(|x| *x < min) {
+                        errs.push(format!("minimum {k} usage per Pod is {}, but total {word}s is {}", fmt(min, f), fmt(x, f)));
+                    }
+                }
+            }
+            for (k, v) in it.get("max").and_then(Value::as_object).unwrap_or(&[]) {
+                let Some(mq) = qty(Some(v)) else { continue };
+                let (max, f) = (nano(&mq), mq.format());
+                if let Some(x) = total("requests", k).filter(|x| *x > max) {
+                    errs.push(format!("maximum {k} usage per Pod is {}, but total requests is {}", fmt(max, f), fmt(x, f)));
+                }
+                match total("limits", k) {
+                    None => errs.push(format!("maximum {k} usage per Pod is {}.  No limit is specified", fmt(max, f))),
+                    Some(x) if x > max => errs.push(format!("maximum {k} usage per Pod is {}, but total limits is {}", fmt(max, f), fmt(x, f))),
+                    _ => {}
+                }
+            }
+            for (k, v) in it.get("maxLimitRequestRatio").and_then(Value::as_object).unwrap_or(&[]) {
+                let (Some(ratio), Some(l), Some(r)) = (qty(Some(v)), total("limits", k), total("requests", k)) else { continue };
+                if r > 0 && l > nano(&ratio) * r / 1_000_000_000 {
+                    errs.push(format!("{k} max limit to request ratio per Pod is {}, but provided ratio is {}", ratio.to_canonical_string(), l as f64 / r as f64));
+                }
+            }
+        }
+    }
     if errs.is_empty() {
         Ok(())
     } else {
@@ -195,6 +257,25 @@ pub fn limit_ranger(spec: &mut Value, ranges: &[Value]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pod_type_limits() {
+        let lr = j(r#"{"spec":{"limits":[{"type":"Pod","max":{"cpu":"1"},"min":{"memory":"10Mi"}}]}}"#);
+        let mut ok = j(r#"{"containers":[{"name":"a","resources":{"requests":{"cpu":"400m","memory":"8Mi"},"limits":{"cpu":"400m"}}},{"name":"b","resources":{"requests":{"cpu":"400m","memory":"8Mi"},"limits":{"cpu":"400m"}}}]}"#);
+        limit_ranger(&mut ok, core::slice::from_ref(&lr)).unwrap();
+        let mut bad = j(r#"{"containers":[{"name":"a","resources":{"requests":{"cpu":"700m","memory":"1Mi"},"limits":{"cpu":"700m"}}},{"name":"b","resources":{"requests":{"cpu":"700m","memory":"1Mi"},"limits":{"cpu":"700m"}}}]}"#);
+        let e = limit_ranger(&mut bad, core::slice::from_ref(&lr)).unwrap_err();
+        assert!(e.contains("maximum cpu usage per Pod is 1, but total requests is 1400m") && e.contains("minimum memory usage per Pod is 10Mi"), "{e}");
+    }
+
+    #[test]
+    fn pvc_limits() {
+        let lr = j(r#"{"spec":{"limits":[{"type":"PersistentVolumeClaim","min":{"storage":"1Gi"},"max":{"storage":"2Gi"}}]}}"#);
+        let pvc = |s: &str| j(&format!(r#"{{"spec":{{"resources":{{"requests":{{"storage":"{s}"}}}}}}}}"#));
+        limit_ranger_pvc(&pvc("1500Mi"), core::slice::from_ref(&lr)).unwrap();
+        assert!(limit_ranger_pvc(&pvc("500Mi"), core::slice::from_ref(&lr)).is_err());
+        assert!(limit_ranger_pvc(&pvc("3Gi"), core::slice::from_ref(&lr)).is_err());
+    }
 
     fn j(s: &str) -> Value {
         kr_fmt::json::parse_str(s).unwrap()

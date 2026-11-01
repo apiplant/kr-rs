@@ -49,7 +49,9 @@ pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config) {
 }
 
 /// List paths (`/api/v1/namespaces/{ns}/{plural}`) of every deletable namespaced resource.
-async fn namespaced_resources<C: Client>(c: &C, ns: &str) -> Result<Vec<String>> {
+/// The second value lists the group versions whose discovery failed.
+async fn namespaced_resources<C: Client>(c: &C, ns: &str) -> Result<(Vec<String>, Vec<String>)> {
+    let mut failed: Vec<String> = Vec::new();
     let mut lists: Vec<(String, Value)> = alloc::vec![("/api/v1".to_string(), c.get("/api/v1").await?)];
     if let Ok(groups) = c.get("/apis").await {
         for g in groups.get("groups").and_then(Value::as_array).unwrap_or(&[]) {
@@ -57,8 +59,9 @@ async fn namespaced_resources<C: Client>(c: &C, ns: &str) -> Result<Vec<String>>
             if gv.is_empty() {
                 continue;
             }
-            if let Ok(l) = c.get(&alloc::format!("/apis/{gv}")).await {
-                lists.push((alloc::format!("/apis/{gv}"), l));
+            match c.get(&alloc::format!("/apis/{gv}")).await {
+                Ok(l) => lists.push((alloc::format!("/apis/{gv}"), l)),
+                Err(_) => failed.push(gv.to_string()),
             }
         }
     }
@@ -73,7 +76,7 @@ async fn namespaced_resources<C: Client>(c: &C, ns: &str) -> Result<Vec<String>>
             }
         }
     }
-    Ok(out)
+    Ok((out, failed))
 }
 
 pub async fn reconcile<C: Client>(c: &C, cfg: &Config, ns: &str) -> Result<Option<u64>> {
@@ -99,19 +102,47 @@ pub async fn reconcile<C: Client>(c: &C, cfg: &Config, ns: &str) -> Result<Optio
         }
     }
     let mut remaining = 0usize;
-    for list in namespaced_resources(c, ns).await? {
+    let mut by_resource: Vec<(String, usize)> = Vec::new();
+    let mut with_fin: Vec<(String, usize)> = Vec::new();
+    let mut failed_delete: Vec<String> = Vec::new();
+    let (lists, bad_groups) = namespaced_resources(c, ns).await?;
+    for list in lists {
         let Ok(l) = c.list(&list, "").await else { continue };
+        let res = list.rsplit('/').next().unwrap_or("").to_string();
+        let (mut n_all, mut n_fin) = (0, 0);
         for o in items(&l) {
-            remaining += 1;
+            n_all += 1;
             if !deleting(&o) {
-                delete_ok(c, &alloc::format!("{list}/{}", name(&o))).await?;
+                if delete_ok(c, &alloc::format!("{list}/{}", name(&o))).await.is_err() {
+                    failed_delete.push(alloc::format!("{res}/{}", name(&o)));
+                }
+            } else if o.pointer(&["metadata", "finalizers"]).and_then(Value::as_array).is_some_and(|f| !f.is_empty()) {
+                n_fin += 1;
             }
+        }
+        remaining += n_all;
+        if n_all > 0 {
+            by_resource.push((res.clone(), n_all));
+        }
+        if n_fin > 0 {
+            with_fin.push((res, n_fin));
         }
     }
     let now = (cfg.now)();
-    if remaining > 0 {
-        let msg = alloc::format!("Some resources are remaining: {remaining} object(s)");
-        put_conditions(c, &path, condition("NamespaceContentRemaining", true, "SomeResourcesRemain", &msg, now)).await?;
+    let listing = |v: &[(String, usize)]| v.iter().map(|(r, n)| alloc::format!("{r}. has {n} resource instances")).collect::<Vec<_>>().join(", ");
+    let existing: Vec<String> = n.pointer(&["status", "conditions"]).and_then(Value::as_array).unwrap_or(&[]).iter().map(|x| str_at(x, &["type"]).to_string()).collect();
+    let states: [(&str, bool, &str, String); 4] = [
+        ("NamespaceDeletionDiscoveryFailure", !bad_groups.is_empty(), "DiscoveryFailed", alloc::format!("Discovery failed for some groups, {} failing: unable to retrieve the complete list of server APIs: {}", bad_groups.len(), bad_groups.join(", "))),
+        ("NamespaceDeletionContentFailure", !failed_delete.is_empty(), "ContentDeletionFailed", alloc::format!("Failed to delete all resource types, {} remaining: {}", failed_delete.len(), failed_delete.join(", "))),
+        ("NamespaceContentRemaining", remaining > 0, "SomeResourcesRemain", alloc::format!("Some resources are remaining: {}", listing(&by_resource))),
+        ("NamespaceFinalizersRemaining", !with_fin.is_empty(), "SomeFinalizersRemain", alloc::format!("Some content in the namespace has finalizers remaining: {}", with_fin.iter().map(|(r, n)| alloc::format!("{r} in {n} resource instances")).collect::<Vec<_>>().join(", "))),
+    ];
+    for (ty, on, reason, msg) in &states {
+        if *on || existing.iter().any(|e| e == ty) {
+            put_conditions(c, &path, condition(ty, *on, reason, if *on { msg } else { "All content successfully deleted, may be waiting on finalization" }, now)).await?;
+        }
+    }
+    if remaining > 0 || !bad_groups.is_empty() {
         return Ok(Some(cfg.retry_ms));
     }
     // Empty: drop our finalizer; the API server removes the namespace once none is left.

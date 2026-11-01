@@ -90,7 +90,7 @@ fn subject(kind: &str, names: &[String]) -> String {
 }
 
 const BASELINE_CAPS: [&str; 13] = ["AUDIT_WRITE", "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL", "MKNOD", "NET_BIND_SERVICE", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT"];
-const SAFE_SYSCTLS: [&str; 12] = [
+pub const SAFE_SYSCTLS: [&str; 12] = [
     "kernel.shm_rmid_forced",
     "net.ipv4.ip_local_port_range",
     "net.ipv4.ip_unprivileged_port_start",

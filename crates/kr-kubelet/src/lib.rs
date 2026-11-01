@@ -43,6 +43,14 @@ use kr_runtime::container::{self, IdMaps, Running, Sandbox, Signaller};
 use kr_runtime::network::{self, Lease, NetConfig};
 use kr_runtime::store::Store;
 
+/// The cluster DNS domain: `KR_CLUSTER_DOMAIN` (set the same on the server and every agent),
+/// default `cluster.local`.
+pub fn cluster_domain() -> String {
+    kr_runtime::store::env_var("KR_CLUSTER_DOMAIN")
+        .filter(|d| !d.is_empty() && d.split('.').all(|l| !l.is_empty() && l.len() < 64 && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')))
+        .unwrap_or_else(|| String::from("cluster.local"))
+}
+
 pub struct Config {
     pub node_name: String,
     /// Root of kubelet state (`<root>/pods/<uid>/...`); usually the image store root.
@@ -303,6 +311,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                                 Err(e) => kr_rt::eprint(alloc::format!("kubelet: rootless egress unavailable (errno {}); pods have no outbound connectivity\n", e.0).as_bytes()),
                             }
                             *self.infra.borrow_mut() = Some(infra);
+                            // Lets another node's API server know pod proxy must go through this kubelet.
+                            let patch = Value::Object(alloc::vec![(String::from("metadata"), Value::Object(alloc::vec![(String::from("annotations"), Value::Object(alloc::vec![(String::from("kr.io/rootless"), Value::from("true"))]))]))]);
+                            let _ = self.c.patch(&alloc::format!("/api/v1/nodes/{}", self.cfg.node_name), "application/merge-patch+json", &patch).await;
                         }
                         r => {
                             kr_rt::eprint(alloc::format!("kubelet: rootless pod network setup failed ({}); pods get no IP\n", r.map(|c| c.to_string()).unwrap_or_else(|e| alloc::format!("{}: errno {}", e.step, e.errno.0))).as_bytes());
@@ -701,6 +712,12 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                         && p.host_ports.iter().any(|(ip, proto, port)| mine.iter().any(|(i2, p2, port2)| proto == p2 && port == port2 && (ip == i2 || ip.is_empty() || i2.is_empty() || ip == "0.0.0.0" || i2 == "0.0.0.0")))
                 });
             drop(pods);
+            // Unsafe sysctls are refused (upstream: `--allowed-unsafe-sysctls`, none here).
+            let unsafe_sysctl = pod.pointer(&["spec", "securityContext", "sysctls"]).and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(|s| s.get("name").and_then(Value::as_str)).find(|n| !kr_apiserver::psa::SAFE_SYSCTLS.contains(n)).map(String::from);
+            if let Some(n) = unsafe_sysctl {
+                self.pods.borrow_mut().get_mut(uid).unwrap().failed_setup = Some(alloc::format!("Pod was rejected: forbidden sysctl: \"{n}\" not allowlisted"));
+                return;
+            }
             if clash {
                 self.pods.borrow_mut().get_mut(uid).unwrap().failed_setup = Some("Pod was rejected: node(s) didn't have free ports for the requested pod ports".into());
                 return;
@@ -729,6 +746,31 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             }
         }
         let policy = pod.pointer(&["spec", "restartPolicy"]).and_then(Value::as_str).unwrap_or("Always").to_string();
+        // Once every app container of a Never/OnFailure pod has finished for good, sidecars are
+        // stopped (and not restarted).
+        if policy != "Always" {
+            let grace = pod.pointer(&["spec", "terminationGracePeriodSeconds"]).and_then(Value::as_u64).unwrap_or(30);
+            let mut pods = self.pods.borrow_mut();
+            let p = pods.get_mut(uid).unwrap();
+            let done = {
+                let apps: Vec<&Ctr> = p.ctrs.iter().filter(|c| !c.init && !c.eph).collect();
+                !apps.is_empty() && apps.iter().all(|c| matches!(&c.state, CState::Terminated(t) if policy == "Never" || t.exit_code == 0))
+            };
+            if done && p.ctrs.iter().any(|c| c.sidecar) {
+                for c in p.ctrs.iter_mut().filter(|c| c.sidecar) {
+                    if let (CState::Running { .. }, Some(s)) = (&c.state, &c.signaller) {
+                        // SIGTERM, then SIGKILL after the grace period.
+                        if c.resize_kill_at == 0 {
+                            c.resize_kill_at = now_ms() + grace * 1000;
+                            let _ = s.send(kr_sys::ns::SIGTERM);
+                        } else if now_ms() >= c.resize_kill_at {
+                            let _ = s.send(9);
+                        }
+                    }
+                }
+                return;
+            }
+        }
         // Init containers: strictly in order; each must succeed before the next.
         let n_init = self.pods.borrow()[uid].ctrs.iter().filter(|c| c.init).count();
         for i in 0..n_init {
@@ -996,6 +1038,12 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             }
         };
         let log_path = alloc::format!("{}/{name}.log\0", self.pods.borrow()[uid].dir);
+        if seq > 1 {
+            // Keep the last run's output for `logs --previous` (and keep it out of this run's file).
+            let cur = log_path.trim_end_matches('\0');
+            let _ = kr_sys::fs::renameat2(kr_sys::ns::AT_FDCWD, log_path.as_bytes(), kr_sys::ns::AT_FDCWD, alloc::format!("{}.prev\0", cur.trim_end_matches(".log")).as_bytes(), 0);
+            self.log_marks.borrow_mut().remove(cur);
+        }
         let log = kr_sys::ns::open(log_path.as_bytes(), kr_sys::ns::O_WRONLY | kr_sys::ns::O_CREAT | 0o2000 /* O_APPEND */, 0o640).ok();
         let limits = if self.cfg.cgroups { built.limits } else { Default::default() };
         let pods = self.pods.borrow();
@@ -1665,7 +1713,7 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
     }
     if let Some(msg) = &p.failed_setup {
         f.push(("message", Value::from(msg.as_str())));
-        f.push(("reason", Value::from(if msg.starts_with("Pod was rejected") { "HostPortConflict" } else { "SandboxFailed" })));
+        f.push(("reason", Value::from(if msg.contains("forbidden sysctl") { "SysctlForbidden" } else if msg.starts_with("Pod was rejected") { "HostPortConflict" } else { "SandboxFailed" })));
     }
     o(f)
 }

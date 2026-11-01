@@ -97,6 +97,8 @@ pub struct ExecSpec<'a> {
     pub stderr: Option<i32>,
     pub maps: &'a IdMaps,
     pub extra_groups: &'a [u32],
+    /// Make stdin (a terminal) the controlling terminal of a new session.
+    pub ctty: bool,
 }
 
 const ALL_NS: u64 = ns::CLONE_NEWUSER | ns::CLONE_NEWNS | ns::CLONE_NEWPID | ns::CLONE_NEWNET | ns::CLONE_NEWIPC | ns::CLONE_NEWUTS | ns::CLONE_NEWCGROUP;
@@ -173,6 +175,10 @@ pub fn exec_in(target: &ExecTarget, spec: &ExecSpec) -> Result<Running, RunError
             if src >= 0 && ns::dup_to(src, dst).is_err() {
                 return 126;
             }
+        }
+        if spec.ctty {
+            let _ = ns::setsid();
+            let _ = ns::set_ctty(0);
         }
         let _ = drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups);
         127

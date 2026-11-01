@@ -32,6 +32,8 @@ pub struct Router {
     pub local: Option<Rc<dyn NodeProxy>>,
     /// roots = cluster CA, client_cert = kube-apiserver-kubelet-client.
     pub tls: Rc<ClientConfig>,
+    /// Dials pods of this node that sit in a private network.
+    pub local_dial: Option<Rc<dyn kr_apiserver::podproxy::PodDialer>>,
 }
 
 fn header<'a>(h: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -174,7 +176,7 @@ impl NodeProxy for Router {
 /// losing read is dropped. That is safe because both reads are cancel-safe: `Conn::poll_read`
 /// consumes nothing when pending, and `TlsStream::read` keeps undelivered plaintext and unsent
 /// ciphertext inside the stream.
-async fn pump(mut client: Box<dyn Conn>, mut node: TlsStream<kr_rt::exec::Async<kr_sys::Fd>>, initial: Vec<u8>) {
+pub(crate) async fn pump<T: Transport>(mut client: Box<dyn Conn>, mut node: T, initial: Vec<u8>) {
     enum Ev {
         Client(usize),
         Node(usize),
@@ -309,4 +311,30 @@ pub async fn serve(proxy: Rc<dyn NodeProxy>, node: String, tls: Rc<core::cell::R
         kr_rt::exec::spawn(server::serve(l6, cfg.clone(), handler.clone()));
     }
     server::serve(listener, cfg, handler).await
+}
+
+/// Pod proxy to a pod in a private (rootless) network: this node's kubelet or, for another node,
+/// a raw tunnel through that node's kubelet (`/pods/<ns>/<pod>/tunnel?port=N`, `Upgrade: kr-tunnel`).
+impl kr_apiserver::podproxy::PodDialer for Router {
+    fn dial(&self, t: &kr_apiserver::podproxy::Target) -> kr_apiserver::podproxy::DialFuture {
+        use kr_apiserver::podproxy::Dialed;
+        let port = t.port;
+        match &t.pod {
+            Some(w) if w.node != self.local_node => {
+                let Some(node_ip) = w.node_ip.filter(|_| w.private_net) else { return Box::pin(async { None }) };
+                let (tls, ns, pod) = (self.tls.clone(), w.namespace.clone(), w.name.clone());
+                Box::pin(async move {
+                    let mut conn = connect(tls, node_ip).await?;
+                    let req = alloc::format!("GET /pods/{ns}/{pod}/tunnel?port={port} HTTP/1.1\r\nHost: {}\r\nUpgrade: kr-tunnel\r\nConnection: Upgrade\r\n\r\n", kr_net::tcp::url_host(node_ip));
+                    conn.write_all(req.as_bytes()).await.ok()?;
+                    let (101, _, _) = read_head(&mut conn).await? else { return None };
+                    Some(Dialed::Remote(conn))
+                })
+            }
+            _ => match &self.local_dial {
+                Some(d) => d.dial(t),
+                None => Box::pin(async { None }),
+            },
+        }
+    }
 }

@@ -11,6 +11,42 @@ use kr_net::http1::server::Response;
 use kr_net::http1::Transport;
 use kr_net::tcp::SocketAddr;
 
+/// A connection to a pod made through a node (rootless pods live in a network namespace the
+/// API server's sockets cannot reach): a relay on this node, or a tunnel to another node's kubelet.
+pub enum Dialed {
+    Local { fd: Rc<kr_rt::exec::Async<kr_sys::Fd>>, keep: alloc::boxed::Box<dyn core::any::Any> },
+    Remote(kr_net::tls::TlsStream<kr_rt::exec::Async<kr_sys::Fd>>),
+}
+
+impl Dialed {
+    pub fn local(fd: Rc<kr_rt::exec::Async<kr_sys::Fd>>, keep: alloc::boxed::Box<dyn core::any::Any>) -> Dialed {
+        Dialed::Local { fd, keep }
+    }
+}
+
+impl Transport for Dialed {
+    async fn read(&mut self, buf: &mut [u8]) -> kr_net::Result<usize> {
+        match self {
+            Dialed::Local { fd, .. } => fd.read(buf).await.map_err(kr_net::Error::Io),
+            Dialed::Remote(t) => t.read(buf).await,
+        }
+    }
+    async fn write_all(&mut self, buf: &[u8]) -> kr_net::Result<()> {
+        match self {
+            Dialed::Local { fd, .. } => kr_net::tcp::write_all_nosignal(fd, buf).await.map_err(kr_net::Error::Io),
+            Dialed::Remote(t) => t.write_all(buf).await,
+        }
+    }
+}
+
+pub type DialFuture = core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = Option<Dialed>>>>;
+
+/// Opens connections to pods the API server cannot reach directly (set by the in-process kubelet).
+pub trait PodDialer {
+    /// None: connect directly (not a pod behind a private network).
+    fn dial(&self, t: &Target) -> DialFuture;
+}
+
 /// Whole-exchange budget: connect, send and read the full reply.
 const TIMEOUT_MS: u64 = 30_000;
 const MAX_BODY: usize = 64 << 20;
@@ -31,6 +67,19 @@ pub struct Target {
     pub content_type: Option<String>,
     pub accept: Option<String>,
     pub body: Vec<u8>,
+    /// Tried first: connects through the node for pods in a private (rootless) network.
+    pub dial: Option<Rc<dyn PodDialer>>,
+    /// `pods/proxy` only: where the pod runs, and whether that node keeps its pods in a private
+    /// (rootless) network, so the request must go through the node's kubelet.
+    pub pod: Option<PodWhere>,
+}
+
+pub struct PodWhere {
+    pub namespace: String,
+    pub name: String,
+    pub node: String,
+    pub node_ip: Option<[u8; 16]>,
+    pub private_net: bool,
 }
 
 /// Addresses the API server must never proxy to: `status.podIP` is written by nodes, and these
@@ -61,6 +110,18 @@ pub async fn forward(t: Target) -> Response {
 }
 
 async fn exchange(t: &Target) -> Result<Vec<u8>, &'static str> {
+    let dialed = match &t.dial {
+        Some(d) => d.dial(t).await,
+        None => None,
+    };
+    if let Some(d) = dialed {
+        if t.tls {
+            let cfg = Rc::new(ClientConfig { roots: Vec::new(), pinned_ca: None, client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
+            let tls = kr_net::tls::TlsStream::connect_insecure(d, cfg, &kr_net::tcp::fmt_ip16(t.ip)).await.map_err(|_| "error establishing TLS with the pod")?;
+            return roundtrip(tls, t).await;
+        }
+        return roundtrip(d, t).await;
+    }
     let sock = kr_net::tcp::connect_addr(SocketAddr { ip: kr_net::tcp::ip_addr16(t.ip), port: t.port }, TIMEOUT_MS).await.map_err(|_| "error trying to reach the pod")?;
     if t.tls {
         let cfg = Rc::new(ClientConfig { roots: Vec::new(), pinned_ca: None, client_cert: None, alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });

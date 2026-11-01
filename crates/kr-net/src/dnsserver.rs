@@ -147,6 +147,31 @@ mod imp {
         Forward,
         /// Malformed: say nothing.
         Drop,
+        /// An ExternalName alias to a name outside the cluster: resolve the target upstream and add
+        /// its addresses to the reply (stub resolvers such as musl's do not chase a CNAME).
+        Chase(alloc::boxed::Box<Pending>),
+    }
+
+    impl core::fmt::Debug for Pending {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "Pending({})", self.target)
+        }
+    }
+
+    impl PartialEq for Pending {
+        fn eq(&self, o: &Self) -> bool {
+            self.target == o.target && self.msg == o.msg
+        }
+    }
+
+    impl Eq for Pending {}
+
+    pub struct Pending {
+        q: Query,
+        msg: Vec<u8>,
+        rep: Reply,
+        target: String,
+        limit: usize,
     }
 
     // ---------- query parsing ----------
@@ -767,7 +792,78 @@ mod imp {
             rep = Reply::new(16); // BADVERS, carried in the OPT record
         }
         let limit = if tcp { 65535 } else { udp_limit(&q) };
+        if matches!(q.qtype, TYPE_A | TYPE_AAAA) {
+            if let Some(Rr { rtype: TYPE_CNAME, data: Data::Name(t), .. }) = rep.answers.last() {
+                let dom = zone.domain().trim_matches('.').to_ascii_lowercase();
+                let inside = t == &dom || t.strip_suffix(dom.as_str()).is_some_and(|x| x.ends_with('.'));
+                if !inside && !t.is_empty() {
+                    let target = t.clone();
+                    return Answer::Chase(alloc::boxed::Box::new(Pending { q, msg: query.to_vec(), rep, target, limit }));
+                }
+            }
+        }
         Answer::Response(encode(&q, query, &rep, limit))
+    }
+
+    /// Resolves the target of an external alias through the upstream resolvers and encodes the
+    /// completed reply.
+    async fn finish(p: Pending, upstream: &[SocketAddr], tcp: bool) -> Vec<u8> {
+        let Pending { q, msg, mut rep, target, limit } = p;
+        let mut qm = Vec::new();
+        qm.extend_from_slice(&[0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+        for l in target.split('.').filter(|l| !l.is_empty() && l.len() < 64) {
+            qm.push(l.len() as u8);
+            qm.extend_from_slice(l.as_bytes());
+        }
+        qm.push(0);
+        qm.extend_from_slice(&q.qtype.to_be_bytes());
+        qm.extend_from_slice(&1u16.to_be_bytes());
+        let up = forward(&qm, upstream, tcp).await;
+        for rr in external_addrs(&up, q.qtype, &target) {
+            rep.answers.push(rr);
+        }
+        encode(&q, &msg, &rep, limit)
+    }
+
+    /// The A or AAAA records (per `qtype`) of an upstream reply, owned by `owner`.
+    fn external_addrs(m: &[u8], qtype: u16, owner: &str) -> Vec<Rr> {
+        let mut out = Vec::new();
+        if m.len() < 12 || m[3] & 0x0f != 0 {
+            return out;
+        }
+        let skip_name = |mut i: usize| -> Option<usize> {
+            loop {
+                let l = *m.get(i)? as usize;
+                if l == 0 {
+                    return Some(i + 1);
+                }
+                if l & 0xc0 == 0xc0 {
+                    return Some(i + 2);
+                }
+                i += 1 + l;
+            }
+        };
+        let (qd, an) = (u16::from_be_bytes([m[4], m[5]]) as usize, u16::from_be_bytes([m[6], m[7]]) as usize);
+        let mut i = 12;
+        for _ in 0..qd {
+            let Some(j) = skip_name(i) else { return out };
+            i = j + 4;
+        }
+        for _ in 0..an {
+            let Some(j) = skip_name(i) else { return out };
+            let Some(h) = m.get(j..j + 10) else { return out };
+            let (t, rdlen) = (u16::from_be_bytes([h[0], h[1]]), u16::from_be_bytes([h[8], h[9]]) as usize);
+            let Some(rd) = m.get(j + 10..j + 10 + rdlen) else { return out };
+            if t == qtype && t == TYPE_A && rd.len() == 4 {
+                out.push(a_rr(Some(owner.to_string()), [rd[0], rd[1], rd[2], rd[3]]));
+            } else if t == qtype && t == TYPE_AAAA && rd.len() == 16 {
+                let mut ip = [0u8; 16];
+                ip.copy_from_slice(rd);
+                out.push(aaaa_rr(Some(owner.to_string()), ip));
+            }
+            i = j + 10 + rdlen;
+        }
+        out
     }
 
     // ---------- forwarding ----------
@@ -961,6 +1057,18 @@ mod imp {
                 Answer::Response(r) => {
                     let _ = udp_sys::sendto(fd, &r, &addr, alen);
                 }
+                Answer::Chase(p) => {
+                    let Some(guard) = acquire(&inflight) else {
+                        let _ = udp_sys::sendto(fd, &error_reply(q, 2), &addr, alen);
+                        continue;
+                    };
+                    let (sock, upstream, client) = (sock.clone(), upstream.clone(), addr);
+                    spawn(async move {
+                        let _guard = guard;
+                        let reply = finish(*p, &upstream, false).await;
+                        let _ = udp_sys::sendto(sock.get_ref().raw(), &reply, &client, alen);
+                    });
+                }
                 Answer::Forward => {
                     let Some(guard) = acquire(&inflight) else {
                         let _ = udp_sys::sendto(fd, &error_reply(q, 2), &addr, alen);
@@ -1009,6 +1117,10 @@ mod imp {
             let reply = match handle(&q, zone, true) {
                 Answer::Drop => return,
                 Answer::Response(r) => r,
+                Answer::Chase(p) => match acquire(inflight) {
+                    Some(_g) => finish(*p, upstream, true).await,
+                    None => error_reply(&q, 2),
+                },
                 Answer::Forward => match acquire(inflight) {
                     Some(_g) => forward(&q, upstream, true).await,
                     None => error_reply(&q, 2),

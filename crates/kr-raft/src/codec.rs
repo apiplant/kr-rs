@@ -215,6 +215,7 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             w.bytes(&snapshot.data);
         }
         MsgBody::TimeoutNow => w.u8(8),
+        MsgBody::Removed => w.u8(9),
     }
     out
 }
@@ -263,6 +264,7 @@ pub fn decode_message(b: &[u8]) -> Option<Message> {
             MsgBody::InstallSnapshot { snapshot: Snapshot { meta, data } }
         }
         8 => MsgBody::TimeoutNow,
+        9 => MsgBody::Removed,
         _ => return None,
     };
     r.done()?;

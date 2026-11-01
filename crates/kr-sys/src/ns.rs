@@ -274,6 +274,58 @@ pub fn setsid() -> Result<()> {
     check(unsafe { super::syscall0(n::SETSID) }).map(|_| ())
 }
 
+/// `ioctl(fd, req, arg)` with an integer or pointer argument.
+fn ioctl(fd: i32, req: usize, arg: usize) -> Result<usize> {
+    // SAFETY: callers pass a valid pointer for the request, or an integer.
+    check(unsafe { syscall3(n::IOCTL, fd as usize, req, arg) })
+}
+
+/// A pseudo-terminal pair `(master, slave)` from the host's devpts. The slave is opened without
+/// becoming a controlling terminal; a process makes it one with [`set_ctty`].
+pub fn openpty() -> Result<(Fd, Fd)> {
+    const TIOCGPTN: usize = 0x8004_5430;
+    const TIOCSPTLCK: usize = 0x4004_5431;
+    let master = open(b"/dev/ptmx\0", O_RDWR | O_NOCTTY, 0)?;
+    let zero = 0i32;
+    ioctl(master.raw(), TIOCSPTLCK, &zero as *const i32 as usize)?;
+    let mut num = 0u32;
+    ioctl(master.raw(), TIOCGPTN, &mut num as *mut u32 as usize)?;
+    // "/dev/pts/<num>\0"
+    let mut path = [0u8; 32];
+    let prefix = b"/dev/pts/";
+    path[..prefix.len()].copy_from_slice(prefix);
+    let mut digits = [0u8; 10];
+    let (mut n, mut k) = (num, 0);
+    loop {
+        digits[k] = b'0' + (n % 10) as u8;
+        k += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    for i in 0..k {
+        path[prefix.len() + i] = digits[k - 1 - i];
+    }
+    let slave = open(&path, O_RDWR | O_NOCTTY, 0)?;
+    Ok((master, slave))
+}
+
+const O_NOCTTY: i32 = 0o400;
+
+/// Sets the terminal size (`TIOCSWINSZ`).
+pub fn set_winsize(fd: i32, width: u16, height: u16) -> Result<()> {
+    const TIOCSWINSZ: usize = 0x5414;
+    let ws = [height, width, 0, 0];
+    ioctl(fd, TIOCSWINSZ, ws.as_ptr() as usize).map(|_| ())
+}
+
+/// Makes `fd` (a terminal) the controlling terminal of this session (`TIOCSCTTY`).
+pub fn set_ctty(fd: i32) -> Result<()> {
+    const TIOCSCTTY: usize = 0x540e;
+    ioctl(fd, TIOCSCTTY, 0).map(|_| ())
+}
+
 pub fn kill(pid: i32, sig: i32) -> Result<()> {
     // SAFETY: integer arguments only.
     check(unsafe { syscall2(n::KILL, pid as usize, sig as usize) }).map(|_| ())

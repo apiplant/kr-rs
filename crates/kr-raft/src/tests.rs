@@ -484,6 +484,7 @@ fn membership_add_and_remove() {
     let nl = s.leader().unwrap();
     assert_ne!(nl, l);
     assert!(!s.nodes[&nl].raft.voters().contains(&l));
+
     s.crash(l);
     s.propose();
     for _ in 0..50 {
@@ -618,4 +619,21 @@ fn old_term_entries_commit_only_with_a_current_term_entry() {
     // Once the current-term no-op is on the majority, everything up to it commits.
     r.step(Message { from: 2, to: 1, term: t, body: MsgBody::AppendResp { success: true, index: noop } });
     assert_eq!(r.commit, noop);
+}
+
+#[test]
+fn removed_follower_is_told_to_stop() {
+    let mut s = Sim::new(23, 3);
+    for _ in 0..100 {
+        s.step_time();
+    }
+    let l = s.leader().unwrap();
+    let f = (1..=3).find(|id| *id != l).unwrap();
+    s.nodes.get_mut(&l).unwrap().raft.propose_conf(EntryKind::RemoveVoter(f)).unwrap();
+    s.drain(l);
+    for _ in 0..400 {
+        s.step_time();
+    }
+    assert!(s.nodes[&f].raft.removed(), "a removed server is told to stop");
+    assert!(!s.nodes[&l].raft.removed());
 }

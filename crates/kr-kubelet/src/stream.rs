@@ -36,6 +36,29 @@ use kr_sys::{ns, Fd};
 /// The kubelet as the API server's node proxy.
 pub struct Proxy<C: Client + Clone + 'static>(pub Rc<Kubelet<C>>);
 
+/// Pod proxy through the node: for a pod of this node whose network is private (rootless), a
+/// relay process inside the pod's namespace carries the connection.
+impl<C: Client + Clone + 'static> kr_apiserver::podproxy::PodDialer for Proxy<C> {
+    fn dial(&self, t: &kr_apiserver::podproxy::Target) -> kr_apiserver::podproxy::DialFuture {
+        let r = self.dial_now(t.ip, t.port);
+        Box::pin(async move { r })
+    }
+}
+
+impl<C: Client + Clone + 'static> Proxy<C> {
+    fn dial_now(&self, ip: [u8; 16], port: u16) -> Option<kr_apiserver::podproxy::Dialed> {
+        let k = &self.0;
+        k.infra.borrow().as_ref()?;
+        let target = {
+            let pods = k.pods.borrow();
+            let p = pods.values().find(|p| p.ip.map(kr_sys::map4) == Some(ip) || p.ip6 == Some(ip))?;
+            p.sandbox.as_ref()?.target().ok()?
+        };
+        let relay = open_relay(&target, port)?;
+        Some(kr_apiserver::podproxy::Dialed::local(relay.fd.clone(), Box::new(relay)))
+    }
+}
+
 struct Query<'a>(Vec<(&'a str, String)>);
 
 impl<'a> Query<'a> {
@@ -150,7 +173,8 @@ impl<C: Client + Clone + 'static> NodeProxy for Proxy<C> {
                 }
                 let hs = websocket::handshake(&ws_request("/exec", headers), &channel::EXEC_PROTOCOLS).map_err(|_| ApiError::bad_request("exec requires a WebSocket or SPDY/3.1 upgrade"))?;
                 let proto = hs.protocol.as_deref().and_then(Protocol::from_token).ok_or_else(|| ApiError::bad_request("no supported streaming protocol"))?;
-                let handler = move |conn: Box<dyn Conn>| -> Pin<Box<dyn Future<Output = ()>>> { Box::pin(exec_session(conn, proto, target, argv, maps, stdin, stdout, stderr)) };
+                let tty = q.flag("tty");
+                let handler = move |conn: Box<dyn Conn>| -> Pin<Box<dyn Future<Output = ()>>> { Box::pin(exec_session(conn, proto, target, argv, maps, stdin, stdout, stderr, tty)) };
                 Ok(hs.into_response(Box::new(handler)))
             }
             "attach" => {
@@ -163,6 +187,19 @@ impl<C: Client + Clone + 'static> NodeProxy for Proxy<C> {
                     Box::pin(attach_session(conn, proto, path, move || Proxy(me.clone()).container_running(&ns, &pod, &ctr)))
                 };
                 Ok(hs.into_response(Box::new(handler)))
+            }
+            "tunnel" => {
+                // Raw TCP to a port of the pod (pod proxy from another node's API server).
+                let port: u16 = q.get("port").and_then(|p| p.parse().ok()).ok_or_else(|| ApiError::bad_request("tunnel requires a port"))?;
+                let target = v.pod_target.clone().ok_or_else(|| ApiError::bad_request("pod sandbox is not running"))?;
+                let relay = open_relay(&target, port).ok_or_else(|| ApiError::new(503, "ServiceUnavailable", "cannot reach the pod"))?;
+                let handler = move |conn: Box<dyn Conn>| -> Pin<Box<dyn Future<Output = ()>>> {
+                    Box::pin(async move {
+                        let d = kr_apiserver::podproxy::Dialed::local(relay.fd.clone(), Box::new(relay));
+                        crate::remote::pump(conn, d, Vec::new()).await;
+                    })
+                };
+                Ok(Response { status: 101, headers: alloc::vec![("Upgrade".into(), "kr-tunnel".into())], body: Body::Upgrade(Box::new(handler)) })
             }
             "portforward" => {
                 let target = v.pod_target.clone().ok_or_else(|| ApiError::bad_request("pod sandbox is not running"))?;
@@ -196,7 +233,11 @@ impl<C: Client + Clone + 'static> NodeProxy for Proxy<C> {
 
 impl<C: Client + Clone + 'static> Proxy<C> {
     fn logs(&self, ns: &str, pod: &str, v: &PodView, q: &Query) -> Result<Response, ApiError> {
-        let path = alloc::format!("{}/{}.log\0", v.dir, v.container);
+        let previous = q.flag("previous");
+        let path = alloc::format!("{}/{}{}\0", v.dir, v.container, if previous { ".prev" } else { ".log" });
+        if previous && kr_sys::fs::newfstatat(kr_sys::ns::AT_FDCWD, path.as_bytes(), 0).is_err() {
+            return Err(ApiError::bad_request(alloc::format!("previous terminated container \"{}\" in pod \"{pod}\" not found", v.container)));
+        }
         let data = kr_sys::fs::read_file(path.as_bytes(), 64 << 20).unwrap_or_default();
         let marks = self.0.log_marks.borrow().get(path.trim_end_matches('\0')).cloned().unwrap_or_default();
         // The file's last write bounds the time of bytes no sample covers yet.
@@ -243,7 +284,7 @@ impl<C: Client + Clone + 'static> Proxy<C> {
         if stamp {
             out = stamp_lines(&out, start, &marks, tail_at);
         }
-        if !q.flag("follow") {
+        if !q.flag("follow") || previous {
             return Ok(Response::new(200, out).with_header("Content-Type", "text/plain"));
         }
         let fd = ns::open(path.as_bytes(), ns::O_RDONLY, 0).map_err(|_| ApiError::not_found("log", &v.container))?;
@@ -376,16 +417,28 @@ enum Ev {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn exec_session(conn: Box<dyn Conn>, proto: Protocol, target: ExecTarget, argv: Vec<Vec<u8>>, maps: kr_runtime::container::IdMaps, want_stdin: bool, want_stdout: bool, want_stderr: bool) {
+async fn exec_session(conn: Box<dyn Conn>, proto: Protocol, target: ExecTarget, argv: Vec<Vec<u8>>, maps: kr_runtime::container::IdMaps, want_stdin: bool, want_stdout: bool, want_stderr: bool, tty: bool) {
     let mut ws = WebSocket::new(conn, WsConfig::default());
     let fail = |msg: &str| channel::error_frame(&channel::status_failure(msg, "InternalError"));
-    // stdin: blocking pipe; kr keeps the write end.
-    let stdin_pipe = if want_stdin { kr_sys::pipe2(kr_sys::O_CLOEXEC).ok() } else { None };
-    let (out_child, out_kr) = match want_stdout.then(pipe_pair).flatten() {
-        Some((c, k)) => (Some(c), Some(k)),
+    // With a terminal, the process gets the slave of a pseudo-terminal as stdin/stdout/stderr
+    // (and as its controlling terminal); kr reads and writes the master.
+    let (master_fd, slave) = match if tty { ns::openpty().ok() } else { None } {
+        Some((m, sl)) => (Some(m), Some(sl)),
         None => (None, None),
     };
-    let (err_child, err_kr) = match want_stderr.then(pipe_pair).flatten() {
+    let master: Option<Rc<Async<Fd>>> = master_fd.and_then(|m| {
+        ns::set_nonblocking(m.raw()).ok()?;
+        Async::new(m).ok().map(Rc::new)
+    });
+    let slave_fd = slave.as_ref().map(|s| s.raw());
+    let pty_on = slave.is_some() && master.is_some();
+    // stdin: blocking pipe; kr keeps the write end.
+    let stdin_pipe = if want_stdin && !pty_on { kr_sys::pipe2(kr_sys::O_CLOEXEC).ok() } else { None };
+    let (out_child, out_kr) = match (want_stdout && !pty_on).then(pipe_pair).flatten() {
+        Some((c, k)) => (Some(c), Some(k)),
+        None => (None, master.clone().filter(|_| want_stdout)),
+    };
+    let (err_child, err_kr) = match (want_stderr && !pty_on).then(pipe_pair).flatten() {
         Some((c, k)) => (Some(c), Some(k)),
         None => (None, None),
     };
@@ -395,10 +448,11 @@ async fn exec_session(conn: Box<dyn Conn>, proto: Protocol, target: ExecTarget, 
         env: &env,
         cwd: b"",
         user: b"",
-        stdin: stdin_pipe.as_ref().map(|(r, _)| r.raw()),
-        stdout: out_child.as_ref().map(|f| f.raw()),
-        stderr: err_child.as_ref().map(|f| f.raw()),
+        stdin: slave_fd.or(stdin_pipe.as_ref().map(|(r, _)| r.raw())),
+        stdout: slave_fd.or(out_child.as_ref().map(|f| f.raw())),
+        stderr: slave_fd.or(err_child.as_ref().map(|f| f.raw())),
         maps: &maps,
+        ctty: pty_on,
         extra_groups: &[],
     };
     let running = match container::exec_in(&target, &spec) {
@@ -412,6 +466,8 @@ async fn exec_session(conn: Box<dyn Conn>, proto: Protocol, target: ExecTarget, 
     // Close the child ends in kr so EOF arrives when the process exits.
     drop(out_child);
     drop(err_child);
+    let master_raw = master.as_ref().map(|m| m.get_ref().raw());
+    drop(slave);
     let mut stdin_w = stdin_pipe.map(|(r, w)| {
         drop(r);
         w
@@ -457,14 +513,20 @@ async fn exec_session(conn: Box<dyn Conn>, proto: Protocol, target: ExecTarget, 
         match ev {
             Ev::Ws(Ok(Message::Binary(m))) => match channel::decode_client(proto, &m) {
                 Ok(ClientMsg::Stdin(d)) => {
-                    if let Some(w) = &stdin_w {
+                    let wfd = stdin_w.as_ref().map(|w| w.raw()).or(master_raw.filter(|_| want_stdin));
+                    if let Some(wfd) = wfd {
                         let mut off = 0;
                         while off < d.len() {
-                            match kr_sys::write(w.raw(), &d[off..]) {
+                            match kr_sys::write(wfd, &d[off..]) {
                                 Ok(n) => off += n,
                                 Err(_) => break,
                             }
                         }
+                    }
+                }
+                Ok(ClientMsg::Resize(sz)) => {
+                    if let Some(m) = master_raw {
+                        let _ = ns::set_winsize(m, sz.width, sz.height);
                     }
                 }
                 Ok(ClientMsg::CloseStream(channel::STDIN)) => stdin_w = None,
@@ -1014,14 +1076,23 @@ async fn spdy_exec(mut io: PfIo, target: ExecTarget, argv: Vec<Vec<u8>>, maps: k
             }
         }
     }
-    let _ = tty;
-    let err_id = err_s.unwrap_or(0);
-    let stdin_pipe = if in_s.is_some() { kr_sys::pipe2(kr_sys::O_CLOEXEC).ok() } else { None };
-    let (out_child, out_kr) = match out_s.and_then(|_| pipe_pair()) {
-        Some((c, k)) => (Some(c), Some(k)),
+    let (master_fd, slave) = match if tty { ns::openpty().ok() } else { None } {
+        Some((m, sl)) => (Some(m), Some(sl)),
         None => (None, None),
     };
-    let (err_child, err_kr) = match errout_s.and_then(|_| pipe_pair()) {
+    let master: Option<Rc<Async<Fd>>> = master_fd.and_then(|m| {
+        ns::set_nonblocking(m.raw()).ok()?;
+        Async::new(m).ok().map(Rc::new)
+    });
+    let slave_fd = slave.as_ref().map(|s| s.raw());
+    let pty_on = slave.is_some() && master.is_some();
+    let err_id = err_s.unwrap_or(0);
+    let stdin_pipe = if in_s.is_some() && !pty_on { kr_sys::pipe2(kr_sys::O_CLOEXEC).ok() } else { None };
+    let (out_child, out_kr) = match out_s.filter(|_| !pty_on).and_then(|_| pipe_pair()) {
+        Some((c, k)) => (Some(c), Some(k)),
+        None => (None, master.clone().filter(|_| out_s.is_some())),
+    };
+    let (err_child, err_kr) = match errout_s.filter(|_| !pty_on).and_then(|_| pipe_pair()) {
         Some((c, k)) => (Some(c), Some(k)),
         None => (None, None),
     };
@@ -1031,10 +1102,11 @@ async fn spdy_exec(mut io: PfIo, target: ExecTarget, argv: Vec<Vec<u8>>, maps: k
         env: &env,
         cwd: b"",
         user: b"",
-        stdin: stdin_pipe.as_ref().map(|(r, _)| r.raw()),
-        stdout: out_child.as_ref().map(|f| f.raw()),
-        stderr: err_child.as_ref().map(|f| f.raw()),
+        stdin: slave_fd.or(stdin_pipe.as_ref().map(|(r, _)| r.raw())),
+        stdout: slave_fd.or(out_child.as_ref().map(|f| f.raw())),
+        stderr: slave_fd.or(err_child.as_ref().map(|f| f.raw())),
         maps: &maps,
+        ctty: pty_on,
         extra_groups: &[],
     };
     let running = match container::exec_in(&target, &spec) {
@@ -1049,6 +1121,8 @@ async fn spdy_exec(mut io: PfIo, target: ExecTarget, argv: Vec<Vec<u8>>, maps: k
     };
     drop(out_child);
     drop(err_child);
+    let master_raw = master.as_ref().map(|m| m.get_ref().raw());
+    drop(slave);
     let mut stdin_w = stdin_pipe.map(|(r, w)| {
         drop(r);
         w
@@ -1117,10 +1191,10 @@ async fn spdy_exec(mut io: PfIo, target: ExecTarget, argv: Vec<Vec<u8>>, maps: k
                         SpdyEvent::Data { id, bytes, fin } => {
                             sess.consume(id, bytes.len());
                             if Some(id) == in_s {
-                                if let Some(w) = &stdin_w {
+                                if let Some(wfd) = stdin_w.as_ref().map(|w| w.raw()).or(master_raw) {
                                     let mut off = 0;
                                     while off < bytes.len() {
-                                        match kr_sys::write(w.raw(), &bytes[off..]) {
+                                        match kr_sys::write(wfd, &bytes[off..]) {
                                             Ok(n) => off += n,
                                             Err(_) => break,
                                         }

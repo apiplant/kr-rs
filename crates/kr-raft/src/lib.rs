@@ -121,6 +121,8 @@ pub enum MsgBody {
     InstallSnapshot { snapshot: Snapshot },
     /// Leadership transfer: start an election now.
     TimeoutNow,
+    /// From a leader to a node that is in nobody's configuration (it was removed): stop.
+    Removed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -231,6 +233,7 @@ pub struct Raft {
     pending_conf: u64,
     // timers
     elapsed: u32,
+    removed: bool,
     timeout: u32,
     heartbeat_elapsed: u32,
     // candidate
@@ -292,6 +295,7 @@ impl Raft {
             learners: Vec::new(),
             pending_conf: 0,
             elapsed: 0,
+            removed: false,
             timeout: 0,
             heartbeat_elapsed: 0,
             votes: BTreeMap::new(),
@@ -319,6 +323,11 @@ impl Raft {
     pub fn leader(&self) -> Option<NodeId> {
         self.leader
     }
+    /// True once a leader told this node it is no longer a member: it should stop.
+    pub fn removed(&self) -> bool {
+        self.removed
+    }
+
     pub fn voters(&self) -> &[NodeId] {
         &self.voters
     }
@@ -622,6 +631,18 @@ impl Raft {
 
     /// Delivers a message from a peer.
     pub fn step(&mut self, m: Message) {
+        // A leader tells a node that is in nobody's configuration (a removed server that keeps
+        // campaigning) to stop. Only a leader knows the latest configuration.
+        if self.role == Role::Leader && matches!(m.body, MsgBody::PreVote { .. } | MsgBody::Vote { .. } | MsgBody::AppendResp { .. }) && m.from != self.cfg.id && !self.members().contains(&m.from) && self.pending_conf <= self.commit {
+            self.send(m.from, self.term, MsgBody::Removed);
+            return;
+        }
+        if let MsgBody::Removed = m.body {
+            if m.term >= self.term {
+                self.removed = true;
+            }
+            return;
+        }
         // Term handling (§5.1), with pre-vote and leader stickiness (§4.2.3 / §9.6).
         match &m.body {
             MsgBody::PreVote { .. } => {
@@ -702,6 +723,7 @@ impl Raft {
                 self.elapsed = 0;
                 self.handle_snapshot(m.from, snapshot);
             }
+            MsgBody::Removed => {}
             MsgBody::TimeoutNow => {
                 if self.role == Role::Follower && self.is_voter(self.cfg.id) {
                     self.become_candidate(true);

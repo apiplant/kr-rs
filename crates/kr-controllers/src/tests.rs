@@ -695,3 +695,18 @@ fn pdb_status_and_eviction() {
         wait_until("allowance back", || async { int_at(&c.get(&alloc::format!("{bp}/b")).await.unwrap(), &["status", "disruptionsAllowed"], -1) == 1 }).await;
     });
 }
+
+#[test]
+fn expired_bootstrap_tokens_are_deleted() {
+    scenario(|c| async move {
+        let b64 = |s: &str| kr_fmt::base64::encode(s.as_bytes());
+        let mk = |id: &str, exp: &str| alloc::format!(r#"{{"metadata":{{"name":"bootstrap-token-{id}"}},"type":"bootstrap.kubernetes.io/token","data":{{"token-id":"{}","expiration":"{}"}}}}"#, b64(id), b64(exp));
+        let p = "/api/v1/namespaces/kube-system/secrets";
+        c.create(p, &parse_str(&mk("aaaaaa", "2001-01-01T00:00:00Z")).unwrap()).await.unwrap();
+        c.create(p, &parse_str(&mk("bbbbbb", "2999-01-01T00:00:00Z")).unwrap()).await.unwrap();
+        c.create(p, &parse_str(r#"{"metadata":{"name":"other"},"type":"Opaque"}"#).unwrap()).await.unwrap();
+        assert_eq!(crate::gc::expire_tokens(&c, 1_700_000_000).await, 1);
+        let names: Vec<String> = items(&c.list(p, "").await.unwrap()).iter().map(|s| name(s).to_string()).collect();
+        assert!(!names.iter().any(|n| n == "bootstrap-token-aaaaaa") && names.iter().any(|n| n == "bootstrap-token-bbbbbb") && names.iter().any(|n| n == "other"));
+    });
+}

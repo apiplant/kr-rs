@@ -75,11 +75,20 @@ pub(crate) fn primary_addr() -> [u8; 16] {
     kr_sys::ns::route_source_any(kr_runtime::store::env_var("KR_PREFER_IPV6").is_some_and(|v| !v.is_empty() && v != "0"))
 }
 
-fn drop_if_ip_changed(pki_dir: &str, file: &str, ip: [u8; 16]) {
+fn drop_if_ip_changed(pki_dir: &str, file: &str, ip: [u8; 16], adv_check: bool) {
     let Ok(b) = fs::read_file(&pki::path(pki_dir, &format!("{file}.pem")), 1 << 20) else { return };
     let Some(der) = core::str::from_utf8(&b).ok().and_then(|p| x509::pem_decode_all(p, "CERTIFICATE").ok()).and_then(|mut v| (!v.is_empty()).then(|| v.remove(0))) else { return };
     let host = kr_net::tcp::fmt_ip16(ip);
-    if x509::Certificate::parse(&der).is_ok_and(|c| !c.matches_host(host.as_bytes())) {
+    // Certificates are valid for a year: reissue one that expires within 30 days at start-up.
+    let now = kr_sys::clock_gettime(0).map(|t| t.tv_sec).unwrap_or(0);
+    if x509::Certificate::parse(&der).is_ok_and(|c| c.not_after - now < 30 * 86400) {
+        eprint(format!("kr server: {file}.pem expires soon; issuing a new one\n").as_bytes());
+        for ext in ["pem", "key"] {
+            let _ = fs::unlinkat(fs::AT_FDCWD, &pki::path(pki_dir, &format!("{file}.{ext}")), 0);
+        }
+        return;
+    }
+    if adv_check && x509::Certificate::parse(&der).is_ok_and(|c| !c.matches_host(host.as_bytes())) {
         eprint(format!("kr server: {file}.pem does not cover {host}; issuing a new one\n").as_bytes());
         for ext in ["pem", "key"] {
             let _ = fs::unlinkat(fs::AT_FDCWD, &pki::path(pki_dir, &format!("{file}.{ext}")), 0);
@@ -92,9 +101,9 @@ fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
     let pki_dir = format!("{data}/pki");
     mkdir_p(&pki_dir)?;
     let adv = primary_addr();
-    if adv != kr_sys::map4([127, 0, 0, 1]) {
-        drop_if_ip_changed(&pki_dir, "apiserver", adv);
-        drop_if_ip_changed(&pki_dir, "server", adv);
+    let routable = adv != kr_sys::map4([127, 0, 0, 1]);
+    for file in ["apiserver", "server", "kubelet-client"] {
+        drop_if_ip_changed(&pki_dir, file, adv, routable && file != "kubelet-client");
     }
     if !exists(&pki::path(&pki_dir, "ca.pem")) {
         pki::create_ca(&pki_dir, "kr-cluster-ca".into(), 3650)?;
@@ -103,6 +112,10 @@ fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
     if !exists(&pki::path(&pki_dir, "apiserver.pem")) {
         let host = hostname();
         let mut dns: Vec<String> = ["localhost", "kubernetes", "kubernetes.default", "kubernetes.default.svc", "kubernetes.default.svc.cluster.local"].iter().map(|s| String::from(*s)).collect();
+        let domain = kr_kubelet::cluster_domain();
+        if domain != "cluster.local" {
+            dns.push(alloc::format!("kubernetes.default.svc.{domain}"));
+        }
         if !host.is_empty() && kr_apiserver::object::is_dns_subdomain(&host) {
             dns.push(host);
         }
@@ -505,7 +518,10 @@ pub fn main(mut args: Args) -> i32 {
             }
         }
         let local: Option<Rc<dyn kr_apiserver::api::NodeProxy>> = kubelet.as_ref().map(|k| Rc::new(kr_kubelet::stream::Proxy(k.clone())) as Rc<dyn kr_apiserver::api::NodeProxy>);
-        api_for_proxy.set_node_proxy(Rc::new(kr_kubelet::remote::Router { local_node: local_node.clone(), local, tls: kubelet_client.clone() }));
+        let local_dial: Option<Rc<dyn kr_apiserver::podproxy::PodDialer>> = kubelet.as_ref().map(|k| Rc::new(kr_kubelet::stream::Proxy(k.clone())) as Rc<dyn kr_apiserver::podproxy::PodDialer>);
+        let router = Rc::new(kr_kubelet::remote::Router { local_node: local_node.clone(), local, tls: kubelet_client.clone(), local_dial });
+        api_for_proxy.set_pod_dialer(router.clone());
+        api_for_proxy.set_node_proxy(router);
         if let Some(k) = kubelet {
             kr_rt::exec::spawn(k.run());
         }

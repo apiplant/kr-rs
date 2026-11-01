@@ -83,6 +83,49 @@ pub fn columns(kind: &str) -> &'static [Col] {
     }
 }
 
+fn selector_text(v: &Value) -> String {
+    let sel = v.pointer(&["spec", "selector", "matchLabels"]).or_else(|| v.pointer(&["spec", "selector"])).and_then(Value::as_object).unwrap_or(&[]);
+    let out: alloc::vec::Vec<String> = sel.iter().filter_map(|(k, x)| Some(alloc::format!("{k}={}", x.as_str()?))).collect();
+    or_none(out.join(","))
+}
+
+fn tpl_ctrs(v: &Value, key: &str) -> String {
+    let cs = v.pointer(&["spec", "template", "spec", "containers"]).and_then(Value::as_array).unwrap_or(&[]);
+    cs.iter().map(|c| s(c, &[key])).collect::<alloc::vec::Vec<_>>().join(",")
+}
+
+fn node_addr(v: &Value) -> String {
+    let a = v.pointer(&["status", "addresses"]).and_then(Value::as_array).unwrap_or(&[]);
+    a.iter().find(|x| s(x, &["type"]) == "InternalIP").map(|x| s(x, &["address"])).unwrap_or_else(|| "<none>".into())
+}
+
+/// Extra columns after AGE that `kubectl get -o wide` adds (table column priority 1).
+pub fn wide_columns(kind: &str) -> &'static [Col] {
+    match kind {
+        "Pod" => &[
+            ("IP", |v| or_none(s(v, &["status", "podIP"]))),
+            ("Node", |v| or_none(s(v, &["spec", "nodeName"]))),
+            ("Nominated Node", |v| or_none(s(v, &["status", "nominatedNodeName"]))),
+            ("Readiness Gates", |v| {
+                let g: alloc::vec::Vec<String> = v.pointer(&["spec", "readinessGates"]).and_then(Value::as_array).unwrap_or(&[]).iter().map(|x| s(x, &["conditionType"])).collect();
+                or_none(g.join(","))
+            }),
+        ],
+        "Deployment" | "ReplicaSet" | "StatefulSet" | "DaemonSet" | "Job" => &[("Containers", |v| tpl_ctrs(v, "name")), ("Images", |v| tpl_ctrs(v, "image")), ("Selector", selector_text)],
+        "Service" => &[("Selector", |v| {
+            let sel = v.pointer(&["spec", "selector"]).and_then(Value::as_object).unwrap_or(&[]);
+            or_none(sel.iter().filter_map(|(k, x)| Some(alloc::format!("{k}={}", x.as_str()?))).collect::<alloc::vec::Vec<_>>().join(","))
+        })],
+        "Node" => &[
+            ("Internal-IP", node_addr),
+            ("OS-Image", |v| s(v, &["status", "nodeInfo", "osImage"])),
+            ("Kernel-Version", |v| s(v, &["status", "nodeInfo", "kernelVersion"])),
+            ("Container-Runtime", |v| s(v, &["status", "nodeInfo", "containerRuntimeVersion"])),
+        ],
+        _ => &[],
+    }
+}
+
 /// Parses "YYYY-MM-DDTHH:MM:SSZ" (fractional seconds and offsets other than Z rejected).
 pub fn parse_rfc3339(t: &str) -> Option<i64> {
     let b = t.as_bytes();

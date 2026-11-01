@@ -85,9 +85,10 @@ fn extra_kinds_crud() {
         ("/apis/apiregistration.k8s.io/v1/apiservices", "v1.foo.example.com", r#"{"metadata":{"name":"v1.foo.example.com"},"spec":{"group":"foo.example.com","version":"v1","groupPriorityMinimum":100,"versionPriority":1}}"#),
         ("/apis/storagemigration.k8s.io/v1/storageversionmigrations", "m1", r#"{"metadata":{"name":"m1"},"spec":{"resource":{"group":"","resource":"secrets"}}}"#),
         ("/apis/resource.k8s.io/v1/devicetaintrules", "t1", r#"{"metadata":{"name":"t1"},"spec":{"taint":{"key":"k","effect":"NoSchedule"}}}"#),
-        ("/apis/certificates.k8s.io/v1/namespaces/default/podcertificaterequests", "r1", r#"{"metadata":{"name":"r1"},"spec":{}}"#),
+        ("/apis/certificates.k8s.io/v1/namespaces/default/podcertificaterequests", "r1", r#"{"metadata":{"name":"r1"},"spec":{"signerName":"example.com/s","podName":"p","serviceAccountName":"sa"}}"#),
     ] {
-        assert_eq!(call(&api, "POST", path, body).0, 201, "{path}");
+        let (code, resp) = call(&api, "POST", path, body);
+        assert_eq!(code, 201, "{path}: {resp:?}");
         assert_eq!(call(&api, "GET", &format!("{path}/{name}"), "").0, 200, "{path}");
     }
     let (_, g) = call(&api, "GET", "/apis/apiregistration.k8s.io/v1", "");

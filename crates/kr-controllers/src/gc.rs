@@ -72,8 +72,28 @@ pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config) {
     loop {
         waiting.set(propagate(&c).await);
         sweep(&c).await;
+        expire_tokens(&c, (cfg.now)()).await;
         let _ = kr_rt::exec::timeout(cfg.gc_ms, notify.notified()).await;
     }
+}
+
+/// Deletes bootstrap-token Secrets (`kube-system`, type `bootstrap.kubernetes.io/token`) whose
+/// `data.expiration` has passed; returns how many were deleted. Expired tokens already fail
+/// authentication, this only stops them accumulating.
+pub async fn expire_tokens<C: Client>(c: &C, now: i64) -> usize {
+    let base = api_path("", "v1", Some("kube-system"), "secrets");
+    let Ok(l) = c.list(&base, "").await else { return 0 };
+    let mut n = 0;
+    for s in items(&l) {
+        if str_at(&s, &["type"]) != "bootstrap.kubernetes.io/token" || deleting(&s) {
+            continue;
+        }
+        let exp = s.pointer(&["data", "expiration"]).and_then(Value::as_str).and_then(|v| kr_fmt::base64::decode(v).ok()).and_then(|b| String::from_utf8(b).ok()).and_then(|e| parse_time(&e));
+        if exp.is_some_and(|e| now > e) && c.delete(&alloc::format!("{base}/{}", name(&s))).await.is_ok() {
+            n += 1;
+        }
+    }
+    n
 }
 
 const ORPHAN: &str = "orphan";
@@ -134,7 +154,10 @@ pub async fn propagate<C: Client>(c: &C) -> bool {
                 // Foreground: the owner waits for this one, whether it is deleted now or already going.
                 remaining += 1;
                 if !deleting(d) {
-                    let _ = c.delete(&object_path(r, d)).await;
+                    // Dependents that own things themselves (ReplicaSet -> pods) go foreground too,
+                    // so the whole tree is gone before the root is.
+                    let fg = !orphan && OWNERS.iter().any(|(g, p)| *g == r.group && *p == r.plural);
+                    let _ = c.delete(&if fg { alloc::format!("{}?propagationPolicy=Foreground", object_path(r, d)) } else { object_path(r, d) }).await;
                 }
             }
         }

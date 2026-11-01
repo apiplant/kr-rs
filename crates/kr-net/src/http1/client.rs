@@ -51,7 +51,7 @@ struct Pool<T> {
     idle_ms: u64,
 }
 
-impl<T> Pool<T> {
+impl<T: Transport> Pool<T> {
     /// Drops every connection idle for longer than the timeout.
     fn expire(&mut self, now: u64) {
         let idle_ms = self.idle_ms;
@@ -59,6 +59,8 @@ impl<T> Pool<T> {
     }
     fn take(&mut self, key: &Key, now: u64) -> Option<T> {
         self.expire(now);
+        // Skip connections the server closed while they idled (no wasted request, no retry).
+        self.idle.retain(|(_, c, _)| !c.peer_gone());
         let i = self.idle.iter().rposition(|(k, _, _)| k == key)?;
         Some(self.idle.remove(i).1)
     }
@@ -511,6 +513,15 @@ impl<T: Transport> Response<T> {
 #[cfg(test)]
 mod pool_tests {
     use super::*;
+
+    impl Transport for u8 {
+        async fn read(&mut self, _: &mut [u8]) -> Result<usize> {
+            Ok(0)
+        }
+        async fn write_all(&mut self, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
 
     fn key() -> Key {
         (Scheme::Http, "h".to_string(), 80)

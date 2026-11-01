@@ -22,7 +22,7 @@ VERSION = "v0.37.0"
 RAW = "https://raw.githubusercontent.com/kubernetes/%s/" + VERSION + "/%s"
 API_GROUPS = ["core/v1", "apps/v1", "batch/v1", "coordination/v1", "discovery/v1", "networking/v1",
               "policy/v1", "scheduling/v1", "rbac/v1", "autoscaling/v1", "autoscaling/v2", "authentication/v1", "authorization/v1", "events/v1", "scheduling/v1alpha3",
-              "admissionregistration/v1", "certificates/v1", "flowcontrol/v1", "node/v1", "resource/v1", "storage/v1"]
+              "admissionregistration/v1", "certificates/v1", "flowcontrol/v1", "node/v1", "resource/v1", "storage/v1", "storagemigration/v1"]
 # local name -> (repo, path inside repo, proto package prefix, go package basename)
 SOURCES = {}
 for _g in API_GROUPS:
@@ -60,7 +60,7 @@ SPECIAL = {
 # Packages whose JSON names are taken from the types.go tags (`$ref`, `x-kubernetes-...`).
 JSON_NAMES_FROM_GO = {APIEXT}
 # Groups outside k8s.io/api (storagemigration): served as JSON only.
-JSON_ONLY_GROUPS = {"storagemigration.k8s.io"}
+JSON_ONLY_GROUPS = set()
 # Extra top-level kinds beyond resources.rs: (apiVersion, kind, message).
 EXTRA_ROOTS = [("v1", "DeleteOptions", META + ".DeleteOptions"),
                ("autoscaling/v1", "Scale", "k8s.io.api.autoscaling.v1.Scale"),
@@ -139,15 +139,45 @@ def resolve(t, pkg):
 
 # ---------------------------------------------------------------- types.go (inline / omitempty)
 
+# Validation data collected from types.go: allowed values of `+enum` string fields and required
+# (no `omitempty`, not `+optional`) string fields, both keyed by (message, field number).
+ENUM_FIELDS = {}
+REQUIRED_FIELDS = set()
+
+
+def go_enums(path):
+    """{enum type name: [values]} for the `// +enum` string types of a types.go."""
+    enums, vals = set(), {}
+    prev_enum = False
+    for line in open(path):
+        m = re.match(r"type (\w+) string", line)
+        if m and prev_enum:
+            enums.add(m.group(1))
+        prev_enum = line.strip().startswith("// +enum")
+        c = re.match(r'\s*(?:const\s+)?\w+\s+(\w+)\s*=\s*"([^"]*)"', line)
+        if c:
+            vals.setdefault(c.group(1), []).append(c.group(2))
+    return {k: v for k, v in vals.items() if k in enums}
+
+
 def parse_go(path, package):
     """Returns {full message name: {number: (json name or None, inline, keep_zero)}}."""
     out = {}
     cur = None
+    enums = go_enums(path)
+    optional = False
+    curname = None
     for line in open(path):
+        if line.strip().startswith("//"):
+            if "+optional" in line:
+                optional = True
+            continue
         m = re.match(r"type (\w+) struct", line)
         if m:
             cur = {}
-            out[package + "." + m.group(1)] = cur
+            curname = package + "." + m.group(1)
+            out[curname] = cur
+            optional = False
             continue
         if line.startswith("}"):
             cur = None
@@ -166,6 +196,14 @@ def parse_go(path, package):
         inline = "inline" in parts[1:] or (embedded and parts[0] == "")
         pointer = bool(re.match(r"\s*\w+\s+\*", line))
         cur[int(pb.group(1))] = (parts[0] or None, inline, pointer or "omitempty" not in parts[1:])
+        gt = re.match(r"\s*\w+\s+(\*?\[?\]?\*?[\w.]+)\s+`", line)
+        base = gt.group(1) if gt else ""
+        if not inline and gt and base in enums:
+            ENUM_FIELDS[(curname, int(pb.group(1)))] = enums[base]
+        if not inline and base in ("string",) or base in enums:
+            if "omitempty" not in parts[1:] and not optional and parts[0]:
+                REQUIRED_FIELDS.add((curname, int(pb.group(1))))
+        optional = False
     return out
 
 
@@ -322,6 +360,17 @@ def main():
     w("pub static KINDS: [(&str, &str, u16); %d] = [\n" % len(rts))
     for av, kind, full in rts:
         w("    (\"%s\", \"%s\", %d),\n" % (av, kind, index[full]))
+    w("];\n\n")
+    enums = sorted((index[m], num, "|".join(v)) for (m, num), v in ENUM_FIELDS.items() if m in index and m not in SPECIAL.values())
+    w("/// Allowed values of `+enum` string fields: (message, field number, values joined by `|`), sorted.\n")
+    w("pub static ENUMS: [(u16, u16, &str); %d] = [\n" % len(enums))
+    for mi, num, vals in enums:
+        w("    (%d, %d, \"%s\"),\n" % (mi, num, vals))
+    w("];\n\n")
+    req = sorted((index[m], num) for (m, num) in REQUIRED_FIELDS if m in index and m not in SPECIAL.values())
+    w("/// Required string fields (no `omitempty`, not `+optional`): (message, field number), sorted.\n")
+    w("pub static REQUIRED: [(u16, u16); %d] = [" % len(req))
+    w(", ".join("(%d, %d)" % r for r in req))
     w("];\n")
     text = "".join(o)
     with open(OUT, "w") as fh:

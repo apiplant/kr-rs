@@ -98,6 +98,10 @@ impl<T: Transport> TlsStream<T> {
 }
 
 impl<T: Transport> Transport for TlsStream<T> {
+    fn peer_gone(&self) -> bool {
+        self.inner.peer_gone()
+    }
+
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         loop {
             let n = self.conn.read(buf);
@@ -126,6 +130,12 @@ pub enum MaybeTls {
 }
 
 impl Transport for MaybeTls {
+    fn peer_gone(&self) -> bool {
+        match self {
+            MaybeTls::Plain(s) => Transport::peer_gone(s),
+            MaybeTls::Tls(s) => s.peer_gone(),
+        }
+    }
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         match self {
             MaybeTls::Plain(s) => Transport::read(s, buf).await,

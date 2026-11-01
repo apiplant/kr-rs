@@ -40,7 +40,7 @@ fn call(api: &ApiServer, method: &str, path: &str, ct: &str, body: &str) -> (u16
 #[test]
 fn path_segment_names() {
     let api = server();
-    let ctb = r#"{"apiVersion":"certificates.k8s.io/v1","kind":"ClusterTrustBundle","metadata":{"name":"test.test:signer-one:0"},"spec":{"signerName":"test.test/signer-one","trustBundle":""}}"#;
+    let ctb = r#"{"apiVersion":"certificates.k8s.io/v1","kind":"ClusterTrustBundle","metadata":{"name":"test.test:signer-one:0"},"spec":{"signerName":"test.test/signer-one","trustBundle":"x"}}"#;
     let (c, v) = call(&api, "POST", "/apis/certificates.k8s.io/v1/clustertrustbundles", "application/json", ctb);
     assert_eq!(c, 201, "{v:?}");
     for ip in ["192.168.2.5", "2001:db8::5"] {

@@ -403,6 +403,10 @@ impl Cluster {
                 let Some(m) = m else { break };
                 self.raft.borrow_mut().step(m);
             }
+            if self.raft.borrow().removed() {
+                kr_rt::eprint(b"kr server: this server was removed from the cluster; stop it and wipe its data. exiting\n");
+                kr_sys::exit_group(0);
+            }
             // Writes by in-process components (controllers) are proposed in batches.
             if self.is_leader() {
                 let recs = api.store.borrow_mut().take_records();

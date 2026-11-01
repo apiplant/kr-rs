@@ -73,5 +73,15 @@ check pod-cluster-dns "$([ "$(P "nslookup kubernetes.default.svc.cluster.local" 
 check pod-external-dns "$([ "$(P "nslookup example.com" | grep -c "^Address.*[0-9a-f]")" -ge 1 ] && echo ok)" ok
 check default-policy-dns "$([ "$(D "nslookup example.com" | grep -c "^Address.*[0-9a-f]")" -ge 1 ] && echo ok)" ok
 check pod-reaches-kubernetes-svc "$(P "wget -qO- -T5 --no-check-certificate https://kubernetes.default.svc.cluster.local/healthz 2>&1" | head -c 40 | grep -c -e ok -e Forbidden -e Unauthorized -e 401 -e 403)" 1
+# pods/proxy reaches a rootless pod through the node (the API server cannot route to the pod network)
+kubectl apply -f - >/dev/null <<Y
+apiVersion: v1
+kind: Pod
+metadata: {name: w}
+spec:
+  containers: [{name: c, image: docker.io/library/alpine:3.20, command: [sh, -c, "while true; do printf \"HTTP/1.0 200 OK\\r\\nContent-Length: 8\\r\\n\\r\\nproxied\\n\" | nc -l -p 8080; done"]}]
+Y
+kubectl wait --for=condition=Ready pod/w --timeout=120s >/dev/null 2>&1; sleep 2
+check pod-proxy "$(kubectl get --raw /api/v1/namespaces/default/pods/w:8080/proxy/ 2>&1)" proxied
 [ $fail = 0 ] && echo "rootless families $MODE: all checks passed" || { echo "FAILED"; tail -5 /home/u/srv.log; exit 1; }
 '
