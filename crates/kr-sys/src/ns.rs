@@ -94,7 +94,7 @@ pub const PR_SET_NO_NEW_PRIVS: usize = 38;
 pub const PR_CAPBSET_DROP: usize = 24;
 pub const PR_CAP_AMBIENT: usize = 47;
 pub const PR_CAP_AMBIENT_CLEAR_ALL: usize = 4;
-pub const O_DIRECTORY: i32 = 0o200000;
+pub const O_DIRECTORY: i32 = super::fs::O_DIRECTORY;
 
 pub const O_RDONLY: i32 = 0;
 pub const O_WRONLY: i32 = 1;
