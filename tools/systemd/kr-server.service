@@ -1,0 +1,21 @@
+[Unit]
+Description=kr Kubernetes server (API server, controllers and the node's kubelet)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/kr server --data /var/lib/kr
+Restart=always
+RestartSec=2
+# Containers, their shims and the pod sandboxes are children of this unit's cgroup. Stopping or
+# restarting the service must only stop the main process: pods keep running and are adopted by
+# the next start (ADR-036). The default (control-group) would kill every pod.
+KillMode=process
+# Let kr create the pod cgroups under this unit.
+Delegate=yes
+TasksMax=infinity
+LimitNOFILE=1048576
+OOMScoreAdjust=-999
+
+[Install]
+WantedBy=multi-user.target

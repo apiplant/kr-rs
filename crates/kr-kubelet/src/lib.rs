@@ -19,6 +19,7 @@ extern crate std;
 
 pub mod evict;
 pub mod node;
+mod adopt;
 pub mod dns;
 pub mod egress;
 mod probe;
@@ -65,6 +66,8 @@ pub struct Config {
     pub vxlan: bool,
     /// Hard eviction: MemAvailable (bytes) below which the node is under memory pressure.
     pub eviction_memory_bytes: u64,
+    /// The node also runs the control plane (`kr server`): it gets the control-plane role label.
+    pub control_plane: bool,
 }
 
 fn now() -> i64 {
@@ -81,6 +84,15 @@ fn remove_tree(path: &str) -> bool {
 }
 
 /// Pod uids are 36-char UUIDs (the owner recorded in kubelet IP leases).
+/// The stdin socket / pty master a shim hands out on its unix socket.
+fn fetch_io_fd(sock: &[u8]) -> Option<kr_sys::Fd> {
+    let conn = kr_sys::ns::unix_connect(sock).ok()?;
+    // The shim answers at once; do not let a stuck one stall the kubelet.
+    let _ = kr_sys::ns::poll2(conn.raw(), -1, 2000);
+    let mut b = [0u8; 1];
+    kr_sys::ns::recv_fd(conn.raw(), &mut b).ok()?.1
+}
+
 fn is_pod_uid(owner: &[u8]) -> bool {
     owner.len() == 36 && owner.iter().filter(|b| **b == b'-').count() == 4
 }
@@ -162,6 +174,11 @@ struct Ctr {
     resize_restart: bool,
     /// When the restart for a resize escalates from SIGTERM to SIGKILL (ms).
     resize_kill_at: u64,
+    /// Host pid and start ticks of the running container's init (see [`adopt`]).
+    proc: Option<(i32, u64)>,
+    /// The shim process holding this container's stdin socket / pty master: (shim pid, its fd, tty).
+    io: Option<(i32, i32, bool)>,
+    shim: i32,
 }
 
 struct PodRt {
@@ -247,6 +264,10 @@ pub struct Kubelet<C: Client> {
     /// whether `stdinOnce` applies and whether it is a terminal master (`tty: true`). `attach -i`
     /// writes to it; shutting a socket down is EOF.
     stdin_keep: RefCell<BTreeMap<String, (Rc<kr_sys::Fd>, bool, bool)>>,
+    /// Pods and containers taken over from the previous run (reported once, after the first sync).
+    adopted: Cell<(u32, u32)>,
+    /// Shims and re-adoption are available (kernel prerequisites met).
+    survive: Cell<bool>,
 }
 
 enum PullGate {
@@ -260,12 +281,14 @@ enum Pull {
     Failed { msg: String, retry_at: u64 },
 }
 
+/// Prefix of the sandbox error that means "try again later" (the pod network is full).
+const NO_IP: &str = "failed to allocate a pod IP";
 const BACKOFF_START_MS: u64 = 10_000;
 const BACKOFF_MAX_MS: u64 = 300_000;
 
 impl<C: Client + Clone + 'static> Kubelet<C> {
     pub fn new(c: C, cfg: Config, store: Store) -> Rc<Self> {
-        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()) })
+        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()), adopted: Cell::new((0, 0)), survive: Cell::new(false) })
     }
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
@@ -277,10 +300,27 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         // Sandboxes die with the previous kr process (even after SIGKILL), so every pod lease is
         // stale. Leases of `kr ctr run` processes are kept while that process runs.
         // Containers of a killed kr survive as orphans: kill whatever is left in the pod cgroups.
-        if self.cfg.cgroups {
-            kr_runtime::cgroup::kill_stale_pods();
+        // One kubelet per root: two would adopt the same pods. The lock goes with the process.
+        let lock = alloc::format!("{}/kubelet.lock\0", self.cfg.root);
+        match kr_sys::ns::open(lock.as_bytes(), kr_sys::ns::O_RDWR | kr_sys::ns::O_CREAT | kr_sys::O_CLOEXEC, 0o600) {
+            Ok(fd) => {
+                if kr_sys::ns::flock_exclusive_nb(fd.raw()).is_err() {
+                    kr_rt::eprint(alloc::format!("kubelet: another kr process already runs the pods under {}; exiting\n", self.cfg.root).as_bytes());
+                    kr_sys::exit_group(1);
+                }
+                core::mem::forget(fd);
+            }
+            Err(_) => kr_rt::eprint(b"kubelet: cannot create the kubelet lock; continuing without\n"),
         }
-        network::gc(alloc::format!("{}/ipam", self.cfg.root).as_bytes(), |owner| !is_pod_uid(owner) && network::owner_alive(owner) != Some(false));
+        // Pods outlive this process and are re-adopted when their pod is seen again; what nobody
+        // claims is cleaned up after the first sync.
+        match container::survive_prerequisites() {
+            Ok(()) => {
+                container::set_survive_parent(true);
+                self.survive.set(true);
+            }
+            Err(missing) => kr_rt::eprint(alloc::format!("kubelet: this kernel lacks {missing}; pods will not survive a restart of kr\n").as_bytes()),
+        }
         node::register(&self.c, &self.cfg).await;
         // The API server assigns the pod subnet at registration.
         for _ in 0..30 {
@@ -299,33 +339,44 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 kr_rt::eprint(alloc::format!("kubelet: network setup failed (errno {}); pods get no IP\n", e.0).as_bytes());
             }
         } else {
-            match container::start_sandbox(b"kr-pod-network", b"", &self.maps, None) {
-                Ok(infra) => {
-                    // ip_forward + bridge inside the infra namespaces; egress is set up
-                    // separately and optional.
-                    let fam = self.fam.get();
-                    let ok = container::run_in_net(&infra, || network::setup_infra_bridge(&pn, fam));
-                    match ok {
-                        Ok(0) => {
-                            // Outbound traffic: a TUN default route served by the userspace NAT.
-                            match network::open_egress(&infra) {
-                                Ok(tun) => {
-                                    kr_rt::exec::spawn(egress::run(tun));
+            if let Some(infra) = self.adopt_infra() {
+                *self.infra.borrow_mut() = Some(infra);
+                self.announce_rootless().await;
+            } else {
+                // The old pod network is gone (or never existed): pods that used it cannot live on.
+                self.kill_recorded(&[]);
+                match container::start_sandbox(b"kr-pod-network", b"", &self.maps, None) {
+                    Ok(infra) => {
+                        // ip_forward + bridge inside the infra namespaces; egress is set up
+                        // separately and optional.
+                        let fam = self.fam.get();
+                        let ok = container::run_in_net(&infra, || network::setup_infra_bridge(&pn, fam));
+                        match ok {
+                            Ok(0) => {
+                                // Outbound traffic: a TUN default route served by the userspace NAT,
+                                // in a helper process that survives this one.
+                                let mut egress = None;
+                                match network::open_egress(&infra) {
+                                    Ok(tun) => match container::spawn_helper(&[b"egress"], tun.raw()) {
+                                        Ok(pid) => egress = network::proc_start(pid as u32).map(|st| (pid, st)),
+                                        Err(e) => kr_rt::eprint(alloc::format!("kubelet: rootless egress unavailable ({}: errno {}); pods have no outbound connectivity\n", e.step, e.errno.0).as_bytes()),
+                                    },
+                                    Err(e) => kr_rt::eprint(alloc::format!("kubelet: rootless egress unavailable (errno {}); pods have no outbound connectivity\n", e.0).as_bytes()),
                                 }
-                                Err(e) => kr_rt::eprint(alloc::format!("kubelet: rootless egress unavailable (errno {}); pods have no outbound connectivity\n", e.0).as_bytes()),
+                                if let (Some((ep, es)), Some(st)) = (egress, network::proc_start(infra.pid as u32)) {
+                                    let _ = kr_runtime::store::write_file_atomic(&self.infra_file(), alloc::format!("{} {st} {ep} {es}\n", infra.pid).as_bytes());
+                                }
+                                *self.infra.borrow_mut() = Some(infra);
+                                self.announce_rootless().await;
                             }
-                            *self.infra.borrow_mut() = Some(infra);
-                            // Lets another node's API server know pod proxy must go through this kubelet.
-                            let patch = Value::Object(alloc::vec![(String::from("metadata"), Value::Object(alloc::vec![(String::from("annotations"), Value::Object(alloc::vec![(String::from("kr.io/rootless"), Value::from("true"))]))]))]);
-                            let _ = self.c.patch(&alloc::format!("/api/v1/nodes/{}", self.cfg.node_name), "application/merge-patch+json", &patch).await;
-                        }
-                        r => {
-                            kr_rt::eprint(alloc::format!("kubelet: rootless pod network setup failed ({}); pods get no IP\n", r.map(|c| c.to_string()).unwrap_or_else(|e| alloc::format!("{}: errno {}", e.step, e.errno.0))).as_bytes());
-                            infra.stop();
+                            r => {
+                                kr_rt::eprint(alloc::format!("kubelet: rootless pod network setup failed ({}); pods get no IP\n", r.map(|c| c.to_string()).unwrap_or_else(|e| alloc::format!("{}: errno {}", e.step, e.errno.0))).as_bytes());
+                                infra.stop();
+                            }
                         }
                     }
+                    Err(e) => kr_rt::eprint(alloc::format!("kubelet: rootless pod network unavailable ({}: errno {})\n", e.step, e.errno.0).as_bytes()),
                 }
-                Err(e) => kr_rt::eprint(alloc::format!("kubelet: rootless pod network unavailable ({}: errno {})\n", e.step, e.errno.0).as_bytes()),
             }
         }
         // Service proxy in the node network namespace (host when root, infra when rootless).
@@ -354,10 +405,92 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         kr_rt::exec::spawn(async move { ev.eviction_loop().await });
         let lm = self.clone();
         kr_rt::exec::spawn(async move { lm.log_mark_loop().await });
+        let mut swept = false;
         loop {
-            self.sync_all().await;
+            let listed = self.sync_all().await;
+            if listed && !swept {
+                swept = true;
+                self.sweep_unclaimed();
+            }
             self.notify.wait(1000).await;
         }
+    }
+
+    /// After the first sync: kills the pods nobody adopted (deleted while the kubelet was down)
+    /// and frees their IPs.
+    fn sweep_unclaimed(&self) {
+        let live: Vec<String> = self.pods.borrow().keys().cloned().collect();
+        if self.cfg.cgroups {
+            kr_runtime::cgroup::kill_stale_pods(&|c| live.iter().any(|u| u.as_bytes() == c));
+        }
+        self.kill_recorded(&live);
+        self.remove_unclaimed_dirs(&live);
+        let (pods, ctrs) = self.adopted.get();
+        kr_rt::eprint(alloc::format!("kubelet: adopted {pods} pods ({ctrs} running containers) left by the previous run\n").as_bytes());
+        network::gc(alloc::format!("{}/ipam", self.cfg.root).as_bytes(), |owner| if is_pod_uid(owner) { live.iter().any(|u| u.as_bytes() == owner) } else { network::owner_alive(owner) != Some(false) });
+    }
+
+    /// Removes the pod directories and container directories (overlay layers) of pods that are
+    /// gone from the API, left by a run that ended before it could clean up.
+    fn remove_unclaimed_dirs(&self, live: &[String]) {
+        let list = |sub: &str| -> Vec<String> {
+            let dir = alloc::format!("{}/{sub}\0", self.cfg.root);
+            let Ok(fd) = kr_sys::ns::open(dir.as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY, 0) else { return Vec::new() };
+            kr_sys::fs::read_dir(&fd).filter_map(Result::ok).filter_map(|e| String::from_utf8(e.name).ok()).collect()
+        };
+        for name in list("pods") {
+            if is_pod_uid(name.as_bytes()) && !live.contains(&name) {
+                let dir = alloc::format!("{}/pods/{name}", self.cfg.root);
+                let _ = self.maps.run_as_root(|| remove_tree(&dir));
+            }
+        }
+        // Container ids are `<pod uid>-<container>-<n>`.
+        for name in list("containers") {
+            let uid = name.get(..36).unwrap_or("");
+            if name.len() > 37 && name.as_bytes()[36] == b'-' && is_pod_uid(uid.as_bytes()) && !live.iter().any(|l| l == uid) {
+                let _ = self.maps.run_as_root(|| self.store.delete_container(&name).is_ok());
+            }
+        }
+    }
+
+    /// Kills the sandbox and containers recorded in the `.adopt` file of every pod directory
+    /// whose uid is not in `keep` (what cgroups cannot reach: rootless, or no cgroups), and
+    /// forgets the record.
+    fn kill_recorded(&self, keep: &[String]) {
+        let dir = alloc::format!("{}/pods\0", self.cfg.root);
+        let Ok(fd) = kr_sys::ns::open(dir.as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY, 0) else { return };
+        let names: Vec<String> = kr_sys::fs::read_dir(&fd).filter_map(Result::ok).filter_map(|e| String::from_utf8(e.name).ok()).filter(|n| is_pod_uid(n.as_bytes()) && !keep.contains(n)).collect();
+        for uid in names {
+            let path = alloc::format!("{}/pods/{uid}/{}\0", self.cfg.root, adopt::FILE);
+            let Ok(raw) = kr_sys::fs::read_file(path.as_bytes(), 1 << 16) else { continue };
+            let _ = kr_sys::fs::unlinkat(kr_sys::ns::AT_FDCWD, path.as_bytes(), 0);
+            let Some((sb, ctrs)) = core::str::from_utf8(&raw).ok().and_then(adopt::decode) else { continue };
+            let kill = |pid: i32, start: u64| {
+                if network::proc_start(pid as u32) == Some(start) {
+                    let _ = kr_sys::ns::kill(pid, kr_sys::ns::SIGKILL);
+                }
+            };
+            for c in &ctrs {
+                kill(c.pid, c.start);
+            }
+            kill(sb.pid, sb.start);
+        }
+    }
+
+    /// Where the rootless infra namespace holder and the egress helper are recorded.
+    fn infra_file(&self) -> String {
+        alloc::format!("{}/infra.adopt", self.cfg.root)
+    }
+
+    /// The rootless pod network of the previous run, if its holder and egress helper still live.
+    fn adopt_infra(&self) -> Option<Sandbox> {
+        let text = kr_sys::fs::read_file(alloc::format!("{}\0", self.infra_file()).as_bytes(), 256).ok()?;
+        let f: Vec<u64> = core::str::from_utf8(&text).ok()?.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        let [pid, start, egress, estart] = f[..] else { return None };
+        if network::proc_start(egress as u32) != Some(estart) {
+            return None;
+        }
+        Sandbox::adopt(pid as i32, start, false)
     }
 
     /// Every 500 ms: records when each container log file grew (see `log_marks`). Marks of
@@ -627,14 +760,15 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
     }
 
-    async fn sync_all(self: &Rc<Self>) {
+    /// One pass over this node's pods. False when the pod list could not be read.
+    async fn sync_all(self: &Rc<Self>) -> bool {
         // Container exits recorded by waiter tasks.
         let exits: Vec<Exit> = core::mem::take(&mut *self.exits.borrow_mut());
         for e in exits {
             self.on_exit(e);
         }
         let q = alloc::format!("fieldSelector=spec.nodeName%3D{}", self.cfg.node_name);
-        let Ok(list) = self.c.list("/api/v1/pods", &q).await else { return };
+        let Ok(list) = self.c.list("/api/v1/pods", &q).await else { return false };
         let desired: Vec<Value> = list.get("items").and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
         let mut seen = Vec::new();
         for pod in &desired {
@@ -665,6 +799,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 self.cleanup(&uid);
             }
         }
+        true
     }
 
     fn on_exit(&self, e: Exit) {
@@ -681,6 +816,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         c.last_term = Some(term);
         c.signaller = None;
         c.target = None;
+        c.proc = None;
+        c.io = None;
         c.probes.clear();
         c.ready = false;
         // CrashLoopBackOff: every restart after an exit waits 10 s, doubling up to 5 min.
@@ -691,12 +828,21 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             c.backoff_ms = 0;
             c.not_before = 0;
         }
+        drop(pods);
+        self.persist(&e.pod_uid);
     }
 
     async fn sync_pod(self: &Rc<Self>, uid: &str, pod: &Value) {
         if !self.pods.borrow().contains_key(uid) {
-            let rt = self.admit(uid, pod);
+            let mut rt = self.admit(uid, pod);
+            if self.survives() {
+                self.try_adopt(uid, pod, &mut rt);
+            } else if self.cfg.cgroups {
+                // Pods do not survive here, so whatever a previous run left under this uid is stray.
+                kr_runtime::cgroup::kill_pod(uid);
+            }
             self.pods.borrow_mut().insert(uid.to_string(), rt);
+            self.persist(uid);
         }
         if self.pods.borrow()[uid].failed_setup.is_some() {
             return;
@@ -744,6 +890,18 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         if self.pods.borrow()[uid].sandbox.is_none() {
             if let Err(e) = self.start_sandbox(uid, pod) {
+                if e.starts_with(NO_IP) {
+                    // Addresses free up as other pods end: stay in ContainerCreating and retry on
+                    // the next sync (one event per pod, not one per second).
+                    let first = self.pods.borrow()[uid].ctrs.first().is_some_and(|c| !matches!(&c.state, CState::Waiting(_, m) if *m == e));
+                    for c in self.pods.borrow_mut().get_mut(uid).unwrap().ctrs.iter_mut() {
+                        c.state = CState::Waiting("ContainerCreating", e.clone());
+                    }
+                    if first {
+                        self.emit_event(pod, "Warning", "FailedCreatePodSandBox", &e).await;
+                    }
+                    return;
+                }
                 self.emit_event(pod, "Warning", "FailedCreatePodSandBox", &e).await;
                 self.pods.borrow_mut().get_mut(uid).unwrap().failed_setup = Some(e);
                 return;
@@ -823,7 +981,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 match p.ctrs.iter().position(|c| c.name == name) {
                     Some(i) => i,
                     None => {
-                        p.ctrs.push(Ctr { name: name.into(), image: e.get("image").and_then(Value::as_str).unwrap_or("").into(), init: false, sidecar: false, eph: true, restart_count: 0, state: CState::Waiting("ContainerCreating", String::new()), last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: false, ready: false, res: String::new(), resize_restart: false, resize_kill_at: 0 });
+                        p.ctrs.push(Ctr { name: name.into(), image: e.get("image").and_then(Value::as_str).unwrap_or("").into(), init: false, sidecar: false, eph: true, restart_count: 0, state: CState::Waiting("ContainerCreating", String::new()), last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: false, ready: false, res: String::new(), resize_restart: false, resize_kill_at: 0, proc: None, io: None, shim: 0 });
                         p.ctrs.len() - 1
                     }
                 }
@@ -833,6 +991,181 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 self.maybe_start(uid, pod, idx).await;
             }
         }
+    }
+
+    /// Lets another node's API server know pod proxy must go through this kubelet.
+    async fn announce_rootless(&self) {
+        let patch = Value::Object(alloc::vec![(String::from("metadata"), Value::Object(alloc::vec![(String::from("annotations"), Value::Object(alloc::vec![(String::from("kr.io/rootless"), Value::from("true"))]))]))]);
+        let _ = self.c.patch(&alloc::format!("/api/v1/nodes/{}", self.cfg.node_name), "application/merge-patch+json", &patch).await;
+    }
+
+    /// Pods outlive this process: always as root, and rootless once the pod network is up.
+    fn survives(&self) -> bool {
+        self.survive.get() && (self.cfg.network || self.infra.borrow().is_some())
+    }
+
+    /// Writes the pod's `.adopt` record (see [`adopt`]) so a restarted kubelet can take it over.
+    fn persist(&self, uid: &str) {
+        if !self.survives() {
+            return;
+        }
+        let text = {
+            let pods = self.pods.borrow();
+            let Some(p) = pods.get(uid) else { return };
+            let Some(sb) = p.sandbox.as_ref() else { return };
+            let Some(start) = kr_runtime::network::proc_start(sb.pid as u32) else { return };
+            let host_net = sb.is_host_net();
+            let rec = adopt::Sb { pid: sb.pid, start, host_net, ip: p.lease.as_ref().map(|l| l.ip) };
+            let ctrs: Vec<adopt::Ctr> = p
+                .ctrs
+                .iter()
+                .filter_map(|c| match (&c.state, c.proc) {
+                    (CState::Running { started_at, id }, Some((pid, start))) if c.shim > 0 => {
+                        let (io_fd, tty) = c.io.map_or((-1, false), |(_, fd, tty)| (fd, tty));
+                        Some(adopt::Ctr { name: c.name.clone(), pid, start, cid: id.clone(), seq: c.seq, started_at: *started_at, shim: c.shim, io_fd, tty })
+                    }
+                    _ => None,
+                })
+                .collect();
+            (alloc::format!("{}/{}", p.dir, adopt::FILE), adopt::encode(&rec, &ctrs))
+        };
+        let _ = kr_runtime::store::write_file_atomic(&text.0, text.1.as_bytes());
+    }
+
+    /// Takes over the sandbox and containers a previous kubelet left running for this pod.
+    /// Anything that cannot be adopted is killed, so the pod then starts from scratch.
+    fn try_adopt(self: &Rc<Self>, uid: &str, pod: &Value, rt: &mut PodRt) {
+        let path = alloc::format!("{}/{}\0", rt.dir, adopt::FILE);
+        let Ok(raw) = kr_sys::fs::read_file(path.as_bytes(), 1 << 16) else {
+            // No record: a new pod, or the kubelet died before writing it. Whatever runs in the
+            // pod's cgroup then belongs to nobody.
+            if self.cfg.cgroups {
+                kr_runtime::cgroup::kill_pod(uid);
+            }
+            return;
+        };
+        let _ = kr_sys::fs::unlinkat(kr_sys::ns::AT_FDCWD, path.as_bytes(), 0);
+        let rec = core::str::from_utf8(&raw).ok().and_then(adopt::decode);
+        let adopted = rec.and_then(|(sb, ctrs)| self.adopt_pod(uid, pod, rt, sb, ctrs));
+        if adopted.is_none() {
+            if self.cfg.cgroups {
+                kr_runtime::cgroup::kill_pod(uid);
+            }
+            rt.sandbox = None;
+            for c in rt.ctrs.iter_mut() {
+                c.state = CState::Waiting("ContainerCreating", String::new());
+                c.signaller = None;
+                c.target = None;
+                c.proc = None;
+            }
+        }
+    }
+
+    fn adopt_pod(self: &Rc<Self>, uid: &str, pod: &Value, rt: &mut PodRt, sb: adopt::Sb, recs: Vec<adopt::Ctr>) -> Option<()> {
+        let sandbox = Sandbox::adopt(sb.pid, sb.start, sb.host_net)?;
+        let pn = self.podnet.get();
+        let fam = self.fam.get();
+        let net = sb.ip.filter(|_| !sb.host_net).map(|ip| NetConfig::with(ip, &pn, fam));
+        if !sb.host_net {
+            // The pod keeps its IP; its lease must exist so nobody else gets it.
+            let ip = sb.ip?;
+            rt.lease = Some(Lease::adopt(alloc::format!("{}/ipam", self.cfg.root).as_bytes(), uid.as_bytes(), ip)?);
+        }
+        rt.ip = if sb.host_net { kr_sys::unmap4(self.cfg.node_ip) } else { sb.ip.filter(|_| fam.v4) };
+        rt.ip6 = if sb.host_net { Some(self.cfg.node_ip).filter(|a| kr_sys::unmap4(*a).is_none()) } else { net.and_then(|n| n.ip6) };
+        if self.cfg.cgroups {
+            let (limits, _) = spec::pod_resources(pod);
+            rt.cg = PodCgroup::create(spec::qos_class(pod), uid, &limits).ok();
+        }
+        if let Some(t) = pod.pointer(&["status", "startTime"]).and_then(Value::as_str).and_then(kr_apiserver::printers::parse_rfc3339) {
+            rt.start_time = t;
+        }
+        // What the API server already knows: restart counts, finished containers, readiness.
+        for c in rt.ctrs.iter_mut() {
+            let key = if c.init { "initContainerStatuses" } else if c.eph { "ephemeralContainerStatuses" } else { "containerStatuses" };
+            let Some(st) = pod.pointer(&["status", key]).and_then(Value::as_array).and_then(|a| a.iter().find(|s| s.get("name").and_then(Value::as_str) == Some(c.name.as_str()))) else { continue };
+            c.restart_count = st.get("restartCount").and_then(Value::as_u64).unwrap_or(0) as u32;
+            c.seq = c.restart_count + 1;
+            c.ready = st.get("ready").and_then(Value::as_bool).unwrap_or(false);
+            c.started = st.get("started").and_then(Value::as_bool).unwrap_or(false);
+            let term = |t: &Value| {
+                let t_of = |k: &str| t.get(k).and_then(Value::as_str).and_then(kr_apiserver::printers::parse_rfc3339).unwrap_or(0);
+                let reason = match t.get("reason").and_then(Value::as_str) {
+                    Some("Completed") => "Completed",
+                    Some("OOMKilled") => "OOMKilled",
+                    _ => "Error",
+                };
+                Term { exit_code: t.get("exitCode").and_then(Value::as_i64).unwrap_or(0) as i32, reason, started_at: t_of("startedAt"), finished_at: t_of("finishedAt"), message: t.get("message").and_then(Value::as_str).unwrap_or("").into() }
+            };
+            if let Some(t) = st.pointer(&["state", "terminated"]) {
+                let t = term(t);
+                c.state = CState::Terminated(t.clone());
+                c.last_term = Some(t);
+            } else if let Some(t) = st.pointer(&["lastState", "terminated"]) {
+                c.last_term = Some(term(t));
+            }
+            c.not_before = 0;
+        }
+        rt.sandbox = Some(sandbox);
+        // Containers that are still running.
+        for r in recs {
+            let Some(i) = rt.ctrs.iter().position(|c| c.name == r.name) else { continue };
+            let cg = if self.cfg.cgroups { rt.cg.as_ref().and_then(|p| kr_runtime::cgroup::Cgroup::open_in(p.rel(), r.cid.as_bytes()).ok()) } else { None };
+            let exit_path = alloc::format!("{}/{}.exit\0", rt.dir, r.cid);
+            let Some(running) = container::Running::adopt(r.pid, r.start, r.shim, sb.host_net, cg, exit_path.clone().into_bytes()) else {
+                // It ended while the kubelet was away: its shim recorded how.
+                let found = container::read_exit_file(exit_path.as_bytes());
+                let _ = kr_sys::fs::unlinkat(kr_sys::ns::AT_FDCWD, exit_path.as_bytes(), 0);
+                let (exit_code, oom) = found.map_or((container::UNKNOWN_EXIT, false), |e| (e.code, e.oom_killed));
+                let _ = self.maps.run_as_root(|| self.store.delete_container(&r.cid).is_ok());
+                let c = &mut rt.ctrs[i];
+                c.seq = r.seq;
+                c.state = CState::Running { started_at: r.started_at, id: r.cid.clone() };
+                let message = spec::termination_message(&rt.dir, &r.name, false, exit_code != 0);
+                self.exits.borrow_mut().push(Exit { pod_uid: uid.to_string(), ctr: r.name.clone(), exit_code, oom, started_at: r.started_at, message });
+                self.notify.notify();
+                continue;
+            };
+            // `attach`: the shim still holds the stdin socket / pty master; take a copy.
+            if r.io_fd >= 0 {
+                let sock = alloc::format!("{}/{}.io", rt.dir, r.name);
+                if let Some(fd) = fetch_io_fd(sock.as_bytes()) {
+                    if kr_sys::ns::set_nonblocking(fd.raw()).is_ok() {
+                        let once = pod.pointer(&["spec", "containers"]).and_then(Value::as_array).and_then(|a| a.iter().find(|x| x.get("name").and_then(Value::as_str) == Some(r.name.as_str()))).and_then(|c| c.get("stdinOnce")).and_then(Value::as_bool) == Some(true);
+                        self.stdin_keep.borrow_mut().insert(alloc::format!("{}/{}", rt.dir, r.name), (Rc::new(fd), once, r.tty));
+                    }
+                } else {
+                    kr_rt::eprint(alloc::format!("kubelet: cannot reattach stdin/terminal of {}/{} after the restart (attach -i unavailable until it restarts)\n", rt.name, r.name).as_bytes());
+                }
+            }
+            let cspec = pod.pointer(&["spec", if rt.ctrs[i].init { "initContainers" } else if rt.ctrs[i].eph { "ephemeralContainers" } else { "containers" }]).and_then(Value::as_array).and_then(|a| a.iter().find(|x| x.get("name").and_then(Value::as_str) == Some(r.name.as_str()))).cloned().unwrap_or(Value::Null);
+            let c = &mut rt.ctrs[i];
+            c.seq = r.seq;
+            c.state = CState::Running { started_at: r.started_at, id: r.cid.clone() };
+            c.signaller = Some(running.signaller());
+            c.target = Some(running.target());
+            c.proc = Some((r.pid, r.start));
+            c.shim = r.shim;
+            c.io = (r.io_fd >= 0).then_some((r.shim, r.io_fd, r.tty));
+            c.probes = [probe::Kind::Startup, probe::Kind::Liveness, probe::Kind::Readiness]
+                .into_iter()
+                .filter(|_| (!c.init || c.sidecar) && !c.eph)
+                .filter_map(|k| cspec.get(k.field()).map(|p| (k, probe::State::new(p.clone(), now_ms()))))
+                .collect();
+            if !c.probes.iter().any(|(k, _)| *k == probe::Kind::Startup) {
+                c.started = true;
+            }
+            if !c.probes.iter().any(|(k, _)| *k == probe::Kind::Readiness) {
+                c.ready = true;
+            }
+            let fallback = cspec.get("terminationMessagePolicy").and_then(Value::as_str) == Some("FallbackToLogsOnError");
+            self.spawn_waiter(uid.to_string(), r.name, r.cid, running, r.started_at, rt.dir.clone(), fallback);
+        }
+        // Init containers that never reported a verdict and are not running died with the kubelet's
+        // view of them: they run again (what an init container must tolerate anyway).
+        let (p, c) = self.adopted.get();
+        self.adopted.set((p + 1, c + rt.ctrs.iter().filter(|c| matches!(c.state, CState::Running { .. })).count() as u32));
+        Some(())
     }
 
     /// Prepares local bookkeeping for a newly seen pod.
@@ -861,6 +1194,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     res: c.get("resources").map(json::to_string).unwrap_or_default(),
                     resize_restart: false,
                     resize_kill_at: 0,
+                    proc: None,
+                    io: None,
+                    shim: 0,
                 });
             }
         }
@@ -879,7 +1215,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         if (self.cfg.network || rootless_net) && !host_net {
             let ipam = alloc::format!("{}/ipam", self.cfg.root);
             let _ = kr_runtime::store::mkdir_p(&ipam, 0o700);
-            lease = network::allocate_in(ipam.as_bytes(), uid.as_bytes(), &self.podnet.get()).ok();
+            lease = match network::allocate_or_reuse(ipam.as_bytes(), uid.as_bytes(), &self.podnet.get()) {
+                Ok(l) => Some(l),
+                // A pod without an address would run without a network: wait for one instead.
+                Err(e) => return Err(alloc::format!("{NO_IP}: no free address in the pod network (errno {})", e.0)),
+            };
         }
         let ip = if host_net { kr_sys::unmap4(self.cfg.node_ip) } else { lease.as_ref().map(|l: &Lease| l.ip) };
         let pn = self.podnet.get();
@@ -940,6 +1280,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         p.lease = lease;
         p.ip = ip.filter(|_| host_net || self.fam.get().v4);
         p.ip6 = if host_net { Some(self.cfg.node_ip).filter(|a| kr_sys::unmap4(*a).is_none()) } else { net.and_then(|n| n.ip6) };
+        drop(pods);
+        self.persist(uid);
         Ok(())
     }
 
@@ -1082,7 +1424,19 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             extra_groups: &built.extra_groups,
             readonly_root: cspec.and_then(|c| c.pointer(&["securityContext", "readOnlyRootFilesystem"])).and_then(Value::as_bool).unwrap_or(false),
         };
-        let r = container::start(&run);
+        let detached = self.survives();
+        // Descriptors a shim must keep for `attach`: our end of the stdin socket / the pty master.
+        let io_fd: Option<(i32, bool)> = stdin_pair.as_ref().map(|(o, _)| (o.raw(), false)).or_else(|| tty_pair.as_ref().map(|(m, _)| (m.raw(), true)));
+        let keep_fds: Vec<i32> = io_fd.map(|(f, _)| f).into_iter().collect();
+        let exit_path = alloc::format!("{pod_dir}/{cid}.exit");
+        let tty_log = alloc::format!("{pod_dir}/{name}.log");
+        let r = if detached {
+            let io_sock = alloc::format!("{pod_dir}/{name}.io");
+            let io = container::ShimIo { keep_fds: &keep_fds, tty_master: tty_pair.as_ref().map(|(m, _)| m.raw()), tty_log: tty_log.as_bytes(), io_fd: io_fd.map(|(f, _)| f), io_sock: io_sock.as_bytes() };
+            container::start_detached(&run, exit_path.as_bytes(), &io)
+        } else {
+            container::start(&run)
+        };
         drop(pods);
         drop(log);
         if r.is_ok() {
@@ -1095,7 +1449,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             } else if let Some((master, _)) = tty_pair {
                 // Terminal output goes to the log file, like a pipe's would.
                 if kr_sys::ns::set_nonblocking(master.raw()).is_ok() {
-                    if let Some(rd) = kr_sys::ns::dup_cloexec(master.raw()).ok().and_then(|d| kr_rt::exec::Async::new(d).ok()) {
+                    if let Some(rd) = kr_sys::ns::dup_cloexec(master.raw()).ok().filter(|_| !detached).and_then(|d| kr_rt::exec::Async::new(d).ok()) {
                         let log_path = alloc::format!("{pod_dir}/{name}.log\0");
                         kr_rt::exec::spawn(async move {
                             let Ok(out) = kr_sys::ns::open(log_path.as_bytes(), kr_sys::ns::O_WRONLY | kr_sys::ns::O_CREAT | 0o2000, 0o640) else { return };
@@ -1125,6 +1479,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     c.signaller = Some(running.signaller());
                     c.target = Some(running.target());
                     c.state = CState::Running { started_at: started, id: cid.clone() };
+                    c.proc = kr_runtime::network::proc_start(running.pid as u32).map(|st| (running.pid, st));
+                    c.shim = running.shim_pid();
+                    c.io = io_fd.filter(|_| detached).map(|(fd, tty)| (running.shim_pid(), fd, tty));
                     // Probes restart with every container start.
                     let cs = cspec.cloned().unwrap_or(Value::Null);
                     c.probes = [probe::Kind::Startup, probe::Kind::Liveness, probe::Kind::Readiness]
@@ -1135,6 +1492,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     c.started = !c.probes.iter().any(|(k, _)| *k == probe::Kind::Startup);
                     c.ready = !c.probes.iter().any(|(k, _)| *k == probe::Kind::Readiness);
                 }
+                self.persist(uid);
                 self.emit_event(pod, "Normal", "Started", &alloc::format!("Started container {name}")).await;
                 // postStart: a failing hook kills the container (restartPolicy decides the rest).
                 if let Some(hook) = cspec.and_then(|c| c.pointer(&["lifecycle", "postStart"])).cloned() {
@@ -1541,7 +1899,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             (status, alloc::format!("/api/v1/namespaces/{}/pods/{}/status", p.ns, p.name))
         };
         let text = json::to_string(&status);
-        if self.pods.borrow().get(uid).is_some_and(|p| p.last_status == text) {
+        // The node controller marks pods of an unreachable node not Ready; when this kubelet is
+        // back and the API disagrees with what it computed, write again despite the cache.
+        let ready_of = |v: &Value| v.pointer(&["status", "conditions"]).or_else(|| v.get("conditions")).and_then(Value::as_array).and_then(|c| c.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("Ready"))).and_then(|c| c.get("status")).and_then(Value::as_str).map(String::from);
+        let api_agrees = ready_of(pod) == ready_of(&status);
+        if api_agrees && self.pods.borrow().get(uid).is_some_and(|p| p.last_status == text) {
             return;
         }
         let mut status = status;
@@ -1782,7 +2144,7 @@ mod status_tests {
     use alloc::vec;
 
     fn ctr(name: &str, init: bool, eph: bool, state: CState) -> Ctr {
-        Ctr { name: name.into(), image: "img".into(), init, sidecar: false, eph, restart_count: 0, state, last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: true, ready: true, res: String::new(), resize_restart: false, resize_kill_at: 0 }
+        Ctr { name: name.into(), image: "img".into(), init, sidecar: false, eph, restart_count: 0, state, last_term: None, signaller: None, not_before: 0, backoff_ms: 0, seq: 0, target: None, probes: Vec::new(), started: true, ready: true, res: String::new(), resize_restart: false, resize_kill_at: 0, proc: None, io: None, shim: 0 }
     }
     fn done(code: i32) -> CState {
         CState::Terminated(Term { exit_code: code, reason: if code == 0 { "Completed" } else { "Error" }, started_at: 1, finished_at: 2, message: String::new() })

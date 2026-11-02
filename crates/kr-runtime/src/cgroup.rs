@@ -133,6 +133,18 @@ fn base() -> Result<Vec<u8>, Errno> {
 }
 
 impl Cgroup {
+    /// The existing cgroup `<base>/<parent>/<name>` of a container that is being re-adopted.
+    pub fn open_in(parent: &[u8], name: &[u8]) -> Result<Cgroup, Errno> {
+        let mut path = base()?;
+        if !parent.is_empty() {
+            path.push(b'/');
+            path.extend_from_slice(parent);
+        }
+        path.push(b'/');
+        path.extend_from_slice(name);
+        Ok(Cgroup { dir: ns::open(&nul(&[&path]), ns::O_RDONLY | ns::O_DIRECTORY, 0)?, path })
+    }
+
     /// Creates `<base>/<name>` with `limits` applied.
     pub fn create(name: &[u8], limits: &Limits) -> Result<Cgroup, Errno> {
         Cgroup::create_in(b"", name, limits)
@@ -370,19 +382,52 @@ fn list_subdirs(path: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Kills everything left in the cgroup of pod `uid` (all QoS classes) and removes it.
+pub fn kill_pod(uid: &str) {
+    if uid.is_empty() || uid.bytes().any(|b| b == b'/' || b == 0 || b == b'.') {
+        return;
+    }
+    let Ok(base) = base() else { return };
+    let mut dirs = Vec::new();
+    for qos in ["Guaranteed", "Burstable", "BestEffort"] {
+        let mut path = base.clone();
+        path.push(b'/');
+        path.extend_from_slice(&pod_rel_path(qos, uid));
+        if ns::open(&nul(&[&path]), ns::O_RDONLY | ns::O_DIRECTORY, 0).is_ok() {
+            dirs.extend(post_order(&path, &list_subdirs));
+        }
+    }
+    if !dirs.is_empty() {
+        kill_dirs(&dirs);
+    }
+}
+
 /// Startup cleanup: kills every process left in the `kr-pods` tree by a previous kr run
 /// (containers outlive a killed kubelet as orphans) and removes the cgroups. Does nothing when
 /// cgroups are unavailable or not delegated.
-pub fn kill_stale_pods() {
+pub fn kill_stale_pods(keep: &dyn Fn(&[u8]) -> bool) {
     let Ok(mut root) = base() else { return };
     root.extend_from_slice(b"/kr-pods");
     if ns::open(&nul(&[&root]), ns::O_RDONLY | ns::O_DIRECTORY, 0).is_err() {
         return;
     }
-    let dirs = post_order(&root, &list_subdirs);
+    // A pod cgroup (any path component that `keep` accepts) with its subtree stays.
+    let all = post_order(&root, &list_subdirs);
+    let kept: Vec<&Vec<u8>> = all.iter().filter(|d| d.split(|&b| b == b'/').any(|c| keep(c))).collect();
+    // Neither the kept pods nor their ancestors (killing a parent kills its whole subtree).
+    let dirs: Vec<Vec<u8>> = all
+        .iter()
+        .filter(|d| !kept.iter().any(|k| k.starts_with(d.as_slice()) && (k.len() == d.len() || k[d.len()] == b'/')))
+        .cloned()
+        .collect();
+    kill_dirs(&dirs);
+}
+
+/// Kills every process in the given cgroups (children before parents) and removes them.
+fn kill_dirs(dirs: &[Vec<u8>]) {
     for _ in 0..50 {
         let mut alive = false;
-        for d in &dirs {
+        for d in dirs {
             // cgroup.kill (Linux 5.14+) kills the whole subtree; older kernels get SIGKILL per pid.
             if ns::write_file(&nul(&[d, b"/cgroup.kill"]), b"1").is_err() {
                 if let Ok(procs) = read_small(&nul(&[d, b"/cgroup.procs"])) {
@@ -402,7 +447,7 @@ pub fn kill_stale_pods() {
         let ts = kr_sys::Timespec { tv_sec: 0, tv_nsec: 20_000_000 };
         let _ = ns::nanosleep(&ts);
     }
-    for d in &dirs {
+    for d in dirs {
         rmdir_retry(d);
     }
 }

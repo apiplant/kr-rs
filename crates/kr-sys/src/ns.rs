@@ -546,6 +546,38 @@ pub fn pidfd_open(pid: i32) -> Result<Fd> {
     check(unsafe { syscall2(434, pid as usize, 0) }).map(|fd| Fd(fd as i32))
 }
 
+/// A close-on-exec duplicate of `fd` numbered `min` or higher (fcntl F_DUPFD_CLOEXEC).
+pub fn dup_cloexec_above(fd: i32, min: i32) -> Result<Fd> {
+    #[cfg(target_arch = "x86_64")]
+    const FCNTL: usize = 72;
+    #[cfg(target_arch = "aarch64")]
+    const FCNTL: usize = 25;
+    const F_DUPFD_CLOEXEC: usize = 1030;
+    // SAFETY: plain integer arguments.
+    check(unsafe { syscall3(FCNTL, fd as usize, F_DUPFD_CLOEXEC, min as usize) }).map(|r| Fd(r as i32))
+}
+
+/// Clears close-on-exec on `fd` (fcntl F_SETFD 0).
+pub fn clear_cloexec(fd: i32) -> Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    const FCNTL: usize = 72;
+    #[cfg(target_arch = "aarch64")]
+    const FCNTL: usize = 25;
+    // SAFETY: plain integer arguments (F_SETFD = 2).
+    check(unsafe { syscall3(FCNTL, fd as usize, 2, 0) }).map(|_| ())
+}
+
+/// Closes the descriptors `first..=last` (close_range, Linux 5.9).
+pub fn close_range(first: u32, last: u32) {
+    let _ = close_range_checked(first, last);
+}
+
+/// Like [`close_range`], reporting `ENOSYS` on kernels without it.
+pub fn close_range_checked(first: u32, last: u32) -> Result<()> {
+    // SAFETY: plain integer arguments.
+    check(unsafe { syscall3(436, first as usize, last as usize, 0) }).map(|_| ())
+}
+
 /// Joins the namespaces `nstype` (CLONE_NEW* flags) of the process behind `pidfd`.
 /// The caller must be single-threaded to join a user namespace.
 pub fn setns(pidfd: &Fd, nstype: u64) -> Result<()> {
@@ -725,6 +757,85 @@ mod sock_nr {
 }
 
 const MSG_NOSIGNAL: usize = 0x4000;
+
+#[cfg(target_arch = "x86_64")]
+mod un_nr {
+    pub const SOCKET: usize = 41;
+    pub const CONNECT: usize = 42;
+    pub const BIND: usize = 49;
+    pub const LISTEN: usize = 50;
+    pub const ACCEPT4: usize = 288;
+    pub const FLOCK: usize = 73;
+}
+#[cfg(target_arch = "aarch64")]
+mod un_nr {
+    pub const SOCKET: usize = 198;
+    pub const CONNECT: usize = 203;
+    pub const BIND: usize = 200;
+    pub const LISTEN: usize = 201;
+    pub const ACCEPT4: usize = 242;
+    pub const FLOCK: usize = 32;
+}
+
+/// `sockaddr_un` for a filesystem path (at most 107 bytes) and its length.
+fn sockaddr_un(path: &[u8]) -> Result<([u8; 110], usize)> {
+    if path.is_empty() || path.len() > 107 || path.contains(&0) {
+        return Err(Errno(36)); // ENAMETOOLONG
+    }
+    let mut a = [0u8; 110];
+    a[0] = 1; // AF_UNIX
+    a[2..2 + path.len()].copy_from_slice(path);
+    Ok((a, 2 + path.len() + 1))
+}
+
+/// A listening AF_UNIX stream socket bound to the filesystem `path` (close-on-exec, non-blocking
+/// accept not needed: use with poll). The file is created with mode 0600.
+pub fn unix_listen(path: &[u8]) -> Result<Fd> {
+    let (addr, len) = sockaddr_un(path)?;
+    // SAFETY: plain integer arguments; AF_UNIX = 1, SOCK_STREAM = 1.
+    let fd = Fd(check(unsafe { syscall3(un_nr::SOCKET, 1, 1 | super::O_CLOEXEC as usize, 0) })? as i32);
+    let old = umask(0o177);
+    // SAFETY: addr is a valid sockaddr_un of `len` bytes.
+    let r = check(unsafe { syscall3(un_nr::BIND, fd.raw() as usize, addr.as_ptr() as usize, len) });
+    umask(old);
+    r?;
+    // SAFETY: plain integer arguments.
+    check(unsafe { syscall2(un_nr::LISTEN, fd.raw() as usize, 8) })?;
+    Ok(fd)
+}
+
+/// Accepts one connection (close-on-exec).
+pub fn unix_accept(listener: i32) -> Result<Fd> {
+    // SAFETY: NULL address and length are allowed.
+    check(unsafe { syscall4(un_nr::ACCEPT4, listener as usize, 0, 0, super::O_CLOEXEC as usize) }).map(|fd| Fd(fd as i32))
+}
+
+/// Connects to the AF_UNIX stream socket at `path`.
+pub fn unix_connect(path: &[u8]) -> Result<Fd> {
+    let (addr, len) = sockaddr_un(path)?;
+    // SAFETY: plain integer arguments; AF_UNIX = 1, SOCK_STREAM = 1.
+    let fd = Fd(check(unsafe { syscall3(un_nr::SOCKET, 1, 1 | super::O_CLOEXEC as usize, 0) })? as i32);
+    // SAFETY: addr is a valid sockaddr_un of `len` bytes.
+    check(unsafe { syscall3(un_nr::CONNECT, fd.raw() as usize, addr.as_ptr() as usize, len) })?;
+    Ok(fd)
+}
+
+/// Takes an exclusive advisory lock on `fd` without waiting (flock LOCK_EX | LOCK_NB). The lock
+/// goes away with the descriptor (or the process).
+pub fn flock_exclusive_nb(fd: i32) -> Result<()> {
+    // SAFETY: plain integer arguments; LOCK_EX = 2, LOCK_NB = 4.
+    check(unsafe { syscall2(un_nr::FLOCK, fd as usize, 2 | 4) }).map(|_| ())
+}
+
+/// Sets the file creation mask, returning the previous one.
+pub fn umask(mask: u32) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    const UMASK: usize = 95;
+    #[cfg(target_arch = "aarch64")]
+    const UMASK: usize = 166;
+    // SAFETY: plain integer argument; umask cannot fail.
+    unsafe { syscall1(UMASK, mask as usize) as u32 }
+}
 
 /// Sends `data` plus one file descriptor (SCM_RIGHTS) over a unix socket.
 pub fn send_fd(sock: i32, data: &[u8], fd: i32) -> Result<usize> {

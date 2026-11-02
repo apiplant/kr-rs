@@ -31,7 +31,30 @@ fn pod_status(v: &Value) -> String {
         return "Terminating".into();
     }
     let p = s(v, &["status", "phase"]);
-    if p.is_empty() { "Pending".into() } else { p }
+    if p.is_empty() {
+        return "Pending".into();
+    }
+    // Like kubectl: a waiting/terminated container reason beats the phase.
+    let init = v.pointer(&["status", "initContainerStatuses"]).and_then(Value::as_array).unwrap_or(&[]);
+    let main = v.pointer(&["status", "containerStatuses"]).and_then(Value::as_array).unwrap_or(&[]);
+    for c in init.iter().chain(main.iter()) {
+        let r = s(c, &["state", "waiting", "reason"]);
+        if !r.is_empty() {
+            return r;
+        }
+    }
+    if p == "Failed" || p == "Running" {
+        for c in main {
+            let r = s(c, &["state", "terminated", "reason"]);
+            if !r.is_empty() && p != "Running" {
+                return r;
+            }
+        }
+    }
+    if s(v, &["status", "reason"]) == "NodeLost" || s(v, &["status", "reason"]) == "Evicted" {
+        return s(v, &["status", "reason"]);
+    }
+    p
 }
 
 fn pod_restarts(v: &Value) -> String {
@@ -64,6 +87,46 @@ fn data_count(v: &Value) -> String {
     (a + b).to_string()
 }
 
+fn cond_true(v: &Value, ty: &str) -> bool {
+    v.pointer(&["status", "conditions"]).and_then(Value::as_array).is_some_and(|c| c.iter().any(|x| s(x, &["type"]) == ty && s(x, &["status"]) == "True"))
+}
+
+fn node_status(v: &Value) -> String {
+    let conds = v.pointer(&["status", "conditions"]).and_then(Value::as_array).unwrap_or(&[]);
+    let st = match conds.iter().find(|x| s(x, &["type"]) == "Ready") {
+        Some(c) if s(c, &["status"]) == "True" => "Ready",
+        _ => "NotReady",
+    };
+    if v.pointer(&["spec", "unschedulable"]).and_then(Value::as_bool) == Some(true) { alloc::format!("{st},SchedulingDisabled") } else { st.into() }
+}
+
+fn node_roles(v: &Value) -> String {
+    let l = v.pointer(&["metadata", "labels"]).and_then(Value::as_object).unwrap_or(&[]);
+    let roles: alloc::vec::Vec<&str> = l.iter().filter_map(|(k, _)| k.strip_prefix("node-role.kubernetes.io/")).collect();
+    or_none(roles.join(","))
+}
+
+fn job_status(v: &Value) -> String {
+    if cond_true(v, "Failed") { "Failed".into() } else if cond_true(v, "Complete") { "Complete".into() } else if cond_true(v, "Suspended") { "Suspended".into() } else { "Running".into() }
+}
+
+fn job_duration(v: &Value) -> String {
+    let Some(start) = parse_rfc3339(&s(v, &["status", "startTime"])) else { return String::new() };
+    let end = parse_rfc3339(&s(v, &["status", "completionTime"])).unwrap_or(start);
+    human_duration(end - start)
+}
+
+fn modes(v: &Value, path: &[&str]) -> String {
+    let m: alloc::vec::Vec<&str> = v.pointer(path).and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(|x| match x.as_str()? {
+        "ReadWriteOnce" => Some("RWO"), "ReadOnlyMany" => Some("ROX"), "ReadWriteMany" => Some("RWX"), "ReadWriteOncePod" => Some("RWOP"), o => Some(o),
+    }).collect();
+    m.join(",")
+}
+
+fn cap(v: &Value, path: &[&str]) -> String {
+    s(v, path)
+}
+
 /// Extra columns between NAME and AGE.
 pub fn columns(kind: &str) -> &'static [Col] {
     match kind {
@@ -74,11 +137,47 @@ pub fn columns(kind: &str) -> &'static [Col] {
         "Service" => &[("Type", |v| { let t = s(v, &["spec", "type"]); if t.is_empty() { "ClusterIP".into() } else { t } }), ("Cluster-IP", |v| or_none(s(v, &["spec", "clusterIP"]))), ("Ports", svc_ports)],
         "Namespace" => &[("Status", |v| { let p = s(v, &["status", "phase"]); if p.is_empty() { "Active".into() } else { p } })],
         "ConfigMap" | "Secret" => &[("Data", data_count)],
-        "Node" => &[("Status", |v| {
-            let ready = v.pointer(&["status", "conditions"]).and_then(Value::as_array).and_then(|c| c.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("Ready"))).and_then(|c| c.get("status")).and_then(Value::as_str) == Some("True");
-            if ready { "Ready".into() } else { "NotReady".into() }
-        })],
-        "Job" => &[("Completions", |v| alloc::format!("{}/{}", n(v, &["status", "succeeded"]), v.pointer(&["spec", "completions"]).and_then(Value::as_i64).unwrap_or(1)))],
+        "Node" => &[("Status", node_status), ("Roles", node_roles)],
+        "Job" => &[
+            ("Status", job_status),
+            ("Completions", |v| alloc::format!("{}/{}", n(v, &["status", "succeeded"]), v.pointer(&["spec", "completions"]).and_then(Value::as_i64).unwrap_or(1))),
+            ("Duration", job_duration),
+        ],
+        "CronJob" => &[
+            ("Schedule", |v| s(v, &["spec", "schedule"])),
+            ("Timezone", |v| or_none(s(v, &["spec", "timeZone"]))),
+            ("Suspend", |v| (v.pointer(&["spec", "suspend"]).and_then(Value::as_bool) == Some(true)).to_string().replace("true", "True").replace("false", "False")),
+            ("Active", |v| v.pointer(&["status", "active"]).and_then(Value::as_array).map_or(0, |a| a.len()).to_string()),
+            ("Last Schedule", |v| parse_rfc3339(&s(v, &["status", "lastScheduleTime"])).map_or("<none>".into(), |_| s(v, &["status", "lastScheduleTime"]))),
+        ],
+        "DaemonSet" => &[
+            ("Desired", |v| n(v, &["status", "desiredNumberScheduled"]).to_string()),
+            ("Current", |v| n(v, &["status", "currentNumberScheduled"]).to_string()),
+            ("Ready", |v| n(v, &["status", "numberReady"]).to_string()),
+            ("Up-to-date", |v| n(v, &["status", "updatedNumberScheduled"]).to_string()),
+            ("Available", |v| n(v, &["status", "numberAvailable"]).to_string()),
+        ],
+        "PersistentVolumeClaim" => &[
+            ("Status", |v| s(v, &["status", "phase"])),
+            ("Volume", |v| s(v, &["spec", "volumeName"])),
+            ("Capacity", |v| cap(v, &["status", "capacity", "storage"])),
+            ("Access Modes", |v| modes(v, &["status", "accessModes"])),
+            ("StorageClass", |v| or_none(s(v, &["spec", "storageClassName"]))),
+        ],
+        "PersistentVolume" => &[
+            ("Capacity", |v| cap(v, &["spec", "capacity", "storage"])),
+            ("Access Modes", |v| modes(v, &["spec", "accessModes"])),
+            ("Reclaim Policy", |v| s(v, &["spec", "persistentVolumeReclaimPolicy"])),
+            ("Status", |v| s(v, &["status", "phase"])),
+            ("Claim", |v| { let ns = s(v, &["spec", "claimRef", "namespace"]); if ns.is_empty() { String::new() } else { alloc::format!("{ns}/{}", s(v, &["spec", "claimRef", "name"])) } }),
+            ("StorageClass", |v| or_none(s(v, &["spec", "storageClassName"]))),
+        ],
+        "StorageClass" => &[
+            ("Provisioner", |v| s(v, &["provisioner"])),
+            ("ReclaimPolicy", |v| { let r = s(v, &["reclaimPolicy"]); if r.is_empty() { "Delete".into() } else { r } }),
+            ("VolumeBindingMode", |v| { let r = s(v, &["volumeBindingMode"]); if r.is_empty() { "Immediate".into() } else { r } }),
+            ("AllowVolumeExpansion", |v| (v.get("allowVolumeExpansion").and_then(Value::as_bool) == Some(true)).to_string()),
+        ],
         _ => &[],
     }
 }

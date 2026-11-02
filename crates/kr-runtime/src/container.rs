@@ -16,12 +16,26 @@ use alloc::string::String;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use kr_sys::ns::{self, CloneArgs};
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use kr_sys::{Errno, Fd};
 
 use crate::cgroup::{Cgroup, Limits};
 use crate::network::{self, NetConfig};
 use crate::security;
+
+static SURVIVE: AtomicBool = AtomicBool::new(false);
+
+/// Sandboxes and containers started afterwards outlive this process (the kubelet re-adopts them
+/// after a restart). Without it they get SIGKILL when the parent dies, as `kr ctr run` wants.
+pub fn set_survive_parent(on: bool) {
+    SURVIVE.store(on, Ordering::Relaxed);
+}
+
+fn clear_pdeathsig() {
+    if SURVIVE.load(Ordering::Relaxed) {
+        let _ = ns::prctl(ns::PR_SET_PDEATHSIG, 0);
+    }
+}
 
 pub struct RunSpec<'a> {
     /// Flattened image rootfs (overlay lowerdir).
@@ -166,7 +180,7 @@ fn fork_into(pidfd: &Fd, nstype: u64, cgroup: Option<i32>, child: impl FnOnce() 
             let _ = kr_sys::write(f.raw(), &fmt_u32(pid as u32));
         }
     }
-    Ok(Running { pid, pidfd: Rc::new(pidfd), cgroup: None, host_net: false })
+    Ok(Running { pid, pidfd: Rc::new(pidfd), cgroup: None, host_net: false, exit_file: None, shim: 0 })
 }
 
 /// Starts `spec` inside a running container (all of its namespaces and its cgroup), with the
@@ -211,6 +225,19 @@ impl Sandbox {
         Ok(Sandbox { pid, pidfd: ns::pidfd_open(pid)?, host_net: false })
     }
 
+    /// A sandbox started by a previous run of this process, if `pid` is still the process that
+    /// started at `start` (clock ticks).
+    pub fn adopt(pid: i32, start: u64, host_net: bool) -> Option<Sandbox> {
+        if network::proc_start(pid as u32) != Some(start) {
+            return None;
+        }
+        let pidfd = ns::pidfd_open(pid).ok()?;
+        if network::proc_start(pid as u32) != Some(start) {
+            return None;
+        }
+        Some(Sandbox { pid, pidfd, host_net })
+    }
+
     /// A target for joining the pod's network (probes); the sandbox owns the netns.
     pub fn target(&self) -> Result<ExecTarget, Errno> {
         Ok(ExecTarget { pidfd: Rc::new(ns::pidfd_open(self.pid)?), cgroup: None, host_net: self.host_net })
@@ -220,6 +247,10 @@ impl Sandbox {
     pub fn stop(&self) {
         let _ = ns::pidfd_send_signal(&self.pidfd, ns::SIGKILL);
         let _ = ns::wait4(self.pid);
+    }
+
+    pub fn is_host_net(&self) -> bool {
+        self.host_net
     }
 
     pub fn is_alive(&self) -> bool {
@@ -379,6 +410,7 @@ fn sandbox_inner(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfi
             let _ = ns::sigmask_reset();
             let argv: [*const u8; 3] = [b"kr\0".as_ptr(), b"pause\0".as_ptr(), core::ptr::null()];
             let envp: [*const u8; 1] = [core::ptr::null()];
+            clear_pdeathsig();
             let _ = ns::execveat_fd(exe, &argv, &envp);
         }
         ns::close_from(3);
@@ -487,7 +519,14 @@ pub struct Running {
     pidfd: Rc<Fd>,
     cgroup: Option<Cgroup>,
     host_net: bool,
+    /// Run by a shim (see [`start_detached`]): not our child. Its exit status is in this file.
+    exit_file: Option<Vec<u8>>,
+    /// The shim process (parent of the container), if any.
+    shim: i32,
 }
+
+/// Exit code reported when a shim's exit file is missing (the shim itself was killed).
+pub const UNKNOWN_EXIT: i32 = 255;
 
 /// Sends signals to a container's pid 1; usable from another task while `wait` runs.
 #[derive(Clone)]
@@ -515,9 +554,51 @@ impl Running {
         ExecTarget { pidfd: self.pidfd.clone(), cgroup: self.cgroup_fd(), host_net: self.host_net }
     }
 
+    /// A container run by a shim of a previous run of this process, or `None` when `pid` is gone
+    /// or is not the process that started at `start` (clock ticks).
+    pub fn adopt(pid: i32, start: u64, shim: i32, host_net: bool, cgroup: Option<Cgroup>, exit_file: Vec<u8>) -> Option<Running> {
+        if network::proc_start(pid as u32) != Some(start) {
+            return None;
+        }
+        let pidfd = ns::pidfd_open(pid).ok()?;
+        // Closed in between: the pid was recycled.
+        if network::proc_start(pid as u32) != Some(start) {
+            return None;
+        }
+        Some(Running { pid, pidfd: Rc::new(pidfd), cgroup, host_net, exit_file: Some(exit_file), shim })
+    }
+
+    pub fn shim_pid(&self) -> i32 {
+        self.shim
+    }
+
     /// Waits for exit without blocking the executor (pidfd becomes readable on exit).
     pub async fn wait(self) -> Result<Exit, RunError> {
-        let Running { pid: _, pidfd, cgroup, host_net: _ } = self;
+        if let Some(path) = self.exit_file.clone() {
+            // Not our child: the shim reaps it and records the status.
+            let fd = kr_rt::exec::Async::new(self.pidfd.clone()).map_err(err("register pidfd"))?;
+            while network::proc_start(self.pid as u32).is_some() {
+                fd.wait_readable().await;
+                // A zombie the shim has not reaped yet still reads as readable; do not spin.
+                if network::proc_start(self.pid as u32).is_some() {
+                    kr_rt::exec::sleep(20).await;
+                }
+            }
+            let mut found = None;
+            for _ in 0..100 {
+                if let Some(e) = read_exit_file(&path) {
+                    found = Some(e);
+                    break;
+                }
+                kr_rt::exec::sleep(20).await;
+            }
+            let _ = kr_sys::fs::unlinkat(ns::AT_FDCWD, &path, 0);
+            if let Some(c) = &self.cgroup {
+                c.remove();
+            }
+            return Ok(found.unwrap_or(Exit { code: UNKNOWN_EXIT, oom_killed: false }));
+        }
+        let Running { pid: _, pidfd, cgroup, host_net: _, exit_file: _, shim: _ } = self;
         let code = match kr_rt::exec::Async::new(pidfd) {
             Ok(fd) => loop {
                 match ns::pidfd_try_wait(fd.get_ref()) {
@@ -610,7 +691,7 @@ pub fn start(spec: &RunSpec) -> Result<Running, RunError> {
 
     drop(go_r);
     drop(rep_w);
-    let running = Running { pid, pidfd: Rc::new(Fd(pidfd)), cgroup, host_net: false };
+    let running = Running { pid, pidfd: Rc::new(Fd(pidfd)), cgroup, host_net: false, exit_file: None, shim: 0 };
     if let Err(e) = spec.maps.apply(pid, uid, gid) {
         let _ = ns::kill(pid, ns::SIGKILL);
         let _ = ns::wait4(pid);
@@ -944,7 +1025,7 @@ fn start_in_sandbox(spec: &RunSpec, sb: &Sandbox, cgroup: Option<Cgroup>, rootle
             return Err(RunError { step: "pidfd_open", errno: e });
         }
     };
-    let running = Running { pid, pidfd: Rc::new(pidfd), cgroup, host_net: sb.host_net };
+    let running = Running { pid, pidfd: Rc::new(pidfd), cgroup, host_net: sb.host_net, exit_file: None, shim: 0 };
     let _ = kr_sys::write(go_w.raw(), b"g");
     drop(go_w);
     let mut rep = [0u8; 3];
@@ -1286,6 +1367,16 @@ fn populate_dev() -> Result<(), Errno> {
         drop(ns::open(&target, ns::O_WRONLY | ns::O_CREAT, 0o666)?);
         ns::mount(Some(&source), &target, None, ns::MS_BIND, None)?;
     }
+    // Standard symlinks (OCI runtime spec): bash process substitution needs /dev/fd/N.
+    for (target, link) in [
+        (&b"/proc/self/fd\0"[..], &b"/dev/fd\0"[..]),
+        (b"/proc/self/fd/0\0", b"/dev/stdin\0"),
+        (b"/proc/self/fd/1\0", b"/dev/stdout\0"),
+        (b"/proc/self/fd/2\0", b"/dev/stderr\0"),
+        (b"pts/ptmx\0", b"/dev/ptmx\0"),
+    ] {
+        let _ = kr_sys::fs::symlinkat(target, kr_sys::fs::AT_FDCWD, link);
+    }
     for dir in [&b"/dev/pts\0"[..], b"/dev/shm\0"] {
         let _ = ns::mkdir(dir, 0o755);
     }
@@ -1326,4 +1417,321 @@ fn exec_argv(spec_argv: &[Vec<u8>], spec_env: &[Vec<u8>]) -> (u8, Errno) {
         }
     }
     (14, last)
+}
+
+/// Checks that the kernel has what shims and sandboxes that outlive the kubelet need: `pidfd_open`
+/// (5.3), `clone3` (5.3) and `close_range` (5.9). `Err` names the first missing piece; the
+/// kubelet then runs containers as its own children, which die with it.
+pub fn survive_prerequisites() -> Result<(), &'static str> {
+    if ns::pidfd_open(kr_sys::fs::getpid() as i32).is_err() {
+        return Err("pidfd_open (Linux 5.3)");
+    }
+    // An empty range far above any descriptor: only ENOSYS means the call is missing.
+    if let Err(Errno(38)) = ns::close_range_checked(1 << 30, (1 << 30) + 1) {
+        return Err("close_range (Linux 5.9)");
+    }
+    let mut a = CloneArgs { exit_signal: 0, ..Default::default() };
+    // A clone3 with invalid arguments fails with EINVAL where it exists, ENOSYS where it does not.
+    a.flags = u64::MAX;
+    // SAFETY: the flags are invalid, so the kernel creates nothing.
+    if let Err(Errno(38)) = unsafe { ns::clone3(&mut a) } {
+        return Err("clone3 (Linux 5.3)");
+    }
+    Ok(())
+}
+
+/// Starts `kr <args>` as a detached process (own session, empty environment, no inherited
+/// descriptors but `fd`, which becomes descriptor 3) that outlives this one. Returns its pid.
+pub fn spawn_helper(args: &[&[u8]], fd: i32) -> Result<i32, RunError> {
+    init_exe_fd();
+    let exe = EXE_FD.load(Ordering::Relaxed);
+    if exe < 3 {
+        return Err(RunError { step: "no executable fd", errno: Errno(2) });
+    }
+    let (pid_r, pid_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
+    let argv_c: Vec<Vec<u8>> = core::iter::once(&b"kr"[..]).chain(args.iter().copied()).map(|a| cstr(&[a])).collect();
+    let mut argv: Vec<*const u8> = argv_c.iter().map(|a| a.as_ptr()).collect();
+    argv.push(core::ptr::null());
+    let mut a = CloneArgs { exit_signal: ns::SIGCHLD as u64, ..Default::default() };
+    // SAFETY: single-threaded runtime (ADR-005).
+    let tmp = unsafe { ns::clone3(&mut a) }.map_err(err("clone3 helper"))?;
+    if tmp == 0 {
+        drop(pid_r);
+        let _ = ns::setsid();
+        let mut b = CloneArgs { exit_signal: ns::SIGCHLD as u64, ..Default::default() };
+        // SAFETY: as above.
+        match unsafe { ns::clone3(&mut b) } {
+            Ok(0) => {
+                let _ = kr_sys::write(pid_w.raw(), &(kr_sys::fs::getpid()).to_le_bytes());
+                // The executable moves out of the way (close-on-exec) while fd 3 is set up.
+                let Ok(exe_fd) = ns::dup_cloexec_above(exe, 100) else { kr_sys::exit_group(126) };
+                if fd != 3 && ns::dup_to(fd, 3).is_err() {
+                    kr_sys::exit_group(126);
+                }
+                let _ = ns::sigmask_reset();
+                // fd 3 must stay open across the exec; everything else goes.
+                ns::close_range(4, (exe_fd.raw() - 1) as u32);
+                ns::close_range(exe_fd.raw() as u32 + 1, u32::MAX);
+                let envp: [*const u8; 1] = [core::ptr::null()];
+                let _ = ns::execveat_fd(exe_fd.raw(), &argv, &envp);
+                kr_sys::exit_group(127)
+            }
+            Ok(_) => kr_sys::exit_group(0),
+            Err(_) => kr_sys::exit_group(1),
+        }
+    }
+    drop(pid_w);
+    let _ = ns::wait4(tmp);
+    let mut pb = [0u8; 4];
+    if read_full(&pid_r, &mut pb) != 4 {
+        return Err(RunError { step: "spawn helper", errno: Errno(5) });
+    }
+    Ok(u32::from_le_bytes(pb) as i32)
+}
+
+/// `<code> <oom 0|1>` written by a shim when its container is gone.
+pub fn read_exit_file(path: &[u8]) -> Option<Exit> {
+    let raw = kr_sys::fs::read_file(path, 64).ok()?;
+    let text = core::str::from_utf8(&raw).ok()?;
+    let mut f = text.split_whitespace();
+    let code: i32 = f.next()?.parse().ok()?;
+    let oom = f.next()? == "1";
+    Some(Exit { code, oom_killed: oom })
+}
+
+/// What a shim keeps open for the container's terminal or stdin.
+pub struct ShimIo<'a> {
+    /// Descriptors the shim must keep (the parent's end of the stdin socket, the pty master).
+    pub keep_fds: &'a [i32],
+    /// With a pty: its master and the log file the shim copies the output to.
+    pub tty_master: Option<i32>,
+    pub tty_log: &'a [u8],
+    /// The descriptor the shim hands to whoever connects to `io_sock` (the pty master or the
+    /// stdin socket's parent end), so a restarted kubelet can reattach.
+    pub io_fd: Option<i32>,
+    pub io_sock: &'a [u8],
+}
+
+/// Like [`start`], but the container's parent is a detached *shim* process that outlives this one:
+/// it reaps the container, writes its exit status to `exit_path`, copies pty output to the log and
+/// holds the stdin socket / pty master open (handed out on a unix socket, see `ShimIo::io_sock`).
+/// The container keeps its death signal, so killing the shim kills it.
+pub fn start_detached(spec: &RunSpec, exit_path: &[u8], io: &ShimIo) -> Result<Running, RunError> {
+    init_exe_fd();
+    let (rep_r, rep_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
+    // Double fork: the shim is nobody's child to reap, and has its own session.
+    let mut a = CloneArgs { exit_signal: ns::SIGCHLD as u64, ..Default::default() };
+    // SAFETY: single-threaded runtime (ADR-005).
+    let tmp = unsafe { ns::clone3(&mut a) }.map_err(err("clone3 shim"))?;
+    if tmp == 0 {
+        drop(rep_r);
+        let _ = ns::setsid();
+        let mut b = CloneArgs { exit_signal: ns::SIGCHLD as u64, ..Default::default() };
+        // SAFETY: as above.
+        match unsafe { ns::clone3(&mut b) } {
+            Ok(0) => shim_main(spec, rep_w, exit_path, io),
+            Ok(_) => kr_sys::exit_group(0),
+            Err(_) => kr_sys::exit_group(1),
+        }
+    }
+    drop(rep_w);
+    let _ = ns::wait4(tmp);
+    let mut head = [0u8; 9];
+    if read_full(&rep_r, &mut head) != 9 {
+        return Err(RunError { step: "shim", errno: Errno(5) });
+    }
+    let word = |o: usize| u32::from_le_bytes([head[o], head[o + 1], head[o + 2], head[o + 3]]);
+    if head[0] != 0 {
+        // Failure: errno, then the step name's length and bytes.
+        let errno = Errno(word(1) as i32);
+        let mut name = alloc::vec![0u8; word(5) as usize];
+        read_full(&rep_r, &mut name);
+        let step: &'static str = alloc::boxed::Box::leak(String::from_utf8_lossy(&name).into_owned().into_boxed_str());
+        return Err(RunError { step, errno });
+    }
+    let (pid, shim) = (word(1) as i32, word(5) as i32);
+    // The shim has not reaped the container, so the pid cannot have been recycled.
+    let pidfd = ns::pidfd_open(pid).map_err(err("pidfd_open"))?;
+    let cgroup = if spec.limits.is_empty() { None } else { Cgroup::open_in(spec.cgroup_parent, spec.id).ok() };
+    Ok(Running { pid, pidfd: Rc::new(pidfd), cgroup, host_net: spec.sandbox.is_some_and(|s| s.host_net), exit_file: Some(cstr(&[exit_path])), shim })
+}
+
+/// The shim: runs in a forked copy of the kubelet, so it keeps the whole spec in memory.
+fn shim_main(spec: &RunSpec, rep: Fd, exit_path: &[u8], io: &ShimIo) -> ! {
+    let _ = ns::sigmask_reset();
+    // Nothing of the parent's sockets or files may stay open here: they would outlive it.
+    let mut keep: Vec<i32> = io.keep_fds.to_vec();
+    keep.extend([0, 1, 2, rep.raw()]);
+    keep.extend(spec.log_fd);
+    keep.extend(spec.stdin_fd);
+    keep.extend(spec.tty_fd);
+    keep.extend(spec.sandbox.map(|s| s.pidfd.raw()));
+    keep.extend(io.tty_master);
+    keep.push(EXE_FD.load(Ordering::Relaxed)); // for the exec into `kr shim`
+    keep.retain(|&f| f >= 0);
+    keep.sort_unstable();
+    keep.dedup();
+    let mut next = 0i64;
+    for &k in &keep {
+        if (k as i64) > next {
+            ns::close_range(next as u32, (k - 1) as u32);
+        }
+        next = k as i64 + 1;
+    }
+    ns::close_range(next as u32, u32::MAX);
+    let run = match start(spec) {
+        Ok(r) => r,
+        Err(e) => {
+            let mut m = Vec::new();
+            m.push(1u8);
+            m.extend_from_slice(&(e.errno.0 as u32).to_le_bytes());
+            m.extend_from_slice(&(e.step.len() as u32).to_le_bytes());
+            m.extend_from_slice(e.step.as_bytes());
+            let _ = kr_sys::write(rep.raw(), &m);
+            kr_sys::exit_group(1)
+        }
+    };
+    let mut m = Vec::new();
+    m.push(0u8);
+    m.extend_from_slice(&(run.pid as u32).to_le_bytes());
+    m.extend_from_slice(&(kr_sys::fs::getpid() as u32).to_le_bytes());
+    let _ = kr_sys::write(rep.raw(), &m);
+    drop(rep);
+    // Become a tiny fresh process (no copy of this one's memory, which holds credentials) that
+    // stays the container's parent: children survive their parent's exec.
+    let exe = EXE_FD.load(Ordering::Relaxed);
+    let cg = run.cgroup.as_ref().map(|_| (spec.cgroup_parent, spec.id));
+    if exe >= 3 {
+        let master = io.tty_master.unwrap_or(-1);
+        let mut keep: Vec<i32> = io.keep_fds.to_vec();
+        keep.extend(io.tty_master);
+        if keep.iter().all(|&f| ns::clear_cloexec(f).is_ok()) {
+            let num = |n: i64| cstr(&[alloc::format!("{n}").as_bytes()]);
+            let argv_c: Vec<Vec<u8>> = alloc::vec![
+                cstr(&[b"kr"]),
+                cstr(&[b"shim"]),
+                num(run.pid as i64),
+                cstr(&[exit_path]),
+                num(master as i64),
+                cstr(&[if io.tty_log.is_empty() { b"-" } else { io.tty_log }]),
+                cstr(&[cg.map_or(&b"-"[..], |c| if c.0.is_empty() { b"." } else { c.0 })]),
+                cstr(&[cg.map_or(&b"-"[..], |c| c.1)]),
+                num(io.io_fd.unwrap_or(-1) as i64),
+                cstr(&[if io.io_sock.is_empty() { b"-" } else { io.io_sock }]),
+            ];
+            let mut argv: Vec<*const u8> = argv_c.iter().map(|a| a.as_ptr()).collect();
+            argv.push(core::ptr::null());
+            let envp: [*const u8; 1] = [core::ptr::null()];
+            // Keep only the shim's own descriptors (and the executable, close-on-exec).
+            if let Ok(exe_fd) = ns::dup_cloexec_above(exe, 200) {
+                let mut keepv = keep.clone();
+                keepv.extend([0, 1, 2, exe_fd.raw()]);
+                keepv.sort_unstable();
+                keepv.dedup();
+                let mut next = 0i64;
+                for &k in &keepv {
+                    if (k as i64) > next {
+                        ns::close_range(next as u32, (k - 1) as u32);
+                    }
+                    next = k as i64 + 1;
+                }
+                ns::close_range(next as u32, u32::MAX);
+                let _ = ns::execveat_fd(exe_fd.raw(), &argv, &envp);
+            }
+        }
+    }
+    // No exec (no executable fd): wait in this process.
+    shim_wait(run.pid, exit_path, io.tty_master, io.tty_log, run.cgroup, io.io_fd.map(|f| (f, io.io_sock)))
+}
+
+/// What a shim does for the rest of its life: copy pty output to the log, reap the container,
+/// record its exit status in `exit_path`. Never returns.
+pub fn shim_wait(pid: i32, exit_path: &[u8], tty_master: Option<i32>, tty_log: &[u8], cgroup: Option<Cgroup>, io: Option<(i32, &[u8])>) -> ! {
+    const PIDFD: u64 = 1;
+    const MASTER: u64 = 2;
+    const LISTENER: u64 = 3;
+    let Ok(pidfd) = ns::pidfd_open(pid) else { kr_sys::exit_group(1) };
+    let Ok(ep) = kr_sys::epoll_create1(kr_sys::EPOLL_CLOEXEC) else { kr_sys::exit_group(1) };
+    let add = |fd: i32, tag: u64| {
+        let mut ev = kr_sys::EpollEvent { events: kr_sys::EPOLLIN, data: tag };
+        kr_sys::epoll_ctl(ep.raw(), kr_sys::EPOLL_CTL_ADD, fd, Some(&mut ev)).is_ok()
+    };
+    add(pidfd.raw(), PIDFD);
+    // The descriptor for `attach` is served on a unix socket (0600), so any later kubelet can
+    // fetch it without ptrace rights.
+    let listener = io.and_then(|(_, path)| {
+        let _ = kr_sys::fs::unlinkat(ns::AT_FDCWD, &cstr(&[path]), 0);
+        ns::unix_listen(path).ok()
+    });
+    if let Some(l) = &listener {
+        add(l.raw(), LISTENER);
+    }
+    // Terminal output goes to the log until the container is gone.
+    let log = tty_master.and_then(|_| ns::open(&cstr(&[tty_log]), ns::O_WRONLY | ns::O_CREAT | 0o2000, 0o640).ok());
+    let mut master_open = tty_master.is_some_and(|m| add(m, MASTER));
+    let mut buf = [0u8; 8192];
+    let mut events = [kr_sys::EpollEvent::zeroed(); 4];
+    let mut exited = false;
+    while !exited {
+        let n = match kr_sys::epoll_wait(ep.raw(), &mut events, -1) {
+            Ok(n) => n,
+            Err(Errno(4)) => continue,
+            Err(_) => break,
+        };
+        for ev in &events[..n] {
+            let tag = ev.data;
+            match tag {
+                PIDFD => exited = true,
+                MASTER => match tty_master.map(|m| kr_sys::read(m, &mut buf)) {
+                    Some(Ok(k)) if k > 0 => {
+                        if let Some(l) = &log {
+                            let _ = kr_sys::write(l.raw(), &buf[..k]);
+                        }
+                    }
+                    Some(Err(Errno(4))) | Some(Err(Errno(11))) => {}
+                    _ => {
+                        // EIO: the slave side is closed; stop watching so we do not spin.
+                        master_open = false;
+                        if let Some(m) = tty_master {
+                            let _ = kr_sys::epoll_ctl(ep.raw(), kr_sys::EPOLL_CTL_DEL, m, None);
+                        }
+                    }
+                },
+                LISTENER => {
+                    if let (Some(l), Some((fd, _))) = (&listener, io) {
+                        if let Ok(conn) = ns::unix_accept(l.raw()) {
+                            let _ = ns::send_fd(conn.raw(), b"x", fd);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let _ = master_open;
+    // What is left in the pty buffer after the exit.
+    if let Some(master) = tty_master {
+        while let Ok(k) = kr_sys::read(master, &mut buf) {
+            if k == 0 {
+                break;
+            }
+            if let Some(l) = &log {
+                let _ = kr_sys::write(l.raw(), &buf[..k]);
+            }
+        }
+    }
+    if let Some((_, path)) = io {
+        let _ = kr_sys::fs::unlinkat(ns::AT_FDCWD, &cstr(&[path]), 0);
+    }
+    let status = ns::wait4(pid);
+    let code = status.map(ns::exit_code).unwrap_or(UNKNOWN_EXIT);
+    let oom = finish_cgroup(&cgroup);
+    let text = alloc::format!("{code} {}\n", oom as u8);
+    let tmp = cstr(&[exit_path, b".tmp"]);
+    if let Ok(f) = ns::open(&tmp, ns::O_WRONLY | ns::O_CREAT | 0o1000, 0o600) {
+        let _ = kr_sys::write(f.raw(), text.as_bytes());
+        drop(f);
+        let _ = kr_sys::fs::renameat2(ns::AT_FDCWD, &tmp, ns::AT_FDCWD, &cstr(&[exit_path]), 0);
+    }
+    kr_sys::exit_group(0)
 }

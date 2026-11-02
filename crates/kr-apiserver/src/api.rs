@@ -1899,6 +1899,7 @@ impl ApiServer {
         if rt.res.plural == "resourcequotas" {
             crate::quota::validate(o).map_err(ApiError::invalid)?;
         }
+        merge_string_data(rt.res, o);
         admit_immutable(rt.res, o, None)?;
         self.admit_quota(rt, o, None)?;
         {
@@ -1997,6 +1998,7 @@ impl ApiServer {
             crate::quota::validate(&new).map_err(ApiError::invalid)?;
         }
         if !status {
+            merge_string_data(rt.res, &mut new);
             admit_immutable(rt.res, &new, Some(&old))?;
         }
         // Usage can change on update only for these kinds (a Service type/port change moves
@@ -3276,6 +3278,19 @@ impl ApiServer {
         };
         let timeout_s: u64 = q.get("timeoutSeconds").and_then(|t| t.parse().ok()).unwrap_or(1800).min(3600);
         Ok(Reply::Watch(WatchStream { watcher, initial, ls, fs, deadline: Some(Box::pin(kr_rt::exec::sleep(timeout_s * 1000))), gv: None }))
+    }
+}
+
+/// Secret `stringData` is write-only: fold it into `data` (base64, overriding existing keys) and drop it.
+fn merge_string_data(res: &Resource, o: &mut Value) {
+    if !(res.group.is_empty() && res.plural == "secrets") {
+        return;
+    }
+    let Some(Value::Object(m)) = o.remove("stringData") else { return };
+    for (k, v) in m.iter() {
+        if let Some(s) = v.as_str() {
+            o.entry_object("data").set(k, Value::from(kr_fmt::base64::encode(s.as_bytes())));
+        }
     }
 }
 

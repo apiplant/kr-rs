@@ -348,6 +348,18 @@ pub struct Lease {
 }
 
 impl Lease {
+    /// The lease of `ip` in `dir` for the pod `owner`, which survived a restart.
+    pub fn adopt(dir: &[u8], owner: &[u8], ip: [u8; 4]) -> Option<Lease> {
+        let mut path = dir.to_vec();
+        path.push(b'/');
+        path.extend_from_slice(&dotted(ip));
+        path.push(0);
+        // Normally still there; recreated (and claimed) if it was lost.
+        let fd = ns::open(&path, ns::O_WRONLY | ns::O_CREAT, 0o600).ok()?;
+        let _ = kr_sys::write(fd.raw(), owner);
+        Some(Lease { ip, path })
+    }
+
     pub fn release(self) {
         let _ = kr_sys::fs::unlinkat(ns::AT_FDCWD, &self.path, 0);
     }
@@ -379,6 +391,43 @@ fn dotted(ip: [u8; 4]) -> Vec<u8> {
 /// container id) is written into the lease for debugging.
 pub fn allocate(dir: &[u8], owner: &[u8]) -> Result<Lease, Errno> {
     allocate_in(dir, owner, &PodNet::default())
+}
+
+/// The lease `owner` already holds in `dir` inside the pod subnet (kept when a pod is started
+/// again after the kubelet crashed before recording it), or a fresh one.
+pub fn allocate_or_reuse(dir: &[u8], owner: &[u8], pn: &PodNet) -> Result<Lease, Errno> {
+    let mut d = dir.to_vec();
+    d.push(0);
+    if let Ok(fd) = ns::open(&d, ns::O_RDONLY | ns::O_DIRECTORY, 0) {
+        let base = u32::from_be_bytes(pn.subnet);
+        let size = 1u32 << (32 - pn.prefix);
+        let names: Vec<Vec<u8>> = kr_sys::fs::read_dir(&fd).filter_map(Result::ok).map(|e| e.name).collect();
+        for name in names {
+            let Some(ip) = core::str::from_utf8(&name).ok().and_then(|n| {
+                let mut o = [0u8; 4];
+                let mut it = n.split('.');
+                for b in o.iter_mut() {
+                    *b = it.next()?.parse().ok()?;
+                }
+                it.next().is_none().then_some(o)
+            }) else { continue };
+            let n = u32::from_be_bytes(ip);
+            if n < base || n - base >= size {
+                continue;
+            }
+            let mut path = dir.to_vec();
+            path.push(b'/');
+            path.extend_from_slice(&name);
+            path.push(0);
+            let Ok(f) = ns::open(&path, ns::O_RDONLY, 0) else { continue };
+            let mut buf = [0u8; 256];
+            let len = kr_sys::read(f.raw(), &mut buf).unwrap_or(0);
+            if &buf[..len] == owner {
+                return Ok(Lease { ip, path });
+            }
+        }
+    }
+    allocate_in(dir, owner, pn)
 }
 
 pub fn allocate_in(dir: &[u8], owner: &[u8], pn: &PodNet) -> Result<Lease, Errno> {

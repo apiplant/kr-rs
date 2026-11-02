@@ -17,6 +17,7 @@
 //! * [`namespace`]: finishes the deletion of Terminating namespaces (empties, then finalizes).
 //! * [`crd`]: finishes the deletion of Terminating CustomResourceDefinitions (deletes instances, drops the finalizer).
 //! * [`pvc`]: PVC/PV binding, a local-path provisioner and pvc-protection.
+//! * [`nodelifecycle`]: marks nodes without heartbeats Unknown, taints them and evicts their pods.
 //! * [`gc`]: deletes dependents whose owner no longer exists (background propagation).
 //!
 //! All of them are *level-triggered*. A watch (list, remember the list's `resourceVersion`,
@@ -47,6 +48,7 @@ pub mod job;
 pub mod mirror;
 pub mod crd;
 pub mod namespace;
+pub mod nodelifecycle;
 pub mod pvc;
 pub mod quota;
 pub mod replicaset;
@@ -113,6 +115,7 @@ pub async fn run_all_with<C: Client + Clone + 'static>(c: C, cfg: Config) {
         spawn(crd::run(c.clone(), cfg)),
         spawn(svm::run(c.clone(), cfg)),
         spawn(pvc::run(c.clone(), cfg)),
+        spawn(nodelifecycle::run(c.clone(), cfg)),
         spawn(gc::run(c, cfg)),
     ]);
     // A never-woken future would let the executor free this task (and abort the guard).

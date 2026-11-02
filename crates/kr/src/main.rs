@@ -32,6 +32,25 @@ fn kr_main(mut args: Args) -> i32 {
     match args.next() {
         // Pod sandbox holder: no allocation, no output, just wait for a signal.
         Some(b"pause") => kr_sys::ns::pause_loop(),
+        // Rootless pod egress (ADR-031) in a process of its own, so pods keep their outbound
+        // connectivity while the kubelet restarts. The TUN device is descriptor 3.
+        // Container shim (parent of one container): kr shim PID EXIT-FILE MASTER-FD TTY-LOG CG-PARENT CG-ID IO-FD IO-SOCKET
+        Some(b"shim") => {
+            let mut a = [&b""[..]; 8];
+            for slot in a.iter_mut() {
+                *slot = args.next().unwrap_or(b"");
+            }
+            let num = |b: &[u8]| core::str::from_utf8(b).ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(-1);
+            let (pid, master) = (num(a[0]), num(a[2]));
+            let cg = (a[4] != b"-").then(|| kr_runtime::cgroup::Cgroup::open_in(if a[4] == b"." { b"" } else { a[4] }, a[5]).ok()).flatten();
+            let io_fd = num(a[6]);
+            let io = (io_fd >= 0 && a[7] != b"-").then_some((io_fd, a[7]));
+            kr_runtime::container::shim_wait(pid, a[1], (master >= 0).then_some(master), if a[3] == b"-" { b"" } else { a[3] }, cg, io)
+        }
+        Some(b"egress") => {
+            exec::block_on(kr_kubelet::egress::run(Fd(3)));
+            0
+        }
         Some(b"version") => {
             print(b"kr 0.0.1\n");
             0

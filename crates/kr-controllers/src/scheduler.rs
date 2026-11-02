@@ -505,6 +505,13 @@ pub fn untolerated_taint(pod: &Value, node: &Value) -> bool {
     taints.iter().filter(|t| matches!(str_at(t, &["effect"]), "NoSchedule" | "NoExecute")).any(|t| !tols.iter().any(|tol| tolerates(tol, t)))
 }
 
+/// True when a `NoExecute` taint of the node is not tolerated by the pod (the only taint effect
+/// that matters for a pod that already runs there).
+pub fn untolerated_noexecute(pod: &Value, node: &Value) -> bool {
+    let tols = pod.pointer(&["spec", "tolerations"]).and_then(Value::as_array).unwrap_or(&[]);
+    node.pointer(&["spec", "taints"]).and_then(Value::as_array).unwrap_or(&[]).iter().filter(|t| str_at(t, &["effect"]) == "NoExecute").any(|t| !tols.iter().any(|tol| tolerates(tol, t)))
+}
+
 pub fn selector_matches(pod: &Value, node: &Value) -> bool {
     let Some(sel) = pod.pointer(&["spec", "nodeSelector"]).and_then(Value::as_object) else { return true };
     sel.iter().all(|(k, v)| node.pointer(&["metadata", "labels", k]).and_then(Value::as_str) == v.as_str())

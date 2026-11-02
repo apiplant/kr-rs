@@ -53,8 +53,9 @@ fn status(cfg: &Config) -> String {
 pub async fn register<C: Client>(c: &C, cfg: &Config) {
     let name = &cfg.node_name;
     let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
+    let role = if cfg.control_plane { r#","node-role.kubernetes.io/control-plane":"""# } else { "" };
     let node = alloc::format!(
-        r#"{{"apiVersion":"v1","kind":"Node","metadata":{{"name":"{name}","labels":{{"kubernetes.io/hostname":"{name}","kubernetes.io/os":"linux","kubernetes.io/arch":"{arch}","node-role.kubernetes.io/control-plane":""}}}},"spec":{{}}}}"#
+        r#"{{"apiVersion":"v1","kind":"Node","metadata":{{"name":"{name}","labels":{{"kubernetes.io/hostname":"{name}","kubernetes.io/os":"linux","kubernetes.io/arch":"{arch}"{role}}}}},"spec":{{}}}}"#
     );
     let _ = c.create("/api/v1/nodes", &json::parse(node.as_bytes()).unwrap()).await;
     update_status(c, cfg).await;
@@ -85,7 +86,7 @@ pub async fn heartbeat_loop<C: Client>(c: &C, cfg: &Config) {
         kr_rt::exec::sleep(10_000).await;
         renew_lease(c, cfg).await;
         ticks += 1;
-        if ticks % 6 == 0 {
+        if ticks % 3 == 0 {
             update_status(c, cfg).await;
         }
     }

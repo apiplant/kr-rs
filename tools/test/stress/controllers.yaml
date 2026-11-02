@@ -1,0 +1,48 @@
+apiVersion: batch/v1
+kind: Job
+metadata: {name: pi, namespace: apps}
+spec:
+  completions: 6
+  parallelism: 3
+  template:
+    spec:
+      restartPolicy: Never
+      containers: [{name: c, image: alpine:3.20, command: [sh, -c, "echo done $HOSTNAME; sleep 2"]}]
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: tick, namespace: apps}
+spec:
+  schedule: "* * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers: [{name: c, image: alpine:3.20, command: [sh, -c, "date"]}]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: ds, namespace: apps}
+spec:
+  selector: {matchLabels: {app: ds}}
+  template:
+    metadata: {labels: {app: ds}}
+    spec:
+      containers:
+      - name: c
+        image: alpine:3.20
+        command: [sh, -c, "echo $NODE; sleep 1d"]
+        env: [{name: NODE, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}]
+        volumeMounts: [{name: h, mountPath: /host-etc, readOnly: true}]
+      volumes: [{name: h, hostPath: {path: /etc}}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: multi, namespace: apps}
+spec:
+  initContainers: [{name: init, image: alpine:3.20, command: [sh, -c, "echo hi > /w/f"], volumeMounts: [{name: w, mountPath: /w}]}]
+  containers:
+  - {name: a, image: alpine:3.20, command: [sh, -c, "cat /w/f; while true; do sleep 1; done"], volumeMounts: [{name: w, mountPath: /w}]}
+  - {name: b, image: alpine:3.20, command: [sh, -c, "sleep 1d"], volumeMounts: [{name: w, mountPath: /w}]}
+  volumes: [{name: w, emptyDir: {}}]

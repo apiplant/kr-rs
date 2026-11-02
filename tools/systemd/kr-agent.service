@@ -1,0 +1,19 @@
+[Unit]
+Description=kr Kubernetes agent (kubelet and service proxy of a worker node)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Put the token in /etc/kr/token (mode 0600).
+ExecStart=/usr/local/bin/kr agent --server https://SERVER:6443 --token-file /etc/kr/token
+Restart=always
+RestartSec=2
+# See kr-server.service: pods must outlive the agent process.
+KillMode=process
+Delegate=yes
+TasksMax=infinity
+LimitNOFILE=1048576
+OOMScoreAdjust=-999
+
+[Install]
+WantedBy=multi-user.target

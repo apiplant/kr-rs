@@ -27,7 +27,7 @@
 //! `observedGeneration`, `collisionCount`. Not modelled: `maxSurge`, `minReadySeconds`, creation
 //! back-off for crash-looping pods.
 
-use crate::scheduler::{selector_matches, untolerated_taint};
+use crate::scheduler::{selector_matches, untolerated_noexecute, untolerated_taint};
 use crate::util::*;
 use crate::Config;
 use alloc::collections::BTreeMap;
@@ -118,6 +118,15 @@ pub fn node_eligible(template_spec: &Value, node: &Value) -> bool {
     selector_matches(&pod, node) && node_affinity_matches(&spec, node) && !untolerated_taint(&pod, node)
 }
 
+/// Whether a daemon pod that already runs on `node` may stay: unlike scheduling a new one, only
+/// `NoExecute` taints count (a node that just went NotReady keeps its daemon pods).
+pub fn node_continues(template_spec: &Value, node: &Value) -> bool {
+    let mut spec = template_spec.clone();
+    spec.set("tolerations", Value::Array(daemon_tolerations(template_spec)));
+    let pod = obj(alloc::vec![("spec", spec.clone())]);
+    selector_matches(&pod, node) && node_affinity_matches(&spec, node) && !untolerated_noexecute(&pod, node)
+}
+
 fn pod_hash(p: &Value) -> &str {
     str_at(p, &["metadata", "labels", REVISION_LABEL])
 }
@@ -174,8 +183,8 @@ pub async fn reconcile<C: Client>(c: &C, ns: &str, dname: &str) -> Result<Option
     let mut old_available: Vec<String> = Vec::new();
     let node_names: Vec<&str> = nodes.iter().map(name).collect();
     for n in &nodes {
-        let eligible = node_eligible(&tspec, n);
         let mut here = by_node.remove(name(n)).unwrap_or_default();
+        let eligible = node_eligible(&tspec, n) || (here.iter().any(|p| !deleting(p)) && node_continues(&tspec, n));
         if !eligible {
             misscheduled += here.iter().filter(|p| !deleting(p)).count() as i64;
             to_delete.extend(here.iter().filter(|p| !deleting(p)).map(|p| name(p).to_string()));
