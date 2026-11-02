@@ -70,6 +70,7 @@ fn setup(tag: &str, ed_server: bool) -> Files {
 fn drive(conn: &mut Connection, sock: &mut TcpStream, mut done: impl FnMut(&mut Connection) -> bool) {
     sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut buf = [0u8; 16384];
+    let mut first: Option<Vec<u8>> = None;
     loop {
         let out = conn.take_output();
         if !out.is_empty() {
@@ -82,7 +83,9 @@ fn drive(conn: &mut Connection, sock: &mut TcpStream, mut done: impl FnMut(&mut 
         if n == 0 {
             return;
         }
+        first.get_or_insert_with(|| buf[..n.min(1024)].to_vec());
         if let Err(e) = conn.feed(&buf[..n]) {
+            eprintln!("first bytes from peer: {}", first.as_ref().unwrap().iter().map(|b| format!("{b:02x}")).collect::<String>());
             let out = conn.take_output();
             let _ = sock.write_all(&out);
             panic!("tls error: {e:?}");
@@ -105,7 +108,7 @@ fn kr_client_vs_s_server(tag: &str, extra: &[&str], ed_server: bool, expect_suit
         .args(extra)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().unwrap();
-    let mut sock = (0..100).find_map(|_| { std::thread::sleep(Duration::from_millis(30)); TcpStream::connect(("127.0.0.1", port)).ok() }).expect("connect");
+    let mut sock = (0..400).find_map(|_| { std::thread::sleep(Duration::from_millis(30)); TcpStream::connect(("127.0.0.1", port)).ok() }).expect("connect");
     let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: vec![f.ca.clone()], client_cert: Some((vec![f.cli_cert.clone()], f.cli_key)), alpn: vec![b"http/1.1".to_vec()], tls12: false });
     let mut c = Connection::client(cfg, b"localhost", rng, now());
     drive(&mut c, &mut sock, |c| !c.is_handshaking());
@@ -285,7 +288,7 @@ fn client_vs_openssl_rsa_chain() {
         .current_dir(&dir)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().unwrap();
-    let mut sock = (0..100).find_map(|_| { std::thread::sleep(Duration::from_millis(30)); TcpStream::connect(("127.0.0.1", port)).ok() }).expect("connect");
+    let mut sock = (0..400).find_map(|_| { std::thread::sleep(Duration::from_millis(30)); TcpStream::connect(("127.0.0.1", port)).ok() }).expect("connect");
     let ca = x509::pem_decode_all(&std::fs::read_to_string(dir.join("ca.pem")).unwrap(), "CERTIFICATE").unwrap();
     let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: ca, client_cert: None, alpn: vec![], tls12: false });
     let mut c = Connection::client(cfg, b"localhost", rng, now());
@@ -332,7 +335,7 @@ fn kr12_vs_s_server(tag: &str, rsa: bool, tls12: bool, extra: &[&str]) -> Result
         .args(extra)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().unwrap();
-    let mut sock = (0..100).find_map(|_| { std::thread::sleep(Duration::from_millis(30)); TcpStream::connect(("127.0.0.1", port)).ok() }).expect("connect");
+    let mut sock = (0..400).find_map(|_| { std::thread::sleep(Duration::from_millis(30)); TcpStream::connect(("127.0.0.1", port)).ok() }).expect("connect");
     let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: vec![ca], client_cert: None, alpn: vec![], tls12 });
     let mut c = Connection::client(cfg, b"localhost", rng, now());
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -390,7 +393,11 @@ fn tls12_refused_unless_enabled_and_without_ems() {
         // A 1.3-only hello: the 1.2-only server answers protocol_version (70) itself.
         let e = kr12_vs_s_server("12off", false, false, &[]).unwrap_err();
         assert!(e.contains("ProtocolVersion") || e.contains("Peer(70)"), "{e}");
-        let e = kr12_vs_s_server("12noems", false, true, &["-no_ems"]).unwrap_err();
-        assert!(e.contains("HandshakeFailure"), "{e}");
+        // `-no_ems` (an s_server that does not offer Extended Master Secret) needs OpenSSL 3.2 or newer.
+        let help = Command::new("openssl").args(["s_server", "-help"]).output().map(|o| String::from_utf8_lossy(&o.stderr).into_owned() + &String::from_utf8_lossy(&o.stdout)).unwrap_or_default();
+        if help.contains("-no_ems") {
+            let e = kr12_vs_s_server("12noems", false, true, &["-no_ems"]).unwrap_err();
+            assert!(e.contains("HandshakeFailure"), "{e}");
+        }
     }
 }

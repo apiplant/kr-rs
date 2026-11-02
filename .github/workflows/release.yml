@@ -50,6 +50,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Tool versions
+        run: |
+          uname -m
+          openssl version
+          kubectl version --client 2>&1 | head -3 || true
+
       - name: Unit tests
         run: tools/test/unit.sh
 
