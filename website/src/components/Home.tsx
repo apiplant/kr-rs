@@ -172,7 +172,7 @@ export function Home() {
       <section id="install" class="pb-16">
         <h2 class="text-2xl font-semibold tracking-tight text-ink sm:text-3xl">Install</h2>
         <p class="mt-3 max-w-2xl leading-relaxed text-muted">
-          Build one file, run it as a service, add nodes with a token.
+          Use a package manager or an archive, run it as a service, add nodes with a token. Linux on x86_64 and aarch64; Apple Silicon through a Linux VM.
         </p>
         <InstallSteps />
       </section>

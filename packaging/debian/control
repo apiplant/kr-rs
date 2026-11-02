@@ -1,0 +1,15 @@
+Package: kr-rs
+Version: @VERSION@
+Section: admin
+Priority: optional
+Architecture: @ARCH@
+Maintainer: apiplant <releases@apiplant.com>
+Installed-Size: @INSTALLED_SIZE@
+Homepage: https://github.com/apiplant/kr-rs
+Description: Kubernetes in one static binary
+ kr is a Kubernetes distribution in a single static binary of about 3 MB,
+ written in Rust with no libc and no third-party crates: API server,
+ datastore, scheduler, controllers, kubelet, container runtime, pod network,
+ service proxy and cluster DNS. Needs Linux 5.10 or newer with cgroup v2 and
+ overlayfs. Systemd units kr-server.service and kr-agent.service are
+ installed but not enabled.

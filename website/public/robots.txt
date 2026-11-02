@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://kr.apiplant.com/sitemap.xml
+Sitemap: https://kr-rs.apiplant.com/sitemap.xml

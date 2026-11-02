@@ -19,7 +19,36 @@ export function DocsQuickstart() {
       </Section>
 
       <Section>
-        <H2>Build</H2>
+        <H2>Install</H2>
+        <P>
+          Packages for Debian and Ubuntu (amd64, arm64), Arch Linux (x86_64) and Homebrew on Linux come from the
+          apiplant repositories. They install <IC>/usr/bin/kr</IC> and the systemd units, without enabling them.
+        </P>
+        <CopyBlock
+          command={`# Debian / Ubuntu
+curl -sSfL https://apt.apiplant.com/apiplant-archive-keyring.gpg | sudo tee /usr/share/keyrings/apiplant.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/apiplant.gpg] https://apt.apiplant.com stable main" | sudo tee /etc/apt/sources.list.d/apiplant.list > /dev/null
+sudo apt update && sudo apt install kr-rs
+
+# Homebrew on Linux
+brew tap apiplant/tap && brew install apiplant/tap/kr-rs`}
+        />
+        <P>
+          Or take a static archive from the{" "}
+          <a class="text-accent hover:text-accent-dim" href="https://github.com/apiplant/kr-rs/releases">releases page</a>:{" "}
+          <IC>kr-rs-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz</IC> or{" "}
+          <IC>kr-rs-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz</IC>. Each has a <IC>.sha256</IC> file. The{" "}
+          <a class="text-accent hover:text-accent-dim" href="/#install">home page</a> has the Arch setup.
+        </P>
+        <Note title="Apple Silicon">
+          kr needs a Linux kernel, so there is no macOS build. On an Apple Silicon Mac, run the aarch64 Linux package
+          or archive inside a Linux VM (Lima, Colima, UTM, or the VM behind Docker Desktop). Inside the VM it is an
+          ordinary aarch64 Linux install.
+        </Note>
+      </Section>
+
+      <Section>
+        <H2>Or build from source</H2>
         <CopyBlock command={`cargo build --release          # produces target/release/kr (about 2.9 MB)`} />
       </Section>
 
