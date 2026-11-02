@@ -218,3 +218,6 @@
 
 116. **Pods died with the kubelet process** — *fixed* (ADR-036)
     Sandboxes and containers were killed when `kr agent` / `kr server` crashed or restarted. Each container now has a detached shim that keeps the exit status, terminal log, stdin socket and pty master; the kubelet re-adopts running pods (pids checked by start time) on its next start. Rootless mode keeps its pod network and egress NAT in surviving processes (`kr egress`, the infra namespace holder). A running `kubectl exec`/`attach` session still ends with the old process.
+
+117. **The TLS server could not send a HelloRetryRequest** — *fixed*
+    A client that offers a key share only for a group the server does not use (a P-384 share with X25519 and P-256 in `supported_groups`, as the arm64 `kubectl` build in CI does) was rejected with `handshake_failure`. `kr-crypto` now answers once with a HelloRetryRequest naming X25519 or P-256 (transcript restarts with `message_hash`), and fails with `illegal_parameter` if the retried ClientHello still has no usable share or changes the cipher suite. Covered by `openssl_and_curl_vs_kr_server` (`-groups P-384:X25519` and `P-384:P-256`). Found by the aarch64 CI job.

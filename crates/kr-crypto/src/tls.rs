@@ -7,7 +7,8 @@
 //! Supported: TLS_CHACHA20_POLY1305_SHA256 (preferred) and TLS_AES_128_GCM_SHA256; X25519 and
 //! secp256r1 key exchange; ecdsa_secp256r1_sha256 and ed25519 signatures; mutual TLS; ALPN;
 //! KeyUpdate; middlebox-compatibility ChangeCipherSpec. Not supported: PSK/resumption, 0-RTT,
-//! HelloRetryRequest as a server (a client must offer a usable key share).
+//! cookies in HelloRetryRequest (the server sends at most one HelloRetryRequest, to ask for X25519
+//! or P-256 when the client only sent a key share for another group).
 //!
 //! TLS 1.2 (RFC 5246), client only and opt-in (`ClientConfig::tls12`), for servers that do not
 //! speak 1.3 (some registry CDNs): ECDHE (X25519, P-256) with ECDSA or RSA certificates and
@@ -624,6 +625,8 @@ pub struct Connection {
     cert_requested: bool,
     session_id: Vec<u8>,
     ccs_allowed: bool,
+    /// Server: a HelloRetryRequest was sent, so the next ClientHello is the second.
+    hrr_sent: bool,
     peer_closed: bool,
     /// Bumped whenever the read keys change.
     read_epoch: u32,
@@ -665,6 +668,7 @@ impl Connection {
             cert_requested: false,
             session_id: Vec::new(),
             ccs_allowed: true,
+            hrr_sent: false,
             peer_closed: false,
             read_epoch: 0,
             tls12: false,
@@ -1090,7 +1094,11 @@ impl Connection {
         }
         // Cipher suite: our preference order.
         let offered = |s: u16| suites.chunks(2).any(|c| c == s.to_be_bytes());
+        let previous_suite = self.suite;
         self.suite = [TLS_CHACHA20_POLY1305_SHA256, TLS_AES_128_GCM_SHA256].into_iter().find(|&s| offered(s)).ok_or(Error::Local(Alert::HandshakeFailure))?;
+        if self.hrr_sent && self.suite != previous_suite {
+            return fail(Alert::IllegalParameter); // the second ClientHello must agree with the first
+        }
         // Signature algorithm for our key must be offered.
         let sig_algs = find_ext(&exts, EXT_SIGNATURE_ALGORITHMS).ok_or(Error::Local(Alert::MissingExtension))?;
         let mut sr = Rd::new(sig_algs);
@@ -1114,7 +1122,47 @@ impl Connection {
                 chosen = Some((group, key));
             }
         }
-        let (group, peer_key) = chosen.ok_or(Error::Local(Alert::HandshakeFailure))?; // no HRR support
+        let Some((group, peer_key)) = chosen else {
+            // No usable key share. A client that supports one of our groups gets one
+            // HelloRetryRequest (RFC 8446 4.1.4) naming it; after that it must comply.
+            if self.hrr_sent {
+                return fail(Alert::IllegalParameter);
+            }
+            let groups = find_ext(&exts, EXT_SUPPORTED_GROUPS).ok_or(Error::Local(Alert::MissingExtension))?;
+            let mut gr = Rd::new(groups);
+            let mut list = Rd::new(gr.vec16()?);
+            gr.done()?;
+            let mut wanted = None;
+            while !list.b.is_empty() {
+                let g = list.u16()?;
+                if wanted.is_none() && (g == GROUP_X25519 || g == GROUP_P256) {
+                    wanted = Some(g);
+                }
+            }
+            let wanted = wanted.ok_or(Error::Local(Alert::HandshakeFailure))?;
+            // The transcript restarts with message_hash(ClientHello1), then the HelloRetryRequest.
+            self.transcript = Sha256::new();
+            self.transcript.update(&[254, 0, 0, 32]);
+            self.transcript.update(&crate::sha2::sha256(msg));
+            let suite = self.suite;
+            let hrr = handshake_msg(HT_SERVER_HELLO, |m| {
+                put_u16(m, 0x0303);
+                m.extend_from_slice(&HRR_RANDOM);
+                put_vec(m, 1, |v| v.extend_from_slice(session_id));
+                put_u16(m, suite);
+                m.push(0);
+                put_vec(m, 2, |e| {
+                    put_ext(e, EXT_SUPPORTED_VERSIONS, |v| put_u16(v, TLS13));
+                    put_ext(e, EXT_KEY_SHARE, |v| put_u16(v, wanted));
+                });
+            });
+            self.send_hs(hrr);
+            if !session_id.is_empty() {
+                self.out.extend_from_slice(&[CT_CCS, 3, 3, 0, 1, 1]);
+            }
+            self.hrr_sent = true;
+            return Ok(()); // stay in SrvWaitClientHello for the second ClientHello
+        };
         // ALPN.
         if let (Some(a), false) = (find_ext(&exts, EXT_ALPN), cfg.alpn.is_empty()) {
             let mut ar = Rd::new(a);
@@ -1148,8 +1196,8 @@ impl Connection {
             });
         });
         self.send_hs(sh);
-        if !self.session_id.is_empty() {
-            self.out.extend_from_slice(&[CT_CCS, 3, 3, 0, 1, 1]);
+        if !self.session_id.is_empty() && !self.hrr_sent {
+            self.out.extend_from_slice(&[CT_CCS, 3, 3, 0, 1, 1]); // after an HRR it already went out
         }
         self.derive_handshake(&shared);
         self.write_keys = Some(RecordKeys::new(self.suite, self.s_hs));

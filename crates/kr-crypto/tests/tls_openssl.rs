@@ -180,7 +180,7 @@ fn openssl_and_curl_vs_kr_server() {
     let dir = f.dir.clone();
     let clients = std::thread::spawn(move || {
         let mut results = Vec::new();
-        for groups in ["X25519", "P-256"] {
+        for groups in ["X25519", "P-256", "P-384:X25519", "P-384:P-256"] {  // the last two send a P-384 share only: the server must retry
             let mut cmd = Command::new("openssl");
             cmd.args(["s_client", "-quiet", "-tls1_3", "-groups", groups, "-connect", &format!("127.0.0.1:{port}"), "-servername", "localhost", "-verify_return_error", "-verify_hostname", "localhost"])
                 .arg("-CAfile").arg(dir.join("ca.pem")).arg("-cert").arg(dir.join("cli.pem")).arg("-key").arg(dir.join("cli.key"))
@@ -199,7 +199,7 @@ fn openssl_and_curl_vs_kr_server() {
         }
         results
     });
-    let rounds = if Command::new("curl").arg("--version").output().is_ok() { 3 } else { 2 };
+    let rounds = if Command::new("curl").arg("--version").output().is_ok() { 5 } else { 4 };
     for _ in 0..rounds {
         let (mut sock, _) = listener.accept().unwrap();
         let mut s = Connection::server(cfg.clone(), rng, now());
