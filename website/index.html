@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>kr — Kubernetes in one 3 MB binary</title>
+    <meta name="description" content="A Kubernetes distribution in one static binary of about 3 MB, written in Rust with no libc and no third-party crates. API server, datastore, scheduler, kubelet, container runtime, pod network and DNS in one executable. Passes Kubernetes conformance: 460 of 460 specs on two nodes." />
+    <meta name="keywords" content="kubernetes, k3s alternative, single binary, rust, no_std, container runtime, lightweight kubernetes, edge, conformance, raft" />
+    <meta name="robots" content="index, follow, max-image-preview:large" />
+    <link rel="canonical" href="https://kr.apiplant.com/" />
+    <meta property="og:site_name" content="kr" />
+    <meta property="og:title" content="kr — Kubernetes in one 3 MB binary" />
+    <meta property="og:description" content="A Kubernetes distribution in one static binary of about 3 MB, written in Rust with no libc and no third-party crates. API server, datastore, scheduler, kubelet, container runtime, pod network and DNS in one executable. Passes Kubernetes conformance: 460 of 460 specs on two nodes." />
+    <meta property="og:url" content="https://kr.apiplant.com/" />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="kr — Kubernetes in one 3 MB binary" />
+    <meta name="twitter:description" content="A Kubernetes distribution in one static binary of about 3 MB, written in Rust with no libc and no third-party crates. API server, datastore, scheduler, kubelet, container runtime, pod network and DNS in one executable. Passes Kubernetes conformance: 460 of 460 specs on two nodes." />
+    <meta name="theme-color" content="#171a21" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f2f5fa" media="(prefers-color-scheme: light)" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "kr",
+        "description": "A Kubernetes distribution in one static binary of about 3 MB, written in Rust with no libc and no third-party crates. API server, datastore, scheduler, kubelet, container runtime, pod network and DNS in one executable. Passes Kubernetes conformance: 460 of 460 specs on two nodes.",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Linux",
+        "url": "https://kr.apiplant.com/",
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+      }
+    </script>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2327282f'/%3E%3Cpath d='M11 6v20M11 16l11-10M11 16l11 10' stroke='%23a78bfa' stroke-width='2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"
+    />
+    <script>
+      // Set the theme before first paint so the page never flashes the wrong one.
+      (function () {
+        try {
+          var stored = localStorage.getItem("kr-theme");
+          var light =
+            stored === "light" ||
+            (!stored && window.matchMedia("(prefers-color-scheme: light)").matches);
+          if (light) document.documentElement.classList.add("light");
+          document.documentElement.style.colorScheme = light ? "light" : "dark";
+        } catch (_) {
+          /* private mode: dark is the default anyway */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/index.tsx"></script>
+  </body>
+</html>
