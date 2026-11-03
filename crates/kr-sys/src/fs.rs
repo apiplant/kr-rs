@@ -22,6 +22,7 @@ pub const EINVAL: i32 = 22;
 pub const ENOTEMPTY: i32 = 39;
 pub const ELOOP: i32 = 40;
 pub const ENODATA: i32 = 61;
+pub const EOVERFLOW: i32 = 75;
 pub const ENOTSUP: i32 = 95;
 
 // ---- open(2) flags ----

@@ -118,8 +118,9 @@ fn ts(sec: i64) -> [Timespec; 2] {
     [Timespec { tv_sec: 0, tv_nsec: fs::UTIME_OMIT }, Timespec { tv_sec: sec, tv_nsec: 0 }]
 }
 
+// EOVERFLOW: the target id is unrepresentable on an idmapped mount (e.g. systemd-homed $HOME).
 fn ignorable_perm(e: Errno) -> bool {
-    matches!(e.0, fs::EPERM | fs::EINVAL | fs::EACCES | fs::ENOTSUP | fs::ENODATA)
+    matches!(e.0, fs::EPERM | fs::EINVAL | fs::EACCES | fs::ENOTSUP | fs::ENODATA | fs::EOVERFLOW)
 }
 
 impl<'a> Unpacker<'a> {

@@ -528,7 +528,7 @@ pub fn main(mut args: Args) -> i32 {
         kr_apiserver::server::run(api, [0, 0, 0, 0], port, tls).await
     }) {
         Ok(()) => 0,
-        Err(_) => fail("listener failed"),
+        Err(e) => fail(&format!("listener failed: {e:?} (is port {port} already in use?)")),
     }
 }
 
@@ -549,8 +549,8 @@ pub fn cgroups_available() -> bool {
             cg.remove();
             true
         }
-        Err(_) => {
-            eprint(b"kr: no delegated cgroup; container resource limits are not enforced\n");
+        Err(e) => {
+            eprint(format!("kr: no delegated cgroup (errno {}); container resource limits are not enforced\n", e.0).as_bytes());
             false
         }
     }

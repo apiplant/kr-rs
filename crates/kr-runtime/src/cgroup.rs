@@ -97,6 +97,25 @@ fn own_path() -> Result<Vec<u8>, Errno> {
         .ok_or(Errno(95)) // EOPNOTSUPP: no unified hierarchy
 }
 
+/// Root only: makes cpu/memory/pids available in `rel` by enabling them top-down in each
+/// ancestor's subtree_control. Root's shell often sits in a cgroup it doesn't own (e.g. a user's
+/// terminal scope after `su`), whose parent hasn't delegated every controller; without this the
+/// write to `rel`'s subtree_control fails with ENOENT.
+fn enable_in_ancestors(rel: &[u8]) -> Result<(), Errno> {
+    let have = read_small(&nul(&[ROOT, rel, b"/cgroup.controllers"]))?;
+    let has = |c: &[u8]| have.split(|b| b.is_ascii_whitespace()).any(|w| w == c);
+    if has(b"cpu") && has(b"memory") && has(b"pids") {
+        return Ok(());
+    }
+    let mut dir = ROOT.to_vec();
+    for comp in rel.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
+        ns::write_file(&nul(&[&dir, b"/cgroup.subtree_control"]), b"+cpu +memory +pids")?;
+        dir.push(b'/');
+        dir.extend_from_slice(comp);
+    }
+    Ok(())
+}
+
 /// Directory under which container cgroups are created (moving kr into the supervisor leaf).
 fn base() -> Result<Vec<u8>, Errno> {
     let mut rel = own_path()?;
@@ -126,6 +145,9 @@ fn base() -> Result<Vec<u8>, Errno> {
                 Err(e) => return Err(e),
             }
         }
+    }
+    if ns::getuid() == 0 {
+        enable_in_ancestors(&rel)?;
     }
     // Enabling controllers that are already enabled is a no-op.
     ns::write_file(&nul(&[&base, b"/cgroup.subtree_control"]), b"+cpu +memory +pids")?;
