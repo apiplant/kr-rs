@@ -879,8 +879,18 @@ async fn pvc_source<C: Client>(c: &C, ns: &str, claim: &str) -> Result<String, S
     if !path.starts_with('/') || path.split('/').any(|s| s == "..") {
         return Err(alloc::format!("persistentvolume \"{pv_name}\": invalid path {path}"));
     }
+    let canon = kr_apiserver::client::STORAGE_ROOT;
+    let local = kr_runtime::store::local_storage_root(canon);
+    let mapped;
+    let path = match path.strip_prefix(canon) {
+        Some(rest) if rest.starts_with('/') && local != canon => {
+            mapped = alloc::format!("{local}{rest}");
+            mapped.as_str()
+        }
+        _ => path,
+    };
     kr_runtime::store::mkdir_p(path, 0o755).map_err(|_| alloc::format!("cannot create {path}"))?;
-    if path.starts_with(kr_apiserver::client::STORAGE_ROOT) {
+    if path.starts_with(local.as_str()) {
         if let Ok(fd) = kr_sys::ns::open(alloc::format!("{path}\0").as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY | kr_sys::fs::O_NOFOLLOW, 0) {
             let _ = kr_sys::fs::fchmod(fd.raw(), 0o777);
         }
@@ -892,7 +902,8 @@ async fn pvc_source<C: Client>(c: &C, ns: &str, claim: &str) -> Result<String, S
 /// (reclaim policy Delete: the controller deleted the PV). Only direct children of the root are
 /// considered, removed through a directory fd so symlinks are never followed.
 pub async fn gc_storage<C: Client>(c: &C) {
-    let Ok(root) = kr_sys::ns::open(alloc::format!("{}\0", kr_apiserver::client::STORAGE_ROOT).as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY | kr_sys::O_CLOEXEC, 0) else { return };
+    let local = kr_runtime::store::local_storage_root(kr_apiserver::client::STORAGE_ROOT);
+    let Ok(root) = kr_sys::ns::open(alloc::format!("{local}\0").as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY | kr_sys::O_CLOEXEC, 0) else { return };
     let names: Vec<String> = kr_sys::fs::read_dir(&root).filter_map(|e| e.ok()).filter_map(|e| String::from_utf8(e.name).ok()).filter(|n| n.starts_with("pvc-") && !n.contains('/')).collect();
     for n in names {
         // Only a definite "not found" proves the volume is gone (anything else: keep the data).

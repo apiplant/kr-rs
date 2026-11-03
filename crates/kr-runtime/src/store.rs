@@ -209,6 +209,88 @@ pub fn root_from(get: &dyn Fn(&str) -> Option<String>, uid: u32) -> Result<Strin
     Err(Error::NoRoot)
 }
 
+/// The store root from [`root_from`], except that a rootless default (not `$KR_ROOT`) on an
+/// idmapped mount — systemd-homed home directories — is replaced by `/var/tmp/kr-<uid>`: such a
+/// mount can only record files owned by the user's own id, so layers and containers owned by
+/// subordinate ids fail with EOVERFLOW. Warns once per process when it does.
+pub fn default_root() -> Result<String> {
+    let uid = fs::getuid();
+    let root = root_from(&env_var, uid)?;
+    if uid == 0 || env_var("KR_ROOT").is_some_and(|v| !v.is_empty()) || !on_idmapped_mount(&root) {
+        return Ok(root);
+    }
+    let alt = format!("/var/tmp/kr-{uid}");
+    match fs::mkdirat(AT_FDCWD, &cpath(&alt)?, 0o700) {
+        Ok(()) | Err(Errno(fs::EEXIST)) => {}
+        Err(e) => return Err(Error::Io("mkdir", e)),
+    }
+    // /var/tmp is shared: refuse a directory (or symlink) someone else planted there.
+    let fd = fs::openat(AT_FDCWD, &cpath(&alt)?, fs::O_RDONLY | fs::O_DIRECTORY | fs::O_NOFOLLOW | fs::O_CLOEXEC, 0).map_err(|e| Error::Io("open", e))?;
+    let st = fs::fstat(fd.raw()).map_err(|e| Error::Io("fstat", e))?;
+    if st.uid != uid || st.mode & 0o077 != 0 {
+        return Err(Error::Unsafe("/var/tmp/kr-<uid> is not a private directory owned by you; set KR_ROOT"));
+    }
+    static WARNED: AtomicU32 = AtomicU32::new(0);
+    if WARNED.swap(1, Ordering::Relaxed) == 0 {
+        let msg = format!(
+            "kr: warning: {root} is on an idmapped mount (systemd-homed?), which cannot hold files owned by \
+             subordinate ids; using {alt} instead. systemd-tmpfiles may clean /var/tmp after 30 days unused: \
+             set KR_ROOT to a directory on a regular filesystem to choose another place.\n"
+        );
+        let _ = kr_sys::write(2, msg.as_bytes());
+    }
+    Ok(alt)
+}
+
+/// Where this node keeps local PersistentVolume data. PV objects always name the canonical
+/// `/var/lib/kr/storage/<pv>` (`canonical`); real root uses it as is, a rootless kubelet (which
+/// cannot write /var/lib) maps it under its own store root.
+pub fn local_storage_root(canonical: &str) -> String {
+    if fs::getuid() == 0 {
+        return canonical.to_string();
+    }
+    match default_root() {
+        Ok(r) => format!("{}/storage", r.trim_end_matches('/')),
+        Err(_) => canonical.to_string(),
+    }
+}
+
+/// True when the mount holding `path` (longest mountpoint prefix in /proc/self/mountinfo) has
+/// the `idmapped` option.
+fn on_idmapped_mount(path: &str) -> bool {
+    let Ok(info) = fs::read_file(b"/proc/self/mountinfo\0", 1 << 22) else { return false };
+    let mut best: (usize, bool) = (0, false);
+    for line in info.split(|&b| b == b'\n') {
+        let f: Vec<&[u8]> = line.split(|&b| b == b' ').collect();
+        if f.len() < 6 {
+            continue;
+        }
+        let mp = unescape_octal(f[4]);
+        let p = path.as_bytes();
+        let covers = mp == b"/" || (p.starts_with(&mp) && (p.len() == mp.len() || p[mp.len()] == b'/'));
+        if covers && mp.len() >= best.0 {
+            best = (mp.len(), f[5].split(|&b| b == b',').any(|o| o == b"idmapped"));
+        }
+    }
+    best.1
+}
+
+/// Decodes mountinfo's `\ooo` escapes (space, tab, newline, backslash).
+fn unescape_octal(s: &[u8]) -> Vec<u8> {
+    let mut o = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == b'\\' && i + 3 < s.len() && s[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b)) {
+            o.push((s[i + 1] - b'0') * 64 + (s[i + 2] - b'0') * 8 + (s[i + 3] - b'0'));
+            i += 4;
+        } else {
+            o.push(s[i]);
+            i += 1;
+        }
+    }
+    o
+}
+
 /// Escapes an image reference into a single safe file name.
 pub fn escape_ref(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
@@ -358,7 +440,7 @@ impl Store {
     pub fn open(root: Option<&str>) -> Result<Store> {
         let root = match root {
             Some(r) => r.to_string(),
-            None => root_from(&env_var, fs::getuid())?,
+            None => default_root()?,
         };
         let root = if root.len() > 1 { root.trim_end_matches('/').to_string() } else { root };
         if !root.starts_with('/') {

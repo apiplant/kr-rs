@@ -763,7 +763,7 @@ impl IdMaps {
         if !rootless(uid) || ns::open(NEWUIDMAP, ns::O_RDONLY, 0).is_err() || ns::open(NEWGIDMAP, ns::O_RDONLY, 0).is_err() {
             return IdMaps::default();
         }
-        let name = passwd_name(uid);
+        let name = passwd_name(uid).or_else(env_user);
         let id = fmt_u32(uid);
         let find = |file: &[u8]| -> Option<(u32, u32)> {
             let data = read_small(file).ok()?;
@@ -887,6 +887,15 @@ fn helper(prog: &[u8], pid: &[u8], id: u32, (start, count): (u32, u32)) -> Resul
         0 => Ok(()),
         _ => Err(Errno(1)),
     }
+}
+
+/// The login name from $USER or $LOGNAME, for users NSS knows but /etc/passwd doesn't (e.g.
+/// systemd-homed). Trusting the environment is safe: newuidmap/newgidmap only apply a range
+/// that /etc/subuid grants to the real caller.
+fn env_user() -> Option<Vec<u8>> {
+    let env = read_small(b"/proc/self/environ\0").ok()?;
+    let get = |k: &[u8]| env.split(|&b| b == 0).find_map(|e| e.strip_prefix(k)).filter(|v| !v.is_empty()).map(|v| v.to_vec());
+    get(b"USER=").or_else(|| get(b"LOGNAME="))
 }
 
 /// Host user name for `uid`, from /etc/passwd (subuid files may key on either).
