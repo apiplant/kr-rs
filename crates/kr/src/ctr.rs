@@ -353,7 +353,7 @@ fn infra_supervisor(root: &str, maps: &IdMaps) -> ! {
     kr_rt::exec::reset_after_fork();
     let infra = kr_rt::exec::block_on(async move {
         if let Some(tun) = egress {
-            kr_rt::exec::spawn(kr_kubelet::egress::run(tun));
+            kr_rt::exec::spawn(kr_kubelet::egress::run(tun, None));
         }
         let mut idle = 0;
         while idle < 5 && infra.is_alive() {

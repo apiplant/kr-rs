@@ -48,7 +48,10 @@ fn kr_main(mut args: Args) -> i32 {
             kr_runtime::container::shim_wait(pid, a[1], (master >= 0).then_some(master), if a[3] == b"-" { b"" } else { a[3] }, cg, io)
         }
         Some(b"egress") => {
-            exec::block_on(kr_kubelet::egress::run(Fd(3)));
+            // kr egress [OWNER-PID OWNER-START]
+            let num = |b: Option<&[u8]>| b.and_then(|b| core::str::from_utf8(b).ok()).and_then(|s| s.parse::<u64>().ok());
+            let owner = num(args.next()).zip(num(args.next())).and_then(|(p, s)| u32::try_from(p).ok().map(|p| (p, s)));
+            exec::block_on(kr_kubelet::egress::run(Fd(3), owner));
             0
         }
         Some(b"version") => {

@@ -356,8 +356,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                                 // Outbound traffic: a TUN default route served by the userspace NAT,
                                 // in a helper process that survives this one.
                                 let mut egress = None;
+                                let (ipid, ist) = (alloc::format!("{}", infra.pid), network::proc_start(infra.pid as u32).map(|s| alloc::format!("{s}")).unwrap_or_default());
                                 match network::open_egress(&infra) {
-                                    Ok(tun) => match container::spawn_helper(&[b"egress"], tun.raw()) {
+                                    Ok(tun) => match container::spawn_helper(&[b"egress", ipid.as_bytes(), ist.as_bytes()], tun.raw()) {
                                         Ok(pid) => egress = network::proc_start(pid as u32).map(|st| (pid, st)),
                                         Err(e) => kr_rt::eprint(alloc::format!("kubelet: rootless egress unavailable ({}: errno {}); pods have no outbound connectivity\n", e.step, e.errno.0).as_bytes()),
                                     },
@@ -422,6 +423,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let live: Vec<String> = self.pods.borrow().keys().cloned().collect();
         if self.cfg.cgroups {
             kr_runtime::cgroup::kill_stale_pods(&|c| live.iter().any(|u| u.as_bytes() == c));
+            kr_runtime::cgroup::prune_previous_base(&alloc::format!("{}/cgroup-base", self.cfg.root));
         }
         self.kill_recorded(&live);
         self.remove_unclaimed_dirs(&live);

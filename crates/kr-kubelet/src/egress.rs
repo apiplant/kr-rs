@@ -80,12 +80,15 @@ struct Egress {
 }
 
 /// Serves `tun` (the infra namespace's default route) until the process exits.
-pub async fn run(tun: Fd) {
+/// `owner` is the pod-network holder (pid, start time) this egress serves: the helper outlives
+/// kubelet restarts on purpose, but must not outlive the network itself (its TUN fd keeps the
+/// old namespace alive, so reads would just block forever).
+pub async fn run(tun: Fd, owner: Option<(u32, u64)>) {
     let Ok(tun) = Async::new(tun) else { return };
     let mut nat = Nat::new(MTU);
     nat.forward_icmp(true);
     let eg = Rc::new(Egress { tun, nat: RefCell::new(nat), tcp: RefCell::new(BTreeMap::new()), udp: RefCell::new(BTreeMap::new()) });
-    exec::spawn(tick(eg.clone()));
+    exec::spawn(tick(eg.clone(), owner));
     let mut buf = [0u8; 65536];
     loop {
         match eg.tun.read(&mut buf).await {
@@ -105,9 +108,14 @@ pub async fn run(tun: Fd) {
     }
 }
 
-async fn tick(eg: Rc<Egress>) {
+async fn tick(eg: Rc<Egress>, owner: Option<(u32, u64)>) {
     loop {
         sleep(1000).await;
+        if let Some((pid, start)) = owner {
+            if network::proc_start(pid) != Some(start) {
+                sys::exit_group(0);
+            }
+        }
         eg.nat.borrow_mut().tick(now_ms());
         eg.pump();
     }

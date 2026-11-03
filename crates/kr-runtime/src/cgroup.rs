@@ -445,6 +445,30 @@ pub fn kill_stale_pods(keep: &dyn Fn(&[u8]) -> bool) {
     kill_dirs(&dirs);
 }
 
+/// Records the current delegated base in `record`, and removes the empty `kr-pods` cgroups a
+/// previous run left under a different base (kr restarted from another scope, e.g. another
+/// terminal). Only empty directories go: rmdir refuses a cgroup that still has processes.
+pub fn prune_previous_base(record: &str) {
+    let Ok(cur) = base() else { return };
+    let mut rec = record.as_bytes().to_vec();
+    rec.push(0);
+    if let Ok(old) = kr_sys::fs::read_file(&rec, 4096) {
+        let old: Vec<u8> = old.strip_suffix(b"\n").unwrap_or(&old).to_vec();
+        if old != cur && old.starts_with(ROOT) && !old.split(|&b| b == b'/').any(|c| c == b"..") {
+            let mut pods = old;
+            pods.extend_from_slice(b"/kr-pods");
+            if ns::open(&nul(&[&pods]), ns::O_RDONLY | ns::O_DIRECTORY, 0).is_ok() {
+                for d in post_order(&pods, &list_subdirs) {
+                    let _ = ns::rmdir(&nul(&[&d]));
+                }
+            }
+        }
+    }
+    let mut v = cur;
+    v.push(b'\n');
+    let _ = crate::store::write_file_atomic(record, &v);
+}
+
 /// Kills every process in the given cgroups (children before parents) and removes them.
 fn kill_dirs(dirs: &[Vec<u8>]) {
     for _ in 0..50 {
