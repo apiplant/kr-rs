@@ -25,8 +25,8 @@ Only work still to do lives here (open items, things to watch, accepted limits).
 117. **No Device Plugin API**
     kubelet does not serve `/var/lib/kubelet/device-plugins` (gRPC). NVIDIA GPU Operator's device plugin cannot register; `nvidia.com/gpu` is never advertised. GPUs work via hostPath device nodes instead. Requires implementing a gRPC (HTTP/2) server+client in kr, which has none today.
 
-118. **`privileged` / capabilities / securityContext ignored**
-    `drop_caps(DEFAULT_CAPS)` always runs; `securityContext.privileged` and capability adds are not honored. Workloads needing caps (NVIDIA validator, Calico, device plugins) fail. Fix: honor privileged by keeping the full cap set in the pod's user namespace.
+118. **`privileged` / capabilities partially honored**
+    kr now keeps all capabilities and skips seccomp/no_new_privs for privileged pods, and runs rootful by default (no user namespace) so privileged pods get real host capabilities (mknod, ipset work). Capability *adds* in securityContext are still not applied. Workloads needing host-netfilter (Calico) work in rootful mode; device-node creation still blocked in rootless (KR_USERNS=1) mode.
 
 120. **Host kernel modules missing in this sandbox**
     Running kernel 7.2.14 has no installed module tree; `xt_comment`/`nft_nat` unavailable. k3s's iptables/nft proxy fails; kr avoids this with netlink + nft over netlink. Environment-specific, not a kr bug.

@@ -81,6 +81,8 @@ pub struct RunSpec<'a> {
     pub readonly_root: bool,
     /// `securityContext.privileged`: keep all capabilities, skip seccomp and no_new_privs.
     pub privileged: bool,
+    /// Run in a user namespace (rootless). False = rootful (host userns), matching k3s default.
+    pub userns: bool,
 }
 
 /// A bind mount of a host path into the container.
@@ -104,6 +106,8 @@ pub struct ExecTarget {
     cgroup: Option<i32>,
     /// The pod shares the host's network namespace (hostNetwork): never joined.
     host_net: bool,
+    /// Whether the pod runs in a user namespace.
+    pub userns: bool,
 }
 
 /// A process to start inside a running container.
@@ -122,7 +126,11 @@ pub struct ExecSpec<'a> {
     pub ctty: bool,
 }
 
-const ALL_NS: u64 = ns::CLONE_NEWUSER | ns::CLONE_NEWNS | ns::CLONE_NEWPID | ns::CLONE_NEWNET | ns::CLONE_NEWIPC | ns::CLONE_NEWUTS | ns::CLONE_NEWCGROUP;
+/// Namespaces joined by exec_in. User namespace only in rootless mode.
+fn all_ns() -> u64 {
+    let base = ns::CLONE_NEWNS | ns::CLONE_NEWPID | ns::CLONE_NEWNET | ns::CLONE_NEWIPC | ns::CLONE_NEWUTS | ns::CLONE_NEWCGROUP;
+    if userns_enabled() { base | ns::CLONE_NEWUSER } else { base }
+}
 
 /// Forks a helper that joins `nstype` namespaces of the process behind `pidfd` and then clones
 /// the real child (CLONE_PARENT: it is kr's child, supervised by pidfd). `child` runs in that
@@ -182,14 +190,15 @@ fn fork_into(pidfd: &Fd, nstype: u64, cgroup: Option<i32>, child: impl FnOnce() 
             let _ = kr_sys::write(f.raw(), &fmt_u32(pid as u32));
         }
     }
-    Ok(Running { pid, pidfd: Rc::new(pidfd), cgroup: None, host_net: false, exit_file: None, shim: 0 })
+    Ok(Running { pid, pidfd: Rc::new(pidfd), cgroup: None, host_net: false, userns: userns_enabled(), exit_file: None, shim: 0 })
 }
 
 /// Starts `spec` inside a running container (all of its namespaces and its cgroup), with the
 /// same privilege drop as the container's own processes. Exit 127 = could not exec.
 pub fn exec_in(target: &ExecTarget, spec: &ExecSpec) -> Result<Running, RunError> {
     let full_map = spec.maps.full();
-    fork_into(&target.pidfd, if target.host_net { ALL_NS & !ns::CLONE_NEWNET } else { ALL_NS }, target.cgroup, || {
+    let all = all_ns();
+    fork_into(&target.pidfd, if target.host_net { all & !ns::CLONE_NEWNET } else { all }, target.cgroup, || {
         let null = ns::open(b"/dev/null\0", ns::O_RDWR, 0).ok();
         let nfd = null.as_ref().map(|n| n.raw()).unwrap_or(-1);
         for (src, dst) in [(spec.stdin.unwrap_or(nfd), 0), (spec.stdout.unwrap_or(nfd), 1), (spec.stderr.unwrap_or(nfd), 2)] {
@@ -209,7 +218,9 @@ pub fn exec_in(target: &ExecTarget, spec: &ExecSpec) -> Result<Running, RunError
 /// Runs `f` in a child that joined the user and network namespaces of a pod (via any of its
 /// processes), e.g. for tcpSocket/httpGet probes that must reach the pod without a pod IP.
 pub fn in_pod_net(target: &ExecTarget, f: impl FnOnce() -> i32) -> Result<Running, RunError> {
-    fork_into(&target.pidfd, if target.host_net { ns::CLONE_NEWUSER } else { ns::CLONE_NEWUSER | ns::CLONE_NEWNET }, None, f)
+    let mut flags = if target.host_net { 0 } else { ns::CLONE_NEWNET };
+    if target.userns { flags |= ns::CLONE_NEWUSER; }
+    fork_into(&target.pidfd, flags, None, f)
 }
 
 /// A pod sandbox: a parked process owning the pod's user, network, UTS and IPC namespaces.
@@ -218,18 +229,23 @@ pub struct Sandbox {
     pub pid: i32,
     pidfd: Fd,
     host_net: bool,
+    pub userns: bool,
 }
 
 impl Sandbox {
     /// A handle on a sandbox owned by another process (the shared `kr ctr` network namespace),
     /// good for joining its namespaces. Do not `stop` it.
     pub fn open(pid: i32) -> Result<Sandbox, Errno> {
-        Ok(Sandbox { pid, pidfd: ns::pidfd_open(pid)?, host_net: false })
+        Ok(Sandbox { pid, pidfd: ns::pidfd_open(pid)?, host_net: false, userns: userns_enabled() })
     }
 
     /// A sandbox started by a previous run of this process, if `pid` is still the process that
     /// started at `start` (clock ticks).
     pub fn adopt(pid: i32, start: u64, host_net: bool) -> Option<Sandbox> {
+        Self::adopt_with_userns(pid, start, host_net, userns_enabled())
+    }
+
+    pub fn adopt_with_userns(pid: i32, start: u64, host_net: bool, userns: bool) -> Option<Sandbox> {
         if network::proc_start(pid as u32) != Some(start) {
             return None;
         }
@@ -237,12 +253,12 @@ impl Sandbox {
         if network::proc_start(pid as u32) != Some(start) {
             return None;
         }
-        Some(Sandbox { pid, pidfd, host_net })
+        Some(Sandbox { pid, pidfd, host_net, userns })
     }
 
     /// A target for joining the pod's network (probes); the sandbox owns the netns.
     pub fn target(&self) -> Result<ExecTarget, Errno> {
-        Ok(ExecTarget { pidfd: Rc::new(ns::pidfd_open(self.pid)?), cgroup: None, host_net: self.host_net })
+        Ok(ExecTarget { pidfd: Rc::new(ns::pidfd_open(self.pid)?), cgroup: None, host_net: self.host_net, userns: self.userns })
     }
 
     /// Kills and reaps the sandbox (its namespaces disappear with the last member).
@@ -266,7 +282,8 @@ impl Sandbox {
         if list.is_empty() {
             return Ok(());
         }
-        let mut flags = ns::CLONE_NEWUSER | ns::CLONE_NEWIPC | ns::CLONE_NEWUTS;
+        let mut flags = ns::CLONE_NEWIPC | ns::CLONE_NEWUTS;
+        if self.userns { flags |= ns::CLONE_NEWUSER; }
         if !self.host_net {
             flags |= ns::CLONE_NEWNET;
         }
@@ -291,23 +308,24 @@ impl Sandbox {
 }
 
 /// Starts a pod sandbox. `net` (root only) attaches it to the bridge with that address.
-pub fn start_sandbox(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>) -> Result<Sandbox, RunError> {
-    sandbox_inner(id, hostname, maps, net, false, false).map(|(pid, pidfd)| Sandbox { pid, pidfd: pidfd.expect("pidfd without CLONE_PARENT"), host_net: false })
+pub fn start_sandbox(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>, userns: bool) -> Result<Sandbox, RunError> {
+    sandbox_inner(id, hostname, maps, net, false, false, userns).map(|(pid, pidfd)| Sandbox { pid, pidfd: pidfd.expect("pidfd without CLONE_PARENT"), host_net: false, userns })
 }
 
 /// Starts a hostNetwork pod sandbox: like `start_sandbox` but without a network namespace, so
 /// the pod's processes share the caller's (the host's, or the rootless user's own).
-pub fn start_host_sandbox(id: &[u8], hostname: &[u8], maps: &IdMaps) -> Result<Sandbox, RunError> {
-    sandbox_inner(id, hostname, maps, None, false, true).map(|(pid, pidfd)| Sandbox { pid, pidfd: pidfd.expect("pidfd without CLONE_PARENT"), host_net: true })
+pub fn start_host_sandbox(id: &[u8], hostname: &[u8], maps: &IdMaps, userns: bool) -> Result<Sandbox, RunError> {
+    sandbox_inner(id, hostname, maps, None, false, true, userns).map(|(pid, pidfd)| Sandbox { pid, pidfd: pidfd.expect("pidfd without CLONE_PARENT"), host_net: true, userns })
 }
 
 /// Starts a pod sandbox whose user and network namespaces are children of `parent`'s (the
 /// rootless pod network): a helper joins `parent`, creates the sandbox as kr's child
 /// (CLONE_PARENT), writes the nested maps and plugs it into the bridge living there.
-pub fn start_sandbox_in(parent: &Sandbox, id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>) -> Result<Sandbox, RunError> {
+pub fn start_sandbox_in(parent: &Sandbox, id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>, userns: bool) -> Result<Sandbox, RunError> {
     let nested = maps.nested();
     let (pid_r, pid_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
-    let helper = fork_into(&parent.pidfd, ns::CLONE_NEWUSER | ns::CLONE_NEWNET, None, move || match sandbox_inner(id, hostname, &nested, net, true, false) {
+    let helper_flags = if userns { ns::CLONE_NEWUSER | ns::CLONE_NEWNET } else { ns::CLONE_NEWNET };
+    let helper = fork_into(&parent.pidfd, helper_flags, None, move || match sandbox_inner(id, hostname, &nested, net, true, false, userns) {
         Ok((pid, _)) => {
             let _ = kr_sys::write(pid_w.raw(), &(pid as u32).to_le_bytes());
             0
@@ -332,13 +350,15 @@ pub fn start_sandbox_in(parent: &Sandbox, id: &[u8], hostname: &[u8], maps: &IdM
     let pid = first as i32;
     // The sandbox is kr's (unreaped) child via CLONE_PARENT: the pid cannot be reused.
     let pidfd = ns::pidfd_open(pid).map_err(err("pidfd_open"))?;
-    Ok(Sandbox { pid, pidfd, host_net: false })
+    Ok(Sandbox { pid, pidfd, host_net: false, userns })
 }
 
 /// Runs `f` inside `sb`'s user and network namespaces and waits for it (e.g. to configure
 /// the bridge in the rootless pod network). Returns its exit code.
 pub fn run_in_net(sb: &Sandbox, f: impl FnOnce() -> i32) -> Result<i32, RunError> {
-    let r = fork_into(&sb.pidfd, ns::CLONE_NEWUSER | ns::CLONE_NEWNET, None, f)?;
+    let mut flags = ns::CLONE_NEWNET;
+    if sb.userns { flags |= ns::CLONE_NEWUSER; }
+    let r = fork_into(&sb.pidfd, flags, None, f)?;
     let status = ns::wait4(r.pid).map_err(err("wait4"))?;
     Ok(ns::exit_code(status))
 }
@@ -356,13 +376,15 @@ fn init_exe_fd() {
 
 /// Shared sandbox start. With `clone_parent` the sandbox becomes the caller's parent's child
 /// (used from a helper inside the pod-network namespaces) and no pidfd is returned.
-fn sandbox_inner(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>, clone_parent: bool, host_net: bool) -> Result<(i32, Option<Fd>), RunError> {
+fn sandbox_inner(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>, clone_parent: bool, host_net: bool, userns: bool) -> Result<(i32, Option<Fd>), RunError> {
     init_exe_fd();
     let (go_r, go_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     let (rep_r, rep_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     let (uid, gid) = (ns::getuid(), ns::getgid());
     let mut pidfd: i32 = -1;
-    let mut args = CloneArgs { flags: ns::CLONE_NEWUSER | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC, ..Default::default() };
+    let mut flags = ns::CLONE_NEWUTS | ns::CLONE_NEWIPC;
+    if userns { flags |= ns::CLONE_NEWUSER; }
+    let mut args = CloneArgs { flags, ..Default::default() };
     if !host_net {
         args.flags |= ns::CLONE_NEWNET;
     }
@@ -427,8 +449,10 @@ fn sandbox_inner(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfi
         }
         Err(e)
     };
-    if let Err(e) = maps.apply(pid, uid, gid) {
-        return fail(e);
+    if userns {
+        if let Err(e) = maps.apply(pid, uid, gid) {
+            return fail(e);
+        }
     }
     if let Some(n) = &net {
         network::forget_neighbour(n.ip);
@@ -521,6 +545,8 @@ pub struct Running {
     pidfd: Rc<Fd>,
     cgroup: Option<Cgroup>,
     host_net: bool,
+    /// Whether this container runs in a user namespace.
+    pub userns: bool,
     /// Run by a shim (see [`start_detached`]): not our child. Its exit status is in this file.
     exit_file: Option<Vec<u8>>,
     /// The shim process (parent of the container), if any.
@@ -529,6 +555,17 @@ pub struct Running {
 
 /// Exit code reported when a shim's exit file is missing (the shim itself was killed).
 pub const UNKNOWN_EXIT: i32 = 255;
+
+/// Whether to run pods in a user namespace (rootless isolation).
+/// Default is rootful (no userns) when kr runs as root, matching k3s.
+/// Set KR_USERNS=1 to opt into user-namespace isolation, or if kr runs as
+/// non-root (forced).
+pub fn userns_enabled() -> bool {
+    if kr_sys::ns::getuid() != 0 {
+        return true;
+    }
+    crate::store::env_var("KR_USERNS").as_deref() == Some("1")
+}
 
 /// Sends signals to a container's pid 1; usable from another task while `wait` runs.
 #[derive(Clone)]
@@ -553,7 +590,7 @@ impl Running {
 
     /// A handle for running more processes inside this container (exec, probes).
     pub fn target(&self) -> ExecTarget {
-        ExecTarget { pidfd: self.pidfd.clone(), cgroup: self.cgroup_fd(), host_net: self.host_net }
+        ExecTarget { pidfd: self.pidfd.clone(), cgroup: self.cgroup_fd(), host_net: self.host_net, userns: self.userns }
     }
 
     /// A container run by a shim of a previous run of this process, or `None` when `pid` is gone
@@ -567,7 +604,7 @@ impl Running {
         if network::proc_start(pid as u32) != Some(start) {
             return None;
         }
-        Some(Running { pid, pidfd: Rc::new(pidfd), cgroup, host_net, exit_file: Some(exit_file), shim })
+        Some(Running { pid, pidfd: Rc::new(pidfd), cgroup, host_net, userns: userns_enabled(), exit_file: Some(exit_file), shim })
     }
 
     pub fn shim_pid(&self) -> i32 {
@@ -600,7 +637,7 @@ impl Running {
             }
             return Ok(found.unwrap_or(Exit { code: UNKNOWN_EXIT, oom_killed: false }));
         }
-        let Running { pid: _, pidfd, cgroup, host_net: _, exit_file: _, shim: _ } = self;
+        let Running { pid: _, pidfd, cgroup, host_net: _, userns: _, exit_file: _, shim: _ } = self;
         let code = match kr_rt::exec::Async::new(pidfd) {
             Ok(fd) => loop {
                 match ns::pidfd_try_wait(fd.get_ref()) {
@@ -654,14 +691,12 @@ pub fn start(spec: &RunSpec) -> Result<Running, RunError> {
         return start_in_sandbox(spec, sb, cgroup, rootless(uid), full_map);
     }
 
+    let mut flags = ns::CLONE_NEWNS | ns::CLONE_NEWPID | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC | ns::CLONE_NEWNET | ns::CLONE_NEWCGROUP;
+    if spec.userns {
+        flags |= ns::CLONE_NEWUSER;
+    }
     let mut args = CloneArgs {
-        flags: ns::CLONE_NEWUSER
-            | ns::CLONE_NEWNS
-            | ns::CLONE_NEWPID
-            | ns::CLONE_NEWUTS
-            | ns::CLONE_NEWIPC
-            | ns::CLONE_NEWNET
-            | ns::CLONE_NEWCGROUP,
+        flags,
         exit_signal: ns::SIGCHLD as u64,
         ..Default::default()
     };
@@ -693,12 +728,14 @@ pub fn start(spec: &RunSpec) -> Result<Running, RunError> {
 
     drop(go_r);
     drop(rep_w);
-    let running = Running { pid, pidfd: Rc::new(Fd(pidfd)), cgroup, host_net: false, exit_file: None, shim: 0 };
-    if let Err(e) = spec.maps.apply(pid, uid, gid) {
-        let _ = ns::kill(pid, ns::SIGKILL);
-        let _ = ns::wait4(pid);
-        running.finish();
-        return Err(e);
+    let running = Running { pid, pidfd: Rc::new(Fd(pidfd)), cgroup, host_net: false, userns: spec.userns, exit_file: None, shim: 0 };
+    if spec.userns {
+        if let Err(e) = spec.maps.apply(pid, uid, gid) {
+            let _ = ns::kill(pid, ns::SIGKILL);
+            let _ = ns::wait4(pid);
+            running.finish();
+            return Err(e);
+        }
     }
     if let Some(n) = &spec.net {
         network::forget_neighbour(n.ip);
@@ -985,7 +1022,9 @@ fn start_in_sandbox(spec: &RunSpec, sb: &Sandbox, cgroup: Option<Cgroup>, rootle
         drop(go_w);
         drop(rep_r);
         drop(pid_r);
-        if let Err(e) = ns::setns(&sb.pidfd, if sb.host_net { ns::CLONE_NEWUSER | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC } else { ns::CLONE_NEWUSER | ns::CLONE_NEWNET | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC }) {
+        let mut setns_flags = if sb.host_net { ns::CLONE_NEWUTS | ns::CLONE_NEWIPC } else { ns::CLONE_NEWNET | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC };
+        if sb.userns { setns_flags |= ns::CLONE_NEWUSER; }
+        if let Err(e) = ns::setns(&sb.pidfd, setns_flags) {
             report_exit(&rep_w, 24, e);
         }
         let mut args = CloneArgs { flags: ns::CLONE_NEWNS | ns::CLONE_NEWPID | ns::CLONE_NEWCGROUP | ns::CLONE_PARENT, ..Default::default() };
@@ -1036,7 +1075,7 @@ fn start_in_sandbox(spec: &RunSpec, sb: &Sandbox, cgroup: Option<Cgroup>, rootle
             return Err(RunError { step: "pidfd_open", errno: e });
         }
     };
-    let running = Running { pid, pidfd: Rc::new(pidfd), cgroup, host_net: sb.host_net, exit_file: None, shim: 0 };
+    let running = Running { pid, pidfd: Rc::new(pidfd), cgroup, host_net: sb.host_net, userns: sb.userns, exit_file: None, shim: 0 };
     let _ = kr_sys::write(go_w.raw(), b"g");
     drop(go_w);
     let mut rep = [0u8; 3];
@@ -1567,7 +1606,7 @@ pub fn start_detached(spec: &RunSpec, exit_path: &[u8], io: &ShimIo) -> Result<R
     // The shim has not reaped the container, so the pid cannot have been recycled.
     let pidfd = ns::pidfd_open(pid).map_err(err("pidfd_open"))?;
     let cgroup = if spec.limits.is_empty() { None } else { Cgroup::open_in(spec.cgroup_parent, spec.id).ok() };
-    Ok(Running { pid, pidfd: Rc::new(pidfd), cgroup, host_net: spec.sandbox.is_some_and(|s| s.host_net), exit_file: Some(cstr(&[exit_path])), shim })
+    Ok(Running { pid, pidfd: Rc::new(pidfd), cgroup, host_net: spec.sandbox.is_some_and(|s| s.host_net), userns: spec.userns, exit_file: Some(cstr(&[exit_path])), shim })
 }
 
 /// The shim: runs in a forked copy of the kubelet, so it keeps the whole spec in memory.

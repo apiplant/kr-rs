@@ -346,7 +346,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             } else {
                 // The old pod network is gone (or never existed): pods that used it cannot live on.
                 self.kill_recorded(&[]);
-                match container::start_sandbox(b"kr-pod-network", b"", &self.maps, None) {
+                match container::start_sandbox(b"kr-pod-network", b"", &self.maps, None, true) {
                     Ok(infra) => {
                         // ip_forward + bridge inside the infra namespaces; egress is set up
                         // separately and optional.
@@ -493,7 +493,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         if network::proc_start(egress as u32) != Some(estart) {
             return None;
         }
-        Sandbox::adopt(pid as i32, start, false)
+        Sandbox::adopt_with_userns(pid as i32, start, false, true)
     }
 
     /// Every 500 ms: records when each container log file grew (see `log_marks`). Marks of
@@ -1018,7 +1018,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let Some(sb) = p.sandbox.as_ref() else { return };
             let Some(start) = kr_runtime::network::proc_start(sb.pid as u32) else { return };
             let host_net = sb.is_host_net();
-            let rec = adopt::Sb { pid: sb.pid, start, host_net, ip: p.lease.as_ref().map(|l| l.ip) };
+            let rec = adopt::Sb { pid: sb.pid, start, host_net, ip: p.lease.as_ref().map(|l| l.ip), userns: sb.userns };
             let ctrs: Vec<adopt::Ctr> = p
                 .ctrs
                 .iter()
@@ -1065,7 +1065,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     }
 
     fn adopt_pod(self: &Rc<Self>, uid: &str, pod: &Value, rt: &mut PodRt, sb: adopt::Sb, recs: Vec<adopt::Ctr>) -> Option<()> {
-        let sandbox = Sandbox::adopt(sb.pid, sb.start, sb.host_net)?;
+        let sandbox = Sandbox::adopt_with_userns(sb.pid, sb.start, sb.host_net, sb.userns)?;
         let pn = self.podnet.get();
         let fam = self.fam.get();
         let net = sb.ip.filter(|_| !sb.host_net).map(|ip| NetConfig::with(ip, &pn, fam));
@@ -1215,6 +1215,16 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let rootless_net = self.infra.borrow().is_some();
         // hostNetwork pods share the kubelet's network namespace: no veth, no pod IP lease.
         let host_net = pod.pointer(&["spec", "hostNetwork"]).and_then(Value::as_bool) == Some(true);
+        let host_users = pod.pointer(&["spec", "hostUsers"]).and_then(Value::as_bool);
+        let userns = if kr_sys::ns::getuid() != 0 {
+            true
+        } else {
+            match host_users {
+                Some(false) => true,
+                Some(true) => false,
+                None => kr_runtime::container::userns_enabled(),
+            }
+        };
         let use_cni = cni::is_enabled() && !host_net;
         if !use_cni && (self.cfg.network || rootless_net) && !host_net {
             let ipam = alloc::format!("{}/ipam", self.cfg.root);
@@ -1235,9 +1245,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             spec::pod_hostname(pod)
         };
         let started = match self.infra.borrow().as_ref() {
-            _ if host_net => container::start_host_sandbox(uid.as_bytes(), hostname.as_bytes(), &self.maps),
-            Some(infra) => container::start_sandbox_in(infra, uid.as_bytes(), hostname.as_bytes(), &self.maps, net),
-            None => container::start_sandbox(uid.as_bytes(), hostname.as_bytes(), &self.maps, net),
+            _ if host_net => container::start_host_sandbox(uid.as_bytes(), hostname.as_bytes(), &self.maps, userns),
+            Some(infra) => container::start_sandbox_in(infra, uid.as_bytes(), hostname.as_bytes(), &self.maps, net, userns),
+            None => container::start_sandbox(uid.as_bytes(), hostname.as_bytes(), &self.maps, net, userns),
         };
         let sb = match started {
             Ok(s) => s,
@@ -1446,6 +1456,18 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             extra_groups: &built.extra_groups,
             readonly_root: cspec.and_then(|c| c.pointer(&["securityContext", "readOnlyRootFilesystem"])).and_then(Value::as_bool).unwrap_or(false),
             privileged: cspec.and_then(|c| c.pointer(&["securityContext", "privileged"])).and_then(Value::as_bool).unwrap_or(false),
+            userns: {
+                let host_users = pod.pointer(&["spec", "hostUsers"]).and_then(Value::as_bool);
+                if kr_sys::ns::getuid() != 0 {
+                    true
+                } else {
+                    match host_users {
+                        Some(false) => true,
+                        Some(true) => false,
+                        None => kr_runtime::container::userns_enabled(),
+                    }
+                }
+            },
         };
         let detached = self.survives();
         // Descriptors a shim must keep for `attach`: our end of the stdin socket / the pty master.

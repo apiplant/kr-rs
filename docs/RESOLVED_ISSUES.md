@@ -238,3 +238,6 @@
     execution with env vars (CNI_COMMAND/CONTAINERID/NETNS/IFNAME/PATH), stdin/stdout, IP
     parsing. Wired into start_sandbox (skips built-in IPAM/veth, uses plugin-returned IPs)
     and cleanup (CNI DEL). Verified end-to-end with a fake plugin returning 10.200.0.5.
+
+## Rootful-by-default (k3s parity)
+- kr now runs pods in the host user namespace by default (rootful), matching k3s. User namespaces are opt-in via KR_USERNS=1 or per-pod hostUsers: false. Privileged pods get all capabilities with seccomp/no_new_privs skipped. This unblocks mknod (NVIDIA) and ipset/iptables (Calico) in rootful mode. Verified: privileged pod mknod succeeded; Calico node progressed past ipset errors.

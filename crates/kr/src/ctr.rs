@@ -186,6 +186,7 @@ fn run(mut args: Args) -> i32 {
         extra_groups: &[],
         readonly_root: false,
             privileged: false,
+            userns: kr_runtime::container::userns_enabled(),
     };
     if let Some(l) = &net.lease {
         let ip = l.ip;
@@ -258,7 +259,7 @@ fn bridge_network(store: &Store, id: &str, maps: &IdMaps) -> Result<CtrNet, i32>
     }
     // The lease comes first so the infra supervisor sees this process as a user.
     let cfg = NetConfig::with(lease.ip, &network::PodNet::default(), fam());
-    let sandbox = rootless_infra(store.root(), maps).and_then(|infra| container::start_sandbox_in(&infra, id.as_bytes(), id.as_bytes(), maps, Some(cfg)).map_err(|e| format!("sandbox: {}: errno {}", e.step, e.errno.0)));
+    let sandbox = rootless_infra(store.root(), maps).and_then(|infra| container::start_sandbox_in(&infra, id.as_bytes(), id.as_bytes(), maps, Some(cfg), kr_runtime::container::userns_enabled()).map_err(|e| format!("sandbox: {}: errno {}", e.step, e.errno.0)));
     match sandbox {
         Ok(sb) => Ok(CtrNet { lease: Some(lease), sandbox: Some(sb) }),
         Err(e) => {
@@ -329,7 +330,7 @@ fn infra_supervisor(root: &str, maps: &IdMaps) -> ! {
         }
     }
     ns::close_from(3);
-    let Ok(infra) = container::start_sandbox(b"kr-ctr-network", b"", maps, None) else { kr_sys::exit_group(1) };
+    let Ok(infra) = container::start_sandbox(b"kr-ctr-network", b"", maps, None, kr_runtime::container::userns_enabled()) else { kr_sys::exit_group(1) };
     let pn = network::PodNet::default();
     if !matches!(container::run_in_net(&infra, || network::setup_infra_bridge(&pn, fam())), Ok(0)) {
         infra.stop();
@@ -487,6 +488,7 @@ fn run_dir(mut args: Args) -> i32 {
         extra_groups: &[],
         readonly_root: false,
             privileged: false,
+            userns: kr_runtime::container::userns_enabled(),
     };
     supervise(&spec)
 }
@@ -519,7 +521,7 @@ fn pod_demo(mut args: Args) -> i32 {
     rootfs.pop();
     let maps = IdMaps::for_current_user();
     let id = container_id();
-    let sb = match container::start_sandbox(id.as_bytes(), b"demo-pod", &maps, None) {
+    let sb = match container::start_sandbox(id.as_bytes(), b"demo-pod", &maps, None, kr_runtime::container::userns_enabled()) {
         Ok(s) => s,
         Err(e) => return fail(&format!("sandbox: {}: errno {}", e.step, e.errno.0)),
     };
@@ -562,6 +564,7 @@ fn pod_demo(mut args: Args) -> i32 {
             extra_groups: &[],
             readonly_root: false,
             privileged: false,
+            userns: kr_runtime::container::userns_enabled(),
         };
         match container::start(&spec) {
             Ok(r) => started.push(r),
