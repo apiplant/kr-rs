@@ -1869,7 +1869,7 @@ impl ApiServer {
         if rt.res.plural == "pods" {
             let ns = rt.namespace.clone().unwrap_or_default();
             self.admit_pod(o, &ns)?;
-            self.admit_priority(o, &ns)?;
+            self.admit_priority(o)?;
             self.admit_pod_classes(o, &ns)?;
         }
         self.admit_pod_security(rt, o, None)?;
@@ -2935,7 +2935,7 @@ impl ApiServer {
 
     /// Priority admission for pods: `spec.priority` and `spec.preemptionPolicy` come from the
     /// PriorityClass named by `spec.priorityClassName` (the global default class when unnamed).
-    fn admit_priority(&self, o: &mut Value, ns: &str) -> R<()> {
+    fn admit_priority(&self, o: &mut Value) -> R<()> {
         let pcr = resources::find("scheduling.k8s.io", "v1", "priorityclasses").unwrap();
         let name = o.pointer(&["spec", "priorityClassName"]).and_then(Value::as_str).unwrap_or("").to_string();
         let class = if name.is_empty() {
@@ -2948,13 +2948,6 @@ impl ApiServer {
                 None => return Err(ApiError::new(403, "Forbidden", alloc::format!("pods \"{}\" is forbidden: no PriorityClass with name {name} was found", o.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("")))),
             }
         };
-        // The built-in critical classes outrank (and can preempt) every workload. As upstream
-        // (kube-apiserver's default limitedResources), they are usable outside kube-system only
-        // where a ResourceQuota explicitly covers the class.
-        let cname = class.as_ref().and_then(|c| c.pointer(&["metadata", "name"])).and_then(Value::as_str).unwrap_or("").to_string();
-        if matches!(cname.as_str(), "system-node-critical" | "system-cluster-critical") && ns != "kube-system" && !self.quota_covers_priority(ns, &cname) {
-            return Err(ApiError::new(403, "Forbidden", alloc::format!("pods \"{}\" is forbidden: insufficient quota to match these scopes: [{{PriorityClass In [system-node-critical system-cluster-critical]}}]", o.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or(""))));
-        }
         let spec = o.entry_object("spec");
         match class {
             Some(c) => {
@@ -3003,18 +2996,6 @@ impl ApiServer {
             Some(msg) => Err(ApiError::new(403, "Forbidden", alloc::format!("pods {name:?} is forbidden: {msg}"))),
             None => Ok(()),
         }
-    }
-
-    /// Whether a ResourceQuota in `ns` has a `PriorityClass In [..class..]` scope selector.
-    fn quota_covers_priority(&self, ns: &str, class: &str) -> bool {
-        let Some(r) = resources::find("", "v1", "resourcequotas") else { return false };
-        self.list_values(r, Some(ns)).iter().any(|q| {
-            q.pointer(&["spec", "scopeSelector", "matchExpressions"]).and_then(Value::as_array).unwrap_or(&[]).iter().any(|e| {
-                e.get("scopeName").and_then(Value::as_str) == Some("PriorityClass")
-                    && e.get("operator").and_then(Value::as_str) == Some("In")
-                    && e.get("values").and_then(Value::as_array).is_some_and(|v| v.iter().any(|x| x.as_str() == Some(class)))
-            })
-        })
     }
 
     /// `authorization.k8s.io/v1` SubjectAccessReview / LocalSubjectAccessReview: the decision for

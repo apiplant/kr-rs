@@ -929,8 +929,19 @@ async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str
         if !path.starts_with('/') {
             return Err(alloc::format!("hostPath {path} must be absolute"));
         }
-        if matches!(h.get("type").and_then(Value::as_str), Some("DirectoryOrCreate")) {
+        // An empty type means "no checks" upstream, but the kubelet still creates a missing
+        // directory before bind-mounting (Calico and others rely on this).
+        if h.get("type").and_then(Value::as_str).is_none_or(|t| t.is_empty() || t == "DirectoryOrCreate") {
             let _ = kr_runtime::store::mkdir_p(path, 0o755);
+        }
+        if matches!(h.get("type").and_then(Value::as_str), Some("FileOrCreate")) {
+            if let Some(parent) = path.rsplit_once('/') {
+                if !parent.0.is_empty() {
+                    let _ = kr_runtime::store::mkdir_p(parent.0, 0o755);
+                }
+            }
+            // Create the file if missing (ignore EEXIST).
+            let _ = kr_sys::ns::open(alloc::format!("{path}\0").as_bytes(), kr_sys::ns::O_WRONLY | kr_sys::ns::O_CREAT | kr_sys::O_CLOEXEC, 0o644);
         }
         Ok(Some(path.to_string()))
     } else if ["configMap", "secret", "projected", "downwardAPI"].iter().any(|k| vol.get(k).is_some()) {

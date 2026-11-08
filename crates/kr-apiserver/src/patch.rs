@@ -178,6 +178,7 @@ pub(crate) fn merge_key(path: &[&str], field: &str) -> Option<&'static str> {
         "taints" => "key",
         "topologySpreadConstraints" => "topologyKey",
         "readinessGates" => "conditionType",
+        "webhooks" => "name",
         _ => return None,
     })
 }

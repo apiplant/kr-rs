@@ -19,3 +19,23 @@ Only work still to do lives here (open items, things to watch, accepted limits).
     - CRD conversion: objects written earlier keep their stored version (a `StorageVersionMigration` rewrites them on request); for a CRD with a conversion webhook, server-side apply through a non-storage version is recorded as an Update (the converted write is a PUT).
     - Rootless: the host cannot reach pod IPs directly (use port-forward or the API server's pod proxy).
     - Memory: with 4 KB pods the 32 MiB history budget keeps about 4,000 events (watch the `410 Expired` rate); per-pod server growth (about 120 KB at 100 pods) has no per-category breakdown.
+
+## Limitations found during Helm/GPU/network evaluation (2026-11-11)
+
+117. **No Device Plugin API**
+    kubelet does not serve `/var/lib/kubelet/device-plugins` (gRPC). NVIDIA GPU Operator's device plugin cannot register; `nvidia.com/gpu` is never advertised. GPUs work via hostPath device nodes instead. Requires implementing a gRPC (HTTP/2) server+client in kr, which has none today.
+
+118. **`privileged` / capabilities / securityContext ignored**
+    `drop_caps(DEFAULT_CAPS)` always runs; `securityContext.privileged` and capability adds are not honored. Workloads needing caps (NVIDIA validator, Calico, device plugins) fail. Fix: honor privileged by keeping the full cap set in the pod's user namespace.
+
+120. **Host kernel modules missing in this sandbox**
+    Running kernel 7.2.14 has no installed module tree; `xt_comment`/`nft_nat` unavailable. k3s's iptables/nft proxy fails; kr avoids this with netlink + nft over netlink. Environment-specific, not a kr bug.
+
+123. **File bind-mounts into pods fail (`errno 2`)**
+    hostPath mounts of Docker bind-mounted files (e.g. `libcuda.so.1`, `nvidia-smi`) fail with `volume mount: errno 2`; directory mounts, device nodes, and regular files work. Investigate nested bind mount of a bind-mounted source.
+
+124. **cert-manager `PartialObjectMetadata` watch churn**
+    cainjector logs recurring `no kind "Secret" is registered for version "v1"`; recovers but causes re-lists. Separate metadata-watch bug.
+
+125. **API TLS handshake ~40% slower than k3s**
+    `kr-crypto` TLS 1.3 handshake ~2.3 ms vs k3s ~1.6 ms (crypto optimized for memory/size). Request handling on warm connections is faster (0.5 ms vs 1.1 ms). Optimize handshake if needed.

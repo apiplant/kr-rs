@@ -19,6 +19,11 @@ pub(crate) fn cpus() -> usize {
     read(b"/proc/cpuinfo\0").lines().filter(|l| l.starts_with("processor")).count().max(1)
 }
 
+/// Configurable node pod limit (default 110, upstream default). Override with KR_MAX_PODS.
+pub(crate) fn max_pods() -> u32 {
+    kr_runtime::store::env_var("KR_MAX_PODS").and_then(|v| v.parse().ok()).unwrap_or(110)
+}
+
 pub(crate) fn memory_ki() -> u64 {
     read(b"/proc/meminfo\0").lines().find_map(|l| l.strip_prefix("MemTotal:")).and_then(|v| v.split_whitespace().next()?.parse().ok()).unwrap_or(0)
 }
@@ -34,8 +39,9 @@ fn status(cfg: &Config) -> String {
     let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
     let (mp, mp_reason) = if crate::evict::under_pressure(memory_available_ki(), cfg.eviction_memory_bytes) { ("True", "KubeletHasInsufficientMemory") } else { ("False", "KubeletHasSufficientMemory") };
     let kernel = read(b"/proc/sys/kernel/osrelease\0");
+    let pods = max_pods();
     alloc::format!(
-        r#"{{"capacity":{{"cpu":"{cpu}","memory":"{mem}Ki","pods":"110"}},"allocatable":{{"cpu":"{cpu}","memory":"{mem}Ki","pods":"110"}},
+        r#"{{"capacity":{{"cpu":"{cpu}","memory":"{mem}Ki","pods":"{pods}"}},"allocatable":{{"cpu":"{cpu}","memory":"{mem}Ki","pods":"{pods}"}},
 "conditions":[{{"type":"Ready","status":"True","reason":"KubeletReady","message":"kr kubelet is posting ready status","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}},
 {{"type":"MemoryPressure","status":"{mp}","reason":"{mp_reason}","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}},
 {{"type":"DiskPressure","status":"False","reason":"KubeletHasNoDiskPressure","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}},

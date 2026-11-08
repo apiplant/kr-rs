@@ -185,6 +185,7 @@ fn run(mut args: Args) -> i32 {
         tty_fd: None,
         extra_groups: &[],
         readonly_root: false,
+            privileged: false,
     };
     if let Some(l) = &net.lease {
         let ip = l.ip;
@@ -485,6 +486,7 @@ fn run_dir(mut args: Args) -> i32 {
         tty_fd: None,
         extra_groups: &[],
         readonly_root: false,
+            privileged: false,
     };
     supervise(&spec)
 }
@@ -559,6 +561,7 @@ fn pod_demo(mut args: Args) -> i32 {
         tty_fd: None,
             extra_groups: &[],
             readonly_root: false,
+            privileged: false,
         };
         match container::start(&spec) {
             Ok(r) => started.push(r),

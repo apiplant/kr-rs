@@ -29,6 +29,7 @@ enum Item {
 struct Class {
     neg: bool,
     items: Vec<Item>,
+    ci: bool,
 }
 
 fn esc_matches(e: Esc, c: char) -> bool {
@@ -42,6 +43,11 @@ fn esc_matches(e: Esc, c: char) -> bool {
 impl Class {
     fn matches(&self, c: char) -> bool {
         let hit = self.items.iter().any(|i| match i {
+            Item::Range(a, b) if self.ci => {
+                let lc = c.to_ascii_lowercase();
+                let (al, bl) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
+                (al <= lc && lc <= bl) || (*a <= c && c <= *b)
+            }
             Item::Range(a, b) => *a <= c && c <= *b,
             Item::Esc(e, neg) => esc_matches(*e, c) != *neg,
         });
@@ -52,6 +58,7 @@ impl Class {
 enum Node {
     Empty,
     Char(char),
+    CharFold(char),
     Any,
     Class(Class),
     Bol,
@@ -65,6 +72,8 @@ enum Node {
 struct Parser {
     s: Vec<char>,
     i: usize,
+    /// `(?i)` is in effect for the remainder of the enclosing group.
+    ci: bool,
 }
 
 impl Parser {
@@ -211,7 +220,7 @@ impl Parser {
                 items.push(Item::Range(lo, lo));
             }
         }
-        Ok(Node::Class(Class { neg, items }))
+        Ok(Node::Class(Class { neg, items, ci: self.ci }))
     }
     fn atom(&mut self) -> Result<Node, String> {
         let c = self.s[self.i];
@@ -222,9 +231,40 @@ impl Parser {
             '$' => Node::Eol,
             '[' => self.class()?,
             '(' => {
+                let saved = self.ci;
                 if self.s.get(self.i) == Some(&'?') {
                     match self.s.get(self.i + 1) {
                         Some(':') => self.i += 2,
+                        Some('i') | Some('-') => {
+                            // Inline flags: `(?i)`, `(?-i)`, `(?i:...)`, `(?-i:...)`.
+                            self.i += 1;
+                            let mut on = true;
+                            let scoped = loop {
+                                match self.s.get(self.i) {
+                                    Some('i') => {
+                                        self.ci = on;
+                                        self.i += 1;
+                                    }
+                                    Some('-') => {
+                                        on = false;
+                                        self.i += 1;
+                                    }
+                                    Some(')') => {
+                                        self.i += 1;
+                                        break false;
+                                    }
+                                    Some(':') => {
+                                        self.i += 1;
+                                        break true;
+                                    }
+                                    _ => return Err("unsupported inline flag".into()),
+                                }
+                            };
+                            if !scoped {
+                                // Applies to the rest of the enclosing group; no node.
+                                return Ok(Node::Empty);
+                            }
+                        }
                         _ => return Err("lookaround and named groups are not supported".into()),
                     }
                 }
@@ -233,6 +273,7 @@ impl Parser {
                     return Err("missing closing )".into());
                 }
                 self.i += 1;
+                self.ci = saved;
                 n
             }
             ')' => return Err("unexpected )".into()),
@@ -250,17 +291,18 @@ impl Parser {
                     _ => {}
                 }
                 match self.escape()? {
-                    Item::Range(a, _) => Node::Char(a),
-                    e => Node::Class(Class { neg: false, items: vec![e] }),
+                    Item::Range(a, _) => if self.ci { Node::CharFold(a) } else { Node::Char(a) },
+                    e => Node::Class(Class { neg: false, items: vec![e], ci: self.ci }),
                 }
             }
-            c => Node::Char(c),
+            c => if self.ci { Node::CharFold(c) } else { Node::Char(c) },
         })
     }
 }
 
 enum Inst {
     Char(char),
+    CharFold(char),
     Any,
     Class(Class),
     Split(usize, usize),
@@ -278,6 +320,7 @@ fn emit(n: &Node, p: &mut Vec<Inst>) -> Result<(), String> {
     match n {
         Node::Empty => {}
         Node::Char(c) => p.push(Inst::Char(*c)),
+        Node::CharFold(c) => p.push(Inst::CharFold(*c)),
         Node::Any => p.push(Inst::Any),
         Node::Class(c) => p.push(Inst::Class(c.clone())),
         Node::Bol => p.push(Inst::Bol),
@@ -350,7 +393,7 @@ fn is_word(c: Option<&char>) -> bool {
 
 impl Regex {
     pub fn new(pat: &str) -> Result<Regex, String> {
-        let mut p = Parser { s: pat.chars().collect(), i: 0 };
+        let mut p = Parser { s: pat.chars().collect(), i: 0, ci: false };
         let n = p.alt()?;
         if p.i < p.s.len() {
             return Err(format!("unexpected {:?} at offset {}", p.s[p.i], p.i));
@@ -389,6 +432,13 @@ impl Regex {
                     Inst::Match => return Ok(true),
                     Inst::Char(c) => {
                         if t.get(pos) != Some(c) {
+                            break;
+                        }
+                        pc += 1;
+                        pos += 1;
+                    }
+                    Inst::CharFold(c) => {
+                        if !t.get(pos).is_some_and(|ch| ch.eq_ignore_ascii_case(c)) {
                             break;
                         }
                         pc += 1;
@@ -466,6 +516,20 @@ mod tests {
         assert!(m(r"\bfoo\b", "a foo b"));
         assert!(m("^$", ""));
         assert!(m(r"^[\d.]+$", "1.2"));
+    }
+
+    #[test]
+    fn case_insensitive_flag() {
+        assert!(m("^(?i)(Disabled|Strict|Loose)?$", "disabled"));
+        assert!(m("^(?i)(Disabled|Strict|Loose)?$", "STRICT"));
+        assert!(!m("^(?i)(Disabled|Strict|Loose)?$", "other"));
+        assert!(m("^(?i)[a-z]+$", "AbC"));
+        assert!(m("^a(?i)b$", "aB"));
+        assert!(!m("^a(?i)b$", "Ab")); // only the remainder is insensitive
+        assert!(m("^(?i:ab)c$", "ABc"));
+        assert!(!m("^(?i:ab)c$", "ABC"));
+        assert!(m("^(?i)ab(?-i)cd$", "ABcd"));
+        assert!(!m("^(?i)ab(?-i)cd$", "ABCD"));
     }
 
     #[test]

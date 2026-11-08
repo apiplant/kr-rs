@@ -25,32 +25,54 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
     let b: Vec<char> = s.chars().collect();
     let (mut i, mut out) = (0, Vec::new());
     while i < b.len() {
-        let c = b[i];
-        if c.is_whitespace() {
+        let raw = b[i] == 'r' && i + 1 < b.len() && (b[i + 1] == '"' || b[i + 1] == '\'');
+    if raw {
+        i += 1;
+    }
+    let c = b[i];
+    if c.is_whitespace() {
+        i += 1;
+    } else if c == '"' || c == '\'' {
+        let quote = c;
+        let triple = i + 2 < b.len() && b[i + 1] == quote && b[i + 2] == quote;
+        if triple {
+            i += 3;
+        } else {
             i += 1;
-        } else if c == '"' || c == '\'' {
-            let mut v = String::new();
-            i += 1;
-            while i < b.len() && b[i] != c {
-                if b[i] == '\\' && i + 1 < b.len() {
-                    i += 1;
-                    v.push(match b[i] {
-                        'n' => '\n',
-                        't' => '\t',
-                        'r' => '\r',
-                        o => o,
-                    });
-                } else {
-                    v.push(b[i]);
+        }
+        let mut v = String::new();
+        let mut closed = false;
+        while i < b.len() {
+            if triple {
+                if i + 2 < b.len() && b[i] == quote && b[i + 1] == quote && b[i + 2] == quote {
+                    i += 3;
+                    closed = true;
+                    break;
                 }
+            } else if b[i] == quote {
+                i += 1;
+                closed = true;
+                break;
+            }
+            if !raw && b[i] == '\\' && i + 1 < b.len() {
+                i += 1;
+                v.push(match b[i] {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    o => o,
+                });
+                i += 1;
+            } else {
+                v.push(b[i]);
                 i += 1;
             }
-            if i >= b.len() {
-                return Err("unterminated string".into());
-            }
-            i += 1;
-            out.push(Tok::Str(v));
-        } else if c.is_ascii_digit() {
+        }
+        if !closed {
+            return Err("unterminated string".into());
+        }
+        out.push(Tok::Str(v));
+    } else if c.is_ascii_digit() {
             let st = i;
             while i < b.len() && (b[i].is_ascii_digit() || b[i] == '.') {
                 i += 1;
@@ -322,7 +344,7 @@ type Vars<'a> = [(&'a str, &'a Value)];
 
 const MACROS: [&str; 5] = ["all", "exists", "exists_one", "filter", "map"];
 const METHODS: [&str; 8] = ["size", "startsWith", "endsWith", "contains", "matches", "lowerAscii", "upperAscii", "trim"];
-const FUNCS: [&str; 6] = ["has", "size", "matches", "int", "double", "string"];
+const FUNCS: [&str; 8] = ["has", "size", "matches", "int", "double", "string", "isURL", "duration"];
 
 /// Rejects references and calls the evaluator does not support (done once, at compile time).
 fn check(e: &E, scope: &mut Vec<String>) -> Result<(), String> {
@@ -450,6 +472,15 @@ fn eval(e: &E, vars: &Vars) -> Result<Value, String> {
                 Value::Number(n) => n.as_f64().to_string(),
                 _ => return Err("string() of unsupported type".into()),
             }),
+            ("isURL", [x]) => {
+                let s = eval(x, vars)?;
+                Value::Bool(s.as_str().map(is_url).unwrap_or(false))
+            }
+            ("duration", [x]) => {
+                let s = eval(x, vars)?;
+                let txt = s.as_str().ok_or("duration() requires a string")?;
+                Value::Number(Number::from_f64(parse_duration(txt).ok_or("invalid duration")?).ok_or("bad number")?)
+            }
             _ => return Err(format!("unsupported function {f}")),
         },
         E::Method(b, m, a) => {
@@ -553,7 +584,12 @@ fn eval(e: &E, vars: &Vars) -> Result<Value, String> {
                     _ => {
                         let ord = match (&a, &b) {
                             (Value::Number(x), Value::Number(y)) => x.as_f64().partial_cmp(&y.as_f64()),
-                            (Value::String(x), Value::String(y)) => Some(x.cmp(y)),
+                            (Value::String(x), Value::String(y)) => match (parse_duration(x), parse_duration(y)) {
+                                (Some(nx), Some(ny)) => nx.partial_cmp(&ny),
+                                _ => Some(x.cmp(y)),
+                            },
+                            (Value::String(x), Value::Number(y)) => parse_duration(x).and_then(|nx| nx.partial_cmp(&y.as_f64())),
+                            (Value::Number(x), Value::String(y)) => parse_duration(y).and_then(|ny| x.as_f64().partial_cmp(&ny)),
                             _ => None,
                         }
                         .ok_or("invalid comparison")?;
@@ -573,6 +609,56 @@ fn eval(e: &E, vars: &Vars) -> Result<Value, String> {
 fn matches_re(s: &Value, re: &Value) -> Result<Value, String> {
     let (Value::String(s), Value::String(re)) = (s, re) else { return Err("matches() requires strings".into()) };
     Ok(Value::Bool(crate::regex::Regex::new(re).map_err(|e| format!("invalid regex: {e}"))?.is_match(s)?))
+}
+
+fn is_url(s: &str) -> bool {
+    // Minimal URL validity check: scheme://host...
+    let Some((scheme, rest)) = s.split_once("://") else { return false };
+    if scheme.is_empty() || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.') {
+        return false;
+    }
+    if rest.is_empty() || rest.contains(' ') || rest.contains('\t') || rest.contains('\n') {
+        return false;
+    }
+    // host part before first '/' '?' '#'
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.split('@').last().unwrap_or("");
+    let host = host.split(':').next().unwrap_or("");
+    if host.is_empty() { return false; }
+    // allow IPv6 brackets
+    if host.starts_with('[') {
+        return host.ends_with(']');
+    }
+    true
+}
+
+fn parse_duration(s: &str) -> Option<f64> {
+    // Supports forms like "1s", "1m", "1h", "1.5s", "100ms", "0s", and bare seconds.
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    // split numeric prefix and unit suffix
+    let mut i = 0;
+    for (idx, c) in s.char_indices() {
+        if c.is_ascii_digit() || c == '.' || c == '-' || c == '+' {
+            i = idx + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if i == 0 { return None; }
+    let (num, unit) = s.split_at(i);
+    let n: f64 = num.parse().ok()?;
+    let mult: f64 = match unit.trim() {
+        "" | "s" | "sec" | "second" | "seconds" => 1.0,
+        "ms" | "millisecond" | "milliseconds" => 1e-3,
+        "us" | "microsecond" | "microseconds" | "µs" => 1e-6,
+        "ns" | "nanosecond" | "nanoseconds" => 1e-9,
+        "m" | "min" | "minute" | "minutes" => 60.0,
+        "h" | "hr" | "hour" | "hours" => 3600.0,
+        "d" | "day" | "days" => 86400.0,
+        _ => return None,
+    };
+    Some(n * mult * 1e9) // nanoseconds
 }
 
 fn size(v: &Value) -> Result<Value, String> {
@@ -794,7 +880,7 @@ mod tests {
 
     #[test]
     fn extended() {
-        let o = json::parse_str(r#"{"l":[1,2,3],"s":"Hello","m":{"a":1},"n":5}"#).unwrap();
+        let o = json::parse_str(r#"{"l":[1,2,3],"s":"Hello","m":{"a":1},"n":5,"u":"https://example.com/a?b=1"}"#).unwrap();
         let v = [("self", &o)];
         let t = |e: &str| cel_bool(e, &v);
         assert_eq!(t("self.l.all(x, x > 0) && self.l.exists(x, x == 2)"), Ok(true));
@@ -804,6 +890,11 @@ mod tests {
         assert_eq!(t("self.n % 2 == 1 ? self.n - 1 == 4 : false"), Ok(true));
         assert_eq!(t("-self.n < 0 && 7 / 2 == 3 && 1.5 * 2 == 3"), Ok(true));
         assert_eq!(t("self.m.all(k, k == 'a')"), Ok(true));
+        assert_eq!(t("isURL(self.u)"), Ok(true));
+        assert_eq!(t("isURL('not a url')"), Ok(false));
+        assert_eq!(t("duration('1m') == duration('60s')"), Ok(true));
+        assert_eq!(t("duration('2m') > duration('1m')"), Ok(true));
+        assert_eq!(t("'2m' >= '1m'"), Ok(true));
         assert!(Program::compile("self.n > 1", &["self"]).is_ok());
         assert!(Program::compile("foo(self)", &["self"]).is_err());
         assert!(Program::compile("other > 1", &["self"]).is_err());

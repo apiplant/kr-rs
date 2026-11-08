@@ -757,6 +757,19 @@ mod tests {
     }
 
     #[test]
+    fn apply_merges_webhooks_by_name() {
+        // cainjector applies a sparse webhook object carrying only `clientConfig.caBundle`;
+        // the rest of the entry (rules, sideEffects, service) must survive.
+        let live = j(r#"{"webhooks":[{"name":"w","rules":[{"apiGroups":["x"]}],"sideEffects":"None","clientConfig":{"service":{"name":"s"}}}]}"#);
+        let r = ap(&live, r#"{"webhooks":[{"name":"w","clientConfig":{"caBundle":"abc"}}]}"#, Vec::new(), "m", false).unwrap();
+        let w = r.object.pointer(&["webhooks"]).unwrap().as_array().unwrap()[0].clone();
+        assert_eq!(w.get("sideEffects").and_then(Value::as_str), Some("None"));
+        assert_eq!(w.pointer(&["clientConfig", "service", "name"]).and_then(Value::as_str), Some("s"));
+        assert_eq!(w.pointer(&["clientConfig", "caBundle"]).and_then(Value::as_str), Some("abc"));
+        assert_eq!(w.get("rules").and_then(Value::as_array).map(|a| a.len()), Some(1));
+    }
+
+    #[test]
     fn apply_merges_keyed_lists_and_removes_items() {
         let live = j(r#"{"spec":{"containers":[{"name":"x","image":"old"}]}}"#);
         let r = ap(&live, r#"{"spec":{"containers":[{"name":"c","image":"i"}]}}"#, Vec::new(), "m", false).unwrap();

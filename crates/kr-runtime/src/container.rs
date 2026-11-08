@@ -79,6 +79,8 @@ pub struct RunSpec<'a> {
     pub extra_groups: &'a [u32],
     /// `readOnlyRootFilesystem`: the root mount becomes read-only (volumes stay as mounted).
     pub readonly_root: bool,
+    /// `securityContext.privileged`: keep all capabilities, skip seccomp and no_new_privs.
+    pub privileged: bool,
 }
 
 /// A bind mount of a host path into the container.
@@ -199,7 +201,7 @@ pub fn exec_in(target: &ExecTarget, spec: &ExecSpec) -> Result<Running, RunError
             let _ = ns::setsid();
             let _ = ns::set_ctty(0);
         }
-        let _ = drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups);
+        let _ = drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups, false);
         127
     })
 }
@@ -1219,11 +1221,10 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
 
     // sysfs needs an owned netns; read-only. Some kernels/policies refuse it rootless: tolerate.
     let _ = ns::mkdir(b"/sys\0", 0o555);
-    if let Err(e) = ns::mount(Some(b"sysfs\0"), b"/sys\0", Some(b"sysfs\0"), ns::MS_RDONLY | ns::MS_NOSUID | ns::MS_NODEV | ns::MS_NOEXEC, None) {
-        if e != Errno(1) {
-            return (9, e);
-        }
-    }
+    // sysfs is not mountable inside a user namespace; bind-mount the host's /sys read-only
+    // instead so workloads that read CPU topology (Calico/felix libbpf) work.
+    let _ = ns::mount(Some(b"/.oldroot/sys\0"), b"/sys\0", None, ns::MS_BIND | ns::MS_RDONLY | ns::MS_NOSUID | ns::MS_NODEV | ns::MS_NOEXEC | ns::MS_REC, None);
+    let _ = ns::mount(None, b"/sys\0", None, ns::MS_BIND | ns::MS_REMOUNT | ns::MS_RDONLY | ns::MS_NOSUID | ns::MS_NODEV | ns::MS_NOEXEC, None);
 
     // The container's own cgroup (the namespace root) as the cgroup2 filesystem, read-only, as
     // runtimes do; limits are visible there (`cpu.max`, `memory.max`). Best effort.
@@ -1249,12 +1250,12 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
             step!(11, ns::sethostname(spec.hostname));
         }
     }
-    drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups)
+    drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups, spec.privileged)
 }
 
 /// The common tail of every process start inside a container: cwd, user, capabilities,
 /// NO_NEW_PRIVS, seccomp, execve. Only returns on failure.
-fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env: &[Vec<u8>], extra_groups: &[u32]) -> (u8, Errno) {
+fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env: &[Vec<u8>], extra_groups: &[u32], privileged: bool) -> (u8, Errno) {
     macro_rules! step {
         ($i:expr, $e:expr) => {
             if let Err(e) = $e {
@@ -1269,7 +1270,9 @@ fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env:
         Ok(ids) => ids,
         Err(e) => return (21, e),
     };
-    step!(16, security::drop_caps(security::DEFAULT_CAPS));
+    if !privileged {
+        step!(16, security::drop_caps(security::DEFAULT_CAPS));
+    }
     let ids = match (ids, extra_groups.is_empty()) {
         (None, false) => Some((0, 0, alloc::vec![0])),
         (ids, _) => ids,
@@ -1288,10 +1291,12 @@ fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env:
         // Leaving uid 0 clears the permitted/effective capability sets (no keepcaps).
         step!(22, ns::setresuid(uid));
     }
-    step!(13, ns::prctl(ns::PR_SET_NO_NEW_PRIVS, 1));
-    // Built before installing: the filter must be the last thing before execve.
-    let filter = security::default_filter();
-    step!(17, ns::seccomp_set_filter(&filter));
+    if !privileged {
+        step!(13, ns::prctl(ns::PR_SET_NO_NEW_PRIVS, 1));
+        // Built before installing: the filter must be the last thing before execve.
+        let filter = security::default_filter();
+        step!(17, ns::seccomp_set_filter(&filter));
+    }
     exec_argv(argv, env)
 }
 
@@ -1743,4 +1748,87 @@ pub fn shim_wait(pid: i32, exit_path: &[u8], tty_master: Option<i32>, tty_log: &
         let _ = kr_sys::fs::renameat2(ns::AT_FDCWD, &tmp, ns::AT_FDCWD, &cstr(&[exit_path]), 0);
     }
     kr_sys::exit_group(0)
+}
+
+/// Runs a host binary to completion, feeding `stdin` on its stdin and capturing stdout.
+/// Used by the CNI runner. Returns the captured stdout on success.
+pub fn run_command(path: &[u8], env: &[(&str, &str)], stdin: &[u8]) -> Result<Vec<u8>, String> {
+    use kr_sys::ns;
+    let (in_r, in_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(|e| alloc::format!("pipe: {}", e.0))?;
+    let (out_r, out_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(|e| alloc::format!("pipe: {}", e.0))?;
+    let (err_r, err_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(|e| alloc::format!("pipe: {}", e.0))?;
+
+    let mut envv: Vec<Vec<u8>> = Vec::new();
+    for (k, v) in env {
+        envv.push(alloc::format!("{k}={v}").into_bytes());
+    }
+    envv.push(b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_vec());
+
+    let mut pathz = path.to_vec();
+    if !pathz.ends_with(&[0]) { pathz.push(0); }
+    // strip trailing null for argv[0] display
+    let argv0 = path.split(|&b| b == 0).next().unwrap_or(path).to_vec();
+
+    let pid = unsafe {
+        let mut args = ns::CloneArgs {
+            flags: 0,
+            exit_signal: ns::SIGCHLD as u64,
+            ..Default::default()
+        };
+        ns::clone3(&mut args).map_err(|e| alloc::format!("clone3: {}", e.0))?
+    };
+    if pid == 0 {
+        let _ = kr_sys::close(in_w.raw());
+        let _ = kr_sys::close(out_r.raw());
+        let _ = kr_sys::close(err_r.raw());
+        let _ = ns::dup_to(in_r.raw(), 0);
+        let _ = ns::dup_to(out_w.raw(), 1);
+        let _ = ns::dup_to(err_w.raw(), 2);
+        // exec
+        let mut argvp: Vec<*const u8> = Vec::new();
+        let mut a0 = argv0.clone(); a0.push(0);
+        argvp.push(a0.as_ptr()); core::mem::forget(a0);
+        argvp.push(core::ptr::null());
+        let mut envp: Vec<*const u8> = Vec::new();
+        for e in &envv {
+            let mut v = e.clone(); v.push(0);
+            envp.push(v.as_ptr()); core::mem::forget(v);
+        }
+        envp.push(core::ptr::null());
+        ns::execve(&pathz, &argvp, &envp);
+        kr_sys::exit_group(127);
+    }
+    // parent
+    let _ = kr_sys::close(in_r.raw());
+    let _ = kr_sys::close(out_w.raw());
+    let _ = kr_sys::close(err_w.raw());
+    let _ = kr_sys::write(in_w.raw(), stdin);
+    let _ = kr_sys::close(in_w.raw());
+    let mut stdout = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match kr_sys::read(out_r.raw(), &mut buf) {
+            Ok(0) => break,
+            Ok(n) => stdout.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    let _ = kr_sys::close(out_r.raw());
+    let st = ns::wait4(pid).unwrap_or(0);
+    let code = ns::exit_code(st);
+    if code != 0 {
+        let mut stderr = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match kr_sys::read(err_r.raw(), &mut buf) {
+                Ok(0) => break,
+                Ok(n) => stderr.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        let _ = kr_sys::close(err_r.raw());
+        return Err(alloc::format!("command exited {code}: {}", String::from_utf8_lossy(&stderr)));
+    }
+    let _ = kr_sys::close(err_r.raw());
+    Ok(stdout)
 }

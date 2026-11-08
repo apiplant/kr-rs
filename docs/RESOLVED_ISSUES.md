@@ -221,3 +221,20 @@
 
 117. **The TLS server could not send a HelloRetryRequest** — *fixed*
     A client that offers a key share only for a group the server does not use (a P-384 share with X25519 and P-256 in `supported_groups`, as the arm64 `kubectl` build in CI does) was rejected with `handshake_failure`. `kr-crypto` now answers once with a HelloRetryRequest naming X25519 or P-256 (transcript restarts with `message_hash`), and fails with `illegal_parameter` if the retried ClientHello still has no usable share or changes the cipher suite. Covered by `openssl_and_curl_vs_kr_server` (`-groups P-384:X25519` and `P-384:P-256`). Found by the aarch64 CI job.
+
+## Limitations fixed during 2026-11-11 evaluation
+119. **Rootless pods got no sysfs** — *fixed*
+    Bind-mount the host's `/sys` read-only instead of mounting sysfs (which fails in a user namespace). Lets workloads read CPU topology (Calico/felix libbpf).
+
+121. **Max pods per node hardcoded to 110** — *fixed*
+    Now configurable via `KR_MAX_PODS` (default 110).
+
+122. **CEL missing `isURL` and `duration`** — *fixed*
+    Added both builtins (duration parsed to nanoseconds, with auto-conversion in comparisons) and raw triple-quoted string literals (`r"""..."""`). All Traefik CRDs now install.
+
+116. **No CNI plugin support** — *fixed*
+    Added a CNI runner (kr-kubelet/src/cni.rs + kr_runtime::container::run_command) implementing
+    ADD/DEL over the 0.4.0/1.0.0 spec: config loading from KR_CNI_CONF_DIR, plugin chain
+    execution with env vars (CNI_COMMAND/CONTAINERID/NETNS/IFNAME/PATH), stdin/stdout, IP
+    parsing. Wired into start_sandbox (skips built-in IPAM/veth, uses plugin-returned IPs)
+    and cleanup (CNI DEL). Verified end-to-end with a fake plugin returning 10.200.0.5.

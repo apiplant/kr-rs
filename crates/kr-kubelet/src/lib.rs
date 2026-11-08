@@ -20,6 +20,7 @@ extern crate std;
 pub mod evict;
 pub mod node;
 mod adopt;
+pub mod cni;
 pub mod dns;
 pub mod egress;
 mod probe;
@@ -1214,7 +1215,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let rootless_net = self.infra.borrow().is_some();
         // hostNetwork pods share the kubelet's network namespace: no veth, no pod IP lease.
         let host_net = pod.pointer(&["spec", "hostNetwork"]).and_then(Value::as_bool) == Some(true);
-        if (self.cfg.network || rootless_net) && !host_net {
+        let use_cni = cni::is_enabled() && !host_net;
+        if !use_cni && (self.cfg.network || rootless_net) && !host_net {
             let ipam = alloc::format!("{}/ipam", self.cfg.root);
             let _ = kr_runtime::store::mkdir_p(&ipam, 0o700);
             lease = match network::allocate_or_reuse(ipam.as_bytes(), uid.as_bytes(), &self.podnet.get()) {
@@ -1225,7 +1227,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         let ip = if host_net { kr_sys::unmap4(self.cfg.node_ip) } else { lease.as_ref().map(|l: &Lease| l.ip) };
         let pn = self.podnet.get();
-        let net = ip.filter(|_| !host_net).map(|ip| NetConfig::with(ip, &pn, self.fam.get()));
+        let net = if use_cni { None } else { ip.filter(|_| !host_net).map(|ip| NetConfig::with(ip, &pn, self.fam.get())) };
         // hostNetwork pods report the node's hostname (upstream: unless spec.hostname is set).
         let hostname = if host_net && pod.pointer(&["spec", "hostname"]).and_then(Value::as_str).is_none_or(str::is_empty) {
             String::from_utf8(kr_sys::fs::read_file(b"/proc/sys/kernel/hostname\0", 256).unwrap_or_default()).unwrap_or_default().trim().to_string()
@@ -1273,7 +1275,25 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         } else {
             None
         };
-        spec::write_etc_hosts(&dir, pod, &hostname, ip, net.and_then(|n| n.ip6)).map_err(|_| String::from("cannot write /etc/hosts"))?;
+        // CNI: run the plugin chain to attach the pod's network namespace, then use
+        // the returned addresses instead of kr's built-in IPAM/veth.
+        let (cni_ip4, cni_ip6) = if use_cni {
+            let cfg = cni::load_config(&cni::conf_dir().unwrap()).unwrap_or(Value::Null);
+            let netns = alloc::format!("/proc/{}/ns/net", sb.pid);
+            match cni::cni_add(&cfg, uid, &netns, "eth0") {
+                Ok(r) => (r.ipv4, r.ipv6),
+                Err(e) => {
+                    sb.stop();
+                    if let Some(l) = lease { l.release(); }
+                    return Err(alloc::format!("cni add: {e}"));
+                }
+            }
+        } else {
+            (None, None)
+        };
+        let ip = cni_ip4.or(ip);
+        let net_ip6 = cni_ip6.or(net.and_then(|n| n.ip6));
+        spec::write_etc_hosts(&dir, pod, &hostname, ip, net_ip6).map_err(|_| String::from("cannot write /etc/hosts"))?;
         spec::write_resolv_conf(&dir, pod, self.infra.borrow().is_some(), self.fam.get()).map_err(|_| String::from("cannot write /etc/resolv.conf"))?;
         let mut pods = self.pods.borrow_mut();
         let p = pods.get_mut(uid).unwrap();
@@ -1281,7 +1301,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         p.cg = cg;
         p.lease = lease;
         p.ip = ip.filter(|_| host_net || self.fam.get().v4);
-        p.ip6 = if host_net { Some(self.cfg.node_ip).filter(|a| kr_sys::unmap4(*a).is_none()) } else { net.and_then(|n| n.ip6) };
+        p.ip6 = if host_net { Some(self.cfg.node_ip).filter(|a| kr_sys::unmap4(*a).is_none()) } else if use_cni { net_ip6 } else { net.and_then(|n| n.ip6) };
         drop(pods);
         self.persist(uid);
         Ok(())
@@ -1425,6 +1445,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             tty_fd: tty_pair.as_ref().map(|(_, sl)| sl.raw()),
             extra_groups: &built.extra_groups,
             readonly_root: cspec.and_then(|c| c.pointer(&["securityContext", "readOnlyRootFilesystem"])).and_then(Value::as_bool).unwrap_or(false),
+            privileged: cspec.and_then(|c| c.pointer(&["securityContext", "privileged"])).and_then(Value::as_bool).unwrap_or(false),
         };
         let detached = self.survives();
         // Descriptors a shim must keep for `attach`: our end of the stdin socket / the pty master.
@@ -1882,6 +1903,15 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         if let Some(l) = p.lease {
             l.release();
+        }
+        // CNI: tear down the pod's network attachment.
+        if cni::is_enabled() {
+            if let Ok(cfg) = cni::load_config(&cni::conf_dir().unwrap()) {
+                let netns = alloc::format!("/proc/{}/ns/net", p.sandbox.as_ref().map(|s| s.pid).unwrap_or(0));
+                if p.sandbox.is_some() {
+                    let _ = cni::cni_del(&cfg, uid, &netns, "eth0");
+                }
+            }
         }
         let _ = self.maps.run_as_root(|| remove_tree(&p.dir));
     }
