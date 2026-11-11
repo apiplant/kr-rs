@@ -136,6 +136,9 @@ pub struct ApiServer {
     /// Warnings for the response of the request being handled.
     warnings: RefCell<Vec<String>>,
     /// Parsed webhook configurations, valid for the stamp they were built at.
+    /// Set while the webhook step dry-runs a write so mutating webhooks see the object first: CRD
+    /// schema validation is then left to the real write (upstream validates after mutation).
+    pub(crate) defer_schema: core::cell::Cell<bool>,
     pub(crate) wh_cache: RefCell<Option<([u64; 12], alloc::rc::Rc<crate::webhook::Configs>)>>,
     /// Stored custom objects already converted for a request in another version, so the
     /// synchronous handlers can read them in that version: (store key, mod revision, apiVersion).
@@ -262,7 +265,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()) };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()) };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -336,7 +339,9 @@ impl ApiServer {
             }
             crate::crd::prune(s, o, true);
             let mut errs = Vec::new();
-            crate::crd::validate(s, o, old, "", &mut errs);
+            if !self.defer_schema.get() {
+                crate::crd::validate(s, o, old, "", &mut errs);
+            }
             if !errs.is_empty() {
                 let name = o.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("");
                 return Err(ApiError::invalid(alloc::format!("{}.{} \"{name}\" is invalid: {}", rt.res.kind, rt.res.group, errs.join(", "))));
@@ -1346,7 +1351,7 @@ impl ApiServer {
                 let ns = rt.namespace.clone().unwrap_or_default();
                 proxy.pod_subresource(sub, &ns, n, &node, node_ip, req.query, req.headers).map(Reply::Http)
             }
-            ("GET", None, None) if q.flag("watch") => self.watch(rt, q),
+            ("GET", None, None) if q.flag("watch") => self.watch(rt, q, req.accept),
             ("GET", None, None) => self.list(req, rt, q),
             ("GET", Some(n), Some("scale")) => self.get_scale(rt, n),
             ("GET", Some(n), None) if wants_table(req.accept) => {
@@ -1529,6 +1534,27 @@ impl ApiServer {
         if wants_table(req.accept) {
             return Ok(Reply::Json(200, self.table(rt.res, &items, rev, cont.as_deref())));
         }
+        if wants_partial(req.accept) {
+            // Metadata-only list: return PartialObjectMetadata objects.
+            let mut out = String::with_capacity(64 + items.len() * 64);
+            out.push_str("{\"kind\":\"PartialObjectMetadataList\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":{\"resourceVersion\":\"");
+            out.push_str(&rev.to_string());
+            out.push('"');
+            if let Some(c) = &cont {
+                out.push_str(",\"continue\":");
+                json::write_str(c, &mut out);
+            }
+            out.push_str("},\"items\":[");
+            for (i, kv) in items.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                let v = json::parse(&kv.value).unwrap_or(Value::Null);
+                let meta = v.get("metadata").cloned().unwrap_or(Value::Object(Vec::new()));
+                let po = obj(alloc::vec![("kind", Value::from("PartialObjectMetadata")), ("apiVersion", Value::from("meta.k8s.io/v1")), ("metadata", meta)]);
+                out.push_str(&json::to_string(&po));
+            }
+            out.push_str("]}");
+            return Ok(Reply::Json(200, out));
+        }
         // Splice the stored JSON directly: no re-encoding of items.
         let mut out = String::with_capacity(64 + items.iter().map(|k| k.value.len() + 1).sum::<usize>());
         out.push_str("{\"kind\":");
@@ -1570,14 +1596,26 @@ impl ApiServer {
             obj(alloc::vec![("name", Value::from(name)), ("type", Value::from(ty)), ("format", Value::from(fmt)), ("description", Value::from(desc)), ("priority", Value::Number(Number::from_u64(prio)))])
         };
         let mut cols = alloc::vec![col("Name", "string", "name", "Name must be unique within a namespace.", 0)];
-        let extra = crate::printers::columns(res.kind);
+        let custom_cols: Option<Vec<(String, String, u64)>> = self.custom.borrow().iter().find(|c| core::ptr::eq(c.res, res)).map(|c| c.printer.clone());
+        let extra = if custom_cols.is_some() { &[][..] } else { crate::printers::columns(res.kind) };
         for (n, _) in extra {
             cols.push(col(n, "string", "", "", 0));
         }
-        cols.push(col("Age", "string", "", "CreationTimestamp", 0));
-        let wide = crate::printers::wide_columns(res.kind);
+        let (cust_main, cust_wide): (Vec<_>, Vec<_>) = custom_cols.unwrap_or_default().into_iter().partition(|c| c.2 == 0);
+        for (n, _, _) in &cust_main {
+            cols.push(col(n, "string", "", "", 0));
+        }
+        // A CRD may define its own Age column (jsonPath .metadata.creationTimestamp).
+        let own_age = cust_main.iter().chain(cust_wide.iter()).any(|c| c.0.eq_ignore_ascii_case("age"));
+        if !own_age {
+            cols.push(col("Age", "string", "", "CreationTimestamp", 0));
+        }
+        let wide = if self.custom.borrow().iter().any(|c| core::ptr::eq(c.res, res)) { &[][..] } else { crate::printers::wide_columns(res.kind) };
         for (n, _) in wide {
             cols.push(col(n, "string", "", "", 1));
+        }
+        for (n, _, pr) in &cust_wide {
+            cols.push(col(n, "string", "", "", *pr));
         }
         let rows: Vec<Value> = items
             .iter()
@@ -1589,10 +1627,18 @@ impl ApiServer {
                 for (_, f) in extra {
                     cells.push(Value::String(f(&o)));
                 }
+                for (_, p, _) in &cust_main {
+                    cells.push(Value::String(crate::crd::json_path(&o, p)));
+                }
                 let created = meta.get("creationTimestamp").and_then(Value::as_str).and_then(crate::printers::parse_rfc3339);
-                cells.push(Value::String(created.map(|c| crate::printers::human_duration(now - c)).unwrap_or_else(|| "<unknown>".into())));
+                if !own_age {
+                    cells.push(Value::String(created.map(|c| crate::printers::human_duration(now - c)).unwrap_or_else(|| "<unknown>".into())));
+                }
                 for (_, f) in wide {
                     cells.push(Value::String(f(&o)));
+                }
+                for (_, p, _) in &cust_wide {
+                    cells.push(Value::String(crate::crd::json_path(&o, p)));
                 }
                 let partial = obj(alloc::vec![("kind", Value::from("PartialObjectMetadata")), ("apiVersion", Value::from("meta.k8s.io/v1")), ("metadata", meta)]);
                 obj(alloc::vec![("cells", Value::Array(cells)), ("object", partial)])
@@ -3204,7 +3250,7 @@ impl ApiServer {
 
     // ---- watch ----
 
-    fn watch(&self, rt: &Route, q: &Query) -> R<Reply> {
+    fn watch(&self, rt: &Route, q: &Query, accept: Option<&str>) -> R<Reply> {
         let ls = Selector::parse(q.get("labelSelector").unwrap_or(""))?;
         let fs = self.field_selectors(rt, q)?.0;
         let prefix = self.list_prefix(rt);
@@ -3220,7 +3266,8 @@ impl ApiServer {
                 for kv in items {
                     if let Ok(v) = json::parse(&kv.value) {
                         if ls.matches(&v) && fs.matches(&v) {
-                            initial.push_back(event_line("ADDED", &kv.value));
+                            let obj = if wants_partial(accept) { to_partial(&kv.value) } else { kv.value.to_vec() };
+                            initial.push_back(event_line("ADDED", &obj));
                         }
                     }
                 }
@@ -3239,7 +3286,8 @@ impl ApiServer {
                 for kv in items {
                     if let Ok(v) = json::parse(&kv.value) {
                         if ls.matches(&v) && fs.matches(&v) {
-                            initial.push_back(event_line("ADDED", &kv.value));
+                            let obj = if wants_partial(accept) { to_partial(&kv.value) } else { kv.value.to_vec() };
+                            initial.push_back(event_line("ADDED", &obj));
                         }
                     }
                 }
@@ -3258,7 +3306,8 @@ impl ApiServer {
             Err(_) => return Err(ApiError::new(500, "InternalError", "watch failed")),
         };
         let timeout_s: u64 = q.get("timeoutSeconds").and_then(|t| t.parse().ok()).unwrap_or(1800).min(3600);
-        Ok(Reply::Watch(WatchStream { watcher, initial, ls, fs, deadline: Some(Box::pin(kr_rt::exec::sleep(timeout_s * 1000))), gv: None }))
+        let partial = wants_partial(accept);
+        Ok(Reply::Watch(WatchStream { watcher, initial, ls, fs, deadline: Some(Box::pin(kr_rt::exec::sleep(timeout_s * 1000))), gv: None, partial }))
     }
 }
 
@@ -3365,6 +3414,21 @@ fn wants_table(accept: Option<&str>) -> bool {
     accept.is_some_and(|a| a.split(',').next().is_some_and(|first| first.contains("as=Table")))
 }
 
+fn wants_partial(accept: Option<&str>) -> bool {
+    accept.is_some_and(|a| a.split(',').next().is_some_and(|first| first.contains("as=PartialObjectMetadata")))
+}
+
+fn to_partial(data: &[u8]) -> Vec<u8> {
+    match json::parse(data) {
+        Ok(v) => {
+            let meta = v.get("metadata").cloned().unwrap_or(Value::Object(Vec::new()));
+            let po = obj(alloc::vec![("kind", Value::from("PartialObjectMetadata")), ("apiVersion", Value::from("meta.k8s.io/v1")), ("metadata", meta)]);
+            json::to_string(&po).into_bytes()
+        }
+        Err(_) => data.to_vec(),
+    }
+}
+
 /// `[scheme:]<name>[:port]` of a proxy request: `(scheme, name, port)`, empty when absent.
 fn proxy_name(name: &str) -> R<(&str, &str, &str)> {
     let parts: Vec<&str> = name.split(':').collect();
@@ -3424,21 +3488,24 @@ pub struct WatchStream {
     deadline: Option<Pin<Box<kr_rt::exec::Sleep>>>,
     /// Custom resources served at several versions: apiVersion to stamp on every event object.
     gv: Option<String>,
+    /// Metadata-only watch: transform objects to PartialObjectMetadata.
+    partial: bool,
 }
 
 impl WatchStream {
-    fn convert(ls: &Selector, fs: &FieldSelector, e: &Event) -> Option<Vec<u8>> {
+    fn convert(ls: &Selector, fs: &FieldSelector, partial: bool, e: &Event) -> Option<Vec<u8>> {
         let filtered = !ls.is_empty() || !fs.is_empty();
         let matches = |kv: &Kv| -> bool { !filtered || json::parse(&kv.value).is_ok_and(|v| ls.matches(&v) && fs.matches(&v)) };
+        let tx = |b: &[u8]| -> Vec<u8> { if partial { to_partial(b) } else { b.to_vec() } };
         match e.kind {
-            EventKind::Delete => matches(&e.kv).then(|| event_line("DELETED", &with_rv(&e.kv))),
+            EventKind::Delete => matches(&e.kv).then(|| event_line("DELETED", &tx(&with_rv(&e.kv)))),
             EventKind::Put => {
                 let now = matches(&e.kv);
                 let before = e.prev.as_ref().is_some_and(&matches);
                 match (e.prev.is_some(), before, now) {
-                    (_, true, true) => Some(event_line("MODIFIED", &e.kv.value)),
-                    (_, false, true) => Some(event_line("ADDED", &e.kv.value)),
-                    (true, true, false) => Some(event_line("DELETED", &e.kv.value)),
+                    (_, true, true) => Some(event_line("MODIFIED", &tx(&e.kv.value))),
+                    (_, false, true) => Some(event_line("ADDED", &tx(&e.kv.value))),
+                    (true, true, false) => Some(event_line("DELETED", &tx(&e.kv.value))),
                     _ => None,
                 }
             }
@@ -3474,7 +3541,7 @@ impl WatchStream {
         loop {
             match w.poll_next(cx) {
                 Poll::Ready(Some(e)) => {
-                    if let Some(l) = Self::convert(&self.ls, &self.fs, &e) {
+                    if let Some(l) = Self::convert(&self.ls, &self.fs, self.partial, &e) {
                         out.extend_from_slice(&Self::retag(&self.gv, l));
                     }
                     if out.len() > 256 * 1024 {

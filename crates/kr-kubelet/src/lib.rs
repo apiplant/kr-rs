@@ -21,6 +21,8 @@ pub mod evict;
 pub mod node;
 mod adopt;
 pub mod cni;
+mod csi;
+pub mod deviceplugin;
 pub mod dns;
 pub mod egress;
 mod probe;
@@ -243,6 +245,8 @@ pub struct Kubelet<C: Client> {
     pods: RefCell<BTreeMap<String, PodRt>>,
     exits: RefCell<Vec<Exit>>,
     notify: Notify,
+    devices: Rc<deviceplugin::Plugins>,
+    csi: Rc<csi::Csi>,
     /// Image pulls in flight or recently failed (image ref -> state).
     pulls: RefCell<BTreeMap<String, Pull>>,
     /// Images pulled successfully by this kubelet (pullPolicy Always / :latest satisfied).
@@ -289,7 +293,9 @@ const BACKOFF_MAX_MS: u64 = 300_000;
 
 impl<C: Client + Clone + 'static> Kubelet<C> {
     pub fn new(c: C, cfg: Config, store: Store) -> Rc<Self> {
-        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()), adopted: Cell::new((0, 0)), survive: Cell::new(false) })
+        let devices = deviceplugin::Plugins::new(&deviceplugin::default_dir(&cfg.root));
+        let csi = csi::Csi::new(&cfg.node_name);
+        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), devices, csi, pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()), adopted: Cell::new((0, 0)), survive: Cell::new(false) })
     }
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
@@ -322,7 +328,15 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             }
             Err(missing) => kr_rt::eprint(alloc::format!("kubelet: this kernel lacks {missing}; pods will not survive a restart of kr\n").as_bytes()),
         }
-        node::register(&self.c, &self.cfg).await;
+        if self.devices.start() {
+            kr_rt::eprint(alloc::format!("kubelet: device plugins register on {}/kubelet.sock\n", self.devices.dir()).as_bytes());
+        }
+        if let Some(d) = self.csi.dir() {
+            kr_rt::eprint(alloc::format!("kubelet: CSI drivers register on {d}/plugins_registry\n").as_bytes());
+            let (csi, c) = (self.csi.clone(), self.c.clone());
+            kr_rt::exec::spawn(async move { csi.run(c).await });
+        }
+        node::register(&self.c, &self.cfg, &self.devices).await;
         // The API server assigns the pod subnet at registration.
         for _ in 0..30 {
             if let Ok(n) = self.c.get(&alloc::format!("/api/v1/nodes/{}", self.cfg.node_name)).await {
@@ -400,7 +414,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             kr_rt::exec::spawn(async move { me.route_loop().await });
         }
         let hb = self.clone();
-        kr_rt::exec::spawn(async move { node::heartbeat_loop(&hb.c, &hb.cfg).await });
+        kr_rt::exec::spawn(async move { node::heartbeat_loop(&hb.c, &hb.cfg, &hb.devices).await });
         let w = self.clone();
         kr_rt::exec::spawn(async move { w.watch_loop().await });
         let ev = self.clone();
@@ -422,6 +436,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     /// and frees their IPs.
     fn sweep_unclaimed(&self) {
         let live: Vec<String> = self.pods.borrow().keys().cloned().collect();
+        self.devices.retain_pods(&live);
+        for u in self.csi.pod_uids().into_iter().filter(|u| !live.contains(u)) {
+            let csi = self.csi.clone();
+            kr_rt::exec::spawn(async move { csi.unmount_pod(&u).await });
+        }
         if self.cfg.cgroups {
             kr_runtime::cgroup::kill_stale_pods(&|c| live.iter().any(|u| u.as_bytes() == c));
             kr_runtime::cgroup::prune_previous_base(&alloc::format!("{}/cgroup-base", self.cfg.root));
@@ -1393,7 +1412,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 return;
             }
         }
-        let built = match spec::build(&self.c, pod, cspec.unwrap_or(&Value::Null), &img, &pod_dir, pod_ip, pod_ip6, &self.cfg.node_name, &kr_net::tcp::fmt_ip16(self.cfg.node_ip), &self.store).await {
+        let built = match spec::build(&self.c, pod, cspec.unwrap_or(&Value::Null), &img, &pod_dir, pod_ip, pod_ip6, &self.cfg.node_name, &kr_net::tcp::fmt_ip16(self.cfg.node_ip), &self.store, &self.devices, &self.csi).await {
             Ok(b) => b,
             Err(msg) => {
                 // A claim that is not bound yet is the pod waiting for its volume, not a config error.
@@ -1402,6 +1421,21 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 self.backoff(uid, i);
                 return;
             }
+        };
+        // securityContext.capabilities: an unknown name is a config error, not a silent default.
+        let caps: Option<Vec<u32>> = match cspec.and_then(|c| c.pointer(&["securityContext", "capabilities"])) {
+            Some(c) => {
+                let names = |f: &str| -> Vec<&str> { c.get(f).and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_str).collect() };
+                match kr_runtime::security::resolve_caps(&names("add"), &names("drop")) {
+                    Ok(set) => Some(set),
+                    Err(m) => {
+                        self.set_waiting(uid, i, "CreateContainerConfigError", m);
+                        self.backoff(uid, i);
+                        return;
+                    }
+                }
+            }
+            None => None,
         };
         spec::apply_fs_group(&self.maps, pod, &pod_dir);
         let seq = self.pods.borrow()[uid].ctrs[i].seq + 1;
@@ -1456,6 +1490,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             extra_groups: &built.extra_groups,
             readonly_root: cspec.and_then(|c| c.pointer(&["securityContext", "readOnlyRootFilesystem"])).and_then(Value::as_bool).unwrap_or(false),
             privileged: cspec.and_then(|c| c.pointer(&["securityContext", "privileged"])).and_then(Value::as_bool).unwrap_or(false),
+            caps: caps.as_deref(),
             userns: {
                 let host_users = pod.pointer(&["spec", "hostUsers"]).and_then(Value::as_bool);
                 if kr_sys::ns::getuid() != 0 {
@@ -1662,7 +1697,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             p.volumes_synced = now_ms();
             p.dir.clone()
         };
-        spec::refresh_volumes(&self.c, pod, &dir).await;
+        spec::refresh_volumes(&self.c, &self.csi, pod, &dir).await;
         spec::apply_fs_group(&self.maps, pod, &dir);
     }
 
@@ -1916,6 +1951,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
 
     fn cleanup(&self, uid: &str) {
         let Some(p) = self.pods.borrow_mut().remove(uid) else { return };
+        self.devices.release_pod(uid);
+        let (csi, u) = (self.csi.clone(), uid.to_string());
+        kr_rt::exec::spawn(async move { csi.unmount_pod(&u).await });
         self.stdin_keep.borrow_mut().retain(|k, _| !k.starts_with(&alloc::format!("{}/", p.dir)));
         if let Some(sb) = &p.sandbox {
             sb.stop();
@@ -2142,10 +2180,14 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
         ("hostIP", Value::from(host_ip.as_str())),
         ("hostIPs", Value::Array(alloc::vec![o(alloc::vec![("ip", Value::from(host_ip.as_str()))])])),
         ("startTime", t(p.start_time)),
-        ("containerStatuses", Value::Array(apps.iter().map(|c| cstat(c)).collect())),
     ];
+    // A pod rejected (or whose sandbox failed) never started a container: its waiting
+    // `ContainerCreating` statuses would hide the failure reason in `kubectl get pods`.
+    if p.failed_setup.is_none() {
+        f.push(("containerStatuses", Value::Array(apps.iter().map(|c| cstat(c)).collect())));
+    }
     let inits: Vec<Value> = p.ctrs.iter().filter(|c| c.init).map(cstat).collect();
-    if !inits.is_empty() {
+    if !inits.is_empty() && p.failed_setup.is_none() {
         f.push(("initContainerStatuses", Value::Array(inits)));
     }
     let ephs: Vec<Value> = p.ctrs.iter().filter(|c| c.eph).map(cstat).collect();
@@ -2278,6 +2320,16 @@ mod status_tests {
         assert_eq!(s(&st, &["initContainerStatuses", "0", "state", "terminated", "reason"]), Some("Completed"));
         assert_eq!(s(cond(&st, "Initialized"), &["status"]), Some("True"));
         assert_eq!(s(&st, &["containerStatuses", "0", "state", "waiting", "reason"]), Some("ContainerCreating"));
+    }
+
+    #[test]
+    fn rejected_pod_reports_reason_without_container_statuses() {
+        let mut p = pod(vec![ctr("run1", false, false, creating())]);
+        p.failed_setup = Some("Pod was rejected: node(s) didn't have free ports for the requested pod ports".into());
+        let st = status_json(&p, "Always");
+        assert_eq!(s(&st, &["phase"]), Some("Failed"));
+        assert_eq!(s(&st, &["reason"]), Some("HostPortConflict"));
+        assert!(st.get("containerStatuses").is_none());
     }
 
     #[test]

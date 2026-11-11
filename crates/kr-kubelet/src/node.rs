@@ -33,7 +33,12 @@ pub(crate) fn memory_available_ki() -> Option<u64> {
     read(b"/proc/meminfo\0").lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|v| v.split_whitespace().next()?.parse().ok())
 }
 
-fn status(cfg: &Config) -> String {
+fn status(cfg: &Config, dp: &crate::deviceplugin::Plugins) -> String {
+    let (mut ext_cap, mut ext_alloc) = (String::new(), String::new());
+    for (k, cap, healthy) in dp.node_resources() {
+        ext_cap.push_str(&alloc::format!(r#","{k}":"{cap}""#));
+        ext_alloc.push_str(&alloc::format!(r#","{k}":"{healthy}""#));
+    }
     let t = rfc3339(now());
     let (cpu, mem) = (cpus(), memory_ki());
     let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
@@ -41,7 +46,7 @@ fn status(cfg: &Config) -> String {
     let kernel = read(b"/proc/sys/kernel/osrelease\0");
     let pods = max_pods();
     alloc::format!(
-        r#"{{"capacity":{{"cpu":"{cpu}","memory":"{mem}Ki","pods":"{pods}"}},"allocatable":{{"cpu":"{cpu}","memory":"{mem}Ki","pods":"{pods}"}},
+        r#"{{"capacity":{{"cpu":"{cpu}","memory":"{mem}Ki","pods":"{pods}"{ext_cap}}},"allocatable":{{"cpu":"{cpu}","memory":"{mem}Ki","pods":"{pods}"{ext_alloc}}},
 "conditions":[{{"type":"Ready","status":"True","reason":"KubeletReady","message":"kr kubelet is posting ready status","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}},
 {{"type":"MemoryPressure","status":"{mp}","reason":"{mp_reason}","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}},
 {{"type":"DiskPressure","status":"False","reason":"KubeletHasNoDiskPressure","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}},
@@ -56,7 +61,7 @@ fn status(cfg: &Config) -> String {
 }
 
 /// Creates the Node (or refreshes its status) and its Lease.
-pub async fn register<C: Client>(c: &C, cfg: &Config) {
+pub async fn register<C: Client>(c: &C, cfg: &Config, dp: &crate::deviceplugin::Plugins) {
     let name = &cfg.node_name;
     let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
     let role = if cfg.control_plane { r#","node-role.kubernetes.io/control-plane":"""# } else { "" };
@@ -64,12 +69,12 @@ pub async fn register<C: Client>(c: &C, cfg: &Config) {
         r#"{{"apiVersion":"v1","kind":"Node","metadata":{{"name":"{name}","labels":{{"kubernetes.io/hostname":"{name}","kubernetes.io/os":"linux","kubernetes.io/arch":"{arch}"{role}}}}},"spec":{{}}}}"#
     );
     let _ = c.create("/api/v1/nodes", &json::parse(node.as_bytes()).unwrap()).await;
-    update_status(c, cfg).await;
+    update_status(c, cfg, dp).await;
     renew_lease(c, cfg).await;
 }
 
-async fn update_status<C: Client>(c: &C, cfg: &Config) {
-    let patch = alloc::format!(r#"{{"status":{}}}"#, status(cfg));
+async fn update_status<C: Client>(c: &C, cfg: &Config, dp: &crate::deviceplugin::Plugins) {
+    let patch = alloc::format!(r#"{{"status":{}}}"#, status(cfg, dp));
     if let Ok(p) = json::parse(patch.as_bytes()) {
         let _ = c.patch(&alloc::format!("/api/v1/nodes/{}/status", cfg.node_name), "application/merge-patch+json", &p).await;
     }
@@ -86,14 +91,20 @@ async fn renew_lease<C: Client>(c: &C, cfg: &Config) {
     }
 }
 
-pub async fn heartbeat_loop<C: Client>(c: &C, cfg: &Config) {
+pub async fn heartbeat_loop<C: Client>(c: &C, cfg: &Config, dp: &crate::deviceplugin::Plugins) {
     let mut ticks = 0u32;
+    let mut seen = dp.generation();
     loop {
-        kr_rt::exec::sleep(10_000).await;
-        renew_lease(c, cfg).await;
+        kr_rt::exec::sleep(1000).await;
         ticks += 1;
-        if ticks % 3 == 0 {
-            update_status(c, cfg).await;
+        if ticks % 10 == 0 {
+            renew_lease(c, cfg).await;
+        }
+        // Device counts changed: push the node status now, not at the next 60 s heartbeat.
+        let g = dp.generation();
+        if ticks % 30 == 0 || g != seen {
+            seen = g;
+            update_status(c, cfg, dp).await;
         }
     }
 }

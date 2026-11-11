@@ -13,8 +13,12 @@
 //!   one node is created. `WaitForFirstConsumer` waits until a pod using the claim is scheduled
 //!   and provisions on that pod's node; `Immediate` picks the first node by name. The kubelet
 //!   creates the directory on first use.
+//! * **External provisioners**: a claim whose class names another provisioner gets the
+//!   `volume.kubernetes.io/storage-provisioner` annotation (and `selected-node` for
+//!   `WaitForFirstConsumer`); the provisioner creates the PV with a `claimRef`, bound as above.
 //! * **Reclaim**: when the claim of a PV is gone, `Delete` deletes the PV (the kubelet then
-//!   removes the directory), anything else marks it `Released`.
+//!   removes the directory), anything else marks it `Released`. PVs of another provisioner are
+//!   only marked `Released`: that provisioner deletes them.
 
 use crate::util::*;
 use crate::Config;
@@ -27,6 +31,9 @@ use kr_fmt::quantity::Quantity;
 pub const PROVISIONER: &str = "kr.io/local-path";
 pub const PROTECTION: &str = "kubernetes.io/pvc-protection";
 const PV_PROTECTION: &str = "kubernetes.io/pv-protection";
+const ANN_PROVISIONER: &str = "volume.kubernetes.io/storage-provisioner";
+const ANN_PROVISIONER_BETA: &str = "volume.beta.kubernetes.io/storage-provisioner";
+const ANN_SELECTED_NODE: &str = "volume.kubernetes.io/selected-node";
 const PVS: &str = "/api/v1/persistentvolumes";
 const CLASSES: &str = "/apis/storage.k8s.io/v1/storageclasses";
 
@@ -172,6 +179,34 @@ async fn sync_pvc<C: Client>(c: &C, pvc: &Value, pod_list: &[Value], vols: &mut 
         }
         return Ok(());
     }
+    // A class served by an external provisioner (a CSI driver's external-provisioner sidecar): it acts
+    // on claims annotated with its name, once a node is chosen when binding waits for a consumer.
+    if let Some(sc) = classes.iter().find(|k| !class.is_empty() && name(k) == class) {
+        let prov = str_at(sc, &["provisioner"]);
+        if !prov.is_empty() && prov != PROVISIONER && prov != "kubernetes.io/no-provisioner" {
+            let mut ann: Vec<(&str, Value)> = Vec::new();
+            for k in [ANN_PROVISIONER, ANN_PROVISIONER_BETA] {
+                if str_at(pvc, &["metadata", "annotations", k]) != prov {
+                    ann.push((k, Value::from(prov)));
+                }
+            }
+            if str_at(sc, &["volumeBindingMode"]) == "WaitForFirstConsumer" && str_at(pvc, &["metadata", "annotations", ANN_SELECTED_NODE]).is_empty() {
+                match users.iter().map(|p| str_at(p, &["spec", "nodeName"])).find(|n| !n.is_empty()) {
+                    Some(n) => ann.push((ANN_SELECTED_NODE, Value::from(n))),
+                    None => ann.clear(), // wait for a scheduled pod
+                }
+            }
+            if !ann.is_empty() {
+                let patch = obj(alloc::vec![("metadata", obj(alloc::vec![("annotations", obj(ann))]))]);
+                match c.patch(&path, MERGE, &patch).await {
+                    Ok(_) => {}
+                    Err(e) if e.code == 409 || e.code == 404 => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            return Ok(());
+        }
+    }
     // Dynamic provisioning.
     let Some(sc) = classes.iter().find(|k| name(k) == class && str_at(k, &["provisioner"]) == PROVISIONER) else { return Ok(()) };
     let node = match users.iter().map(|p| str_at(p, &["spec", "nodeName"])).find(|n| !n.is_empty()) {
@@ -272,7 +307,8 @@ async fn sync_pv<C: Client>(c: &C, pv: &Value, claims: &[Value]) -> Result<()> {
             }
         }
         None if phase == "Released" => {}
-        None if str_at(pv, &["spec", "persistentVolumeReclaimPolicy"]) == "Delete" => delete_ok(c, &path).await?,
+        // A volume another provisioner created is deleted by that provisioner (it sees `Released`).
+        None if str_at(pv, &["spec", "persistentVolumeReclaimPolicy"]) == "Delete" && matches!(str_at(pv, &["metadata", "annotations", "pv.kubernetes.io/provisioned-by"]), "" | PROVISIONER) => delete_ok(c, &path).await?,
         None => set_phase(c, &path, "Released").await?,
     }
     Ok(())

@@ -87,6 +87,31 @@ fn resolve_mut<'a>(doc: &'a mut Value, toks: &[String]) -> Result<&'a mut Value,
     Ok(cur)
 }
 
+/// Creates the missing objects on the way to the parent of `path` (never replaces a value).
+fn ensure_parents(doc: &mut Value, path: &[String]) {
+    let Some((_, parents)) = path.split_last() else { return };
+    let mut cur = doc;
+    for (i, t) in parents.iter().enumerate() {
+        match cur {
+            Value::Object(_) => {
+                if cur.get(t).is_none() {
+                    let append = path.get(i + 1).is_some_and(|n| n == "-");
+                    cur.set(t, if append { Value::Array(Vec::new()) } else { Value::Object(Vec::new()) });
+                }
+                cur = match cur.get_mut(t) {
+                    Some(c) => c,
+                    None => return,
+                };
+            }
+            Value::Array(a) => match t.parse::<usize>().ok().filter(|&n| n < a.len()) {
+                Some(n) => cur = &mut a[n],
+                None => return,
+            },
+            _ => return,
+        }
+    }
+}
+
 fn op_add(doc: &mut Value, toks: &[String], v: Value) -> Result<(), PatchError> {
     let Some((last, parent)) = toks.split_last() else {
         *doc = v;
@@ -119,6 +144,17 @@ fn op_remove(doc: &mut Value, toks: &[String]) -> Result<Value, PatchError> {
 }
 
 pub fn json_patch(doc: &mut Value, ops: &Value) -> Result<(), PatchError> {
+    json_patch_with(doc, ops, false)
+}
+
+/// Patches returned by admission webhooks. Kubernetes applies those with the JSON-patch library's
+/// lenient options, and webhooks rely on it: `replace` of a member that is absent sets it, and
+/// `add` below absent objects creates them (e.g. `add /metadata/finalizers/-` on a new object).
+pub fn json_patch_lenient(doc: &mut Value, ops: &Value) -> Result<(), PatchError> {
+    json_patch_with(doc, ops, true)
+}
+
+fn json_patch_with(doc: &mut Value, ops: &Value, lenient: bool) -> Result<(), PatchError> {
     let Some(ops) = ops.as_array() else { return err("JSON patch must be an array") };
     if ops.len() > 10_000 {
         return err("too many patch operations");
@@ -129,12 +165,28 @@ pub fn json_patch(doc: &mut Value, ops: &Value) -> Result<(), PatchError> {
         let value = || op.get("value").cloned().ok_or_else(|| PatchError("value missing".into()));
         let from = || -> Result<Vec<String>, PatchError> { pointer_tokens(op.get("from").and_then(Value::as_str).ok_or_else(|| PatchError("from missing".into()))?) };
         match name {
-            "add" => op_add(doc, &path, value()?)?,
+            "add" => {
+                if lenient {
+                    ensure_parents(doc, &path);
+                }
+                op_add(doc, &path, value()?)?
+            }
             "remove" => {
                 op_remove(doc, &path)?;
             }
             "replace" => {
                 let v = value()?;
+                if lenient {
+                    ensure_parents(doc, &path);
+                    if let Some((last, parent)) = path.split_last() {
+                        if let Ok(o @ Value::Object(_)) = resolve_mut(doc, parent) {
+                            if o.get(last).is_none() {
+                                o.set(last, v);
+                                continue;
+                            }
+                        }
+                    }
+                }
                 *resolve_mut(doc, &path)? = v;
             }
             "move" => {
@@ -353,6 +405,17 @@ mod tests {
 
     fn j(s: &str) -> Value {
         parse_str(s).unwrap()
+    }
+
+    #[test]
+    fn lenient_webhook_patches() {
+        let mut d = j(r#"{"metadata":{"name":"a"}}"#);
+        json_patch_lenient(&mut d, &j(r#"[{"op":"replace","path":"/metadata/finalizers","value":["x"]},{"op":"add","path":"/spec/a/b","value":1},{"op":"add","path":"/metadata/fin2/-","value":"y"}]"#)).unwrap();
+        assert_eq!(kr_fmt::json::to_string(&d), r#"{"metadata":{"name":"a","finalizers":["x"],"fin2":["y"]},"spec":{"a":{"b":1}}}"#);
+        // Strict mode still refuses.
+        let mut d = j(r#"{"metadata":{}}"#);
+        assert!(json_patch(&mut d, &j(r#"[{"op":"replace","path":"/metadata/finalizers","value":[]}]"#)).is_err());
+        assert!(json_patch(&mut d, &j(r#"[{"op":"add","path":"/spec/a/b","value":1}]"#)).is_err());
     }
 
     #[test]

@@ -140,7 +140,7 @@ fn walk(v: &Value, old: Option<&Value>, names: &mut Vec<String>, lists: Lists, s
                 }
             }
             let mut out = Vec::new();
-            for (k, c) in fs {
+            for (i, (k, c)) in fs.iter().enumerate() {
                 if names.is_empty() {
                     match scope {
                         Scope::NoStatus if k == "status" => continue,
@@ -152,7 +152,7 @@ fn walk(v: &Value, old: Option<&Value>, names: &mut Vec<String>, lists: Lists, s
                     continue;
                 }
                 names.push(k.clone());
-                let sub = walk(c, old.and_then(|o| o.get(k)), names, lists, scope);
+                let sub = walk(c, old.and_then(|o| o.get_hinted(k, i)), names, lists, scope);
                 names.pop();
                 if let Some(s) = sub {
                     out.push((alloc::format!("f:{k}"), s));

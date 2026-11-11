@@ -241,3 +241,24 @@
 
 ## Rootful-by-default (k3s parity)
 - kr now runs pods in the host user namespace by default (rootful), matching k3s. User namespaces are opt-in via KR_USERNS=1 or per-pod hostUsers: false. Privileged pods get all capabilities with seccomp/no_new_privs skipped. This unblocks mknod (NVIDIA) and ipset/iptables (Calico) in rootful mode. Verified: privileged pod mknod succeeded; Calico node progressed past ipset errors.
+
+## PartialObjectMetadata watch support
+- kr now handles `as=PartialObjectMetadata` (and `as=PartialObjectMetadataList`) in list and watch requests, returning metadata-only objects. Fixes cert-manager cainjector's recurring "no kind Secret is registered for version v1" watch churn.
+
+## Device Plugin API (was KNOWN_ISSUES #117)
+- The kubelet serves `v1beta1.Registration` on `<device-plugins dir>/kubelet.sock` (`/var/lib/kubelet/device-plugins` as root), follows each plugin's `ListAndWatch`, advertises capacity/allocatable of its resource on the Node and allocates devices (`Allocate`, `PreStartContainer`, CDI JSON) when a container limits it. See ADR-038. Not yet verified against NVIDIA's real plugin.
+
+## Closed without a code change (2026-11-11)
+- #117 No Device Plugin API: implemented, see ADR-038.
+- #120 Host kernel modules missing in this sandbox: environment-specific (no module tree for the running kernel); kr does not depend on `xt_comment`/`nft_nat` because it programs the datapath over netlink/nft. Not a kr bug.
+- #123 File bind-mounts of a deleted inode: the kernel refuses to bind-mount an unlinked inode (also plain `mount --bind`); recreate the host mount. Kept under accepted limitations.
+- #124 PartialObjectMetadata watch churn: fixed (metadata-only list/watch).
+- #125 API TLS handshake speed: moved to accepted limitations.
+
+## Event-loop stall on big objects (2026-11-11)
+- A PUT of NFD's 557 KB `NodeFeature` took ~700 ms on the single-threaded loop (`kr: slow request`). The cost was quadratic lookups in objects with thousands of keys: `same_json` (generation check), `has_duplicate_keys`, `fieldval::pruned_paths`, `ssa::fields` against the old object and `crd::validate`. They now look at the same position first (`Value::get_hinted`) and use a set for duplicate keys. The same PUT takes ~80 ms.
+
+## Container capabilities and rejected-pod status (2026-11-11)
+- `securityContext.capabilities.add/drop` (incl. `ALL`, with or without `CAP_`) now set the container's capability set (`security::resolve_caps`: default, minus drop, plus add); an unknown name fails the container with `CreateContainerConfigError`.
+- A pod rejected at admission (`HostPortConflict`, forbidden sysctl) or failing sandbox setup no longer reports waiting `containerStatuses`, so `kubectl get pods` shows the reason.
+

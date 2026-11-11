@@ -395,7 +395,7 @@ async fn mutate(ctx: &Ctx<'_>, wh: &Value, cur: &mut Value, old: &Value) -> Resu
         }
         let ops = json::parse(&kr_fmt::base64::decode(p).map_err(|_| "invalid patch encoding")?).map_err(|_| "invalid patch")?;
         let mut n = cur.clone();
-        patch::json_patch(&mut n, &ops).map_err(|e| e.0)?;
+        patch::json_patch_lenient(&mut n, &ops).map_err(|e| e.0)?;
         Ok(n)
     })();
     match applied {
@@ -447,7 +447,11 @@ async fn admit(api: &ApiServer, req: &Req<'_>, rt: &Route, op: &'static str, mod
         Mode::Resource | Mode::Scale => {
             let q2 = if req.query.is_empty() { "dryRun=All".to_string() } else { format!("{}&dryRun=All", req.query) };
             let dreq = Req { method: req.method, path: req.path, query: &q2, content_type: req.content_type, accept: None, body: req.body, user: Some(user.clone()), bearer: req.bearer, headers: req.headers, authz_verb: req.authz_verb };
-            let result = match api.handle_w(&dreq).0 {
+            // Mutating webhooks run before schema validation (the real write validates the result).
+            api.defer_schema.set(!muts.is_empty() && op != "DELETE");
+            let dry_result = api.handle_w(&dreq).0;
+            api.defer_schema.set(false);
+            let result = match dry_result {
                 Reply::Json(c, b) if c < 300 => json::parse(b.as_bytes()).map_err(|_| Reply::err(ApiError::new(500, "InternalError", "bad admission result")))?,
                 other => return Err(other),
             };

@@ -162,7 +162,7 @@ fn run(mut args: Args) -> i32 {
     // host's own resolvers are reachable (loopback stubs are not, so those get the forwarder too).
     let resolv = format!("{}/resolv.conf", dirs.root);
     let _ = kr_runtime::store::write_file_atomic(&resolv, resolv_conf(net.sandbox.is_some()).as_bytes());
-    let mounts = [Mount { source: resolv.into_bytes(), sub_path: None, target: b"/etc/resolv.conf".to_vec(), readonly: false }];
+    let mounts = [Mount { source: resolv.into_bytes(), sub_path: None, target: b"/etc/resolv.conf".to_vec(), readonly: false, prop: container::Prop::Private }];
     let spec = RunSpec {
         rootfs: &rootfs,
         upper: dirs.upper.as_bytes(),
@@ -186,6 +186,7 @@ fn run(mut args: Args) -> i32 {
         extra_groups: &[],
         readonly_root: false,
             privileged: false,
+            caps: None,
             userns: kr_runtime::container::userns_enabled(),
     };
     if let Some(l) = &net.lease {
@@ -488,6 +489,7 @@ fn run_dir(mut args: Args) -> i32 {
         extra_groups: &[],
         readonly_root: false,
             privileged: false,
+            caps: None,
             userns: kr_runtime::container::userns_enabled(),
     };
     supervise(&spec)
@@ -527,7 +529,7 @@ fn pod_demo(mut args: Args) -> i32 {
     };
     let vol = format!("{}/containers/{id}-vol", store.root());
     let _ = ns::mkdir(&nul(vol.as_bytes()), 0o755);
-    let mounts = [Mount { source: vol.clone().into_bytes(), sub_path: None, target: b"/shared".to_vec(), readonly: false }];
+    let mounts = [Mount { source: vol.clone().into_bytes(), sub_path: None, target: b"/shared".to_vec(), readonly: false, prop: container::Prop::Private }];
     let env = [DEFAULT_PATH.as_bytes().to_vec()];
     let mk = |name: &str, argv: &[&str]| -> (String, Vec<Vec<u8>>) {
         (format!("{id}-{name}"), argv.iter().map(|a| a.as_bytes().to_vec()).collect())
@@ -564,6 +566,7 @@ fn pod_demo(mut args: Args) -> i32 {
             extra_groups: &[],
             readonly_root: false,
             privileged: false,
+            caps: None,
             userns: kr_runtime::container::userns_enabled(),
         };
         match container::start(&spec) {

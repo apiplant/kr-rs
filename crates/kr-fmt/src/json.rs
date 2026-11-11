@@ -285,6 +285,15 @@ impl Value {
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.as_object()?.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v)
     }
+    /// Like [`get`](Self::get) for a caller walking two objects in step: tries position `hint`
+    /// first, so a map compared with a copy of itself costs linear instead of quadratic time.
+    pub fn get_hinted(&self, key: &str, hint: usize) -> Option<&Value> {
+        let o = self.as_object()?;
+        match o.get(hint) {
+            Some((k, v)) if k == key => Some(v),
+            _ => self.get(key),
+        }
+    }
     /// Array element.
     pub fn at(&self, i: usize) -> Option<&Value> {
         self.as_array()?.get(i)
@@ -346,7 +355,16 @@ impl Value {
     /// True if any object (at any depth) contains the same key twice.
     pub fn has_duplicate_keys(&self) -> bool {
         match self {
-            Value::Object(o) => o.iter().enumerate().any(|(i, (k, v))| o[..i].iter().any(|(k2, _)| k2 == k) || v.has_duplicate_keys()),
+            Value::Object(o) => {
+                // Big maps (label sets, feature tables) would make the pairwise scan quadratic.
+                let dup = if o.len() > 16 {
+                    let mut seen = alloc::collections::BTreeSet::new();
+                    o.iter().any(|(k, _)| !seen.insert(k.as_str()))
+                } else {
+                    o.iter().enumerate().any(|(i, (k, _))| o[..i].iter().any(|(k2, _)| k2 == k))
+                };
+                dup || o.iter().any(|(_, v)| v.has_duplicate_keys())
+            }
             Value::Array(a) => a.iter().any(Value::has_duplicate_keys),
             _ => false,
         }

@@ -26,6 +26,67 @@ pub const DEFAULT_CAPS: &[u32] = &[
     31, // SETFCAP
 ];
 
+/// Capability names as `securityContext.capabilities` spells them (no `CAP_` prefix), by number.
+const CAP_NAMES: &[&str] = &[
+    "CHOWN", "DAC_OVERRIDE", "DAC_READ_SEARCH", "FOWNER", "FSETID", "KILL", "SETGID", "SETUID", "SETPCAP", "LINUX_IMMUTABLE",
+    "NET_BIND_SERVICE", "NET_BROADCAST", "NET_ADMIN", "NET_RAW", "IPC_LOCK", "IPC_OWNER", "SYS_MODULE", "SYS_RAWIO", "SYS_CHROOT",
+    "SYS_PTRACE", "SYS_PACCT", "SYS_ADMIN", "SYS_BOOT", "SYS_NICE", "SYS_RESOURCE", "SYS_TIME", "SYS_TTY_CONFIG", "MKNOD", "LEASE",
+    "AUDIT_WRITE", "AUDIT_CONTROL", "SETFCAP", "MAC_OVERRIDE", "MAC_ADMIN", "SYSLOG", "WAKE_ALARM", "BLOCK_SUSPEND", "AUDIT_READ",
+    "PERFMON", "BPF", "CHECKPOINT_RESTORE",
+];
+
+fn cap_number(name: &str) -> Option<u32> {
+    let n = name.strip_prefix("CAP_").unwrap_or(name);
+    CAP_NAMES.iter().position(|c| *c == n).map(|i| i as u32)
+}
+
+/// The capability set of a container: the default set, minus `drop`, plus `add` (so a name in both
+/// stays, as in containerd). `ALL` stands for every capability. An unknown name is an error.
+pub fn resolve_caps(add: &[&str], drop: &[&str]) -> Result<Vec<u32>, alloc::string::String> {
+    let all = |names: &[&str], set: &mut Vec<u32>, adding: bool| -> Result<(), alloc::string::String> {
+        for n in names {
+            let list: Vec<u32> = if *n == "ALL" {
+                (0..CAP_NAMES.len() as u32).collect()
+            } else {
+                alloc::vec![cap_number(n).ok_or_else(|| alloc::format!("unknown capability {n:?}"))?]
+            };
+            for c in list {
+                if adding {
+                    if !set.contains(&c) {
+                        set.push(c);
+                    }
+                } else {
+                    set.retain(|x| *x != c);
+                }
+            }
+        }
+        Ok(())
+    };
+    let mut set = DEFAULT_CAPS.to_vec();
+    all(drop, &mut set, false)?;
+    all(add, &mut set, true)?;
+    set.sort_unstable();
+    Ok(set)
+}
+
+#[cfg(test)]
+mod caps_tests {
+    use super::*;
+
+    #[test]
+    fn resolve() {
+        assert_eq!(resolve_caps(&[], &[]).unwrap(), DEFAULT_CAPS.to_vec());
+        let none = resolve_caps(&[], &["ALL"]).unwrap();
+        assert!(none.is_empty());
+        let c = resolve_caps(&["NET_ADMIN", "CAP_SYS_TIME"], &["ALL"]).unwrap();
+        assert_eq!(c, alloc::vec![12, 25]);
+        let d = resolve_caps(&[], &["NET_RAW", "MKNOD"]).unwrap();
+        assert!(!d.contains(&13) && !d.contains(&27) && d.contains(&0));
+        assert!(resolve_caps(&["NOPE"], &[]).is_err());
+        assert_eq!(resolve_caps(&["ALL"], &[]).unwrap().len(), CAP_NAMES.len());
+    }
+}
+
 /// Highest capability number we try to drop; unknown ones return EINVAL and are skipped.
 const CAP_LAST: u32 = 63;
 

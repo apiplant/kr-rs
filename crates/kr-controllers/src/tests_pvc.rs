@@ -176,3 +176,33 @@ fn immediate_or_missing_claim_blocks_scheduling() {
 fn sched_msg(p: &Value) -> String {
     p.pointer(&["status", "conditions"]).and_then(Value::as_array).and_then(|a| a.iter().find(|k| str_at(k, &["type"]) == "PodScheduled")).map(|k| str_at(k, &["message"]).to_string()).unwrap_or_default()
 }
+
+#[test]
+fn external_provisioner_gets_annotations_and_owns_deletion() {
+    scenario(|c| async move {
+        c.create("/api/v1/nodes", &node("n1", "{}", "[]", "4")).await.unwrap();
+        let imm = v(r#"{"metadata":{"name":"ext"},"provisioner":"driver.example.io","volumeBindingMode":"Immediate"}"#);
+        let wffc = v(r#"{"metadata":{"name":"extw"},"provisioner":"driver.example.io","volumeBindingMode":"WaitForFirstConsumer"}"#);
+        c.create(CLASSES, &imm).await.unwrap();
+        c.create(CLASSES, &wffc).await.unwrap();
+        c.create(CLAIMS, &claim("a", "ext")).await.unwrap();
+        c.create(CLAIMS, &claim("b", "extw")).await.unwrap();
+        let ann = |n: &'static str, k: &'static str| {
+            let c = c.clone();
+            async move { str_at(&c.get(&alloc::format!("{CLAIMS}/{n}")).await.unwrap(), &["metadata", "annotations", k]).to_string() }
+        };
+        wait_until("immediate annotated", || async { ann("a", "volume.kubernetes.io/storage-provisioner").await == "driver.example.io" }).await;
+        // WaitForFirstConsumer: nothing until a pod using the claim is scheduled.
+        assert_eq!(ann("b", "volume.kubernetes.io/storage-provisioner").await, "");
+        c.create(PODS, &pod_with("app", "b")).await.unwrap();
+        wait_until("selected node", || async { ann("b", "volume.kubernetes.io/selected-node").await == "n1" }).await;
+        assert_eq!(ann("b", "volume.beta.kubernetes.io/storage-provisioner").await, "driver.example.io");
+        // No local-path PV is made for it.
+        assert!(get_opt(&c, &alloc::format!("{PVS}/pvc-{}", str_at(&c.get(&alloc::format!("{CLAIMS}/a")).await.unwrap(), &["metadata", "uid"]))).await.unwrap().is_none());
+        // A foreign PV with reclaim Delete is only Released when its claim goes.
+        let pv = v(r#"{"metadata":{"name":"pv-ext","annotations":{"pv.kubernetes.io/provisioned-by":"driver.example.io"}},"spec":{"storageClassName":"ext","persistentVolumeReclaimPolicy":"Delete","accessModes":["ReadWriteOnce"],"capacity":{"storage":"1Gi"},"claimRef":{"namespace":"default","name":"gone","uid":"x"},"csi":{"driver":"driver.example.io","volumeHandle":"h"}}}"#);
+        c.create(PVS, &pv).await.unwrap();
+        wait_until("released", || async { str_at(&c.get(&alloc::format!("{PVS}/pv-ext")).await.unwrap(), &["status", "phase"]) == "Released" }).await;
+        assert!(get_opt(&c, &alloc::format!("{PVS}/pv-ext")).await.unwrap().is_some());
+    });
+}

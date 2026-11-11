@@ -34,6 +34,9 @@ pub fn set_survive_parent(on: bool) {
 fn clear_pdeathsig() {
     if SURVIVE.load(Ordering::Relaxed) {
         let _ = ns::prctl(ns::PR_SET_PDEATHSIG, 0);
+        // Own session: a Ctrl-C (SIGINT/SIGHUP to the terminal's foreground group or session) aimed at
+        // the kubelet must not reach the sandboxes it will re-adopt.
+        let _ = ns::setsid();
     }
 }
 
@@ -81,8 +84,22 @@ pub struct RunSpec<'a> {
     pub readonly_root: bool,
     /// `securityContext.privileged`: keep all capabilities, skip seccomp and no_new_privs.
     pub privileged: bool,
+    /// `securityContext.capabilities` resolved to capability numbers (see `security::resolve_caps`);
+    /// `None` is the default set. Ignored when `privileged`.
+    pub caps: Option<&'a [u32]>,
     /// Run in a user namespace (rootless). False = rootful (host userns), matching k3s default.
     pub userns: bool,
+}
+
+/// Mount propagation of a volume (`volumeMounts[].mountPropagation`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prop {
+    /// The default: mounts made later on either side stay where they are.
+    Private,
+    /// Mounts made later on the host below the volume appear in the container.
+    HostToContainer,
+    /// Also mounts made in the container below the volume appear on the host (CSI node plugins).
+    Bidirectional,
 }
 
 /// A bind mount of a host path into the container.
@@ -97,6 +114,8 @@ pub struct Mount {
     /// Absolute path inside the container; must not traverse symlinks.
     pub target: Vec<u8>,
     pub readonly: bool,
+    /// Needs a rootful container: user namespaces cannot propagate mounts to the host.
+    pub prop: Prop,
 }
 
 /// What `exec_in` needs to enter a running container.
@@ -210,7 +229,7 @@ pub fn exec_in(target: &ExecTarget, spec: &ExecSpec) -> Result<Running, RunError
             let _ = ns::setsid();
             let _ = ns::set_ctty(0);
         }
-        let _ = drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups, false);
+        let _ = drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups, false, None);
         127
     })
 }
@@ -519,6 +538,7 @@ const STEPS: &[&str] = &[
     "volume mount",
     "stdio",
     "read-only rootfs",
+    "clone propagating volume",
 ];
 
 /// NUL-terminated concatenation of `parts`.
@@ -1142,8 +1162,8 @@ fn open_mount_target(path: &[u8], dir: bool) -> Result<Fd, Errno> {
 }
 
 /// Bind-mounts each volume from the old root (still attached at /.oldroot).
-fn mount_volumes(mounts: &[Mount]) -> Result<(), Errno> {
-    for m in mounts {
+fn mount_volumes(mounts: &[Mount], trees: &[Option<kr_sys::Fd>]) -> Result<(), Errno> {
+    for (i, m) in mounts.iter().enumerate() {
         if m.source.first() != Some(&b'/') || m.target.first() != Some(&b'/') {
             return Err(Errno(22));
         }
@@ -1167,7 +1187,21 @@ fn mount_volumes(mounts: &[Mount]) -> Result<(), Errno> {
         let mut fdpath = b"/proc/self/fd/".to_vec();
         fdpath.extend_from_slice(&fmt_u32(target.raw() as u32));
         fdpath.push(0);
-        ns::mount(Some(&src), &fdpath, None, ns::MS_BIND | ns::MS_REC, None)?;
+        // A propagating volume was cloned (open_tree) before the root went private, so the clone is
+        // still a peer of the host's mount; attach that instead of a fresh private bind.
+        match trees.get(i).and_then(Option::as_ref) {
+            Some(t) => {
+                ns::move_mount_to(t.raw(), target.raw())?;
+                if m.prop == Prop::HostToContainer {
+                    let mounted = open_mount_target(&m.target, is_dir)?;
+                    let mut mpath = b"/proc/self/fd/".to_vec();
+                    mpath.extend_from_slice(&fmt_u32(mounted.raw() as u32));
+                    mpath.push(0);
+                    ns::mount(None, &mpath, None, ns::MS_SLAVE | ns::MS_REC, None)?;
+                }
+            }
+            None => ns::mount(Some(&src), &fdpath, None, ns::MS_BIND | ns::MS_REC, None)?,
+        }
         if m.readonly {
             // In a user namespace the remount must repeat every flag the source mount locks
             // (nosuid/nodev/noexec and the atime mode), so carry over what fstatfs reports.
@@ -1228,6 +1262,19 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
         return (0, Errno(32));
     }
 
+    // Volumes with mount propagation are cloned while the host's shared mounts are still visible
+    // as peers; the clone keeps that relation after the root below goes private.
+    let mut trees: Vec<Option<kr_sys::Fd>> = Vec::new();
+    for m in spec.mounts {
+        if m.prop != Prop::Private && m.sub_path.is_none() && !rootless {
+            match ns::open_tree_clone(&cstr(&[&m.source])) {
+                Ok(t) => trees.push(Some(t)),
+                Err(e) => return (28, e),
+            }
+        } else {
+            trees.push(None);
+        }
+    }
     step!(1, ns::mount(None, b"/\0", None, ns::MS_REC | ns::MS_PRIVATE, None));
 
     let mut opts = cstr(&[b"lowerdir=", spec.rootfs, b",upperdir=", spec.upper, b",workdir=", spec.work]);
@@ -1272,7 +1319,7 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
         let _ = ns::mount(Some(b"cgroup\0"), b"/sys/fs/cgroup\0", Some(b"cgroup2\0"), ns::MS_RDONLY | ns::MS_NOSUID | ns::MS_NODEV | ns::MS_NOEXEC, None);
     }
 
-    step!(25, mount_volumes(spec.mounts));
+    step!(25, mount_volumes(spec.mounts, &trees));
     if spec.readonly_root {
         step!(27, ns::mount(None, b"/\0", None, ns::MS_BIND | ns::MS_REMOUNT | ns::MS_RDONLY, None));
     }
@@ -1289,12 +1336,12 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
             step!(11, ns::sethostname(spec.hostname));
         }
     }
-    drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups, spec.privileged)
+    drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups, spec.privileged, spec.caps)
 }
 
 /// The common tail of every process start inside a container: cwd, user, capabilities,
 /// NO_NEW_PRIVS, seccomp, execve. Only returns on failure.
-fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env: &[Vec<u8>], extra_groups: &[u32], privileged: bool) -> (u8, Errno) {
+fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env: &[Vec<u8>], extra_groups: &[u32], privileged: bool, caps: Option<&[u32]>) -> (u8, Errno) {
     macro_rules! step {
         ($i:expr, $e:expr) => {
             if let Err(e) = $e {
@@ -1310,7 +1357,7 @@ fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env:
         Err(e) => return (21, e),
     };
     if !privileged {
-        step!(16, security::drop_caps(security::DEFAULT_CAPS));
+        step!(16, security::drop_caps(caps.unwrap_or(security::DEFAULT_CAPS)));
     }
     let ids = match (ids, extra_groups.is_empty()) {
         (None, false) => Some((0, 0, alloc::vec![0])),

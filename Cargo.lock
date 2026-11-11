@@ -41,6 +41,7 @@ name = "kr-controllers"
 version = "0.1.3"
 dependencies = [
  "kr-apiserver",
+ "kr-crypto",
  "kr-fmt",
  "kr-rt",
  "kr-store",

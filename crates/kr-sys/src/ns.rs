@@ -10,6 +10,8 @@ mod n {
     pub const MOUNT: usize = 165;
     pub const UMOUNT2: usize = 166;
     pub const PIVOT_ROOT: usize = 155;
+    pub const OPEN_TREE: usize = 428;
+    pub const MOVE_MOUNT: usize = 429;
     pub const CHDIR: usize = 80;
     pub const SETHOSTNAME: usize = 170;
     pub const GETUID: usize = 102;
@@ -40,6 +42,8 @@ mod n {
     pub const MOUNT: usize = 40;
     pub const UMOUNT2: usize = 39;
     pub const PIVOT_ROOT: usize = 41;
+    pub const OPEN_TREE: usize = 428;
+    pub const MOVE_MOUNT: usize = 429;
     pub const CHDIR: usize = 49;
     pub const SETHOSTNAME: usize = 161;
     pub const GETUID: usize = 174;
@@ -236,6 +240,29 @@ pub fn mount(source: Option<&[u8]>, target: &[u8], fstype: Option<&[u8]>, flags:
 pub fn umount2(target: &[u8], flags: usize) -> Result<()> {
     // SAFETY: target is NUL-terminated.
     check(unsafe { syscall2(n::UMOUNT2, c(target)?, flags) }).map(|_| ())
+}
+
+pub const MS_SLAVE: usize = 1 << 19;
+pub const MS_SHARED: usize = 1 << 20;
+
+/// `open_tree(AT_FDCWD, path, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_RECURSIVE)`: a detached
+/// copy of the mount tree at `path`. A copy of a shared mount is a peer of it, which is how
+/// `Bidirectional` mount propagation survives the container's private mount namespace.
+pub fn open_tree_clone(path: &[u8]) -> Result<Fd> {
+    const AT_FDCWD: usize = -100isize as usize;
+    // OPEN_TREE_CLONE | O_CLOEXEC | AT_RECURSIVE
+    // SAFETY: path is NUL-terminated.
+    check(unsafe { syscall3(n::OPEN_TREE, AT_FDCWD, c(path)?, 1 | 0o2000000 | 0x8000) }).map(|r| Fd(r as i32))
+}
+
+/// Attaches the detached mount tree `tree` (from `open_tree_clone`) on the directory or file open
+/// as `target`. The target is passed as an fd: `move_mount` does not follow a `/proc/self/fd`
+/// symlink in a path.
+pub fn move_mount_to(tree: i32, target: i32) -> Result<()> {
+    const MOVE_MOUNT_F_EMPTY_PATH: usize = 4;
+    const MOVE_MOUNT_T_EMPTY_PATH: usize = 0x40;
+    // SAFETY: both paths are the NUL-terminated empty string; the fds name the trees.
+    check(unsafe { syscall5(n::MOVE_MOUNT, tree as usize, c(b"\0")?, target as usize, c(b"\0")?, MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH) }).map(|_| ())
 }
 
 pub fn pivot_root(new_root: &[u8], put_old: &[u8]) -> Result<()> {

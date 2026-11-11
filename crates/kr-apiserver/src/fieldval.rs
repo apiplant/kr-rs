@@ -259,9 +259,9 @@ pub fn unknown_meta(v: &Value) -> Vec<String> {
 pub fn pruned_paths(orig: &Value, pruned: &Value, path: &str, out: &mut Vec<String>) {
     match (orig, pruned) {
         (Value::Object(a), Value::Object(_)) => {
-            for (k, av) in a {
+            for (i, (k, av)) in a.iter().enumerate() {
                 let p = join(path, k);
-                match pruned.get(k) {
+                match pruned.get_hinted(k, i) {
                     None => out.push(p),
                     Some(pv) => pruned_paths(av, pv, &p, out),
                 }

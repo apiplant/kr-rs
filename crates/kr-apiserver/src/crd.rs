@@ -31,6 +31,8 @@ pub struct Custom {
     pub storage: String,
     /// Field selector labels of this version (`selectableFields` JSON paths without the leading dot).
     pub selectable: Vec<String>,
+    /// `additionalPrinterColumns` of this version: (name, jsonPath, priority).
+    pub printer: Vec<(String, String, u64)>,
 }
 
 impl Custom {
@@ -268,9 +270,77 @@ pub fn build(crd: &Value, existing: &[Custom]) -> Vec<Custom> {
                 categories: leak_all(&cats),
             }))
         });
-        out.push(Custom { res, crd: str_at(crd, &["metadata", "name"]).to_string(), schema: v.pointer(&["schema", "openAPIV3Schema"]).cloned(), scale, webhook: webhook.clone(), storage: storage.clone(), selectable: selectable_labels(v) });
+        out.push(Custom { res, crd: str_at(crd, &["metadata", "name"]).to_string(), schema: v.pointer(&["schema", "openAPIV3Schema"]).cloned(), scale, webhook: webhook.clone(), storage: storage.clone(), selectable: selectable_labels(v), printer: printer_columns(v) });
     }
     out
+}
+
+fn printer_columns(v: &Value) -> Vec<(String, String, u64)> {
+    let cols = v.get("additionalPrinterColumns").and_then(Value::as_array).unwrap_or(&[]);
+    cols.iter()
+        .filter_map(|c| {
+            let name = c.get("name")?.as_str()?;
+            let path = c.get("jsonPath")?.as_str()?;
+            // `Age` is always appended by the server.
+            Some((name.to_string(), path.to_string(), c.get("priority").and_then(Value::as_u64).unwrap_or(0)))
+        })
+        .collect()
+}
+
+/// Evaluates the JSONPath subset CRD printer columns use: `.a.b`, `[n]`, `['k']`, `[*]` (first
+/// match) and `[?(@.f=="v")]`. Returns the first match rendered as text, empty when absent.
+pub fn json_path(o: &Value, path: &str) -> String {
+    let p = path.trim().trim_start_matches('{').trim_end_matches('}');
+    let mut cur: Vec<&Value> = alloc::vec![o];
+    let b = p.as_bytes();
+    let mut i = 0;
+    while i < b.len() && !cur.is_empty() {
+        if b[i] == b'.' {
+            i += 1;
+            let st = i;
+            while i < b.len() && b[i] != b'.' && b[i] != b'[' {
+                i += 1;
+            }
+            let k = &p[st..i];
+            if !k.is_empty() {
+                cur = cur.iter().filter_map(|v| v.get(k)).collect();
+            }
+        } else if b[i] == b'[' {
+            let end = match p[i..].find("]") {
+                Some(e) => i + e,
+                None => return String::new(),
+            };
+            let inner = p[i + 1..end].trim();
+            i = end + 1;
+            if inner == "*" {
+                cur = cur.iter().filter_map(|v| v.as_array()).flat_map(|a| a.iter()).collect();
+            } else if let Some(f) = inner.strip_prefix("?(").and_then(|x| x.strip_suffix(')')) {
+                let (lhs, rhs) = match f.split_once("==") {
+                    Some(x) => x,
+                    None => return String::new(),
+                };
+                let field = lhs.trim().trim_start_matches("@.");
+                let want = rhs.trim().trim_matches(|c| c == '"' || c == '\'');
+                cur = cur.iter().filter_map(|v| v.as_array()).flat_map(|a| a.iter()).filter(|e| e.get(field).map(|x| text(x) == want).unwrap_or(false)).collect();
+            } else if let Ok(n) = inner.parse::<usize>() {
+                cur = cur.iter().filter_map(|v| v.as_array().and_then(|a| a.get(n))).collect();
+            } else {
+                let k = inner.trim_matches(|c| c == '\'' || c == '"');
+                cur = cur.iter().filter_map(|v| v.get(k)).collect();
+            }
+        } else {
+            i += 1;
+        }
+    }
+    cur.first().map(|v| text(v)).unwrap_or_default()
+}
+
+fn text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        o => json::to_string(o),
+    }
 }
 
 /// Field selector labels a CRD version declares in `selectableFields`.
@@ -294,6 +364,18 @@ pub fn prune(s: &Value, v: &mut Value, root: bool) {
             let addl = s.get("additionalProperties");
             let preserve = is_true(s.get("x-kubernetes-preserve-unknown-fields"));
             let known = |k: &str| props.is_some_and(|p| p.iter().any(|(n, _)| n == k));
+            // Like Kubernetes: a null for a field whose schema is not `nullable: true` is dropped
+            // (before defaulting), so clients that serialize unset fields as null still validate.
+            fields.retain(|(k, fv)| {
+                if !matches!(fv, Value::Null) || (root && k == "metadata") {
+                    return true;
+                }
+                let ps = props.and_then(|p| p.iter().find(|(n, _)| n == k)).map(|(_, ps)| ps).or(match addl {
+                    Some(a @ Value::Object(_)) => Some(a),
+                    _ => None,
+                });
+                !ps.is_some_and(|ps| !is_true(ps.get("nullable")))
+            });
             if let Some(p) = props {
                 for (k, ps) in p {
                     if !root || k != "metadata" {
@@ -520,8 +602,8 @@ pub fn validate(s: &Value, v: &Value, old: Option<&Value>, path: &str, errs: &mu
                 errs.push(alloc::format!("{at}: Invalid value: should have at most {n} properties"));
             }
             let props = s.get("properties").and_then(Value::as_object);
-            for (k, fv) in fields {
-                let o = old.and_then(|o| o.get(k));
+            for (i, (k, fv)) in fields.iter().enumerate() {
+                let o = old.and_then(|o| o.get_hinted(k, i));
                 match props.and_then(|p| p.iter().find(|(n, _)| n == k)) {
                     Some((_, ps)) => validate(ps, fv, o, &join(path, k), errs),
                     None => {
@@ -756,5 +838,35 @@ fn check_schema(s: &Value, path: &str, pos: Pos, errs: &mut Vec<String>) {
     }
     if let Some(n) = s.get("not") {
         check_schema(n, &alloc::format!("{path}.not"), Pos::Logic, errs);
+    }
+}
+
+#[cfg(test)]
+mod null_tests {
+    use super::*;
+
+    #[test]
+    fn nulls_dropped_unless_nullable() {
+        let sch = json::parse_str(r#"{"type":"object","properties":{"status":{"type":"object","properties":{"at":{"type":"string"},"keep":{"type":"string","nullable":true},"d":{"type":"string","default":"x"}}}}}"#).unwrap();
+        let mut o = json::parse_str(r#"{"status":{"at":null,"keep":null,"d":null}}"#).unwrap();
+        prune(&sch, &mut o, true);
+        assert_eq!(json::to_string(&o), r#"{"status":{"keep":null,"d":"x"}}"#);
+    }
+}
+
+#[cfg(test)]
+mod printer_tests {
+    use super::*;
+
+    #[test]
+    fn json_path_cert_manager_columns() {
+        let o = json::parse(br#"{"spec":{"secretName":"s","issuerRef":{"name":"i"}},"status":{"conditions":[{"type":"Issuing","status":"False"},{"type":"Ready","status":"True","message":"ok"}],"n":3}}"#).unwrap();
+        assert_eq!(json_path(&o, r#".status.conditions[?(@.type=="Ready")].status"#), "True");
+        assert_eq!(json_path(&o, r#".status.conditions[?(@.type=="Ready")].message"#), "ok");
+        assert_eq!(json_path(&o, ".spec.secretName"), "s");
+        assert_eq!(json_path(&o, ".spec.issuerRef.name"), "i");
+        assert_eq!(json_path(&o, ".status.conditions[0].type"), "Issuing");
+        assert_eq!(json_path(&o, ".status.n"), "3");
+        assert_eq!(json_path(&o, ".status.missing.x"), "");
     }
 }

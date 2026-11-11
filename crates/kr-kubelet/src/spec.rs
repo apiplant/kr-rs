@@ -7,7 +7,7 @@ use kr_apiserver::client::{meta, Client};
 use kr_fmt::json::Value;
 use kr_fmt::quantity::Quantity;
 use kr_runtime::cgroup::Limits;
-use kr_runtime::container::Mount;
+use kr_runtime::container::{self, Mount};
 use kr_runtime::store::ImageConfig;
 
 pub struct Built {
@@ -857,10 +857,10 @@ fn chown_tree(path: &str, gid: u32, depth: u32) {
 
 /// Re-materializes configMap/secret/projected/downwardAPI volumes of a running pod (live
 /// updates and token rotation). Files are replaced atomically.
-pub async fn refresh_volumes<C: Client>(c: &C, pod: &Value, pod_dir: &str) {
+pub async fn refresh_volumes<C: Client>(c: &C, csi: &crate::csi::Csi, pod: &Value, pod_dir: &str) {
     for vol in pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]) {
         if ["configMap", "secret", "projected", "downwardAPI"].iter().any(|k| vol.get(k).is_some()) {
-            let _ = volume_source(c, pod, vol, pod_dir).await;
+            let _ = volume_source(c, csi, pod, vol, pod_dir).await;
         }
     }
 }
@@ -868,13 +868,16 @@ pub async fn refresh_volumes<C: Client>(c: &C, pod: &Value, pod_dir: &str) {
 /// PVC -> bound PV -> host directory (`hostPath` or `local`). The directory is created when
 /// missing, world-writable like local-path-provisioner. An unbound claim is an error the caller
 /// retries (the pod stays in ContainerCreating).
-async fn pvc_source<C: Client>(c: &C, ns: &str, claim: &str) -> Result<String, String> {
+async fn pvc_source<C: Client>(c: &C, csi: &crate::csi::Csi, pod: &Value, ns: &str, claim: &str, claim_readonly: bool) -> Result<String, String> {
     let pvc = c.get(&alloc::format!("/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}")).await.map_err(|_| alloc::format!("persistentvolumeclaim \"{claim}\" not found"))?;
     let pv_name = pvc.pointer(&["spec", "volumeName"]).and_then(Value::as_str).unwrap_or("");
     if pv_name.is_empty() || pvc.pointer(&["status", "phase"]).and_then(Value::as_str) != Some("Bound") {
         return Err(alloc::format!("persistentvolumeclaim \"{claim}\" not bound"));
     }
     let pv = c.get(&alloc::format!("/api/v1/persistentvolumes/{pv_name}")).await.map_err(|_| alloc::format!("persistentvolume \"{pv_name}\" not found"))?;
+    if pv.pointer(&["spec", "csi"]).is_some() {
+        return csi.mount_pv(c, pod, &pv, claim_readonly).await;
+    }
     let path = ["hostPath", "local"].iter().find_map(|k| pv.pointer(&["spec", k, "path"]).and_then(Value::as_str)).ok_or_else(|| alloc::format!("persistentvolume \"{pv_name}\": unsupported volume source"))?;
     if !path.starts_with('/') || path.split('/').any(|s| s == "..") {
         return Err(alloc::format!("persistentvolume \"{pv_name}\": invalid path {path}"));
@@ -914,7 +917,7 @@ pub async fn gc_storage<C: Client>(c: &C) {
 }
 
 /// Resolves a pod volume to a host directory (creating/materializing it).
-async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str) -> Result<Option<String>, String> {
+async fn volume_source<C: Client>(c: &C, csi: &crate::csi::Csi, pod: &Value, vol: &Value, pod_dir: &str) -> Result<Option<String>, String> {
     let name = vol.get("name").and_then(Value::as_str).unwrap_or("");
     let dir = alloc::format!("{pod_dir}/volumes/{name}");
     if vol.get("emptyDir").is_some() {
@@ -959,7 +962,7 @@ async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str
         }
         r.map(|()| Some(dir))
     } else if let Some(p) = vol.get("persistentVolumeClaim") {
-        pvc_source(c, meta(pod, "namespace"), p.get("claimName").and_then(Value::as_str).unwrap_or("")).await.map(Some)
+        pvc_source(c, csi, pod, meta(pod, "namespace"), p.get("claimName").and_then(Value::as_str).unwrap_or(""), p.get("readOnly").and_then(Value::as_bool).unwrap_or(false)).await.map(Some)
     } else {
         // Other types: not yet (KNOWN_ISSUES); mounted as an empty dir.
         kr_runtime::store::mkdir_p(&dir, 0o755).map_err(|_| String::from("cannot create volume dir"))?;
@@ -967,7 +970,7 @@ async fn volume_source<C: Client>(c: &C, pod: &Value, vol: &Value, pod_dir: &str
     }
 }
 
-pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig, pod_dir: &str, ip: Option<[u8; 4]>, ip6: Option<[u8; 16]>, node: &str, host_ip: &str, store: &kr_runtime::store::Store) -> Result<Built, String> {
+pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig, pod_dir: &str, ip: Option<[u8; 4]>, ip6: Option<[u8; 16]>, node: &str, host_ip: &str, store: &kr_runtime::store::Store, dp: &crate::deviceplugin::Plugins, csi: &crate::csi::Csi) -> Result<Built, String> {
     let ns = meta(pod, "namespace");
     // env: image env, then container env (later wins), with $(VAR) expansion.
     let mut env: Vec<(String, String)> = img.env.iter().filter_map(|e| e.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect();
@@ -1023,7 +1026,7 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         dedup.retain(|(x, _)| *x != k);
         dedup.push((k, v));
     }
-    let env = dedup;
+    let mut env = dedup;
 
     // argv: command replaces ENTRYPOINT (and drops CMD); args replaces CMD.
     let command = strs(ctr.get("command"));
@@ -1053,8 +1056,8 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
     let limits = container_limits(pod, ctr);
     let vols = pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]);
     let mut mounts = alloc::vec![
-        Mount { source: alloc::format!("{pod_dir}/etc-hosts").into_bytes(), sub_path: None, target: b"/etc/hosts".to_vec(), readonly: false },
-        Mount { source: alloc::format!("{pod_dir}/resolv.conf").into_bytes(), sub_path: None, target: b"/etc/resolv.conf".to_vec(), readonly: false },
+        Mount { source: alloc::format!("{pod_dir}/etc-hosts").into_bytes(), sub_path: None, target: b"/etc/hosts".to_vec(), readonly: false, prop: container::Prop::Private },
+        Mount { source: alloc::format!("{pod_dir}/resolv.conf").into_bytes(), sub_path: None, target: b"/etc/resolv.conf".to_vec(), readonly: false, prop: container::Prop::Private },
     ];
     for vm in ctr.get("volumeMounts").and_then(Value::as_array).unwrap_or(&[]) {
         let name = vm.get("name").and_then(Value::as_str).unwrap_or("");
@@ -1067,7 +1070,7 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
             root.pop();
             Some(String::from_utf8(root).map_err(|_| String::from("bad image path"))?)
         } else {
-            volume_source(c, pod, vol, pod_dir).await?
+            volume_source(c, csi, pod, vol, pod_dir).await?
         };
         let Some(src) = src else { continue };
         let mut sub_path = None;
@@ -1097,7 +1100,15 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
             sub_path = Some(sub.as_bytes().to_vec());
         }
         let ro = vm.get("readOnly").and_then(Value::as_bool).unwrap_or(false) || ["configMap", "secret", "projected", "downwardAPI", "image"].iter().any(|k| vol.get(k).is_some());
-        mounts.push(Mount { source: src.into_bytes(), sub_path, target: target.as_bytes().to_vec(), readonly: ro });
+        let prop = match vm.get("mountPropagation").and_then(Value::as_str) {
+            None | Some("") | Some("None") => container::Prop::Private,
+            Some("HostToContainer") => container::Prop::HostToContainer,
+            // As upstream validation: a container that can mount into the host must be privileged.
+            Some("Bidirectional") if ctr.pointer(&["securityContext", "privileged"]).and_then(Value::as_bool) == Some(true) => container::Prop::Bidirectional,
+            Some("Bidirectional") => return Err(String::from("mountPropagation Bidirectional requires a privileged container")),
+            Some(other) => return Err(alloc::format!("unsupported mountPropagation {other}")),
+        };
+        mounts.push(Mount { source: src.into_bytes(), sub_path, target: target.as_bytes().to_vec(), readonly: ro, prop });
     }
     // terminationMessagePath: a fresh world-writable file per start (any runAsUser must be able to
     // write it), read back by the kubelet once the container exits.
@@ -1106,12 +1117,63 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         let host = term_file(pod_dir, ctr.get("name").and_then(Value::as_str).unwrap_or(""));
         if let Ok(fd) = kr_sys::ns::open(alloc::format!("{host}\0").as_bytes(), kr_sys::ns::O_WRONLY | kr_sys::ns::O_CREAT | kr_sys::fs::O_TRUNC, 0o666) {
             let _ = kr_sys::fs::fchmod(fd.raw(), 0o666);
-            mounts.push(Mount { source: host.into_bytes(), sub_path: None, target: tpath.as_bytes().to_vec(), readonly: false });
+            mounts.push(Mount { source: host.into_bytes(), sub_path: None, target: tpath.as_bytes().to_vec(), readonly: false, prop: container::Prop::Private });
         }
     }
     let mut extra_groups: Vec<u32> = pod.pointer(&["spec", "securityContext", "supplementalGroups"]).and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_u64).map(|g| g as u32).collect();
     if let Some(fg) = pod.pointer(&["spec", "securityContext", "fsGroup"]).and_then(Value::as_u64) {
         extra_groups.push(fg as u32);
+    }
+    // Device plugin resources: allocate devices (plugin env wins over the container's).
+    let mut wants: Vec<(String, usize)> = Vec::new();
+    for (k, v) in ctr.pointer(&["resources", "limits"]).and_then(Value::as_object).unwrap_or(&[]) {
+        if dp.manages(k) {
+            let n = quantity(Some(v)).and_then(|q| q.value()).and_then(|n| usize::try_from(n).ok()).unwrap_or(0);
+            if n > 0 {
+                wants.push((k.clone(), n));
+            }
+        }
+    }
+    // NVIDIA runtime class: `NVIDIA_VISIBLE_DEVICES` selects CDI devices, as the NVIDIA container
+    // runtime would. Only pods that name the runtime class get host GPUs this way.
+    let mut grant: Option<crate::deviceplugin::Grant> = None;
+    if wants.is_empty() && pod.pointer(&["spec", "runtimeClassName"]).and_then(Value::as_str).is_some_and(crate::deviceplugin::is_nvidia_runtime_class) {
+        let names = env.iter().rev().find(|(k, _)| k == "NVIDIA_VISIBLE_DEVICES").map(|(_, v)| crate::deviceplugin::visible_devices_to_cdi(v)).unwrap_or_default();
+        if !names.is_empty() {
+            grant = Some(crate::deviceplugin::cdi_grant(&names)?);
+        }
+    }
+    if !wants.is_empty() {
+        let (uid, cname) = (meta(pod, "uid"), ctr.get("name").and_then(Value::as_str).unwrap_or(""));
+        grant = Some(dp.allocate(uid, cname, &wants).await?);
+    }
+    if let Some(g) = grant {
+        if !g.ld_folders.is_empty() {
+            let mut p = env.iter().find(|(k, _)| k == "LD_LIBRARY_PATH").map(|(_, v)| v.clone()).unwrap_or_default();
+            for f in &g.ld_folders {
+                if !p.split(':').any(|x| x == f) {
+                    if !p.is_empty() {
+                        p.push(':');
+                    }
+                    p.push_str(f);
+                }
+            }
+            env.retain(|(k, _)| k != "LD_LIBRARY_PATH");
+            env.push(("LD_LIBRARY_PATH".into(), p));
+        }
+        for (k, v) in g.envs {
+            env.retain(|(x, _)| *x != k);
+            env.push((k, v));
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for (c, h, ro) in g.mounts.iter().map(|(c, h, ro)| (c, h, *ro)).chain(g.devices.iter().map(|(c, h, p)| (c, h, !p.contains('w')))) {
+            if !c.starts_with('/') || !h.starts_with('/') || seen.contains(&c.as_str()) {
+                continue;
+            }
+            seen.push(c);
+            mounts.retain(|m| m.target != c.as_bytes());
+            mounts.push(Mount { source: h.clone().into_bytes(), sub_path: None, target: c.clone().into_bytes(), readonly: ro, prop: container::Prop::Private });
+        }
     }
     let cwd = ctr.get("workingDir").and_then(Value::as_str).filter(|w| !w.is_empty()).map(String::from).unwrap_or_else(|| img.working_dir.clone());
     Ok(Built {

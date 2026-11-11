@@ -231,7 +231,15 @@ fn check_type(o: &Value, t: &Target) -> Result<(), ApiError> {
 pub fn same_json(a: &Option<&Value>, b: &Option<&Value>) -> bool {
     fn eq(a: &Value, b: &Value) -> bool {
         match (a, b) {
-            (Value::Object(x), Value::Object(y)) => x.len() == y.len() && x.iter().all(|(k, v)| b.get(k).is_some_and(|w| eq(v, w)) && a.get(k).is_some()),
+            (Value::Object(x), Value::Object(y)) => {
+                // Clients mostly keep the stored key order, so look at the same position first
+                // (a linear lookup per member is quadratic on big maps).
+                x.len() == y.len()
+                    && x.iter().enumerate().all(|(i, (k, v))| match y.get(i) {
+                        Some((k2, w)) if k2 == k => eq(v, w),
+                        _ => b.get(k).is_some_and(|w| eq(v, w)) && a.get(k).is_some(),
+                    })
+            }
             (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| eq(p, q)),
             _ => a == b,
         }
@@ -538,6 +546,29 @@ mod tests {
         for (i, x) in b.iter_mut().enumerate() {
             *x = (i * 37 + 11) as u8;
         }
+    }
+
+    #[test]
+    fn same_json_ignores_order_and_handles_big_maps() {
+        let a = parse_str(r#"{"a":1,"b":{"x":1,"y":[1,2]},"c":3}"#).unwrap();
+        let b = parse_str(r#"{"c":3,"b":{"y":[1,2],"x":1},"a":1}"#).unwrap();
+        assert!(same_json(&Some(&a), &Some(&b)));
+        let c = parse_str(r#"{"c":3,"b":{"y":[1,2],"x":2},"a":1}"#).unwrap();
+        assert!(!same_json(&Some(&a), &Some(&c)));
+        // Same length, different key: not equal.
+        let d = parse_str(r#"{"a":1,"b":{"x":1,"y":[1,2]},"z":3}"#).unwrap();
+        assert!(!same_json(&Some(&a), &Some(&d)));
+        let big = |rev: bool| {
+            let mut keys: Vec<usize> = (0..20_000).collect();
+            if rev {
+                keys.reverse();
+            }
+            let body: Vec<String> = keys.iter().map(|k| alloc::format!("\"k{k}\":{k}")).collect();
+            parse_str(&alloc::format!("{{{}}}", body.join(","))).unwrap()
+        };
+        assert!(same_json(&Some(&big(false)), &Some(&big(false))));
+        assert!(same_json(&Some(&big(false)), &Some(&big(true))));
+        assert!(!big(false).has_duplicate_keys());
     }
 
     #[test]

@@ -98,6 +98,11 @@ fn start_webhook(ca_name: &Name, ca_key: &SigningKey) -> u16 {
                     let p = kr_fmt::base64::encode(br#"[{"op":"add","path":"/data/mutated","value":"yes"}]"#);
                     format!(r#"{{"response":{{"uid":"{uid}","allowed":true,"patchType":"JSONPatch","patch":"{p}"}}}}"#)
                 }
+                "/fixenum" => {
+                    // Fills an enum the client left empty (Longhorn-style defaulting webhook).
+                    let p = kr_fmt::base64::encode(br#"[{"op":"replace","path":"/spec/mode","value":"fast"}]"#);
+                    format!(r#"{{"response":{{"uid":"{uid}","allowed":true,"patchType":"JSONPatch","patch":"{p}"}}}}"#)
+                }
                 "/slow" => {
                     sleep(2500).await;
                     format!(r#"{{"response":{{"uid":"{uid}","allowed":true}}}}"#)
@@ -378,6 +383,25 @@ fn run() {
         let r = last("/deny");
         assert_eq!((r.pointer(&["kind", "kind"]).and_then(Value::as_str), r.pointer(&["kind", "group"]).and_then(Value::as_str), r.pointer(&["subResource"]).and_then(Value::as_str)), (Some("TokenRequest"), Some("authentication.k8s.io"), Some("token")));
         uninstall(&c, VWC, "token").await;
+
+        // A mutating webhook runs before CRD schema validation, so it can fix an invalid value.
+        let crd = v(r#"{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{"name":"gizmos.example.com"},"spec":{"group":"example.com","scope":"Namespaced","names":{"plural":"gizmos","singular":"gizmo","kind":"Gizmo"},"versions":[{"name":"v1","served":true,"storage":true,"schema":{"openAPIV3Schema":{"type":"object","properties":{"spec":{"type":"object","properties":{"mode":{"type":"string","enum":["fast","slow"]}}}}}}}]}}"#);
+        c.create("/apis/apiextensions.k8s.io/v1/customresourcedefinitions", &crd).await.unwrap();
+        let gizmos = "/apis/example.com/v1/namespaces/default/gizmos";
+        let g = |n: &str| v(&format!(r#"{{"apiVersion":"example.com/v1","kind":"Gizmo","metadata":{{"name":"{n}"}},"spec":{{"mode":""}}}}"#));
+        for _ in 0..50 {
+            if c.get("/apis/example.com/v1").await.is_ok() {
+                break;
+            }
+            sleep(100).await;
+        }
+        assert_eq!(c.create(gizmos, &g("bad")).await.unwrap_err().code, 422);
+        let fix = wh(&e, "/fixenum", "").replace(r#""apiGroups":[""]"#, r#""apiGroups":["example.com"]"#).replace(r#""resources":["configmaps"]"#, r#""resources":["gizmos"]"#);
+        install(&c, MWC, "fixenum", &[fix]).await;
+        let o = c.create(gizmos, &g("ok")).await.unwrap();
+        assert_eq!(o.pointer(&["spec", "mode"]).and_then(Value::as_str), Some("fast"));
+        uninstall(&c, MWC, "fixenum").await;
+        assert_eq!(c.create(gizmos, &g("bad2")).await.unwrap_err().code, 422);
     });
 }
 
