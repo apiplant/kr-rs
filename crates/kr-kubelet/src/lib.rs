@@ -911,7 +911,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             return;
         }
         if self.pods.borrow()[uid].sandbox.is_none() {
-            if let Err(e) = self.start_sandbox(uid, pod) {
+            if let Err(e) = self.start_sandbox(uid, pod).await {
                 if e.starts_with(NO_IP) {
                     // Addresses free up as other pods end: stay in ContainerCreating and retry on
                     // the next sync (one event per pod, not one per second).
@@ -1227,7 +1227,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ip6: None, node_ip: self.cfg.node_ip, ctrs, start_time: now(), kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, cpu_request: spec::cpu_request(pod), resize_pending: None, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod) }
     }
 
-    fn start_sandbox(&self, uid: &str, pod: &Value) -> Result<(), String> {
+    async fn start_sandbox(&self, uid: &str, pod: &Value) -> Result<(), String> {
         let dir = self.pods.borrow()[uid].dir.clone();
         kr_runtime::store::mkdir_p(&dir, 0o711).map_err(|_| String::from("cannot create pod directory"))?;
         let mut lease = None;
@@ -1309,7 +1309,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let (cni_ip4, cni_ip6) = if use_cni {
             let cfg = cni::load_config(&cni::conf_dir().unwrap()).unwrap_or(Value::Null);
             let netns = alloc::format!("/proc/{}/ns/net", sb.pid);
-            match cni::cni_add(&cfg, uid, &netns, "eth0") {
+            let cni_args = alloc::format!("IgnoreUnknown=1;K8S_POD_NAMESPACE={};K8S_POD_NAME={};K8S_POD_INFRA_CONTAINER_ID={uid}", meta(pod, "namespace"), meta(pod, "name"));
+            match cni::cni_add(&cfg, uid, &netns, "eth0", &cni_args).await {
                 Ok(r) => (r.ipv4, r.ipv6),
                 Err(e) => {
                     sb.stop();
@@ -1325,7 +1326,15 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         spec::write_etc_hosts(&dir, pod, &hostname, ip, net_ip6).map_err(|_| String::from("cannot write /etc/hosts"))?;
         spec::write_resolv_conf(&dir, pod, self.infra.borrow().is_some(), self.fam.get()).map_err(|_| String::from("cannot write /etc/resolv.conf"))?;
         let mut pods = self.pods.borrow_mut();
-        let p = pods.get_mut(uid).unwrap();
+        // The pod can be deleted while a CNI plugin runs (the loop is not blocked any more).
+        let Some(p) = pods.get_mut(uid) else {
+            drop(pods);
+            sb.stop();
+            if let Some(l) = lease {
+                l.release();
+            }
+            return Err(String::from("pod removed during network setup"));
+        };
         p.sandbox = Some(sb);
         p.cg = cg;
         p.lease = lease;
@@ -1457,6 +1466,14 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             self.log_marks.borrow_mut().remove(cur);
         }
         let log = kr_sys::ns::open(log_path.as_bytes(), kr_sys::ns::O_WRONLY | kr_sys::ns::O_CREAT | 0o2000 /* O_APPEND */, 0o640).ok();
+        // A container writes its output to this file, and one that reopens `/dev/stderr` (nginx,
+        // Calico's whisker) needs write permission on it as its own user: give a numeric
+        // runAsUser/USER ownership of the file (still mode 0640, so nobody else gets access).
+        if kr_sys::ns::getuid() == 0 {
+            if let Some(uid) = built.user.split(':').next().and_then(|u| u.parse::<u32>().ok()).filter(|u| *u != 0) {
+                let _ = kr_sys::fs::fchownat(kr_sys::ns::AT_FDCWD, log_path.as_bytes(), uid, u32::MAX, 0);
+            }
+        }
         // `stdin: true`: the container reads one end of a socketpair that `kubectl attach -i`
         // feeds through ours; no attach is no input, not EOF. `tty: true`: a pseudo-terminal
         // instead, whose master we read into the log and `attach` writes to.
@@ -1484,6 +1501,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             net: None,
             sandbox: p.sandbox.as_ref(),
             mounts: &built.mounts,
+            hooks: &built.hooks,
             log_fd: log.as_ref().map(|f| f.raw()),
             stdin_fd: stdin_read.map(|f| f.raw()),
             tty_fd: tty_pair.as_ref().map(|(_, sl)| sl.raw()),
@@ -1964,13 +1982,16 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         if let Some(l) = p.lease {
             l.release();
         }
-        // CNI: tear down the pod's network attachment.
-        if cni::is_enabled() {
+        // CNI: tear down the pod's network attachment (a plugin may call back into this process, so
+        // it runs as a task, not inline).
+        if cni::is_enabled() && p.sandbox.is_some() {
             if let Ok(cfg) = cni::load_config(&cni::conf_dir().unwrap()) {
                 let netns = alloc::format!("/proc/{}/ns/net", p.sandbox.as_ref().map(|s| s.pid).unwrap_or(0));
-                if p.sandbox.is_some() {
-                    let _ = cni::cni_del(&cfg, uid, &netns, "eth0");
-                }
+                let args = alloc::format!("IgnoreUnknown=1;K8S_POD_NAMESPACE={};K8S_POD_NAME={};K8S_POD_INFRA_CONTAINER_ID={uid}", p.ns, p.name);
+                let uid = uid.to_string();
+                kr_rt::exec::spawn(async move {
+                    let _ = cni::cni_del(&cfg, &uid, &netns, "eth0", &args).await;
+                });
             }
         }
         let _ = self.maps.run_as_root(|| remove_tree(&p.dir));

@@ -109,6 +109,41 @@ pub fn drop_caps(keep: &[u32]) -> Result<(), Errno> {
     ns::capset(mask)
 }
 
+/// What the user switch itself needs: SETGID and SETUID for setgroups/setresgid/setresuid, and
+/// SETPCAP to drop from the bounding set afterwards.
+const SWITCH_CAPS: &[u32] = &[6, 7, 8];
+
+/// First half of dropping to `keep`: the set plus what `setresuid` needs, so `drop: [ALL]` with a
+/// `runAsUser` still starts.
+pub fn drop_caps_for_switch(keep: &[u32]) -> Result<(), Errno> {
+    let mut set = keep.to_vec();
+    for c in SWITCH_CAPS {
+        if !set.contains(c) {
+            set.push(*c);
+        }
+    }
+    drop_caps(&set)
+}
+
+/// Second half, after the user switch: removes the switch-only capabilities. A process that left
+/// uid 0 has no capabilities left (no ambient set) so the bounding-set drops may fail; that is fine.
+pub fn finish_drop(keep: &[u32]) -> Result<(), Errno> {
+    let mut mask = 0u64;
+    for &c in keep {
+        mask |= 1 << c;
+    }
+    for c in SWITCH_CAPS {
+        if mask & (1 << c) == 0 {
+            let _ = ns::prctl(ns::PR_CAPBSET_DROP, *c as usize);
+        }
+    }
+    match ns::capset(mask) {
+        // Raising the sets of a process that left uid 0 is refused; it has none to trim.
+        Err(_) if ns::getuid() != 0 => Ok(()),
+        r => r,
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 mod arch {
     pub const AUDIT_ARCH: u32 = 0xC000_003E;

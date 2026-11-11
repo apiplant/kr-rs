@@ -114,11 +114,14 @@ pub struct Grant {
     pub devices: Vec<(String, String, String)>,
     pub annotations: Vec<(String, String)>,
     pub cdi: Vec<String>,
-    /// Library folders from CDI `update-ldcache` hooks; the kubelet has no ldconfig step, so
-    /// they are appended to `LD_LIBRARY_PATH`.
-    pub ld_folders: Vec<String>,
-    /// (target, link path) from CDI `create-symlinks` hooks, resolved into mounts by `cdi_resolve`.
-    pub links: Vec<(String, String)>,
+    /// `additionalGids` of the CDI edits: supplementary groups of the container's processes (the
+    /// group of the device nodes, so non-root users may open them).
+    pub gids: Vec<u32>,
+    /// OCI hooks of the CDI edits (run by the container runtime at their lifecycle stage).
+    pub hooks: kr_runtime::hooks::Hooks,
+    /// CDI hooks that cannot be honoured (unknown stage, relative path); a container that needs
+    /// them must not start without them.
+    pub bad_hooks: Vec<String>,
 }
 
 fn kv(b: &[u8]) -> (String, String) {
@@ -194,8 +197,13 @@ fn encode_ids(ids: &[String], with_container: bool) -> Vec<u8> {
 
 // ------------------------------------------------------------------ CDI
 
-fn cdi_dirs() -> [&'static str; 2] {
-    ["/etc/cdi", "/var/run/cdi"]
+/// CDI spec directories: `/etc/cdi` and `/var/run/cdi`, or the colon-separated absolute paths in
+/// `KR_CDI_DIRS` (operator-set, like the NVIDIA toolkit's own override; tests).
+fn cdi_dirs() -> Vec<String> {
+    match kr_runtime::store::env_var("KR_CDI_DIRS") {
+        Some(v) => v.split(':').filter(|d| d.starts_with('/')).map(String::from).collect(),
+        None => alloc::vec!["/etc/cdi".to_string(), "/var/run/cdi".to_string()],
+    }
 }
 
 /// Applies the `containerEdits` object of a CDI spec or device to `g`.
@@ -215,76 +223,25 @@ fn cdi_edits(e: &Value, g: &mut Grant) {
         let ro = m.get("options").and_then(Value::as_array).unwrap_or(&[]).iter().any(|o| o.as_str() == Some("ro"));
         g.mounts.push((c.to_string(), h.to_string(), ro));
     }
-    // Hooks are not executed. `update-ldcache --folder F` is emulated by LD_LIBRARY_PATH;
-    // the rest (create-symlinks, cuda-compat, ...) are skipped.
+    for gid in e.get("additionalGids").and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_u64).filter_map(|g| u32::try_from(g).ok()) {
+        if !g.gids.contains(&gid) {
+            g.gids.push(gid);
+        }
+    }
     for h in e.get("hooks").and_then(Value::as_array).unwrap_or(&[]) {
-        let args: Vec<&str> = h.get("args").and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_str).collect();
-        if args.contains(&"create-symlinks") {
-            for w in args.windows(2) {
-                if w[0] == "--link" {
-                    if let Some((t, l)) = w[1].split_once("::") {
-                        if l.starts_with('/') && !t.is_empty() {
-                            g.links.push((t.to_string(), l.to_string()));
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-        if !args.contains(&"update-ldcache") {
-            continue;
-        }
-        for w in args.windows(2) {
-            if w[0] == "--folder" && w[1].starts_with('/') && !g.ld_folders.iter().any(|f| f == w[1]) {
-                g.ld_folders.push(w[1].to_string());
-            }
+        let strs = |k: &str| -> Vec<Vec<u8>> { h.get(k).and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_str).map(|s| s.as_bytes().to_vec()).collect() };
+        let path = h.get("path").and_then(Value::as_str).unwrap_or("");
+        let stage = h.get("hookName").and_then(Value::as_str).unwrap_or("");
+        let hook = kr_runtime::hooks::Hook { path: path.as_bytes().to_vec(), args: strs("args"), env: strs("env"), timeout: h.get("timeout").and_then(Value::as_u64).unwrap_or(0).min(3600) as u32 };
+        if !g.hooks.add(stage, hook) {
+            g.bad_hooks.push(format!("{stage} {path}"));
         }
     }
 }
 
-/// Lexically resolves `t` against the directory of `link` (`..` and `.` handled).
-fn link_target(t: &str, link: &str) -> String {
-    let base = if t.starts_with('/') { String::new() } else { link.rsplit_once('/').map(|x| x.0).unwrap_or("").to_string() };
-    let mut parts: Vec<&str> = Vec::new();
-    for seg in base.split('/').chain(t.split('/')) {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            x => parts.push(x),
-        }
-    }
-    format!("/{}", parts.join("/"))
-}
-
-/// Emulates `create-symlinks` hooks: a link whose target is a mounted file becomes a bind
-/// mount of that file's host path at the link path. Chains resolve over repeated passes;
-/// links to anything else are skipped.
-fn resolve_links(g: &mut Grant) {
-    let mut pending = core::mem::take(&mut g.links);
-    loop {
-        let before = pending.len();
-        pending.retain(|(t, l)| {
-            let tgt = link_target(t, l);
-            match g.mounts.iter().find(|m| m.0 == tgt).map(|m| m.1.clone()) {
-                Some(host) => {
-                    if !g.mounts.iter().any(|m| m.0 == *l) {
-                        g.mounts.push((l.clone(), host, true));
-                    }
-                    false
-                }
-                None => true,
-            }
-        });
-        if pending.is_empty() || pending.len() == before {
-            break;
-        }
-    }
-}
-
-/// Runtime classes that stand for the NVIDIA container runtime.
-pub fn is_nvidia_runtime_class(name: &str) -> bool {
+/// RuntimeClass handlers that stand for the NVIDIA container runtime. The handler is read from the
+/// pod's `RuntimeClass` object, so the class can have any name.
+pub fn is_nvidia_handler(name: &str) -> bool {
     matches!(name, "nvidia" | "nvidia-cdi" | "nvidia-legacy")
 }
 
@@ -301,7 +258,8 @@ pub fn visible_devices_to_cdi(value: &str) -> Vec<String> {
 /// Resolves CDI device names to a grant from the host's CDI specs.
 pub fn cdi_grant(names: &[String]) -> Result<Grant, String> {
     let mut g = Grant::default();
-    cdi_resolve(&cdi_dirs(), names, &mut g)?;
+    let dirs = cdi_dirs();
+    cdi_resolve(&dirs.iter().map(String::as_str).collect::<Vec<_>>(), names, &mut g)?;
     Ok(g)
 }
 
@@ -323,11 +281,19 @@ fn cdi_apply(spec: &Value, name: &str, g: &mut Grant) -> bool {
 
 fn cdi_resolve(dirs: &[&str], names: &[String], g: &mut Grant) -> Result<(), String> {
     let mut specs: Vec<Value> = Vec::new();
+    let mut untrusted: Vec<String> = Vec::new();
     for dir in dirs {
         let Ok(fd) = kr_sys::ns::open(format!("{dir}\0").as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY, 0) else { continue };
         let mut files: Vec<String> = kr_sys::fs::read_dir(&fd).filter_map(Result::ok).filter_map(|e| String::from_utf8(e.name).ok()).filter(|n| n.ends_with(".json") || n.ends_with(".yaml") || n.ends_with(".yml")).collect();
         files.sort();
         for f in files {
+            // Specs can name programs the runtime executes as root: only root-owned (or our own),
+            // not group/world-writable files count.
+            let trusted = kr_sys::fs::newfstatat(kr_sys::ns::AT_FDCWD, format!("{dir}/{f}\0").as_bytes(), 0).is_ok_and(|st| (st.uid == 0 || st.uid == kr_sys::ns::getuid()) && st.mode & 0o022 == 0);
+            if !trusted {
+                untrusted.push(format!("{dir}/{f}"));
+                continue;
+            }
             let Ok(b) = kr_sys::fs::read_file(format!("{dir}/{f}\0").as_bytes(), 8 << 20) else { continue };
             let v = if f.ends_with(".json") { json::parse(&b).ok() } else { core::str::from_utf8(&b).ok().and_then(|t| kr_fmt::yaml::parse(t).ok()) };
             if let Some(v) = v {
@@ -337,10 +303,13 @@ fn cdi_resolve(dirs: &[&str], names: &[String], g: &mut Grant) -> Result<(), Str
     }
     for n in names {
         if !specs.iter().any(|s| cdi_apply(s, n, g)) {
-            return Err(format!("CDI device {n} requested by the device plugin is not defined in any spec under /etc/cdi or /var/run/cdi"));
+            let skipped = if untrusted.is_empty() { String::new() } else { format!(" (ignored, not owned by root or writable by others: {})", untrusted.join(", ")) };
+            return Err(format!("CDI device {n} requested by the device plugin is not defined in any spec under /etc/cdi or /var/run/cdi{skipped}"));
         }
     }
-    resolve_links(g);
+    if !g.bad_hooks.is_empty() {
+        return Err(format!("CDI hooks that are not supported (stage must be createRuntime, createContainer, startContainer, poststart or poststop, and the path absolute): {}", g.bad_hooks.join(", ")));
+    }
     Ok(())
 }
 
@@ -663,7 +632,8 @@ impl Plugins {
         }
         let cdi = core::mem::take(&mut total.cdi);
         if !cdi.is_empty() {
-            cdi_resolve(&cdi_dirs(), &cdi, &mut total)?;
+            let dirs = cdi_dirs();
+            cdi_resolve(&dirs.iter().map(String::as_str).collect::<Vec<_>>(), &cdi, &mut total)?;
         }
         Ok(total)
     }
@@ -1002,27 +972,20 @@ mod nvidia_rc_tests {
         assert!(visible_devices_to_cdi("void").is_empty());
         assert!(visible_devices_to_cdi("").is_empty());
         assert!(visible_devices_to_cdi("../etc").is_empty());
-        assert!(is_nvidia_runtime_class("nvidia") && !is_nvidia_runtime_class("runc"));
+        assert!(is_nvidia_handler("nvidia") && !is_nvidia_handler("runc"));
     }
 
     #[test]
-    fn symlink_hooks_become_mounts() {
-        let spec = kr_fmt::json::parse_str(r#"{"kind":"nvidia.com/gpu","devices":[{"name":"all","containerEdits":{"mounts":[{"hostPath":"/usr/lib/libnvidia-ml.so.1.2","containerPath":"/usr/lib/libnvidia-ml.so.1.2"}],"hooks":[{"args":["create-symlinks","--link","libnvidia-ml.so.1::/usr/lib/libnvidia-ml.so","--link","libnvidia-ml.so.1.2::/usr/lib/libnvidia-ml.so.1","--link","../x::/nowhere/y"]}]}}]}"#).unwrap();
+    fn hooks_are_collected_by_stage() {
+        let spec = kr_fmt::json::parse_str(r#"{"kind":"nvidia.com/gpu","containerEdits":{"hooks":[{"hookName":"createContainer","path":"/usr/bin/h","args":["h","update-ldcache"],"env":["A=1"],"timeout":5}]},"devices":[{"name":"all","containerEdits":{"hooks":[{"hookName":"createRuntime","path":"/usr/bin/h","args":["h","x"]},{"hookName":"poststop","path":"/usr/bin/h"},{"hookName":"createContainer","path":"rel"}],"additionalGids":[985,989,985]}}]}"#).unwrap();
         let mut g = Grant::default();
         assert!(cdi_apply(&spec, "nvidia.com/gpu=all", &mut g));
-        resolve_links(&mut g);
-        let host = |c: &str| g.mounts.iter().find(|m| m.0 == c).map(|m| m.1.clone());
-        assert_eq!(host("/usr/lib/libnvidia-ml.so.1").as_deref(), Some("/usr/lib/libnvidia-ml.so.1.2"));
-        assert_eq!(host("/usr/lib/libnvidia-ml.so").as_deref(), Some("/usr/lib/libnvidia-ml.so.1.2"));
-        assert_eq!(host("/nowhere/y"), None);
-        assert_eq!(link_target("../a", "/usr/lib/gbm/x"), "/usr/lib/a");
-    }
-
-    #[test]
-    fn ldcache_hook_becomes_folders() {
-        let spec = kr_fmt::json::parse_str(r#"{"kind":"nvidia.com/gpu","devices":[{"name":"all","containerEdits":{"hooks":[{"hookName":"createContainer","args":["nvidia-cdi-hook","update-ldcache","--folder","/usr/lib","--folder","/usr/lib/vdpau"]},{"args":["create-symlinks","--link","a::b"]}]}}]}"#).unwrap();
-        let mut g = Grant::default();
-        assert!(cdi_apply(&spec, "nvidia.com/gpu=all", &mut g));
-        assert_eq!(g.ld_folders, ["/usr/lib", "/usr/lib/vdpau"]);
+        assert_eq!(g.hooks.create_container.len(), 1);
+        assert_eq!(g.hooks.create_container[0].args, [b"h".to_vec(), b"update-ldcache".to_vec()]);
+        assert_eq!((g.hooks.create_container[0].env.clone(), g.hooks.create_container[0].timeout), (alloc::vec![b"A=1".to_vec()], 5));
+        assert_eq!(g.hooks.create_runtime.len(), 1);
+        assert_eq!(g.hooks.poststop.len(), 1);
+        assert_eq!(g.gids, [985, 989]);
+        assert_eq!(g.bad_hooks, ["createContainer rel"]);
     }
 }

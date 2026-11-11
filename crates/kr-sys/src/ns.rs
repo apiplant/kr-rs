@@ -13,6 +13,8 @@ mod n {
     pub const OPEN_TREE: usize = 428;
     pub const MOVE_MOUNT: usize = 429;
     pub const CHDIR: usize = 80;
+    pub const BPF: usize = 321;
+    pub const CHROOT: usize = 161;
     pub const SETHOSTNAME: usize = 170;
     pub const GETUID: usize = 102;
     pub const GETGID: usize = 104;
@@ -45,6 +47,8 @@ mod n {
     pub const OPEN_TREE: usize = 428;
     pub const MOVE_MOUNT: usize = 429;
     pub const CHDIR: usize = 49;
+    pub const BPF: usize = 280;
+    pub const CHROOT: usize = 51;
     pub const SETHOSTNAME: usize = 161;
     pub const GETUID: usize = 174;
     pub const GETGID: usize = 176;
@@ -273,6 +277,41 @@ pub fn pivot_root(new_root: &[u8], put_old: &[u8]) -> Result<()> {
 pub fn chdir(path: &[u8]) -> Result<()> {
     // SAFETY: path is NUL-terminated.
     check(unsafe { syscall1(n::CHDIR, c(path)?) }).map(|_| ())
+}
+
+/// Loads a `BPF_PROG_TYPE_CGROUP_DEVICE` program (`insns` = raw `struct bpf_insn`s, 8 bytes each).
+/// Needs CAP_BPF/CAP_SYS_ADMIN.
+pub fn bpf_load_cgroup_device(insns: &[u8]) -> Result<Fd> {
+    if insns.is_empty() || insns.len() % 8 != 0 {
+        return Err(Errno(22));
+    }
+    let license = b"GPL\0";
+    let mut attr = [0u8; 128];
+    attr[0..4].copy_from_slice(&15u32.to_ne_bytes()); // BPF_PROG_TYPE_CGROUP_DEVICE
+    attr[4..8].copy_from_slice(&((insns.len() / 8) as u32).to_ne_bytes());
+    attr[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_ne_bytes());
+    attr[16..24].copy_from_slice(&(license.as_ptr() as u64).to_ne_bytes());
+    // SAFETY: attr is a zeroed union bpf_attr-sized buffer; insns and license outlive the call.
+    check(unsafe { syscall3(n::BPF, 5, attr.as_mut_ptr() as usize, attr.len()) }).map(|fd| Fd(fd as i32))
+}
+
+/// Attaches a loaded cgroup-device program to the cgroup directory `cgroup` (BPF_CGROUP_DEVICE,
+/// `BPF_F_ALLOW_MULTI`: programs of ancestor cgroups keep applying).
+pub fn bpf_attach_cgroup_device(prog: &Fd, cgroup: &Fd) -> Result<()> {
+    let mut attr = [0u8; 128];
+    attr[0..4].copy_from_slice(&(cgroup.raw() as u32).to_ne_bytes());
+    attr[4..8].copy_from_slice(&(prog.raw() as u32).to_ne_bytes());
+    attr[8..12].copy_from_slice(&6u32.to_ne_bytes()); // BPF_CGROUP_DEVICE
+    attr[12..16].copy_from_slice(&2u32.to_ne_bytes()); // BPF_F_ALLOW_MULTI
+    // SAFETY: attr is a zeroed union bpf_attr-sized buffer; BPF_PROG_ATTACH = 8.
+    check(unsafe { syscall3(n::BPF, 8, attr.as_mut_ptr() as usize, attr.len()) }).map(|_| ())
+}
+
+/// `chroot(path)`: the process's root becomes `path` (used by OCI hooks that must see the host
+/// root while the container's root is mounted below it).
+pub fn chroot(path: &[u8]) -> Result<()> {
+    // SAFETY: path is NUL-terminated.
+    check(unsafe { syscall1(n::CHROOT, c(path)?) }).map(|_| ())
 }
 
 pub fn sethostname(name: &[u8]) -> Result<()> {

@@ -13,7 +13,7 @@ use kr_sys::ns;
 
 const USAGE: &[u8] = b"usage:
   kr ctr pull <image>
-  kr ctr run [--memory 64Mi] [--cpus 500m] [--pids 64] [--user uid[:gid]] <image> [--] [cmd args...]
+  kr ctr run [--memory 64Mi] [--cpus 500m] [--pids 64] [--user uid[:gid]] [--cdi vendor/class=name] <image> [--] [cmd args...]
   kr ctr run-dir [limits...] <rootfs> <state-dir> [--] <cmd> [args...]
 ";
 
@@ -33,7 +33,7 @@ pub fn main(mut args: Args) -> i32 {
 }
 
 /// Parses leading limit flags and then `n` positional arguments; the rest is the command.
-fn parse(args: &mut Args, n: usize) -> Result<(Limits, Option<&'static [u8]>, Vec<&'static [u8]>, Vec<Vec<u8>>), i32> {
+fn parse(args: &mut Args, n: usize, cdi: &mut Vec<String>) -> Result<(Limits, Option<&'static [u8]>, Vec<&'static [u8]>, Vec<Vec<u8>>), i32> {
     let mut limits = Limits::default();
     let mut user = None;
     let mut positional = Vec::new();
@@ -44,6 +44,16 @@ fn parse(args: &mut Args, n: usize) -> Result<(Limits, Option<&'static [u8]>, Ve
             if user.is_none() {
                 eprint(USAGE);
                 return Err(2);
+            }
+            continue;
+        }
+        if a == b"--cdi" {
+            match args.next().and_then(utf8) {
+                Some(n) => cdi.push(n),
+                None => {
+                    eprint(USAGE);
+                    return Err(2);
+                }
             }
             continue;
         }
@@ -112,7 +122,8 @@ fn container_id() -> String {
 }
 
 fn run(mut args: Args) -> i32 {
-    let (limits, user, pos, override_cmd) = match parse(&mut args, 1) {
+    let mut cdi: Vec<String> = Vec::new();
+    let (limits, user, pos, override_cmd) = match parse(&mut args, 1, &mut cdi) {
         Ok(v) => v,
         Err(c) => return c,
     };
@@ -162,7 +173,29 @@ fn run(mut args: Args) -> i32 {
     // host's own resolvers are reachable (loopback stubs are not, so those get the forwarder too).
     let resolv = format!("{}/resolv.conf", dirs.root);
     let _ = kr_runtime::store::write_file_atomic(&resolv, resolv_conf(net.sandbox.is_some()).as_bytes());
-    let mounts = [Mount { source: resolv.into_bytes(), sub_path: None, target: b"/etc/resolv.conf".to_vec(), readonly: false, prop: container::Prop::Private }];
+    let mut mounts = alloc::vec![Mount { source: resolv.into_bytes(), sub_path: None, target: b"/etc/resolv.conf".to_vec(), readonly: false, prop: container::Prop::Private }];
+    // CDI devices: environment, device nodes, mounts and OCI hooks of the host's CDI specs.
+    let mut hooks = kr_runtime::hooks::Hooks::default();
+    let mut gids: Vec<u32> = Vec::new();
+    if !cdi.is_empty() {
+        let g = match kr_kubelet::deviceplugin::cdi_grant(&cdi) {
+            Ok(g) => g,
+            Err(e) => {
+                net.release();
+                return fail(&e);
+            }
+        };
+        for (k, v) in g.envs {
+            env.retain(|e| !e.starts_with(format!("{k}=").as_bytes()));
+            env.push(format!("{k}={v}").into_bytes());
+        }
+        for (c, h, ro) in g.mounts.iter().map(|(c, h, ro)| (c, h, *ro)).chain(g.devices.iter().map(|(c, h, p)| (c, h, !p.contains('w')))) {
+            mounts.retain(|m| m.target != c.as_bytes());
+            mounts.push(Mount { source: h.clone().into_bytes(), sub_path: None, target: c.clone().into_bytes(), readonly: ro, prop: container::Prop::Private });
+        }
+        hooks = g.hooks;
+        gids = g.gids;
+    }
     let spec = RunSpec {
         rootfs: &rootfs,
         upper: dirs.upper.as_bytes(),
@@ -183,11 +216,12 @@ fn run(mut args: Args) -> i32 {
         log_fd: None,
         stdin_fd: None,
         tty_fd: None,
-        extra_groups: &[],
+        extra_groups: &gids,
         readonly_root: false,
             privileged: false,
             caps: None,
             userns: kr_runtime::container::userns_enabled(),
+            hooks: &hooks,
     };
     if let Some(l) = &net.lease {
         let ip = l.ip;
@@ -447,7 +481,7 @@ fn nul(p: &[u8]) -> Vec<u8> {
 
 /// Dev command: run a container from a plain directory, without the image store.
 fn run_dir(mut args: Args) -> i32 {
-    let (limits, user, pos, argv) = match parse(&mut args, 2) {
+    let (limits, user, pos, argv) = match parse(&mut args, 2, &mut Vec::new()) {
         Ok(v) => v,
         Err(c) => return c,
     };
@@ -491,6 +525,7 @@ fn run_dir(mut args: Args) -> i32 {
             privileged: false,
             caps: None,
             userns: kr_runtime::container::userns_enabled(),
+            hooks: &kr_runtime::hooks::NONE,
     };
     supervise(&spec)
 }
@@ -568,6 +603,7 @@ fn pod_demo(mut args: Args) -> i32 {
             privileged: false,
             caps: None,
             userns: kr_runtime::container::userns_enabled(),
+            hooks: &kr_runtime::hooks::NONE,
         };
         match container::start(&spec) {
             Ok(r) => started.push(r),

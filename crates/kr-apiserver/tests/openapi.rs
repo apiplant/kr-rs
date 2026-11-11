@@ -96,3 +96,34 @@ fn unserving_a_version_removes_its_definition() {
         assert_eq!(call(&api, "GET", p, "", "").0, 200, "{p}");
     }
 }
+
+#[test]
+fn v2_is_served_as_gnostic_protobuf() {
+    use kr_fmt::proto::Reader;
+    let api = server();
+    assert_eq!(call(&api, "POST", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions", "application/json", CRD).0, 201);
+    let body = kr_apiserver::openapi::v2_proto(&[]);
+    // Document: swagger=1, info=2, paths=8, definitions=9 (NamedSchema{name=1, schema=2}).
+    let mut r = Reader::new(&body);
+    let (mut swagger, mut names) = (String::new(), Vec::new());
+    while let Some(f) = r.next().unwrap() {
+        match f.number {
+            1 => swagger = f.as_str().unwrap().to_string(),
+            9 => {
+                let mut d = Reader::new(f.as_bytes().unwrap());
+                while let Some(e) = d.next().unwrap() {
+                    assert_eq!(e.number, 1);
+                    let mut ns = Reader::new(e.as_bytes().unwrap());
+                    let n = ns.next().unwrap().unwrap();
+                    assert_eq!(n.number, 1);
+                    names.push(n.as_str().unwrap().to_string());
+                    assert_eq!(ns.next().unwrap().unwrap().number, 2);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(swagger, "2.0");
+    assert!(names.iter().any(|n| n == "io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"));
+    let _ = api;
+}

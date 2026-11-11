@@ -773,7 +773,9 @@ fn check_schema(s: &Value, path: &str, pos: Pos, errs: &mut Vec<String>) {
     } else if pos == Pos::Root && !ty.is_empty() && ty != "object" {
         errs.push(alloc::format!("{path}.type: Invalid value: {ty:?}: must be object at the root"));
     }
-    if ios && !ty.is_empty() {
+    // Controller-gen output such as the Tigera operator's `dscpMark` pairs `type: integer` with
+    // `x-kubernetes-int-or-string: true`; a real apiserver takes it, so only other types are refused.
+    if ios && !ty.is_empty() && !matches!(ty, "integer" | "string") {
         errs.push(alloc::format!("{path}.type: Forbidden: must be empty to be structural when x-kubernetes-int-or-string is true"));
     }
     if !ty.is_empty() && !matches!(ty, "object" | "array" | "string" | "integer" | "number" | "boolean") {

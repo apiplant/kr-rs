@@ -344,14 +344,20 @@ type Vars<'a> = [(&'a str, &'a Value)];
 
 const MACROS: [&str; 5] = ["all", "exists", "exists_one", "filter", "map"];
 const METHODS: [&str; 8] = ["size", "startsWith", "endsWith", "contains", "matches", "lowerAscii", "upperAscii", "trim"];
-const FUNCS: [&str; 8] = ["has", "size", "matches", "int", "double", "string", "isURL", "duration"];
+/// CEL strings-extension methods.
+const STR_METHODS: [&str; 8] = ["substring", "indexOf", "lastIndexOf", "split", "replace", "charAt", "join", "reverse"];
+/// Kubernetes IP/CIDR library methods (receivers are canonical strings).
+const IP_METHODS: [&str; 11] = ["family", "isUnspecified", "isLoopback", "isLinkLocalMulticast", "isLinkLocalUnicast", "isGlobalUnicast", "containsIP", "containsCIDR", "ip", "masked", "prefixLength"];
+const FUNCS: [&str; 13] = ["has", "size", "matches", "int", "double", "string", "isURL", "duration", "type", "isIP", "ip", "isCIDR", "cidr"];
+/// Bare identifiers that evaluate to a type value (a string holding the type name).
+const TYPE_NAMES: [&str; 9] = ["int", "uint", "double", "string", "bool", "list", "map", "null_type", "bytes"];
 
 /// Rejects references and calls the evaluator does not support (done once, at compile time).
 fn check(e: &E, scope: &mut Vec<String>) -> Result<(), String> {
     match e {
         E::Lit(_) => Ok(()),
         E::Var(n) => {
-            if scope.contains(n) {
+            if scope.contains(n) || TYPE_NAMES.contains(&n.as_str()) {
                 Ok(())
             } else {
                 Err(format!("undeclared reference to '{n}'"))
@@ -398,7 +404,7 @@ fn check(e: &E, scope: &mut Vec<String>) -> Result<(), String> {
                 let r = check(body, scope);
                 scope.pop();
                 r
-            } else if METHODS.contains(&m.as_str()) {
+            } else if METHODS.contains(&m.as_str()) || STR_METHODS.contains(&m.as_str()) || IP_METHODS.contains(&m.as_str()) {
                 a.iter().try_for_each(|x| check(x, scope))
             } else {
                 Err(format!("undeclared reference to '{m}' (unsupported method)"))
@@ -424,7 +430,11 @@ fn items(v: &Value) -> Result<Vec<Value>, String> {
 fn eval(e: &E, vars: &Vars) -> Result<Value, String> {
     Ok(match e {
         E::Lit(v) => v.clone(),
-        E::Var(n) => vars.iter().rev().find(|(k, _)| k == n).map(|(_, v)| (*v).clone()).ok_or_else(|| format!("undeclared reference to {n:?}"))?,
+        E::Var(n) => match vars.iter().rev().find(|(k, _)| k == n) {
+            Some((_, v)) => (*v).clone(),
+            None if TYPE_NAMES.contains(&n.as_str()) => Value::String(n.clone()),
+            None => return Err(format!("undeclared reference to {n:?}")),
+        },
         E::Field(b, n) => eval(b, vars)?.get(n).cloned().ok_or_else(|| format!("no such key: {n}"))?,
         E::Index(b, k) => match (eval(b, vars)?, eval(k, vars)?) {
             (o @ Value::Object(_), Value::String(k)) => o.get(&k).cloned().ok_or_else(|| format!("no such key: {k}"))?,
@@ -472,6 +482,28 @@ fn eval(e: &E, vars: &Vars) -> Result<Value, String> {
                 Value::Number(n) => n.as_f64().to_string(),
                 _ => return Err("string() of unsupported type".into()),
             }),
+            ("type", [x]) => Value::String(
+                match eval(x, vars)? {
+                    Value::Null => "null_type",
+                    Value::Bool(_) => "bool",
+                    Value::Number(n) if n.is_integer() => "int",
+                    Value::Number(_) => "double",
+                    Value::String(_) => "string",
+                    Value::Array(_) => "list",
+                    Value::Object(_) => "map",
+                }
+                .to_string(),
+            ),
+            ("isIP", [x]) => Value::Bool(matches!(eval(x, vars)?, Value::String(s) if parse_ip(&s).is_some())),
+            ("isCIDR", [x]) => Value::Bool(matches!(eval(x, vars)?, Value::String(s) if parse_cidr(&s).is_some())),
+            ("ip", [x]) => match eval(x, vars)? {
+                Value::String(s) => Value::String(fmt_ip(parse_ip(&s).ok_or_else(|| format!("ParseAddr({s:?}): invalid IP address"))?)),
+                _ => return Err("ip() requires a string".into()),
+            },
+            ("cidr", [x]) => match eval(x, vars)? {
+                Value::String(s) => Value::String(fmt_cidr(parse_cidr(&s).ok_or_else(|| format!("network address parse error during conversion from string: {s:?}"))?)),
+                _ => return Err("cidr() requires a string".into()),
+            },
             ("isURL", [x]) => {
                 let s = eval(x, vars)?;
                 Value::Bool(s.as_str().map(is_url).unwrap_or(false))
@@ -514,7 +546,25 @@ fn eval(e: &E, vars: &Vars) -> Result<Value, String> {
             if m == "size" && a.is_empty() {
                 return size(&recv);
             }
+            if let (Value::Array(l), "join") = (&recv, m.as_str()) {
+                let args = a.iter().map(|x| eval(x, vars)).collect::<Result<Vec<_>, _>>()?;
+                let sep = match args.as_slice() {
+                    [] => "",
+                    [Value::String(x)] => x.as_str(),
+                    _ => return Err("join() takes an optional string separator".into()),
+                };
+                let parts = l.iter().map(|x| x.as_str().ok_or("join() requires a list of strings")).collect::<Result<Vec<_>, _>>()?;
+                return Ok(Value::String(parts.join(sep)));
+            }
             let Value::String(s) = &recv else { return Err(format!("unsupported method {m}")) };
+            if STR_METHODS.contains(&m.as_str()) {
+                let args = a.iter().map(|x| eval(x, vars)).collect::<Result<Vec<_>, _>>()?;
+                return str_method(m, s, &args);
+            }
+            if IP_METHODS.contains(&m.as_str()) {
+                let args = a.iter().map(|x| eval(x, vars)).collect::<Result<Vec<_>, _>>()?;
+                return ip_method(m, s, &args);
+            }
             if a.is_empty() {
                 return Ok(Value::String(match m.as_str() {
                     "lowerAscii" => s.to_ascii_lowercase(),
@@ -603,6 +653,258 @@ fn eval(e: &E, vars: &Vars) -> Result<Value, String> {
                 }
             }
         },
+    })
+}
+
+fn find_chars(h: &[char], n: &[char], from: usize) -> Option<usize> {
+    (from..=h.len().checked_sub(n.len())?).find(|&i| h[i..i + n.len()] == *n)
+}
+
+fn str_method(m: &str, s: &str, args: &[Value]) -> Result<Value, String> {
+    let c: Vec<char> = s.chars().collect();
+    let int = |v: &Value| match v {
+        Value::Number(n) if n.is_integer() => Ok(n.as_f64() as i64),
+        _ => Err(format!("{m}() requires an int argument")),
+    };
+    let st = |v: &Value| v.as_str().map(|x| x.chars().collect::<Vec<char>>()).ok_or_else(|| format!("{m}() requires a string argument"));
+    let idx = |i: i64| Value::Number(Number::from_i64(i));
+    let strv = |x: &[char]| Value::String(x.iter().collect());
+    Ok(match (m, args) {
+        ("substring", [a]) | ("substring", [a, _]) => {
+            let b = int(a)?;
+            let e = match args.get(1) {
+                Some(e) => int(e)?,
+                None => c.len() as i64,
+            };
+            if b < 0 || e < b || e > c.len() as i64 {
+                return Err(format!("substring range [{b}, {e}] out of bounds for length {}", c.len()));
+            }
+            strv(&c[b as usize..e as usize])
+        }
+        ("indexOf", [n]) | ("indexOf", [n, _]) => {
+            let off = match args.get(1) {
+                Some(o) => int(o)?,
+                None => 0,
+            };
+            if off < 0 || off > c.len() as i64 {
+                return Err("indexOf() offset out of range".into());
+            }
+            idx(find_chars(&c, &st(n)?, off as usize).map_or(-1, |i| i as i64))
+        }
+        ("lastIndexOf", [n]) | ("lastIndexOf", [n, _]) => {
+            let n = st(n)?;
+            let off = match args.get(1) {
+                Some(o) => int(o)?,
+                None => c.len() as i64,
+            };
+            if off < 0 || off > c.len() as i64 {
+                return Err("lastIndexOf() offset out of range".into());
+            }
+            idx((0..=(off as usize).min(c.len().saturating_sub(n.len())))
+                .rev()
+                .find(|&i| i + n.len() <= c.len() && c[i..i + n.len()] == *n)
+                .map_or(-1, |i| i as i64))
+        }
+        ("charAt", [i]) => {
+            let i = int(i)?;
+            if i < 0 || i > c.len() as i64 {
+                return Err("charAt() index out of range".into());
+            }
+            strv(c.get(i as usize..i as usize + 1).unwrap_or(&[]))
+        }
+        ("reverse", []) => Value::String(c.iter().rev().collect()),
+        ("split", [sep]) | ("split", [sep, _]) => {
+            let sep = st(sep)?;
+            let limit = match args.get(1) {
+                Some(n) => int(n)?,
+                None => -1,
+            };
+            if limit == 0 {
+                return Ok(Value::Array(Vec::new()));
+            }
+            let (mut out, mut at) = (Vec::new(), 0);
+            if sep.is_empty() {
+                out = c.iter().map(|x| Value::String(x.to_string())).collect();
+                if limit > 0 && out.len() > limit as usize {
+                    let rest: String = c[limit as usize - 1..].iter().collect();
+                    out.truncate(limit as usize - 1);
+                    out.push(Value::String(rest));
+                }
+                return Ok(Value::Array(out));
+            }
+            while limit < 0 || (out.len() as i64) < limit - 1 {
+                let Some(i) = find_chars(&c, &sep, at) else { break };
+                out.push(strv(&c[at..i]));
+                at = i + sep.len();
+            }
+            out.push(strv(&c[at..]));
+            Value::Array(out)
+        }
+        ("replace", [o, n]) | ("replace", [o, n, _]) => {
+            let (o, n) = (st(o)?, st(n)?);
+            let limit = match args.get(2) {
+                Some(l) => int(l)?,
+                None => -1,
+            };
+            let (mut out, mut at, mut done) = (String::new(), 0, 0);
+            while !o.is_empty() && (limit < 0 || done < limit) {
+                let Some(i) = find_chars(&c, &o, at) else { break };
+                out.extend(&c[at..i]);
+                out.extend(&n);
+                at = i + o.len();
+                done += 1;
+            }
+            out.extend(&c[at..]);
+            Value::String(out)
+        }
+        _ => return Err(format!("unsupported arguments to {m}()")),
+    })
+}
+
+/// An IP address as (bits, is_v6); IPv4 lives in the low 32 bits.
+type Ip = (u128, bool);
+
+fn parse_v4(s: &str) -> Option<u32> {
+    let mut n = 0u32;
+    let mut parts = 0;
+    for p in s.split('.') {
+        if p.is_empty() || p.len() > 3 || !p.bytes().all(|c| c.is_ascii_digit()) || (p.len() > 1 && p.starts_with('0')) {
+            return None;
+        }
+        n = (n << 8) | p.parse::<u32>().ok().filter(|v| *v < 256)?;
+        parts += 1;
+    }
+    (parts == 4).then_some(n)
+}
+
+fn parse_groups(s: &str, out: &mut Vec<u16>) -> Option<()> {
+    if s.is_empty() {
+        return Some(());
+    }
+    let n = s.split(':').count();
+    for (i, g) in s.split(':').enumerate() {
+        if i + 1 == n && g.contains('.') {
+            let v = parse_v4(g)?;
+            out.push((v >> 16) as u16);
+            out.push(v as u16);
+        } else if !g.is_empty() && g.len() <= 4 && g.bytes().all(|c| c.is_ascii_hexdigit()) {
+            out.push(u16::from_str_radix(g, 16).ok()?);
+        } else {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn parse_ip(s: &str) -> Option<Ip> {
+    if !s.contains(':') {
+        return parse_v4(s).map(|v| (v as u128, false));
+    }
+    let (mut head, mut tail) = (Vec::new(), Vec::new());
+    let g = match s.split_once("::") {
+        Some((h, t)) => {
+            parse_groups(h, &mut head)?;
+            parse_groups(t, &mut tail)?;
+            if head.len() + tail.len() > 7 {
+                return None;
+            }
+            let mut g = head;
+            g.resize(8 - tail.len(), 0);
+            g.extend(tail);
+            g
+        }
+        None => {
+            parse_groups(s, &mut head)?;
+            head
+        }
+    };
+    (g.len() == 8).then(|| (g.iter().fold(0u128, |a, x| (a << 16) | *x as u128), true))
+}
+
+fn fmt_ip((bits, v6): Ip) -> String {
+    if !v6 {
+        let b = bits as u32;
+        return format!("{}.{}.{}.{}", b >> 24, (b >> 16) & 255, (b >> 8) & 255, b & 255);
+    }
+    let g: Vec<u16> = (0..8).map(|i| (bits >> (112 - 16 * i)) as u16).collect();
+    // RFC 5952: compress the longest run (>= 2) of zero groups, the first on ties.
+    let (mut best, mut i) = ((0, 0), 0);
+    while i < 8 {
+        if g[i] == 0 {
+            let st = i;
+            while i < 8 && g[i] == 0 {
+                i += 1;
+            }
+            if i - st > best.1 {
+                best = (st, i - st);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    let hex = |r: &[u16]| r.iter().map(|x| format!("{x:x}")).collect::<Vec<_>>().join(":");
+    if best.1 < 2 {
+        return hex(&g);
+    }
+    format!("{}::{}", hex(&g[..best.0]), hex(&g[best.0 + best.1..]))
+}
+
+fn parse_cidr(s: &str) -> Option<(Ip, u32)> {
+    let (a, p) = s.split_once('/')?;
+    let ip = parse_ip(a)?;
+    if p.is_empty() || p.len() > 3 || !p.bytes().all(|c| c.is_ascii_digit()) || (p.len() > 1 && p.starts_with('0')) {
+        return None;
+    }
+    let p: u32 = p.parse().ok()?;
+    (p <= if ip.1 { 128 } else { 32 }).then_some((ip, p))
+}
+
+fn fmt_cidr((ip, p): (Ip, u32)) -> String {
+    format!("{}/{p}", fmt_ip(ip))
+}
+
+fn net_bits((bits, v6): Ip, p: u32) -> u128 {
+    let host = (if v6 { 128 } else { 32 }) - p;
+    bits.checked_shr(host).unwrap_or(0).checked_shl(host).unwrap_or(0)
+}
+
+fn ip_method(m: &str, s: &str, args: &[Value]) -> Result<Value, String> {
+    if let Some((ip @ (bits, v6), p)) = parse_cidr(s) {
+        let arg_s = || match args {
+            [Value::String(x)] => Ok(x.as_str()),
+            _ => Err(format!("{m}() requires a string argument")),
+        };
+        return Ok(match m {
+            "ip" => Value::String(fmt_ip(ip)),
+            "masked" => Value::String(fmt_cidr(((net_bits(ip, p), v6), p))),
+            "prefixLength" => Value::Number(Number::from_i64(p as i64)),
+            "family" => Value::Number(Number::from_i64(if v6 { 6 } else { 4 })),
+            "containsIP" => {
+                let x = parse_ip(arg_s()?).ok_or("containsIP() requires a valid IP")?;
+                Value::Bool(x.1 == v6 && net_bits(x, p) == net_bits((bits, v6), p))
+            }
+            "containsCIDR" => {
+                let (x, xp) = parse_cidr(arg_s()?).ok_or("containsCIDR() requires a valid CIDR")?;
+                Value::Bool(x.1 == v6 && xp >= p && net_bits(x, p) == net_bits((bits, v6), p))
+            }
+            _ => return Err(format!("{m}() is not supported on a CIDR")),
+        });
+    }
+    let (bits, v6) = parse_ip(s).ok_or_else(|| format!("{m}() receiver {s:?} is not an IP or CIDR"))?;
+    let top = |n: u32| (bits >> (128 - n)) as u32;
+    let b4 = bits as u32;
+    let multicast = if v6 { top(8) == 0xff } else { b4 >> 28 == 0xe };
+    let ll_uni = if v6 { top(10) == 0x3fa } else { b4 >> 16 == 0xa9fe };
+    let ll_multi = if v6 { top(16) == 0xff02 } else { b4 >> 8 == 0xe00000 };
+    let loopback = if v6 { bits == 1 } else { b4 >> 24 == 127 };
+    Ok(match m {
+        "family" => Value::Number(Number::from_i64(if v6 { 6 } else { 4 })),
+        "isUnspecified" => Value::Bool(bits == 0),
+        "isLoopback" => Value::Bool(loopback),
+        "isLinkLocalMulticast" => Value::Bool(ll_multi),
+        "isLinkLocalUnicast" => Value::Bool(ll_uni),
+        "isGlobalUnicast" => Value::Bool(bits != 0 && !loopback && !multicast && !ll_uni && !(!v6 && b4 == u32::MAX)),
+        _ => return Err(format!("{m}() requires a CIDR receiver")),
     })
 }
 
@@ -756,6 +1058,7 @@ fn ty(e: &E, resolve: &dyn Fn(&str, &[&str]) -> Option<Ty>, warns: &mut Vec<Stri
             });
             match f.as_str() {
                 "size" | "int" => "int",
+                "type" | "ip" | "cidr" => "dyn",
                 "double" => "double",
                 "string" => "string",
                 _ => "bool",
@@ -767,7 +1070,11 @@ fn ty(e: &E, resolve: &dyn Fn(&str, &[&str]) -> Option<Ty>, warns: &mut Vec<Stri
                 t(x, warns);
             });
             match m.as_str() {
-                "size" => "int",
+                "size" | "family" | "prefixLength" => "int",
+                "ip" | "masked" => "dyn",
+                "substring" | "replace" | "charAt" | "join" | "reverse" => "string",
+                "indexOf" | "lastIndexOf" => "int",
+                "split" => "list",
                 "lowerAscii" | "upperAscii" | "trim" => "string",
                 "filter" | "map" => "list",
                 _ => "bool",
@@ -901,6 +1208,58 @@ mod tests {
         assert!(Program::compile("self.l.all(x, y > 1)", &["self"]).is_err());
         assert!(Program::compile("self.foo()", &["self"]).is_err());
         assert!(Program::compile("self.n > oldSelf.n", &["self", "oldSelf"]).unwrap().uses("oldSelf"));
+    }
+
+    #[test]
+    fn type_and_ip_library() {
+        let o = |j: &str| json::parse_str(j).unwrap();
+        let t = |e: &str, j: &str| cel_bool(e, &[("self", &o(j))]);
+        let proto = "type(self.protocol) == int ? self.protocol in [6, 17, 132] : self.protocol in ['TCP', 'UDP', 'SCTP']";
+        assert_eq!(t(proto, r#"{"protocol":6}"#), Ok(true));
+        assert_eq!(t(proto, r#"{"protocol":"TCP"}"#), Ok(true));
+        assert_eq!(t(proto, r#"{"protocol":"ICMP"}"#), Ok(false));
+        assert_eq!(t(proto, r#"{"protocol":7}"#), Ok(false));
+        assert_eq!(t("int('5') == 5 && type(1.5) == double && type([]) == list && type({}) == map", "{}"), Ok(true));
+        assert_eq!(t("type(self.a) == string", r#"{"a":"x"}"#), Ok(true));
+        let masked = "cidr(self.cidr) == cidr(self.cidr).masked()";
+        assert_eq!(t(masked, r#"{"cidr":"10.0.0.0/24"}"#), Ok(true));
+        assert_eq!(t(masked, r#"{"cidr":"10.0.0.5/24"}"#), Ok(false));
+        assert_eq!(t("cidr(self.cidr).ip().family() != 6", r#"{"cidr":"10.0.0.5/24"}"#), Ok(true));
+        assert_eq!(t("cidr(self.cidr).ip().family() != 6", r#"{"cidr":"fd00::/8"}"#), Ok(false));
+        let ll = "!cidr('169.254.0.0/16').containsIP(cidr(self.cidr).ip())";
+        assert_eq!(t(ll, r#"{"cidr":"10.0.0.5/24"}"#), Ok(true));
+        assert_eq!(t(ll, r#"{"cidr":"169.254.1.1/32"}"#), Ok(false));
+        assert_eq!(t("cidr('fe80::/10').containsIP('fe80::1')", "{}"), Ok(true));
+        assert_eq!(t("cidr('10.0.0.0/8').containsCIDR('10.1.0.0/16') && !cidr('10.1.0.0/16').containsCIDR('10.0.0.0/8')", "{}"), Ok(true));
+        assert_eq!(t("self.all(n, isCIDR(n) || isIP(n))", r#"["10.0.0.0/8","::1","1.2.3.4"]"#), Ok(true));
+        assert_eq!(t("self.all(n, isCIDR(n) || isIP(n))", r#"["10.0.0.0/8","nope"]"#), Ok(false));
+        assert_eq!(t("cidr(self.cidr).prefixLength() <= 26", r#"{"cidr":"10.0.0.0/24"}"#), Ok(true));
+        assert_eq!(t("cidr(self.cidr).prefixLength() <= 26", r#"{"cidr":"10.0.0.0/27"}"#), Ok(false));
+        assert!(t("ip('1.2.3')== ip('1.2.3')", "{}").is_err());
+        assert!(t("cidr('10.0.0.0/33') == cidr('10.0.0.0/8')", "{}").is_err());
+        assert_eq!(t("!isIP('1.2.3.256') && !isCIDR('10.0.0.0') && !isIP('::g')", "{}"), Ok(true));
+        assert_eq!(t("ip('2001:0db8:0:0:0:0:0:1') == ip('2001:db8::1') && ip('2001:db8::1') == '2001:db8::1'", "{}"), Ok(true));
+        assert_eq!(t("ip('::1').isLoopback() && ip('0.0.0.0').isUnspecified() && ip('8.8.8.8').isGlobalUnicast() && ip('fe80::1').isLinkLocalUnicast() && ip('224.0.0.1').isLinkLocalMulticast()", "{}"), Ok(true));
+        assert!(Program::compile("type(self.p) == int ? 1 : 2", &["self"]).is_ok());
+        assert!(Program::compile("int > 1", &["self"]).is_ok());
+        let w = Program::compile(proto, &["self"]).unwrap().type_warnings(&|_, _| None);
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn string_extensions() {
+        let o = |j: &str| json::parse_str(j).unwrap();
+        let t = |e: &str, j: &str| cel_bool(e, &[("self", &o(j))]);
+        let rule = "self == '' || isIP(self) || (self.startsWith('[') && self.contains(']:') && isIP(self.substring(1, self.lastIndexOf(']:'))) && self.substring(self.lastIndexOf(']:') + 2).matches('^[0-9]{1,5}$') && int(self.substring(self.lastIndexOf(']:') + 2)) >= 1 && int(self.substring(self.lastIndexOf(']:') + 2)) <= 65535) || (self.matches('^[0-9.]+:[0-9]{1,5}$') && isIP(self.split(':')[0]) && int(self.split(':')[1]) >= 1 && int(self.split(':')[1]) <= 65535)";
+        assert!(Program::compile(rule, &["self"]).is_ok());
+        for (v, want) in [("", true), ("10.0.0.1", true), ("[fd00::1]:179", true), ("10.0.0.1:179", true), ("10.0.0.1:99999", false), ("junk", false)] {
+            assert_eq!(t(rule, &format!("\"{v}\"")), Ok(want), "{v}");
+        }
+        assert_eq!(t("int('179') == 179", "\"\""), Ok(true));
+        let c = "'hello world'.substring(6) == 'world' && 'hello'.substring(1, 3) == 'el' && 'abca'.indexOf('a', 1) == 3 && 'abc'.indexOf('z') == -1 && 'abca'.lastIndexOf('a') == 3 && 'abca'.lastIndexOf('a', 2) == 0 && 'a,b,c'.split(',').size() == 3 && 'a,b,c'.split(',', 2)[1] == 'b,c' && 'aaa'.replace('a', 'b', 2) == 'bba' && 'aaa'.replace('a', 'c') == 'ccc' && 'abc'.charAt(1) == 'b' && ['a','b'].join('-') == 'a-b' && ['a','b'].join() == 'ab' && 'abc'.reverse() == 'cba'";
+        assert_eq!(t(c, "{}"), Ok(true));
+        assert!(t("'abc'.substring(2, 5) == ''", "{}").is_err());
+        assert!(t("'abc'.substring(-1) == ''", "{}").is_err());
     }
 
     #[test]

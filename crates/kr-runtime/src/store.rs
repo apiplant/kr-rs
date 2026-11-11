@@ -624,6 +624,8 @@ impl Store {
         if !valid_container_id(id) {
             return Err(Error::Unsafe("bad container id"));
         }
+        // OCI poststop hooks run once the container has ended, before its directory goes.
+        crate::hooks::run_poststop(self.join(&format!("containers/{id}")).as_bytes());
         let dir = cpath(&self.join("containers"))?;
         let fd = fs::openat(AT_FDCWD, &dir, fs::O_PATH | fs::O_DIRECTORY | fs::O_CLOEXEC, 0).ctx("open containers")?;
         fs::remove_all(fd.raw(), &cpath(id)?).ctx("remove container")

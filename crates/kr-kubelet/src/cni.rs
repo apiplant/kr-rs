@@ -83,23 +83,24 @@ pub struct CniResult {
     pub ipv6: Option<[u8; 16]>,
 }
 
-fn run_plugin(plugin: &str, _config: &str, envs: &[(&str, &str)], stdin: &[u8]) -> Result<Vec<u8>, String> {
+async fn run_plugin(plugin: &str, _config: &str, envs: &[(&str, &str)], stdin: &[u8]) -> Result<Vec<u8>, String> {
     let bin = alloc::format!("{}/{}", bin_dir(), plugin);
     let env: Vec<(&str, &str)> = envs.to_vec();
-    kr_runtime::container::run_command(bin.as_bytes(), &env, stdin)
+    kr_runtime::container::run_command(bin.as_bytes(), &env, stdin).await
 }
 
 /// Run the CNI ADD chain. `netns` is the path to the pod's network namespace
 /// (e.g. /proc/<pid>/ns/net). Returns the resulting IPs.
-pub fn cni_add(config: &Value, container_id: &str, netns: &str, ifname: &str) -> Result<CniResult, String> {
+/// `args` is `CNI_ARGS` (`K8S_POD_NAMESPACE=..;K8S_POD_NAME=..`), which Calico and Cilium need.
+pub async fn cni_add(config: &Value, container_id: &str, netns: &str, ifname: &str, args: &str) -> Result<CniResult, String> {
     // Handle conflist (plugins array) vs single plugin.
     let plugins: Vec<Value> = if let Some(arr) = config.get("plugins").and_then(Value::as_array) {
         arr.to_vec()
     } else {
         alloc::vec![config.clone()]
     };
-    let mut result_json = config.clone();
-    // Run each plugin in sequence, feeding previous result.
+    // Run each plugin in sequence, feeding the previous result (`prevResult`) to the next.
+    let mut prev: Option<Value> = None;
     let mut last_stdout: Vec<u8> = Vec::new();
     for p in &plugins {
         let plugin_type = p.get("type").and_then(Value::as_str).ok_or("plugin missing type")?;
@@ -107,6 +108,9 @@ pub fn cni_add(config: &Value, container_id: &str, netns: &str, ifname: &str) ->
         let mut cfg = p.clone();
         if let Some(n) = config.get("name") { cfg.set("name", n.clone()); }
         if let Some(cv) = config.get("cniVersion") { cfg.set("cniVersion", cv.clone()); }
+        if let Some(r) = &prev {
+            cfg.set("prevResult", r.clone());
+        }
         let cfg_str = json::to_string(&cfg);
         let cni_path = bin_dir();
         let envs = [
@@ -114,16 +118,12 @@ pub fn cni_add(config: &Value, container_id: &str, netns: &str, ifname: &str) ->
             ("CNI_CONTAINERID", container_id),
             ("CNI_NETNS", netns),
             ("CNI_IFNAME", ifname),
+            ("CNI_ARGS", args),
             ("CNI_PATH", cni_path.as_str()),
         ];
-        let stdout = run_plugin(plugin_type, &cfg_str, &envs, cfg_str.as_bytes())?;
+        let stdout = run_plugin(plugin_type, &cfg_str, &envs, cfg_str.as_bytes()).await?;
         last_stdout = stdout;
-        // Parse result for prevResult chaining (CNI 0.4.0+)
-        if let Ok(r) = json::parse(&last_stdout) {
-            // attach as prevResult for next plugin
-            cfg.set("prevResult", r);
-            result_json = cfg;
-        }
+        prev = json::parse(&last_stdout).ok();
     }
     // Parse final result.
     let r = json::parse(&last_stdout).map_err(|e| alloc::format!("parse cni result: {e}"))?;
@@ -145,8 +145,9 @@ pub fn cni_add(config: &Value, container_id: &str, netns: &str, ifname: &str) ->
                 }
                 if ok { res.ipv4 = Some(a); }
             } else if ver == "6" {
-                // parse IPv6
-                // simple: use kr_net? just store first 16 bytes via std? no std. Skip for now.
+                if let Some(a) = kr_net::tcp::parse_ipv6(ipstr) {
+                    res.ipv6 = Some(a);
+                }
             }
         }
     }
@@ -154,13 +155,14 @@ pub fn cni_add(config: &Value, container_id: &str, netns: &str, ifname: &str) ->
 }
 
 /// Run CNI DEL.
-pub fn cni_del(config: &Value, container_id: &str, netns: &str, ifname: &str) -> Result<(), String> {
+pub async fn cni_del(config: &Value, container_id: &str, netns: &str, ifname: &str, args: &str) -> Result<(), String> {
     let plugins: Vec<Value> = if let Some(arr) = config.get("plugins").and_then(Value::as_array) {
         arr.to_vec()
     } else {
         alloc::vec![config.clone()]
     };
     // DEL runs in reverse order.
+    let mut first_err: Option<String> = None;
     for p in plugins.iter().rev() {
         let plugin_type = p.get("type").and_then(Value::as_str).ok_or("plugin missing type")?;
         let mut cfg = p.clone();
@@ -173,11 +175,15 @@ pub fn cni_del(config: &Value, container_id: &str, netns: &str, ifname: &str) ->
             ("CNI_CONTAINERID", container_id),
             ("CNI_NETNS", netns),
             ("CNI_IFNAME", ifname),
+            ("CNI_ARGS", args),
             ("CNI_PATH", cni_path.as_str()),
         ];
-        let _ = run_plugin(plugin_type, &cfg_str, &envs, cfg_str.as_bytes())?;
+        // Best effort: one plugin failing must not leave the rest of the chain's state behind.
+        if let Err(e) = run_plugin(plugin_type, &cfg_str, &envs, cfg_str.as_bytes()).await {
+            first_err.get_or_insert(e);
+        }
     }
-    Ok(())
+    first_err.map_or(Ok(()), Err)
 }
 
 /// Whether CNI is configured (KR_CNI_CONF_DIR set and has config).

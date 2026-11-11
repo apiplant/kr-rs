@@ -1188,6 +1188,10 @@ impl ApiServer {
                 return Ok(Reply::Json(200, json::to_string(&doc)));
             }
             ["openapi", "v3"] => return Ok(Reply::Json(200, crate::openapi::index(&extra))),
+            ["openapi", "v2"] if req.accept.is_some_and(|a| a.contains("proto-openapi.spec.v2")) => {
+                let body = crate::openapi::v2_proto(&self.custom.borrow());
+                return Ok(Reply::Http(kr_net::http1::server::Response::new(200, body).with_header("Content-Type", "application/com.github.proto-openapi.spec.v2@v1.0+protobuf")));
+            }
             ["openapi", "v2"] => return Ok(Reply::Json(200, crate::openapi::v2(&self.custom.borrow()))),
             ["openapi", "v3", rest @ ..] => {
                 let p = rest.join("/");

@@ -89,6 +89,8 @@ pub struct RunSpec<'a> {
     pub caps: Option<&'a [u32]>,
     /// Run in a user namespace (rootless). False = rootful (host userns), matching k3s default.
     pub userns: bool,
+    /// OCI lifecycle hooks (CDI `hooks`); see `crate::hooks`. Use `hooks::NONE` for none.
+    pub hooks: &'a crate::hooks::Hooks,
 }
 
 /// Mount propagation of a volume (`volumeMounts[].mountPropagation`).
@@ -170,8 +172,12 @@ fn fork_into(pidfd: &Fd, nstype: u64, cgroup: Option<i32>, child: impl FnOnce() 
             let _ = kr_sys::write(pid_w.raw(), &b);
             kr_sys::exit_group(126)
         };
-        if let Err(e) = ns::setns(pidfd, nstype) {
-            fail(0, e);
+        // Nothing to join (a host-network probe in a rootful kubelet): setns with an empty set is
+        // EINVAL, and the helper simply stays where it is.
+        if nstype != 0 {
+            if let Err(e) = ns::setns(pidfd, nstype) {
+                fail(0, e);
+            }
         }
         // No CLONE_INTO_CGROUP here: after joining the target's cgroup namespace the kernel
         // refuses it (ENOENT); kr moves the process via cgroup.procs right after the clone.
@@ -539,7 +545,82 @@ const STEPS: &[&str] = &[
     "stdio",
     "read-only rootfs",
     "clone propagating volume",
+    "run hook",
 ];
+
+/// Index of "run hook" in `STEPS`.
+const STEP_HOOK: u8 = 29;
+
+/// The error for a setup failure the child reported as `rep` (step, errno lo, errno hi). A failed
+/// hook carries the tail of `<bundle>/hooks.log` in the step text.
+fn step_error(spec: &RunSpec, rep: &[u8; 3]) -> RunError {
+    let errno = Errno(rep[1] as i32 | (rep[2] as i32) << 8);
+    if rep[0] == STEP_HOOK {
+        let tail = crate::hooks::log_tail(&crate::hooks::bundle_of(spec.merged), 600);
+        let step: &'static str = alloc::boxed::Box::leak(alloc::format!("run hook (status {}): {}", errno.0, tail).into_boxed_str());
+        return RunError { step, errno };
+    }
+    RunError { step: STEPS.get(rep[0] as usize).copied().unwrap_or("unknown"), errno }
+}
+
+/// The byte string the parent sends to let the child start: `g` and the child's pid as the
+/// runtime sees it (the child, in its own pid namespace, cannot know it; hooks need it).
+fn go_message(pid: i32) -> [u8; 5] {
+    let p = (pid as u32).to_le_bytes();
+    [b'g', p[0], p[1], p[2], p[3]]
+}
+
+/// Writes the OCI bundle (`config.json`) that hooks read. No-op without hooks.
+fn prepare_hooks(spec: &RunSpec) -> Result<(), RunError> {
+    if spec.hooks.is_empty() {
+        return Ok(());
+    }
+    crate::hooks::write_bundle(&crate::hooks::bundle_of(spec.merged), spec.merged, spec.argv, spec.env, spec.cwd, spec.hostname).map_err(err("write hook bundle"))
+}
+
+/// Attaches the device-cgroup filter (see `crate::devfilter`) to a new container cgroup, before any
+/// process enters it. Not for privileged containers, rootless runs (no device nodes can be made
+/// there) or `KR_DEVICE_FILTER=off`. Fails the start when it cannot be attached: a container
+/// without the filter could open every host device.
+fn device_filter(spec: &RunSpec, cg: &Option<Cgroup>) -> Result<(), RunError> {
+    let Some(cg) = cg else { return Ok(()) };
+    if spec.privileged || ns::getuid() != 0 || crate::store::env_var("KR_DEVICE_FILTER").as_deref() == Some("off") {
+        return Ok(());
+    }
+    let mut rules = crate::devfilter::defaults();
+    for m in spec.mounts {
+        if let Some(r) = crate::devfilter::rule_for(&m.source, m.readonly) {
+            rules.push(r);
+        }
+    }
+    crate::devfilter::attach(&cg.dir, &rules).map_err(err("attach device filter (KR_DEVICE_FILTER=off disables it)"))
+}
+
+/// `createRuntime` hooks, in the runtime namespace, with the container created and waiting.
+fn hooks_create_runtime(spec: &RunSpec, pid: i32) -> Result<(), RunError> {
+    if spec.hooks.create_runtime.is_empty() {
+        return Ok(());
+    }
+    let bundle = crate::hooks::bundle_of(spec.merged);
+    let log = crate::hooks::open_log(&bundle);
+    let st = crate::hooks::state(spec.id, "creating", pid, &bundle);
+    crate::hooks::run_all(&spec.hooks.create_runtime, &st, None, log.as_ref()).map_err(|f| {
+        let tail = crate::hooks::log_tail(&bundle, 600);
+        let step: &'static str = alloc::boxed::Box::leak(alloc::format!("run createRuntime hook: {tail}").into_boxed_str());
+        RunError { step, errno: f.errno() }
+    })
+}
+
+/// `poststart` hooks; a failure is logged to hooks.log and otherwise ignored, as the spec says.
+fn hooks_poststart(spec: &RunSpec, pid: i32) {
+    if spec.hooks.poststart.is_empty() {
+        return;
+    }
+    let bundle = crate::hooks::bundle_of(spec.merged);
+    let log = crate::hooks::open_log(&bundle);
+    let st = crate::hooks::state(spec.id, "running", pid, &bundle);
+    let _ = crate::hooks::run_all(&spec.hooks.poststart, &st, None, log.as_ref());
+}
 
 /// NUL-terminated concatenation of `parts`.
 fn cstr(parts: &[&[u8]]) -> Vec<u8> {
@@ -689,6 +770,7 @@ fn finish_cgroup(cg: &Option<Cgroup>) -> bool {
 
 /// Starts the container and returns once its entrypoint has been exec'd (or setup failed).
 pub fn start(spec: &RunSpec) -> Result<Running, RunError> {
+    prepare_hooks(spec)?;
     // Overlay options are comma/colon separated, so those bytes (and NUL) must not occur in paths.
     let bad = |p: &[u8]| p.is_empty() || p.iter().any(|&b| b == b',' || b == b':' || b == 0);
     if bad(spec.rootfs) || bad(spec.upper) || bad(spec.work) || bad(spec.merged) || spec.argv.is_empty() {
@@ -707,6 +789,12 @@ pub fn start(spec: &RunSpec) -> Result<Running, RunError> {
         Some(Cgroup::create_in(spec.cgroup_parent, spec.id, &spec.limits).map_err(err("create cgroup (is kr in a delegated cgroup? try systemd-run --user --scope -p Delegate=yes)"))?)
     };
 
+    if let Err(e) = device_filter(spec, &cgroup) {
+        if let Some(cg) = &cgroup {
+            cg.remove();
+        }
+        return Err(e);
+    }
     if let Some(sb) = spec.sandbox {
         return start_in_sandbox(spec, sb, cgroup, rootless(uid), full_map);
     }
@@ -766,16 +854,23 @@ pub fn start(spec: &RunSpec) -> Result<Running, RunError> {
             return Err(RunError { step: "attach network", errno: e });
         }
     }
-    let _ = kr_sys::write(go_w.raw(), b"g");
+    if let Err(e) = hooks_create_runtime(spec, pid) {
+        let _ = ns::kill(pid, ns::SIGKILL);
+        let _ = ns::wait4(pid);
+        running.finish();
+        return Err(e);
+    }
+    let _ = kr_sys::write(go_w.raw(), &go_message(pid));
     drop(go_w);
 
     let mut rep = [0u8; 3];
     if read_full(&rep_r, &mut rep) == 3 {
         let _ = ns::wait4(pid);
         running.finish();
-        let step = STEPS.get(rep[0] as usize).copied().unwrap_or("unknown");
-        return Err(RunError { step, errno: Errno(rep[1] as i32 | (rep[2] as i32) << 8) });
+        return Err(step_error(spec, &rep));
     }
+    hooks_poststart(spec, pid);
+    let _ = crate::hooks::save_poststop(&crate::hooks::bundle_of(spec.merged), spec.id, &spec.hooks.poststop);
     Ok(running)
 }
 
@@ -1021,6 +1116,7 @@ fn fmt_u32(mut n: u32) -> Vec<u8> {
 /// the container (new mount/pid/cgroup namespaces) as kr's own child via CLONE_PARENT and
 /// reports its pid. kr then supervises it with a pidfd exactly like a standalone container.
 fn start_in_sandbox(spec: &RunSpec, sb: &Sandbox, cgroup: Option<Cgroup>, rootless: bool, full_map: bool) -> Result<Running, RunError> {
+    prepare_hooks(spec)?;
     let (go_r, go_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     let (rep_r, rep_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     let (pid_r, pid_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
@@ -1077,7 +1173,7 @@ fn start_in_sandbox(spec: &RunSpec, sb: &Sandbox, cgroup: Option<Cgroup>, rootle
     if read_full(&pid_r, &mut pb) != 4 {
         let mut rep = [0u8; 3];
         let e = if read_full(&rep_r, &mut rep) == 3 {
-            RunError { step: STEPS.get(rep[0] as usize).copied().unwrap_or("unknown"), errno: Errno(rep[1] as i32 | (rep[2] as i32) << 8) }
+            step_error(spec, &rep)
         } else {
             RunError { step: "join sandbox", errno: Errno(5) }
         };
@@ -1096,15 +1192,22 @@ fn start_in_sandbox(spec: &RunSpec, sb: &Sandbox, cgroup: Option<Cgroup>, rootle
         }
     };
     let running = Running { pid, pidfd: Rc::new(pidfd), cgroup, host_net: sb.host_net, userns: sb.userns, exit_file: None, shim: 0 };
-    let _ = kr_sys::write(go_w.raw(), b"g");
+    if let Err(e) = hooks_create_runtime(spec, pid) {
+        let _ = ns::kill(pid, ns::SIGKILL);
+        let _ = ns::wait4(pid);
+        running.finish();
+        return Err(e);
+    }
+    let _ = kr_sys::write(go_w.raw(), &go_message(pid));
     drop(go_w);
     let mut rep = [0u8; 3];
     if read_full(&rep_r, &mut rep) == 3 {
         let _ = ns::wait4(pid);
         running.finish();
-        let step = STEPS.get(rep[0] as usize).copied().unwrap_or("unknown");
-        return Err(RunError { step, errno: Errno(rep[1] as i32 | (rep[2] as i32) << 8) });
+        return Err(step_error(spec, &rep));
     }
+    hooks_poststart(spec, pid);
+    let _ = crate::hooks::save_poststop(&crate::hooks::bundle_of(spec.merged), spec.id, &spec.hooks.poststop);
     Ok(running)
 }
 
@@ -1257,10 +1360,13 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
     }
     // Die with the parent rather than linger as an orphaned pid-1.
     let _ = ns::prctl(ns::PR_SET_PDEATHSIG, ns::SIGKILL as usize);
-    let mut b = [0u8; 1];
-    if read_full(go, &mut b) != 1 {
+    let mut b = [0u8; 5];
+    if read_full(go, &mut b) != 5 {
         return (0, Errno(32));
     }
+    let host_pid = i32::from_le_bytes([b[1], b[2], b[3], b[4]]);
+    // Opened before pivot_root: the hooks' log file lives in the host's bundle directory.
+    let hook_log = if spec.hooks.create_container.is_empty() && spec.hooks.start_container.is_empty() { None } else { crate::hooks::open_log(&crate::hooks::bundle_of(spec.merged)) };
 
     // Volumes with mount propagation are cloned while the host's shared mounts are still visible
     // as peers; the clone keeps that relation after the root below goes private.
@@ -1320,6 +1426,7 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
     }
 
     step!(25, mount_volumes(spec.mounts, &trees));
+    step!(STEP_HOOK, run_create_container_hooks(spec, host_pid, hook_log.as_ref()));
     if spec.readonly_root {
         step!(27, ns::mount(None, b"/\0", None, ns::MS_BIND | ns::MS_REMOUNT | ns::MS_RDONLY, None));
     }
@@ -1336,7 +1443,33 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
             step!(11, ns::sethostname(spec.hostname));
         }
     }
+    if !spec.hooks.start_container.is_empty() {
+        let bundle = crate::hooks::bundle_of(spec.merged);
+        let st = crate::hooks::state(spec.id, "created", host_pid, &bundle);
+        if let Err(f) = crate::hooks::run_all(&spec.hooks.start_container, &st, None, hook_log.as_ref()) {
+            return (STEP_HOOK, f.errno());
+        }
+    }
     drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups, spec.privileged, spec.caps)
+}
+
+/// `createContainer` hooks. They run with the host root as their root and the container's whole
+/// root filesystem (rootfs, /dev, /proc, volumes, device nodes) bind-mounted at `root.path`
+/// (the merged directory), which is where runc's hooks see it; the bind is detached afterwards.
+fn run_create_container_hooks(spec: &RunSpec, host_pid: i32, log: Option<&Fd>) -> Result<(), Errno> {
+    if spec.hooks.create_container.is_empty() {
+        return Ok(());
+    }
+    if spec.merged.first() != Some(&b'/') {
+        return Err(Errno(22));
+    }
+    let target = cstr(&[b"/.oldroot", spec.merged]);
+    ns::mount(Some(b"/\0"), &target, None, ns::MS_BIND | ns::MS_REC, None)?;
+    let bundle = crate::hooks::bundle_of(spec.merged);
+    let st = crate::hooks::state(spec.id, "created", host_pid, &bundle);
+    let r = crate::hooks::run_all(&spec.hooks.create_container, &st, Some(b"/.oldroot\0"), log);
+    let _ = ns::umount2(&target, ns::MNT_DETACH);
+    r.map_err(|f| f.errno())
 }
 
 /// The common tail of every process start inside a container: cwd, user, capabilities,
@@ -1357,7 +1490,7 @@ fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env:
         Err(e) => return (21, e),
     };
     if !privileged {
-        step!(16, security::drop_caps(caps.unwrap_or(security::DEFAULT_CAPS)));
+        step!(16, security::drop_caps_for_switch(caps.unwrap_or(security::DEFAULT_CAPS)));
     }
     let ids = match (ids, extra_groups.is_empty()) {
         (None, false) => Some((0, 0, alloc::vec![0])),
@@ -1378,6 +1511,7 @@ fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env:
         step!(22, ns::setresuid(uid));
     }
     if !privileged {
+        step!(16, security::finish_drop(caps.unwrap_or(security::DEFAULT_CAPS)));
         step!(13, ns::prctl(ns::PR_SET_NO_NEW_PRIVS, 1));
         // Built before installing: the filter must be the last thing before execve.
         let filter = security::default_filter();
@@ -1837,8 +1971,10 @@ pub fn shim_wait(pid: i32, exit_path: &[u8], tty_master: Option<i32>, tty_log: &
 }
 
 /// Runs a host binary to completion, feeding `stdin` on its stdin and capturing stdout.
-/// Used by the CNI runner. Returns the captured stdout on success.
-pub fn run_command(path: &[u8], env: &[(&str, &str)], stdin: &[u8]) -> Result<Vec<u8>, String> {
+/// Used by the CNI runner. Returns the captured stdout on success. Does not block the executor: a
+/// CNI plugin may call back into this very process (Calico's asks the API server, through the
+/// Service proxy, which kr serves), so waiting for it synchronously would deadlock until it times out.
+pub async fn run_command(path: &[u8], env: &[(&str, &str)], stdin: &[u8]) -> Result<Vec<u8>, String> {
     use kr_sys::ns;
     let (in_r, in_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(|e| alloc::format!("pipe: {}", e.0))?;
     let (out_r, out_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(|e| alloc::format!("pipe: {}", e.0))?;
@@ -1884,37 +2020,46 @@ pub fn run_command(path: &[u8], env: &[(&str, &str)], stdin: &[u8]) -> Result<Ve
         ns::execve(&pathz, &argvp, &envp);
         kr_sys::exit_group(127);
     }
-    // parent
-    let _ = kr_sys::close(in_r.raw());
-    let _ = kr_sys::close(out_w.raw());
-    let _ = kr_sys::close(err_w.raw());
+    // parent: the child's ends go away by dropping the owning `Fd`s (a manual close here would be
+    // closed a second time on drop, after other tasks may have reused the number).
+    drop(in_r);
+    drop(out_w);
+    drop(err_w);
     let _ = kr_sys::write(in_w.raw(), stdin);
-    let _ = kr_sys::close(in_w.raw());
-    let mut stdout = Vec::new();
+    drop(in_w);
+    let pidfd = ns::pidfd_open(pid).map_err(|e| alloc::format!("pidfd_open: {}", e.0))?;
+    for fd in [out_r.raw(), err_r.raw()] {
+        let _ = ns::set_nonblocking(fd);
+    }
+    let out = kr_rt::exec::Async::new(out_r).map_err(|e| alloc::format!("register stdout: {}", e.0))?;
+    let err = kr_rt::exec::Async::new(err_r).map_err(|e| alloc::format!("register stderr: {}", e.0))?;
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
     let mut buf = [0u8; 4096];
+    // Stdout to EOF; stderr is drained on the way so a chatty plugin never fills its pipe.
     loop {
-        match kr_sys::read(out_r.raw(), &mut buf) {
-            Ok(0) => break,
+        match out.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
             Ok(n) => stdout.extend_from_slice(&buf[..n]),
-            Err(_) => break,
+        }
+        while let Ok(n @ 1..) = kr_sys::read(err.get_ref().raw(), &mut buf) {
+            stderr.extend_from_slice(&buf[..n]);
         }
     }
-    let _ = kr_sys::close(out_r.raw());
-    let st = ns::wait4(pid).unwrap_or(0);
-    let code = ns::exit_code(st);
-    if code != 0 {
-        let mut stderr = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            match kr_sys::read(err_r.raw(), &mut buf) {
-                Ok(0) => break,
-                Ok(n) => stderr.extend_from_slice(&buf[..n]),
-                Err(_) => break,
-            }
+    while let Ok(n @ 1..) = kr_sys::read(err.get_ref().raw(), &mut buf) {
+        stderr.extend_from_slice(&buf[..n]);
+    }
+    // The exit status, awaited on the pidfd (the plugin may outlive closing its stdout).
+    let pidfd = kr_rt::exec::Async::new(pidfd).map_err(|e| alloc::format!("register pidfd: {}", e.0))?;
+    let code = loop {
+        match ns::pidfd_try_wait(pidfd.get_ref()) {
+            Ok(Some(c)) => break c,
+            Ok(None) => pidfd.wait_readable().await,
+            Err(Errno(4)) => {}
+            Err(e) => return Err(alloc::format!("waitid: {}", e.0)),
         }
-        let _ = kr_sys::close(err_r.raw());
+    };
+    if code != 0 {
         return Err(alloc::format!("command exited {code}: {}", String::from_utf8_lossy(&stderr)));
     }
-    let _ = kr_sys::close(err_r.raw());
     Ok(stdout)
 }

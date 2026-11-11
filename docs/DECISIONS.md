@@ -21,7 +21,6 @@ Raw syscalls go through inline asm (`kr-sys`) for x86_64 and aarch64. Host requi
 ## ADR-004: Own `_start`, allocator and mem* intrinsics in `kr-rt`
 `kr-rt` provides the entry point, the panic handler (abort and print to stderr), an mmap-backed size-class allocator, and `memcpy/memmove/memset/memcmp/bcmp`.
 **Why:** `compiler_builtins` doesn't export mem* on `-gnu` targets when there is no libc.
-**Note:** the phase-0 allocator is single-threaded. Threads will need per-thread slabs or a lock, so revisit this when N-worker mode lands.
 **Status:** accepted.
 
 ## ADR-005: Hand-rolled epoll executor, no tokio
@@ -37,7 +36,7 @@ It is single-threaded by default and uses a hierarchical timer wheel.
 - Single-thread invariant: all executor state lives in one `static` (`UnsafeCell` + `unsafe impl Sync`, like the allocator). No `RefCell` borrow is held across anything that can drop a waker.
 
 ## ADR-006: Embedded store replaces etcd
-An append-only log, an in-memory B-tree index and MVCC resourceVersion. Raft for HA comes later.
+An append-only log, an in-memory B-tree index and MVCC resourceVersion. HA replicates this log with Raft (ADR-026).
 **Why:** etcd is the largest share of k3s/k8s memory. A single-node cluster needs no consensus.
 **Status:** accepted.
 
@@ -47,7 +46,7 @@ The kubelet calls `kr-runtime` directly: OCI image pull, overlayfs, clone3 names
 **Status:** accepted.
 
 ## ADR-008: Networking built in
-A bridge+veth CNI with host-local IPAM, a VXLAN or host-gw overlay over netlink, nftables Service VIPs over netlink, and in-process cluster DNS.
+A bridge+veth CNI with host-local IPAM, a VXLAN or host-gw overlay over netlink, a userspace Service proxy (ADR-022) with nftables only for masquerade, and in-process cluster DNS.
 **Why:** this removes flannel, kube-proxy, CoreDNS and the iptables binaries.
 **Status:** accepted.
 
@@ -57,7 +56,7 @@ TLS 1.3, X.509 and the primitives are kept behind one crate boundary. Wycheproof
 **Status:** accepted.
 
 ## ADR-010: Reduced API surface
-Only core/v1, apps/v1, batch/v1, coordination, discovery and RBAC are supported. Types are code-generated in `build.rs` from OpenAPI.
+The resource table in `crates/kr-apiserver/src/resources.rs` is the authority on what is served. It started as core/v1, apps/v1, batch/v1, coordination, discovery and RBAC and has grown to what conformance and common operators need (CRDs, admission, aggregation, certificates, networking, policy, storage, autoscaling, flow control, ...). Types are code-generated in `build.rs` from OpenAPI.
 **Why:** this covers kubectl and common workloads. Legacy, alpha and cloud-provider code is dropped, as k3s does.
 **Status:** accepted.
 
@@ -109,6 +108,7 @@ Scalars use the YAML 1.2 core schema: `null/~`, `true/false` (any of three cases
 **Status:** accepted.
 
 ## ADR-013: Phase 1 layering, with plain-HTTP registries until TLS lands
+*(Historical: TLS landed with ADR-020 and pulls from `https` registries work. The layering below still holds.)*
 Crates:
 - `kr-archive` handles inflate (RFC 1951/1952) and tar. It is pure: no syscalls, `forbid(unsafe)`.
 - `kr-net` holds the HTTP/1.1 client and server plus the OCI distribution (registry v2) client.
@@ -149,6 +149,7 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 **Status:** accepted.
 
 ## ADR-016: Rootless-first runtime using kernel isolation; qemu only for privileged paths
+*(Update: the server and agent now run rootful by default, with the host user namespace; rootless is opt-in. The isolation primitives below are used in both modes.)*
 `kr-runtime` isolates containers with kernel primitives directly: no podman/runc, consistent with ADR-007.
 - A **user namespace** is created first, unprivileged. Inside it we are uid 0 and can create mount, pid, net, uts, ipc and cgroup namespaces, mount overlayfs (Linux ≥ 5.11) and call `pivot_root`.
 - **cgroup v2** limits go through a delegated subtree: `systemd-run --user --scope -p Delegate=yes` in dev, and the agent's own systemd unit (`Delegate=yes`) in production. The controllers available rootless are cpu, memory and pids. io and cpuset need a root agent.
@@ -159,7 +160,7 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 
 ## ADR-017: Flattened per-image rootfs + per-container overlay; safe unpack via openat2
 - Each image's layers are applied in order into one flattened directory: `<root>/images/<config-digest>/rootfs`. Whiteouts are applied by deleting. A container gets an overlay with that directory as `lowerdir` and a private `upper`/`work`, mounted with `userxattr` (ADR-016).
-  **Why:** whiteout char devices (0:0) and `trusted.*` xattrs are not reliably creatable rootless, so flattening sidesteps both. **Cost:** disk space is not shared between images that share base layers (*revisit:* layer-level lowerdirs once running as root).
+  **Why:** whiteout char devices (0:0) and `trusted.*` xattrs are not reliably creatable rootless, so flattening sidesteps both. (Cost: KNOWN_ISSUES #130.)
 - Every filesystem operation during unpack goes through `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)` relative to the rootfs dirfd, so the kernel itself prevents symlink and `..` escapes. The lexical `sanitize()` from kr-archive is a first filter, not the guard.
 - Layers have a decompression-bomb cap: a per-layer uncompressed byte limit and an entry-count limit, configurable with safe defaults.
 - Rootless: device nodes in layers are skipped. uid/gid ownership is not preserved (single-uid mapping). Subuid ranges via `newuidmap` come later.
@@ -184,6 +185,7 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
   - An arch check, plus a kill on the x32 ABI.
   - A deny-list (EPERM) covering io_uring, bpf, userfaultfd, keyrings, perf, kexec/modules, mount APIs, setns/unshare, time setting, and kcmp/process_vm.
   - `clone3` returns ENOSYS, so libc falls back to `clone`, whose flags *are* inspectable. `clone` with namespace flags gets EPERM.
+- **Device access (rootful, non-privileged):** a `BPF_PROG_TYPE_CGROUP_DEVICE` program (`kr_runtime::devfilter`) is attached to the container's cgroup before the child enters it. It allows `null`, `zero`, `full`, `random`, `urandom`, `tty`, `console`, `ptmx`, the container's own `pts` (136:*) and the device nodes the container was given (CDI or device-plugin nodes, `hostPath` device nodes; read-only mounts get read only); `mknod` of anything stays allowed because the node it makes cannot be opened. Privileged and rootless containers get no filter. Failing to attach fails the start; `KR_DEVICE_FILTER=off` disables it. Pods that were started before this keep running unfiltered until they are recreated.
 - **Setup errors** travel back to the parent over a CLOEXEC pipe as `(step, errno)`. EOF on that pipe means exec succeeded.
 - **cgroups:**
   - kr moves the delegated cgroup's processes into `kr-supervisor` and enables `cpu memory pids` on the parent.
@@ -263,13 +265,13 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **kr-apiserver:** generic JSON objects, with the server validating only the fields it relies on: type, metadata, labels/annotations and names.
   - **Resources:** a static resource table drives discovery, routing, keys (`/registry/<group>/<plural>/[ns/]name`) and the OpenAPI v3 probe surface.
   - **Patches:** merge patch, JSON patch, and strategic merge patch with a built-in merge-key table.
-  - **Server-side apply** is approximated as create-or-strategic-merge.
+  - **Server-side apply** has its own implementation (`ssa.rs`, ADR-028 for apply configurations).
   - **Status/scale:** status and scale subresources; `generation` bumps when `spec` changes.
   - **Deletes:** finalizer-aware deletes, and synchronous namespace deletion.
   - **Watches:** chunked NDJSON with selector enter/leave semantics, and 410 for compacted revisions.
   - **Server-side Table printing:** `kubectl get`.
 - **Lists:** stored JSON is spliced directly into list responses; no decode/encode per item.
-- **Authentication:** TLS client certificates against the cluster CA (CN = user, O = groups). Until RBAC lands, only `system:masters` is authorized.
+- **Authentication:** TLS client certificates against the cluster CA (CN = user, O = groups), bearer tokens and service-account tokens. Authorization is RBAC plus the Node authorizer (ADR-023).
 - **Bootstrap:** `kr server` creates the CA, the apiserver and admin certificates, and `admin.kubeconfig` on first start.
 - **Protobuf request bodies** (sent by kubectl's typed clients) are decoded with a generated schema table; responses are always JSON.
 
@@ -282,7 +284,7 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **Service proxy:** a userspace proxy inside kr. One `local 10.96.0.0/16` route makes every ClusterIP bindable in the node network namespace.
   - kr listens on ClusterIP:port (and 0.0.0.0:nodePort) and splices to ready endpoints (round-robin or ClientIP affinity). UDP gets per-client sessions.
   - Rootless, a socket factory inside the pod-network namespace creates the sockets and passes them over SCM_RIGHTS.
-  - Trade-off: lower throughput than a kernel datapath, but identical behaviour as root and rootless, no packet-rewrite rules, and simple testing. An nftables DNAT datapath can replace it later behind the same reconcile loop.
+  - Identical behaviour as root and rootless, no packet-rewrite rules, and simple testing. (Costs: KNOWN_ISSUES #133.)
 - **Cluster DNS:** kr serves `cluster.local` itself from a 1 s snapshot of Services, Endpoints and Pods, bound on the kube-dns ClusterIP 10.96.0.10:53. Other names are forwarded to the host resolvers.
   - Pods get resolv.conf per `dnsPolicy`, plus Docker-link service environment variables.
 - **Multi-node:**
@@ -307,7 +309,7 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
   - serviceaccounts/token: only for service accounts used by the node's pods.
 - **Credential lifetimes:**
   - **Join tokens:** `kr token create [--ttl]` creates a bootstrap-token Secret with `expiration`, using the local admin certificate.
-  - **Node certificate rotation:** `/kr/join` also accepts a node's own certificate and re-issues for the same name only. The agent renews at 2/3 of the lifetime with fresh keys, replaces the files via rename, and swaps the TLS configs in place (`Remote::set_client_cert`, the kubelet server's `tls_slot`). There's no CSR API, because kr issues directly.
+  - **Node certificate rotation:** `/kr/join` also accepts a node's own certificate and re-issues for the same name only. The agent renews at 2/3 of the lifetime with fresh keys, replaces the files via rename, and swaps the TLS configs in place (`Remote::set_client_cert`, the kubelet server's `tls_slot`).
   - `KR_NODE_CERT_SECONDS` shortens node certificates for testing.
 
 **Status:** accepted.
@@ -325,8 +327,7 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
   - A process is used instead of a thread because the runtime is single-threaded by design (KNOWN_ISSUES #3).
 - **Group commit:** while one fsync is in flight, later writers wait and share the next fsync, so there is one fsync per batch.
 - **Fallback:** if the helper can't start or dies, commits fall back to a blocking fsync.
-- **In-process writers:** the controllers and the server's own kubelet call the API in-process and don't await durability. A background task flushes their writes every second, so a crash can lose up to about one second of them. These components re-derive their state from the API, so that's acceptable.
-- **Watch delivery:** watch events are delivered when written, not when durable. This is a deliberate small deviation from etcd.
+- **In-process writers:** the controllers and the server's own kubelet call the API in-process and don't await durability. A background task flushes their writes every second. (Durability limits: KNOWN_ISSUES #127.)
 - **Compaction:** every minute, the log is rewritten into a snapshot once it exceeds 8 MiB and is more than 4× the live data.
 
 **Status:** accepted.
@@ -399,20 +400,19 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 ## ADR-027: opt-in registry mirrors (`KR_REGISTRY_MIRRORS`)
 - **What:** `KR_REGISTRY_MIRRORS=registry.k8s.io=http://10.0.0.4:5000,docker.io=https://cache:5000` maps an upstream registry to a mirror. A pull tries the mirror first, anonymously; any failure (unreachable, missing image) falls back to the upstream with the pod's credentials. Like docker's `registry-mirrors`, the mirror is trusted for tag-to-digest resolution only: blobs are still verified against the manifest digests. `http://` mirrors are plain HTTP (the same as the insecure-registry list).
 - **Why:** test runs (conformance, multi-node scripts) downloaded the same ~600 MB of images in every throwaway container. `tools/test/registry-cache.sh` runs one `registry:2` pull-through proxy per upstream with blobs in named docker volumes, and the test scripts pass the mirrors automatically when the caches are up. A warm agnhost pull went from 47 s to 1.7 s.
-- **Not chosen:** a registry config file (containerd `hosts.toml` style). An env var is enough for now; credentials are never sent to mirrors, so a mirror needing auth is not supported.
 **Status:** accepted.
 
 ## ADR-028: admission policies in the existing admission pass
 - **What:** ValidatingAdmissionPolicy and MutatingAdmissionPolicy are evaluated in `webhook::run`'s admission pass, on the dry-run result: mutating policies, mutating webhooks, validating policies, validating webhooks (upstream's plugin order). Parsed policies and bindings share the webhook configuration cache, keyed by the count and newest revision of all six configuration kinds.
 - **CEL:** the existing evaluator (`cel.rs`) was extended rather than replaced: map literals and `Object{...}` construction evaluate to plain JSON, so an apply configuration is just a partial object. Typing is a separate static pass over the same AST (`type_warnings`) that only reports operator overloads whose operand types are both known; everything it cannot type is `dyn`, so it never produces warnings cel-go would not.
 - **Type checking is synchronous:** `status.typeChecking` is computed when the policy is written instead of by a controller (upstream sets it shortly after). Clients poll for it, so being early is indistinguishable.
-- **Apply configurations** are merged with the strategic-merge code (list keys from the same tables) rather than structured-merge-diff; the results agree for the common cases (maps, keyed lists) and differ for atomic structs and sets.
+- **Apply configurations** are merged with the strategic-merge code (list keys from the same tables) rather than structured-merge-diff (see KNOWN_ISSUES #146).
 **Status:** accepted.
 
 ## ADR-029: Pod Security admission built in
 - **What:** the upstream PodSecurity admission plugin, in `psa.rs`, evaluated in the API server's create/update path for pods (deny on `enforce`, warning on `warn`) and pod-template workloads (warnings only).
 - **Defaults:** unlabelled namespaces are `privileged`, as upstream ships; kr does not change the default so that existing manifests keep working, and clusters opt namespaces in with labels. An invalid level label is evaluated as `restricted` and rejected on namespace writes (fail closed).
-- **Scope:** the baseline and restricted checks of `latest` with upstream's wording (clients and e2e tests match on it). `-version` labels are accepted and ignored; no exemption configuration; `audit` is accepted but kr has no audit log.
+- **Scope:** the baseline and restricted checks of `latest` with upstream's wording (clients and e2e tests match on it).
 - **Why built in:** hostNetwork, privileged and hostPath pods are otherwise available to anyone who can create pods. kr's user-namespaced sandboxes reduce the blast radius, but namespaces need the same declarative guardrail upstream gives.
 **Status:** accepted.
 
@@ -421,7 +421,7 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **Impersonation** is part of authentication (`ApiServer::authenticate`): the caller is authorized for `impersonate` on `users`, `serviceaccounts`, `groups`, then the request continues as the impersonated identity, with `system:authenticated` added. UID and extra headers are ignored.
 - **CRD selectable fields** are parsed per request (`ApiServer::field_selectors`). When a conversion webhook exists, terms on custom fields are returned apart and evaluated on the converted objects by the transport (`convert.rs`), because the sync handlers only see the stored version. A collection delete with such terms is therefore a list, the filter and per-item deletes there (admission webhooks are not consulted for those items).
 - **Pod certificates:** the kubelet owns key generation (the private key never reaches the API), the API server only checks bounds and shape of the request, the signer is whatever updates the request status. Rotation is the kubelet's re-stage after 80% of the lifetime, not `beginRefreshAt`. Only ECDSAP256 (kr-crypto has no RSA key generation, and P-384/P-521 or Ed25519 PKCS#10 signing are not needed by the suite).
-- **Pod resize** applies `resources` to the live cgroups in the kubelet's periodic sync and reports them in the status; no `PodResize*` conditions are produced, since nothing is deferred or infeasible in a single-node kr.
+- **Pod resize** applies `resources` to the live cgroups in the kubelet's periodic sync and reports them in the status (the `PodResize*` conditions, `Deferred`/`Infeasible` handling and `resizePolicy` came with ADR-033).
 - **ControllerRevision data** reproduces the Go rendering instead of the template as stored, because upstream clients compare the bytes; the template hash used for naming is unchanged.
 
 **Status:** accepted.
@@ -430,7 +430,7 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 
 **Context:** rootless pods live in an infra user+net namespace that had no route out. The host namespace cannot be reached by veth without privileges, and nftables masquerade needs root.
 **Decision:** the infra namespace gets a TUN device `kr-out` (100.64.255.1/30) as its default route. kr, in the host namespace, receives the descriptor over SCM_RIGHTS and serves it with `kr_net::usernat`, a slirp-style engine (no I/O, unit-tested) that terminates the pod's TCP itself and relays each flow over ordinary host sockets; UDP flows map to host UDP sockets; ICMP echo goes out through an unprivileged ICMP socket (`ping_group_range`). DNS to 100.64.255.2:53 is redirected to the host's first nameserver, which `kr ctr run` writes into resolv.conf. The pod sees the real destination address (transparent), so no rewriting rules exist. Driver: `kr-kubelet/src/egress.rs`.
-- Window scaling is offered when the pod's SYN has it (shift 4, 1 MiB); IP fragments are reassembled and generated. No retransmission timers toward the pod (the TUN is lossless), IPv4 only.
+- Window scaling is offered when the pod's SYN has it (shift 4, 1 MiB); IP fragments are reassembled and generated. No retransmission timers toward the pod (the TUN is lossless); IPv4 only when written, IPv6 followed in ADR-032.
 - Service ClusterIPs and pod-to-pod traffic never reach the TUN (local routes in the infra namespace).
 - `kr ctr run`: the detached infra supervisor runs the same driver on its own executor (`exec::reset_after_fork` drops the inherited reactor state).
 
@@ -448,7 +448,6 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **Rootless.** `usernat` works on 16-byte addresses: IPv6 TCP/UDP, ICMPv6 echo (through an unprivileged ICMPv6 socket) and errors, hop-limit expiry (`traceroute`), with the NAT hop at `fd00:88:ffff:1::2` on a transit `/126` of the TUN. The engine quotes the whole offending packet in errors (busybox `traceroute -6` ignores short quotes).
 - **Host side (follow-up).** The API server also listens on `[::]` (`IPV6_V6ONLY`, best effort). `kube-dns` is dual stack (`fd00:96::a`, the DNS server listens on both). The `kubernetes` Service is dual stack only when the host has a global IPv6 address (`api::host_ip6`: source address towards a public IPv6 destination, no link-local): then it gets `fd00:96::1`, an IPv6 EndpointSlice `kubernetes-v6`, and the node reports a second `InternalIP`. NodePort and hostPort get `[::]` listeners (`IPV6_V6ONLY`, hostPort backed by the pod's IPv6 address); `/etc/hosts` and the `status.podIPs` env var list both addresses. The host-gw backend adds the peer's `/64` via its IPv6 `InternalIP` (routes are added, stale ones are not removed until restart).
 - **IPv6 underlay (hosts without IPv4).** Node and server addresses are 16 bytes everywhere (IPv4 mapped as `::ffff:a.b.c.d`; `tcp::parse_ip16/fmt_ip16/url_host/ip_bytes16`): the primary address is the IPv4 source towards the internet if there is one, else the global IPv6 source (`ns::route_source_any`; `KR_PREFER_IPV6=1` forces IPv6 on a dual-stack host, which is how the tests run). `kr agent --server https://[fd05::1]:6443` joins over IPv6; Raft, write forwarding, the kubelet endpoint (`:10250`) and the API listener also listen on `[::]` (`IPV6_V6ONLY`); node and server certificates carry the right IP SAN (4 or 16 bytes). VXLAN uses `IFLA_VXLAN_LOCAL6` and IPv6 FDB destinations (the VTEP MAC is a hash of the address); host-gw routes pod IPv6 subnets only on an IPv6 underlay. Pods still get both families (the IPv4 pod network is internal), and the `kubernetes` Service keeps its IPv4 ClusterIP: the proxy lets that one Service use endpoints of either family, so an IPv6-only API server is reached through `10.96.0.1`.
-- **Not done:** IPv6-only *pods* (pods always have the IPv4 twin); host-gw on an IPv6 underlay routes only the IPv6 pod subnets; the registry mirror, image pulls and DNS upstreams are whatever the host resolver gives (IPv6 works where the host has it).
 
 **Status:** accepted.
 
@@ -456,7 +455,7 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 
 **Context:** three documented gaps: APF objects were stored but not enforced, watches of aggregated APIs answered 501, and in-place pod resize ignored `resizePolicy` and `PodResizePending`.
 **Decision:**
-- **APF (`kr-apiserver/src/apf.rs`).** Requests arriving over HTTP are classified by the first matching FlowSchema (lowest `matchingPrecedence`, then name; subjects User/Group/ServiceAccount, resource and non-resource rules) into a priority level. A limited level gets `600 * shares / sum(shares)` seats; over that, requests wait in per-flow queues (flow = schema plus user or namespace per `distinguisherMethod`) served round robin, and are refused with 429 and `Retry-After: 1` when the level rejects, the queues are full (`queues * queueLengthLimit`) or the wait exceeds 15 s. `Exempt` never waits. Watches, exec/attach/port-forward/proxy, followed logs, `/kr/` endpoints and requests forwarded by another HA server are not counted; in-process callers (controllers, the local kubelet) do not go through HTTP and are not throttled. The suggested FlowSchemas and levels (exempt, probes, leader-election, node-high, system, workload-high/low, global-default, catch-all) are created when missing; objects are re-read every second. Responses carry `X-Kubernetes-PF-FlowSchema-UID` and `X-Kubernetes-PF-PriorityLevel-UID`. A request takes one seat whatever its size (no work estimation), and there is no borrowing between levels (`lendablePercent` is stored only).
+- **APF (`kr-apiserver/src/apf.rs`).** Requests arriving over HTTP are classified by the first matching FlowSchema (lowest `matchingPrecedence`, then name; subjects User/Group/ServiceAccount, resource and non-resource rules) into a priority level. A limited level gets `600 * shares / sum(shares)` seats; over that, requests wait in per-flow queues (flow = schema plus user or namespace per `distinguisherMethod`) served round robin, and are refused with 429 and `Retry-After: 1` when the level rejects, the queues are full (`queues * queueLengthLimit`) or the wait exceeds 15 s. `Exempt` never waits. Watches, exec/attach/port-forward/proxy, followed logs, `/kr/` endpoints and requests forwarded by another HA server are not counted; in-process callers (controllers, the local kubelet) do not go through HTTP and are not throttled. The suggested FlowSchemas and levels (exempt, probes, leader-election, node-high, system, workload-high/low, global-default, catch-all) are created when missing; objects are re-read every second. Responses carry `X-Kubernetes-PF-FlowSchema-UID` and `X-Kubernetes-PF-PriorityLevel-UID`.
 - **Aggregated watches.** A `watch` request is relayed as a stream: the extension's status and `Content-Type` are returned when its head arrives, then its chunked body is copied chunk by chunk by a task (one hour idle limit) until either side closes.
 - **Resize.** The kubelet checks a changed `resources` against the node first: over the node's capacity is `Infeasible`, not fitting next to the other pods' requests is `Deferred`; both are reported as the `PodResizePending` condition (reason and message) and retried each sync, nothing is applied meanwhile. When it fits, a container whose changed resource has `resizePolicy: RestartContainer` is stopped (SIGTERM) and restarted at once with the new limits regardless of `restartPolicy` and without backoff (the restart count rises, `PodResizeInProgress` is reported until it is running), the others get their cgroup limits updated live.
 **Status:** accepted.
@@ -472,7 +471,6 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **DNS and egress.** Pods' `resolv.conf` points at the `kube-dns` address of the pod's primary family (a Default-policy IPv6-only pod gets IPv6 resolvers only; IPv4 ones are replaced by the cluster DNS, or in rootless mode the NAT's `fd00:88:ffff:1::2` forwarder). The rootless forwarder resolves through the host's first nameserver of any family.
 - **Changing families.** The server stores an explicit setting (`/kr/pod-families`; a server started without the variable uses it, so HA leaders agree) and, when it starts, rewrites every Node's `podCIDRs` to the setting, keeping each node's pod network number, and recreates the `kubernetes` and `kube-dns` Services when the families changed. Agents and kubelets read their CIDRs at start, so they follow when restarted; a running kubelet logs that it must be restarted. Pods from before the change are lost with the restart, as with any kr restart. Peers are only routed in the families both nodes have, so nodes that disagree for a moment do not break each other.
 - **Standalone containers.** `kr ctr run` follows `KR_POD_FAMILIES` too (default dual stack); the rootless bridge is shared, so the first run decides its families.
-- **Not done:** IPv6-only pods on a host without IPv6 (bridge setup fails and pods get no address).
 **Status:** accepted.
 
 
@@ -489,7 +487,7 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **Guard rails.** One kubelet per root: `<root>/kubelet.lock` (`flock`, released with the process) makes a second `kr agent`/`kr server` on the same root exit, so two never adopt the same pods. The kubelet checks the kernel at start (`survive_prerequisites`: `pidfd_open`, `clone3`, `close_range`, i.e. Linux 5.9) and, if something is missing, says so and runs containers as its own children as before. A pod without a record has whatever runs in its cgroup killed before it starts, and a lease the pod already holds is reused (a crash between allocating an address and writing the record leaked one). After the first sync the sweep also removes pod and container directories of pods that are gone. When the pod network has no free address a pod stays in `ContainerCreating` and retries; it used to start without any network.
 - **Record format** (`.adopt`) is versioned and only ever extended (readers ignore unknown trailing fields and lines), see `docs/UPGRADING.md`. Pods started by a binary older than this ADR carry a death signal inside the container that nothing can clear, so the first upgrade onto this version needs a drain; later ones do not.
 **Deployment note:** a service manager must not kill the whole control group on stop (systemd `KillMode=process`, as for k3s), or shims and containers go with the agent.
-**Consequences:** a pod keeps its IP, processes, open connections, terminal log and exit status across `kill -9` of the agent or the server; `attach -i` works again after the restart (a running `kubectl exec`/`attach` session itself still ends with the old process). One shim process per running container (about 1 MB resident each, measured: 200 pods = 250 MB of shims; adopting 200 pods after a `kill -9` takes 9 s). Tested by `tools/test/stress.sh`, `failure.sh` (binary swap with SIGTERM, killed shim, recycled-pid records, crash loop, crash during creation, second agent), `soak.sh` (200 pods, churn with a crash every minute, leak accounting) and `rootless-survive.sh`.
+**Consequences:** a pod keeps its IP, processes, open connections, terminal log and exit status across `kill -9` of the agent or the server; `attach -i` works again after the restart. One shim process per running container (about 1 MB resident each, measured: 200 pods = 250 MB of shims; adopting 200 pods after a `kill -9` takes 9 s). Tested by `tools/test/stress.sh`, `failure.sh` (binary swap with SIGTERM, killed shim, recycled-pid records, crash loop, crash during creation, second agent), `soak.sh` (200 pods, churn with a crash every minute, leak accounting) and `rootless-survive.sh`.
 **Status:** accepted.
 
 ## ADR-037: node lifecycle controller
@@ -503,20 +501,21 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **Node status.** `status.capacity[r]` = devices, `allocatable[r]` = healthy devices, merged into the node status patch. Every resource ever advertised is remembered (also across kubelet restarts, in the allocations file) and reported as `"0"` when gone, since a merge patch cannot delete. The heartbeat loop ticks every second and patches the status at once when a counter changed, otherwise every 30 s.
 - **Allocation.** `spec::build` asks `Plugins::allocate` for each container whose `resources.limits` name a managed resource. Devices come from the healthy ones not held by another (pod uid, container); the same container keeps its devices across restarts (`Allocate` is called again with the same ids). `PreStartContainer` runs when the plugin asked for it. The response is applied: envs (plugin wins over the container env), mounts as bind mounts, `DeviceSpec`s as bind mounts of the host node onto the container path (read-only unless the permissions contain `w`; the mount code creates the target file). Annotations are parsed and dropped. A failure (unregistered resource, not enough healthy free devices, Allocate error, missing CDI spec) is returned as the `build` error, so the container shows `CreateContainerConfigError` with the message and is retried with back-off; it never starts without its devices. A failed fresh reservation is released.
 - **State.** The registry lives in the `Plugins` object owned by the kubelet (the crate forbids `unsafe`, so no global). Devices are freed when the pod is cleaned up. `<dir>/kr-allocations.json` (pod uid, container, resource, device ids; plus the resource names) is rewritten on every change and loaded at start; after the first successful pod sync `sweep_unclaimed` drops allocations of pods that are not on the node anymore (the same moment as ADR-036's sweep). Init container allocations are held until the pod ends.
-- **CDI.** `cdiDevices` in an `AllocateResponse` are resolved against JSON and YAML (`.yaml`/`.yml`, as the NVIDIA toolkit writes) specs in `/etc/cdi` and `/var/run/cdi` (`kind`, `devices[].name`, top-level and per-device `containerEdits`: `env`, `deviceNodes`, `mounts`). `hooks` are not read; a device without a spec fails the container start.
+- **CDI.** `cdiDevices` in an `AllocateResponse` are resolved against JSON and YAML (`.yaml`/`.yml`, as the NVIDIA toolkit writes) specs in `/etc/cdi` and `/var/run/cdi` (`kind`, `devices[].name`, top-level and per-device `containerEdits`: `env`, `deviceNodes`, `mounts`). `hooks` run as OCI hooks (ADR-039); a device without a spec fails the container start.
 - **Scheduling.** No change: the scheduler already fits extended resources from `allocatable` and treats a limit as the request; the API server does not validate extended resources further.
-**Not implemented:** `GetPreferredAllocation` (topology-aware choice; the first free devices are used), topology hints, eviction or pod failure when a device turns unhealthy, device resources in `PodResources`, CDI hooks, `Allocate` for several containers in one call (one call per container and resource), reuse of the plugin connection.
 **Consequences:** about the size of the module in the binary (see the commit); plugins written for upstream kubelet work unchanged if they only use v1beta1 Register/ListAndWatch/Allocate.
 **Status:** accepted.
 
 ## ADR-039: NVIDIA RuntimeClass emulation through CDI; CRD printer columns
 **Context:** The GPU Operator's validator pods (and CUDA workloads) use `runtimeClassName: nvidia` with `NVIDIA_VISIBLE_DEVICES`, which upstream container runtimes turn into GPU access through the NVIDIA container runtime or CDI. kr has no such runtime hook, so `nvidia-smi` was not found in the pod and the plugin's init container never got its toolkit-ready marker. Separately, `kubectl get <custom resource>` showed only Name and Age because the server ignored a CRD's `additionalPrinterColumns`.
 **Decision:**
-- A pod whose `runtimeClassName` is `nvidia`, `nvidia-cdi` or `nvidia-legacy` gets CDI devices `nvidia.com/gpu=<x>` for each token of `NVIDIA_VISIBLE_DEVICES` (`all`, an index, or a `GPU-` UUID; `none`/`void`/unset/anything else gives nothing). Pods without that runtime class never get GPUs this way, so the env var alone is not enough. Resolution reuses the CDI code of ADR-038 (host specs in `/etc/cdi`, `/var/run/cdi`).
-- CDI hooks are not run. Two are emulated: `update-ldcache --folder F` appends `F` to `LD_LIBRARY_PATH`, and `create-symlinks --link T::L` becomes a bind mount of the host file behind `T` (itself a mounted file, resolved relative to `L`'s directory, chains allowed) at `L`. Links to anything else and other hooks (cuda-compat) are skipped.
+- A pod whose `RuntimeClass` object (looked up by the kubelet; a missing class fails the container start) has `handler` `nvidia`, `nvidia-cdi` or `nvidia-legacy` gets CDI devices `nvidia.com/gpu=<x>` for each token of `NVIDIA_VISIBLE_DEVICES` (`all`, an index, or a `GPU-` UUID; `none`/`void`/unset/anything else gives nothing). Pods without that runtime class never get GPUs this way, so the env var alone is not enough. Resolution reuses the CDI code of ADR-038 (host specs in `/etc/cdi`, `/var/run/cdi`).
+- CDI hooks are run as OCI hooks (see the addition below); nothing is emulated.
 - The API server keeps a CRD version's `additionalPrinterColumns` and uses them (JSONPath subset: `.a.b`, `[n]`, `[*]`, `['k']`, `[?(@.f=="v")]`) in Table output for custom resources; priority >0 columns are wide-only. Built-in kinds keep their fixed printers.
-**Consequences:** Host GPU access is granted to any pod that can name the `nvidia` RuntimeClass, as on upstream clusters; restrict `runtimeClassName` with admission policy if that matters. Untested with a real GPU until the validator runs.
+**Consequences:** Host GPU access is granted to any pod that can name the `nvidia` RuntimeClass, as on upstream clusters; restrict `runtimeClassName` with admission policy if that matters. Open GPU items: KNOWN_ISSUES #138-#142 and #160-#164. Hooks and device nodes were verified with the host's NVIDIA CDI specs on an RTX 4090 through `kr ctr run --cdi` (`nvidia-smi -L` works in an Ubuntu container).
 **Status:** accepted.
+
+**Addition (same ADR, OCI hook lifecycle):** CDI `hooks` (`hookName`, `path`, `args`, `env`, `timeout`) are run by `kr_runtime::hooks`, replacing the `LD_LIBRARY_PATH` and symlink-to-bind-mount emulation. Each hook gets the container state JSON on stdin and exactly its own `env`; the container's directory holds `config.json` (`root.path` = the merged rootfs) and `hooks.log`, which collects hook output (not the container log) and is quoted in the start error. Stages: `createRuntime` (and `prestart`) in the runtime namespace after the container's namespaces exist; `createContainer` after the rootfs, `/dev`, `/proc` and all volumes are mounted and before the read-only remount, with the host root as the hook's root and the container's root recursively bind-mounted at `root.path` (what runc's hooks see; `nvidia-cdi-hook update-ldcache` runs the host `ldconfig` against it), detached afterwards; `startContainer` inside the container right before the exec; `poststart` after the start, failures only logged; `poststop` is saved to `poststop.json` in the container directory at start and run (state `stopped`, pid 0, failures only logged, once) by `Store::delete_container` just before the directory is removed, so it also runs after a kubelet restart. `state.pid` is the container's pid in the runtime's pid namespace (sent to the child with the go byte). A failing hook, or one that exceeds `timeout` (default 120 s), fails the container start. Specs that are not owned by root or are group/world-writable are ignored, since hooks run as root. A hook with an unknown stage or a relative path fails the start instead of being skipped. CDI `additionalGids` become supplementary groups of the container (also for `kr ctr run --cdi`); `KR_CDI_DIRS` (colon-separated) replaces `/etc/cdi:/var/run/cdi`. `kr ctr run --cdi <vendor/class=name>` applies CDI devices to a plain container (used to verify with the host's NVIDIA specs: `nvidia-smi -L` works in an Ubuntu container). `NVIDIA_VISIBLE_DEVICES` under the `nvidia*` runtime classes still selects CDI devices in the kubelet, as `nvidia-container-runtime` does in CDI mode.
 
 ## ADR-040: Kubernetes compatibility for Longhorn: lenient webhook patches, nulls in custom objects
 **Context:** Longhorn's mutating webhook (`mutator.longhorn.io`) made `longhorn-manager` crash-loop: kr rejected its patch with `error applying patch: path not found: finalizers`. Kubernetes applies webhook patches with the JSON-patch library's lenient options, which webhooks rely on.
@@ -531,9 +530,7 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 - **Controller (`kr-controllers/src/attachdetach.rs`).** Every 3 s: a non-terminal scheduled pod using a Bound PVC of a CSI PV whose driver needs attach gets `VolumeAttachment` `csi-<sha256(handle+driver+node)>` (label `kr.io/attach-controller`); labelled ones nobody needs are deleted. Unlabelled attachments are never touched.
 - **Mount propagation (`kr-runtime`).** `volumeMounts[].mountPropagation` (`HostToContainer`, `Bidirectional`) is honoured. The volume is cloned with `open_tree(OPEN_TREE_CLONE|AT_RECURSIVE)` while the new mount namespace still shares the host's peer groups, then attached with `move_mount` after `pivot_root`; the clone stays a peer of the host mount (`HostToContainer` is then made `MS_SLAVE|MS_REC`). Plain binds stay private. `Bidirectional` requires `securityContext.privileged: true` (as upstream), a rootful container and no `subPath`. The host mount holding the volume must be shared (systemd's default for `/`).
 - **External provisioners (`kr-controllers/src/pvc.rs`).** A claim whose StorageClass names another provisioner gets `volume.kubernetes.io/storage-provisioner` and the beta annotation (and `volume.kubernetes.io/selected-node` for `WaitForFirstConsumer`, once a pod using the claim is scheduled), which the CSI external-provisioner sidecar acts on; the PV it creates carries a `claimRef` and binds through the existing static path. A PV with another `pv.kubernetes.io/provisioned-by` is only marked `Released` when its claim goes: that provisioner deletes it (kr no longer deletes it, which would leak the backing volume).
-**Not implemented:** block volumes, inline ephemeral CSI volumes, volume stats, expansion on the node, `NodeExpandVolume`, `volumesInUse` accounting, per-driver volume limits in scheduling.
 **Consequences:** Longhorn is installed with `--set csi.kubeletRootDir=/var/lib/kubelet`. Tested only with fake drivers until run with a real one.
 **Status:** accepted.
 **Addition (same ADR):** mutating webhooks run before CRD schema validation. The webhook step dry-runs the write to get the object; that dry run used to validate the schema first, so a webhook that fills a required enum (Longhorn's `Volume` mutator) was never reached (`Unsupported value: ""`). While the dry run feeds mutating webhooks, `ApiServer::defer_schema` skips the schema check; the real write validates the mutated object.
 **Addition (propagation details, same ADR):** the clone is attached with `move_mount(tree, "", target_fd, "", F_EMPTY_PATH|T_EMPTY_PATH)`; passing `/proc/self/fd/N` as a path fails with EINVAL because `move_mount` does not follow a final symlink. A volume that asks for propagation and cannot be cloned or attached now fails the container start (`clone propagating volume`, `volume mount`) instead of silently becoming a private bind. Verified: `HostToContainer` shows `master:` in the container's mountinfo and a mount made on the host after the container started (a loop-mounted ext4) is visible; `Bidirectional` works for Longhorn's CSI plugin.
-

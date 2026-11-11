@@ -20,6 +20,8 @@ pub struct Built {
     pub limits: Limits,
     /// fsGroup + supplementalGroups.
     pub extra_groups: Vec<u32>,
+    /// OCI lifecycle hooks from CDI specs.
+    pub hooks: kr_runtime::hooks::Hooks,
 }
 
 /// Host file backing a container's terminationMessagePath.
@@ -1134,32 +1136,35 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
             }
         }
     }
-    // NVIDIA runtime class: `NVIDIA_VISIBLE_DEVICES` selects CDI devices, as the NVIDIA container
-    // runtime would. Only pods that name the runtime class get host GPUs this way.
+    // RuntimeClass handler `nvidia*`: `NVIDIA_VISIBLE_DEVICES` selects CDI devices, as the NVIDIA
+    // container runtime does in CDI mode. The class is looked up, so it must exist and its
+    // `handler` (not its name) decides; pods without such a class never get host GPUs this way.
     let mut grant: Option<crate::deviceplugin::Grant> = None;
-    if wants.is_empty() && pod.pointer(&["spec", "runtimeClassName"]).and_then(Value::as_str).is_some_and(crate::deviceplugin::is_nvidia_runtime_class) {
-        let names = env.iter().rev().find(|(k, _)| k == "NVIDIA_VISIBLE_DEVICES").map(|(_, v)| crate::deviceplugin::visible_devices_to_cdi(v)).unwrap_or_default();
-        if !names.is_empty() {
-            grant = Some(crate::deviceplugin::cdi_grant(&names)?);
+    if wants.is_empty() {
+        if let Some(rc) = pod.pointer(&["spec", "runtimeClassName"]).and_then(Value::as_str).filter(|n| !n.is_empty()) {
+            if !rc.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.') {
+                return Err(alloc::format!("invalid runtimeClassName {rc:?}"));
+            }
+            let class = c.get(&alloc::format!("/apis/node.k8s.io/v1/runtimeclasses/{rc}")).await.map_err(|_| alloc::format!("RuntimeClass \"{rc}\" not found"))?;
+            if class.get("handler").and_then(Value::as_str).is_some_and(crate::deviceplugin::is_nvidia_handler) {
+                let names = env.iter().rev().find(|(k, _)| k == "NVIDIA_VISIBLE_DEVICES").map(|(_, v)| crate::deviceplugin::visible_devices_to_cdi(v)).unwrap_or_default();
+                if !names.is_empty() {
+                    grant = Some(crate::deviceplugin::cdi_grant(&names)?);
+                }
+            }
         }
     }
     if !wants.is_empty() {
         let (uid, cname) = (meta(pod, "uid"), ctr.get("name").and_then(Value::as_str).unwrap_or(""));
         grant = Some(dp.allocate(uid, cname, &wants).await?);
     }
+    let mut hooks = kr_runtime::hooks::Hooks::default();
     if let Some(g) = grant {
-        if !g.ld_folders.is_empty() {
-            let mut p = env.iter().find(|(k, _)| k == "LD_LIBRARY_PATH").map(|(_, v)| v.clone()).unwrap_or_default();
-            for f in &g.ld_folders {
-                if !p.split(':').any(|x| x == f) {
-                    if !p.is_empty() {
-                        p.push(':');
-                    }
-                    p.push_str(f);
-                }
+        hooks = g.hooks;
+        for gid in g.gids {
+            if !extra_groups.contains(&gid) {
+                extra_groups.push(gid);
             }
-            env.retain(|(k, _)| k != "LD_LIBRARY_PATH");
-            env.push(("LD_LIBRARY_PATH".into(), p));
         }
         for (k, v) in g.envs {
             env.retain(|(x, _)| *x != k);
@@ -1184,6 +1189,7 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         mounts,
         limits,
         extra_groups,
+        hooks,
     })
 }
 

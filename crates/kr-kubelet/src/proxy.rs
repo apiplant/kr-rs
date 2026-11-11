@@ -373,7 +373,14 @@ impl<C: Client + Clone + 'static> Proxy<C> {
                     }
                 }
                 let mk = |eps: &Vec<(Ip, u16)>| Backends { eps: eps.clone(), rr: Cell::new(0), affinity };
-                desired.insert(Key { proto, ip: cip, port: port as u16, host: false }, mk(&list));
+                // No ready endpoint, no listener: the connection is refused all the same, and the
+                // port stays free for a host-network pod that listens on it (Calico's typha binds
+                // 0.0.0.0:5473 for the Service with that ClusterIP and port; a specific-address
+                // listener of ours would make that bind fail). Once such a pod is the endpoint, the
+                // bind below fails with EADDRINUSE and the pod answers the ClusterIP itself.
+                if !list.is_empty() {
+                    desired.insert(Key { proto, ip: cip, port: port as u16, host: false }, mk(&list));
+                }
                 if let (false, Some(np)) = (want6, p.get("nodePort").and_then(Value::as_u64)) {
                     desired.insert(Key { proto, ip: kr_sys::map4([0, 0, 0, 0]), port: np as u16, host: true }, mk(&list));
                 }

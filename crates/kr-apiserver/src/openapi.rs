@@ -164,3 +164,121 @@ pub fn v2(custom: &[Custom]) -> String {
         ("definitions", Value::Object(defs)),
     ]))
 }
+
+/// `/openapi/v2` as the gnostic `openapi_v2.Document` protobuf (what kubectl and helm ask for with
+/// `application/com.github.proto-openapi.spec.v2@v1.0+protobuf`). Field numbers follow
+/// OpenAPIv2.proto; only what the clients' schema validation reads is encoded (types, properties,
+/// items, additionalProperties, refs, required, descriptions, and `x-*` extensions as YAML/JSON).
+pub fn v2_proto(custom: &[Custom]) -> Vec<u8> {
+    use kr_fmt::proto::Writer;
+
+    fn schema(w: &mut Writer, s: &Value) {
+        let Value::Object(fields) = s else { return };
+        for (k, v) in fields {
+            match (k.as_str(), v) {
+                ("$ref", Value::String(r)) => {
+                    w.string(1, r);
+                }
+                ("format", Value::String(x)) => {
+                    w.string(2, x);
+                }
+                ("title", Value::String(x)) => {
+                    w.string(3, x);
+                }
+                ("description", Value::String(x)) => {
+                    w.string(4, x);
+                }
+                ("pattern", Value::String(x)) => {
+                    w.string(13, x);
+                }
+                ("required", Value::Array(a)) => {
+                    for r in a.iter().filter_map(Value::as_str) {
+                        w.string(19, r);
+                    }
+                }
+                ("additionalProperties", Value::Object(_)) => {
+                    w.message(21, |m| {
+                        m.message(1, |x| schema(x, v));
+                    });
+                }
+                ("additionalProperties", Value::Bool(b)) => {
+                    w.message(21, |m| {
+                        m.bool(2, *b);
+                    });
+                }
+                ("type", Value::String(t)) => {
+                    w.message(22, |m| {
+                        m.string(1, t);
+                    });
+                }
+                ("type", Value::Array(a)) => {
+                    w.message(22, |m| {
+                        for t in a.iter().filter_map(Value::as_str) {
+                            m.string(1, t);
+                        }
+                    });
+                }
+                ("items", Value::Object(_)) => {
+                    w.message(23, |m| {
+                        m.message(1, |x| schema(x, v));
+                    });
+                }
+                ("items", Value::Array(a)) => {
+                    w.message(23, |m| {
+                        for i in a {
+                            m.message(1, |x| schema(x, i));
+                        }
+                    });
+                }
+                ("allOf", Value::Array(a)) => {
+                    for i in a {
+                        w.message(24, |x| schema(x, i));
+                    }
+                }
+                ("properties", Value::Object(props)) => {
+                    w.message(25, |m| {
+                        for (n, ps) in props {
+                            m.message(1, |ns| {
+                                ns.string(1, n);
+                                ns.message(2, |x| schema(x, ps));
+                            });
+                        }
+                    });
+                }
+                ("readOnly", Value::Bool(b)) => {
+                    w.bool(27, *b);
+                }
+                (ext, v) if ext.starts_with("x-") => {
+                    w.message(31, |na| {
+                        na.string(1, ext);
+                        // gnostic's Any: field 2 carries the value as YAML; JSON is YAML.
+                        na.message(2, |a| {
+                            a.string(2, &json::to_string(v));
+                        });
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let doc = json::parse(v2(custom).as_bytes()).unwrap_or(Value::Null);
+    let mut w = Writer::new();
+    w.string(1, "2.0");
+    w.message(2, |i| {
+        i.string(1, "Kubernetes");
+        i.string(6, "v1.37.0-kr");
+    });
+    w.message(8, |_| {});
+    w.message(9, |d| {
+        if let Some(Value::Object(defs)) = doc.get("definitions") {
+            for (name, sc) in defs {
+                d.message(1, |ns| {
+                    ns.string(1, name);
+                    ns.message(2, |x| schema(x, sc));
+                });
+            }
+        }
+    });
+    w.into_bytes()
+}

@@ -262,3 +262,13 @@
 - `securityContext.capabilities.add/drop` (incl. `ALL`, with or without `CAP_`) now set the container's capability set (`security::resolve_caps`: default, minus drop, plus add); an unknown name fails the container with `CreateContainerConfigError`.
 - A pod rejected at admission (`HostPortConflict`, forbidden sysctl) or failing sandbox setup no longer reports waiting `containerStatuses`, so `kubectl get pods` shows the reason.
 
+## Calico bring-up fixes (2026-11-12)
+- **CNI plugins blocked the event loop.** `cni_add`/`cni_del` ran the plugin synchronously, and Calico's plugin calls the API server through the Service proxy, i.e. the very loop that was waiting for it: every pod start stalled for the plugin's timeout (5-20 s API latency, handshake timeouts). The chain now runs on pidfd/pipe readiness (`run_command` is async); teardown is a task. `CNI_ARGS` (`K8S_POD_NAMESPACE`/`K8S_POD_NAME`) is passed, `prevResult` is chained to the next plugin (it was dropped), IPv6 results are parsed and DEL tries every plugin.
+- **Probes on host-network pods always failed in a rootful kubelet** (`setns` with an empty namespace set, EINVAL), so typha and calico-node were killed by liveness. Nothing is joined when there is nothing to join.
+- **Service ports without a ready endpoint are not bound**, leaving the port to a host-network pod (typha `:5473`).
+- **A container with a numeric `runAsUser`/`USER` owns its log file** so `nginx` can reopen `/dev/stderr`.
+- **`/openapi/v2` is served as the gnostic protobuf** when asked, which Helm's schema validation needs for charts with custom resources.
+- **CEL:** `type()` and the type identifiers, the IP/CIDR library (`ip`, `cidr`, `isIP`, `isCIDR`, `family`, `masked`, `prefixLength`, `containsIP`, `containsCIDR`, ...) and the strings extension (`substring`, `indexOf`, `lastIndexOf`, `split`, `replace`, `charAt`, `join`, `reverse`).
+- A CRD may pair `type: integer` (or `string`) with `x-kubernetes-int-or-string`.
+- `capabilities: drop: [ALL]` with a `runAsUser` no longer fails at `setresuid` (the user switch keeps `SETUID`/`SETGID`/`SETPCAP` until it is done).
+
