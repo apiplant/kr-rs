@@ -19,7 +19,7 @@
 
 use crate::util::*;
 use crate::Config;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use core::cell::RefCell;
@@ -125,7 +125,8 @@ async fn schedule_one<C: Client>(c: &C, cfg: &Config, snap: &Snap, ns: &str, nam
         return Ok(Some(cfg.retry_ms));
     }
     let pinned = volume_affinity(c, ns, &pod).await?;
-    let picked = pick(&pod, &nodes, &all_pods, &pinned);
+    let full = volume_limit_nodes(c, ns, &pod, &all_pods).await?;
+    let picked = pick(&pod, &nodes, &all_pods, &pinned, &full);
     // Preemption plan (owned: the snapshot is released before any await).
     let plan: Option<(String, Vec<Value>)> = if picked.is_err() { preemption(&pod, &nodes, &all_pods, &pinned).map(|(n, v)| (str_at(n, &["metadata", "name"]).to_string(), v.into_iter().cloned().collect())) } else { None };
     drop(all_pods);
@@ -236,6 +237,77 @@ async fn volume_affinity<C: Client>(c: &C, ns: &str, pod: &Value) -> Result<Vec<
         }
     }
     Ok(out)
+}
+
+/// The unique CSI volumes (`<driver>^<handle>`) behind the pod's PVC volumes; claims that are
+/// not bound yet count nothing (their volume does not exist, upstream's filter skips them too).
+fn pod_csi_volumes(pod: &Value, claims: &BTreeMap<String, (String, String)>) -> BTreeSet<(String, String)> {
+    let ns = namespace(pod);
+    pod.pointer(&["spec", "volumes"])
+        .and_then(Value::as_array)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|v| claims.get(&alloc::format!("{ns}/{}", str_at(v, &["persistentVolumeClaim", "claimName"]))).cloned())
+        .collect()
+}
+
+/// NodeVolumeLimits: the nodes where the pod's new CSI volumes would exceed the driver's
+/// `CSINode.spec.drivers[].allocatable.count` (volumes already used by pods there count once,
+/// however many pods share them). A driver without a count has no limit.
+fn nodes_over_volume_limit(new: &BTreeSet<(String, String)>, limits: &BTreeMap<String, BTreeMap<String, u64>>, claims: &BTreeMap<String, (String, String)>, all_pods: &[Value]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (node, drivers) in limits {
+        let mut used: BTreeSet<(String, String)> = BTreeSet::new();
+        for p in all_pods.iter().filter(|p| str_at(p, &["spec", "nodeName"]) == node && !pod_terminal(p)) {
+            used.extend(pod_csi_volumes(p, claims));
+        }
+        for (driver, limit) in drivers {
+            let on_node = used.iter().filter(|(d, _)| d == driver).count() as u64;
+            let extra = new.iter().filter(|(d, _)| d == driver).filter(|v| !used.contains(*v)).count() as u64;
+            if extra > 0 && on_node + extra > *limit {
+                out.insert(node.clone());
+            }
+        }
+    }
+    out
+}
+
+async fn volume_limit_nodes<C: Client>(c: &C, ns: &str, pod: &Value, all_pods: &[Value]) -> Result<BTreeSet<String>> {
+    let _ = ns;
+    // Cheap exits: a pod with no PVC, or a cluster where no driver publishes a limit.
+    if !pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]).iter().any(|v| !str_at(v, &["persistentVolumeClaim", "claimName"]).is_empty()) {
+        return Ok(BTreeSet::new());
+    }
+    let mut limits: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+    for n in items(&c.list("/apis/storage.k8s.io/v1/csinodes", "").await?) {
+        for d in n.pointer(&["spec", "drivers"]).and_then(Value::as_array).unwrap_or(&[]) {
+            if let Some(count) = d.pointer(&["allocatable", "count"]).and_then(Value::as_u64) {
+                limits.entry(str_at(&n, &["metadata", "name"]).to_string()).or_default().insert(str_at(d, &["name"]).to_string(), count);
+            }
+        }
+    }
+    if limits.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    // PVC -> (driver, handle), through the bound PVs.
+    let mut pvs: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for pv in items(&c.list("/api/v1/persistentvolumes", "").await?) {
+        let (d, h) = (str_at(&pv, &["spec", "csi", "driver"]), str_at(&pv, &["spec", "csi", "volumeHandle"]));
+        if !d.is_empty() && !h.is_empty() {
+            pvs.insert(str_at(&pv, &["metadata", "name"]).to_string(), (d.to_string(), h.to_string()));
+        }
+    }
+    let mut claims: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for pvc in items(&c.list(&pvcs(None), "").await?) {
+        if let Some(v) = pvs.get(str_at(&pvc, &["spec", "volumeName"])) {
+            claims.insert(alloc::format!("{}/{}", namespace(&pvc), name(&pvc)), v.clone());
+        }
+    }
+    let new = pod_csi_volumes(pod, &claims);
+    if new.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    Ok(nodes_over_volume_limit(&new, &limits, &claims, all_pods))
 }
 
 async fn mark_unschedulable<C: Client>(c: &C, cfg: &Config, path: &str, pod: &Value, msg: &str) -> Result<()> {
@@ -546,9 +618,9 @@ fn port_conflict(pod: &Value, other: &Value) -> bool {
 }
 
 /// Chooses a node name, or explains (`0/N nodes are available: ...`) why none fits.
-fn pick(pod: &Value, nodes: &[Value], all_pods: &[Value], pinned: &[Value]) -> core::result::Result<String, String> {
+fn pick(pod: &Value, nodes: &[Value], all_pods: &[Value], pinned: &[Value], full: &BTreeSet<String>) -> core::result::Result<String, String> {
     let want = requests(pod);
-    let (mut volume, mut not_ready, mut taint, mut selector, mut cpu, mut mem, mut count, mut ports) = (0, 0, 0, 0, 0, 0, 0, 0);
+    let (mut volume, mut not_ready, mut taint, mut selector, mut cpu, mut mem, mut count, mut ports, mut vlimit) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
     let mut best: Option<(i128, usize, &str)> = None; // (score, pods on node, name)
     let mut ext: BTreeMap<String, usize> = BTreeMap::new();
     for n in nodes {
@@ -563,6 +635,10 @@ fn pick(pod: &Value, nodes: &[Value], all_pods: &[Value], pinned: &[Value]) -> c
         }
         if !pinned.iter().all(|s| node_affinity_matches(s, n)) {
             volume += 1;
+            continue;
+        }
+        if full.contains(nname) {
+            vlimit += 1;
             continue;
         }
         if untolerated_taint(pod, n) {
@@ -614,6 +690,7 @@ fn pick(pod: &Value, nodes: &[Value], all_pods: &[Value], pinned: &[Value]) -> c
         (not_ready, "node(s) were not ready"),
         (selector, "node(s) didn't match Pod's node selector"),
         (volume, "node(s) had volume node affinity conflict"),
+        (vlimit, "node(s) exceed max volume count"),
         (taint, "node(s) had untolerated taint"),
         (cpu, "Insufficient cpu"),
         (mem, "Insufficient memory"),
@@ -657,9 +734,9 @@ mod tests {
         let pod = v(r#"{"spec":{"containers":[{"resources":{"requests":{"cpu":"1","memory":"1Gi"}}}]}}"#);
         let busy = v(r#"{"spec":{"nodeName":"a","containers":[{"resources":{"requests":{"cpu":"2"}}}]}}"#);
         let nodes = [node("a"), node("b"), node("c")];
-        assert_eq!(pick(&pod, &nodes, &[busy], &[]).unwrap(), "b"); // a is busier; b and c tie, name wins
+        assert_eq!(pick(&pod, &nodes, &[busy], &[], &BTreeSet::new()).unwrap(), "b"); // a is busier; b and c tie, name wins
         let big = v(r#"{"spec":{"containers":[{"resources":{"requests":{"cpu":"5"}}}]}}"#);
-        assert!(pick(&big, &nodes, &[], &[]).unwrap_err().contains("Insufficient cpu"));
+        assert!(pick(&big, &nodes, &[], &[], &BTreeSet::new()).unwrap_err().contains("Insufficient cpu"));
     }
 
     #[test]
@@ -668,9 +745,9 @@ mod tests {
         let pod = v(r#"{"spec":{"containers":[{}]}}"#);
         let nodes = [node("a"), node("b")];
         let pin = |n: &str| v(&alloc::format!(r#"{{"affinity":{{"nodeAffinity":{{"requiredDuringSchedulingIgnoredDuringExecution":{{"nodeSelectorTerms":[{{"matchExpressions":[{{"key":"kubernetes.io/hostname","operator":"In","values":["{n}"]}}]}}]}}}}}}}}"#));
-        assert_eq!(pick(&pod, &nodes, &[], &[pin("b")]).unwrap(), "b");
-        assert!(pick(&pod, &nodes, &[], &[pin("b"), pin("a")]).unwrap_err().contains("volume node affinity conflict"));
-        assert!(pick(&pod, &nodes, &[], &[]).is_ok()); // unbound WaitForFirstConsumer claim: no pin
+        assert_eq!(pick(&pod, &nodes, &[], &[pin("b")], &BTreeSet::new()).unwrap(), "b");
+        assert!(pick(&pod, &nodes, &[], &[pin("b"), pin("a")], &BTreeSet::new()).unwrap_err().contains("volume node affinity conflict"));
+        assert!(pick(&pod, &nodes, &[], &[], &BTreeSet::new()).is_ok()); // unbound WaitForFirstConsumer claim: no pin
     }
 
     #[test]
@@ -681,5 +758,26 @@ mod tests {
         assert!(port_conflict(&pp("10.0.0.1", "TCP"), &pp("10.0.0.1", "TCP")));
         assert!(port_conflict(&pp("", "TCP"), &pp("10.0.0.2", "TCP")));
         assert!(!port_conflict(&v(r#"{"spec":{"containers":[{"ports":[{"containerPort":80}]}]}}"#), &pp("", "TCP")));
+    }
+
+    #[test]
+    fn csi_volume_limits_count_unique_volumes_per_driver() {
+        let claims: BTreeMap<String, (String, String)> = [("d/a", "csi", "v1"), ("d/b", "csi", "v2"), ("d/shared", "csi", "v1"), ("d/other", "nfs", "x")].iter().map(|(k, d, h)| (k.to_string(), (d.to_string(), h.to_string()))).collect();
+        let pod = |name: &str, node: &str, claim: &str| v(&alloc::format!(r#"{{"metadata":{{"namespace":"d","name":"{name}"}},"spec":{{"nodeName":"{node}","volumes":[{{"persistentVolumeClaim":{{"claimName":"{claim}"}}}}]}}}}"#));
+        let limits: BTreeMap<String, BTreeMap<String, u64>> = [("n1".to_string(), [("csi".to_string(), 1u64)].into_iter().collect()), ("n2".to_string(), [("csi".to_string(), 2u64)].into_iter().collect())].into_iter().collect();
+        let on = [pod("p1", "n1", "a"), pod("p2", "n2", "a")];
+        let new: BTreeSet<(String, String)> = pod_csi_volumes(&pod("new", "", "b"), &claims);
+        // n1 holds 1 of 1: the new volume does not fit; n2 holds 1 of 2: it does.
+        assert_eq!(nodes_over_volume_limit(&new, &limits, &claims, &on), ["n1".to_string()].into_iter().collect());
+        // The same volume under another claim is already attached: no new volume.
+        let same: BTreeSet<(String, String)> = pod_csi_volumes(&pod("new", "", "shared"), &claims);
+        assert!(nodes_over_volume_limit(&same, &limits, &claims, &on).is_empty());
+        // Another driver is not limited; terminal pods free their volumes.
+        let nfs: BTreeSet<(String, String)> = pod_csi_volumes(&pod("new", "", "other"), &claims);
+        assert!(nodes_over_volume_limit(&nfs, &limits, &claims, &on).is_empty());
+        let mut done = pod("p1", "n1", "a");
+        done.entry_object("status").set("phase", Value::from("Succeeded"));
+        assert!(nodes_over_volume_limit(&new, &limits, &claims, &[done]).is_empty());
+        assert_eq!(pick(&pod("new", "", "b"), &[v(r#"{"metadata":{"name":"n1"},"status":{"conditions":[{"type":"Ready","status":"True"}],"allocatable":{"cpu":"4","memory":"8Gi","pods":"110"}}}"#)], &[], &[], &["n1".to_string()].into_iter().collect()).unwrap_err(), "0/1 nodes are available: 1 node(s) exceed max volume count.");
     }
 }
