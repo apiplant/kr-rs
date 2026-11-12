@@ -547,3 +547,6 @@
 
 277. **Images and layers were never removed** — *fixed* (part of #130, ADR-057)
     The kubelet checks every 5 minutes; above `KR_IMAGE_GC_HIGH` (85 %) of the store's filesystem it removes images no pod on the node names and no container directory records, least recently used first, never younger than `KR_IMAGE_GC_MIN_AGE` (120 s), until usage is at or below `KR_IMAGE_GC_LOW` (80 %). Removing an image drops its refs, directory, the shared layers and the blobs no remaining image uses. `tests/gc.rs` covers sharing.
+
+278. **NetworkPolicy chains had one rule per peer pod IP and port** — *fixed* (part of #202)
+    `netpol_batch` puts three or more single-address peers with the same ports into a named hash set (`<chain>-s<n>`, elements in messages of 512) and matches it with one `lookup` rule per port; checked in a real kernel (`tools/test/nft-proxy.sh`, scenario `pol-set`) and by `peers_with_the_same_ports_become_a_set`.

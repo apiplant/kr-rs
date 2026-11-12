@@ -102,6 +102,11 @@ check "policy: another client is dropped" "$(clientD 10.88.1.2 9090 1)" "error T
 check "policy: the allowed client on another port is dropped" "$(client 10.88.1.2 9091 1)" "error TimeoutError"
 check "policy through a ClusterIP: the allowed client (source kept by the DNAT)" "$(client 10.96.0.50 8080 1)" "B 10.88.0.2"
 check "policy through a ClusterIP: the other client is dropped (#165)" "$(clientD 10.96.0.50 8080 1)" "error TimeoutError"
+scenario pol-set
+check "policy with a set of peers: a member reaches the pod" "$(client 10.88.1.2 9090 1)" "B 10.88.0.2"
+check "policy with a set of peers: a non-member is dropped" "$(clientD 10.88.1.2 9090 1)" "error TimeoutError"
+check "policy with a set of peers: a member on another port is dropped" "$(client 10.88.1.2 9091 1)" "error TimeoutError"
+check "the peers are in a set" "$(nft list set inet kr-netpol i4_0-s1 2>&1 | grep -c "10.88.9.1")" "1"
 scenario pol-deny-all
 check "policy: default deny drops everyone" "$(client 10.88.1.2 9090 1)" "error TimeoutError"
 scenario pol-egress

@@ -22,6 +22,8 @@ const NFT_MSG_NEWTABLE: u16 = 0; // NFT_MSG_NEWTABLE
 const NFT_MSG_DELTABLE: u16 = 2; // NFT_MSG_DELTABLE
 const NFT_MSG_NEWCHAIN: u16 = 3; // NFT_MSG_NEWCHAIN
 const NFT_MSG_NEWRULE: u16 = 6; // NFT_MSG_NEWRULE
+const NFT_MSG_NEWSET: u16 = 9; // NFT_MSG_NEWSET
+const NFT_MSG_NEWSETELEM: u16 = 12; // NFT_MSG_NEWSETELEM
 
 const NFTA_TABLE_NAME: u16 = 1; // NFTA_TABLE_NAME
 const NFTA_CHAIN_TABLE: u16 = 1; // NFTA_CHAIN_TABLE
@@ -429,6 +431,49 @@ fn offsets(v6: bool) -> (u32, u32) {
     if v6 { (8, 24) } else { (12, 16) }
 }
 
+/// Peers of one rule group are put in a set once there are this many (fewer stay plain rules).
+const SET_MIN: usize = 3;
+const NFT_TYPE_IPADDR: u32 = 7; // nft datatype ipv4_addr
+const NFT_TYPE_IP6ADDR: u32 = 8; // nft datatype ipv6_addr
+
+/// `lookup` of the address at `off` in `set`: the rule continues when it is a member.
+fn set_match(b: &mut NlBuf, off: u32, len: usize, set: &[u8]) {
+    payload(b, NFT_PAYLOAD_NETWORK_HEADER, off, len as u32);
+    expr_begin(b, b"lookup");
+    b.attr_str(1, set); // NFTA_LOOKUP_SET
+    b.attr_u32_be(2, NFT_REG_1); // NFTA_LOOKUP_SREG
+    expr_end(b);
+}
+
+/// Creates `set` (a hash set of addresses of `len` bytes) in table `t` with its elements.
+fn new_addr_set(b: &mut NlBuf, f: u8, t: &[u8], set: &[u8], id: u32, addrs: &[&[u8]]) {
+    let len = addrs[0].len();
+    msg(b, NFT_MSG_NEWSET, NLM_F_ACK | NLM_F_CREATE, f, 0);
+    b.attr_str(1, t); // NFTA_SET_TABLE
+    b.attr_str(2, set); // NFTA_SET_NAME
+    b.attr_u32_be(3, 0); // NFTA_SET_FLAGS
+    b.attr_u32_be(4, if len == 16 { NFT_TYPE_IP6ADDR } else { NFT_TYPE_IPADDR }); // NFTA_SET_KEY_TYPE
+    b.attr_u32_be(5, len as u32); // NFTA_SET_KEY_LEN
+    b.attr_u32_be(10, id); // NFTA_SET_ID
+    b.end();
+    // Elements in messages of a bounded size.
+    for chunk in addrs.chunks(512) {
+        msg(b, NFT_MSG_NEWSETELEM, NLM_F_ACK | NLM_F_CREATE, f, 0);
+        b.attr_str(1, t); // NFTA_SET_ELEM_LIST_TABLE
+        b.attr_str(2, set); // NFTA_SET_ELEM_LIST_SET
+        b.nest_begin(3); // NFTA_SET_ELEM_LIST_ELEMENTS
+        for a in chunk {
+            b.nest_begin(NFTA_LIST_ELEM);
+            b.nest_begin(1); // NFTA_SET_ELEM_KEY
+            b.attr(NFTA_DATA_VALUE, a);
+            b.nest_end();
+            b.nest_end();
+        }
+        b.nest_end();
+        b.end();
+    }
+}
+
 fn netpol_batch(fam: PolFam, chains: &[NpChain]) -> NlBuf {
     let f = if fam == PolFam::Bridge { NFPROTO_BRIDGE } else { 1 /* NFPROTO_INET */ };
     let t = NETPOL_TABLE;
@@ -480,35 +525,74 @@ fn netpol_batch(fam: PolFam, chains: &[NpChain]) -> NlBuf {
             });
         }
     }
+    let mut set_id = 0u32;
     for c in chains {
         let v6 = c.ip.len() == 16;
         let (src, dst) = offsets(v6);
         let peer_off = if c.ingress { src } else { dst };
+        // Single-address peers (pods) that share their ports go into one set per port list; the
+        // rest (ipBlock prefixes, any peer, small groups) stay plain rules.
+        let host = |a: &NpAllow| a.peer.as_ref().is_some_and(|(ad, pre)| *pre as usize == ad.len() * 8);
+        let mut groups: alloc::collections::BTreeMap<&[NpPort], alloc::vec::Vec<&[u8]>> = alloc::collections::BTreeMap::new();
+        for a in c.allows.iter().filter(|a| host(a)) {
+            groups.entry(&a.ports[..]).or_default().push(&a.peer.as_ref().unwrap().0);
+        }
+        let mut sets: alloc::vec::Vec<(&[NpPort], alloc::vec::Vec<u8>)> = alloc::vec::Vec::new();
+        for (ports, mut addrs) in groups {
+            addrs.sort();
+            addrs.dedup();
+            if addrs.len() >= SET_MIN {
+                set_id += 1;
+                let name = alloc::format!("{}-s{set_id}", c.name).into_bytes();
+                new_addr_set(&mut b, f, t, &name, set_id, &addrs);
+                sets.push((ports, name));
+            }
+        }
+        let allow_rule = |b: &mut NlBuf, a: &NpAllow, set: Option<&[u8]>, port: Option<&NpPort>| {
+            rule(b, f, t, c.name.as_bytes(), |b| {
+                if let Some(set) = set {
+                    family_guard(b, fam, v6);
+                    set_match(b, peer_off, c.ip.len(), set);
+                } else if let Some((ad, pre)) = &a.peer {
+                    if *pre > 0 {
+                        addr_match(b, peer_off, ad, *pre);
+                    }
+                }
+                if let Some(p) = port {
+                    meta(b, NFT_META_L4PROTO);
+                    cmp(b, NFT_CMP_EQ, &[p.proto]);
+                    if p.hi != 0 {
+                        payload(b, NFT_PAYLOAD_TRANSPORT_HEADER, 2, 2);
+                        if p.lo == p.hi {
+                            cmp(b, NFT_CMP_EQ, &p.lo.to_be_bytes());
+                        } else {
+                            cmp(b, NFT_CMP_GTE, &p.lo.to_be_bytes());
+                            cmp(b, NFT_CMP_LTE, &p.hi.to_be_bytes());
+                        }
+                    }
+                }
+                verdict(b, NFT_RETURN, None);
+            });
+        };
+        for (ports, name) in &sets {
+            let dummy = NpAllow { peer: None, ports: alloc::vec::Vec::new() };
+            if ports.is_empty() {
+                allow_rule(&mut b, &dummy, Some(name), None);
+            }
+            for p in ports.iter() {
+                allow_rule(&mut b, &dummy, Some(name), Some(p));
+            }
+        }
         for a in &c.allows {
+            if host(a) && sets.iter().any(|(ports, _)| *ports == &a.ports[..]) {
+                continue; // in a set
+            }
             let ports: &[NpPort] = &a.ports;
-            let n = ports.len().max(1);
-            for i in 0..n {
-                rule(&mut b, f, t, c.name.as_bytes(), |b| {
-                    if let Some((ad, pre)) = &a.peer {
-                        if *pre > 0 {
-                            addr_match(b, peer_off, ad, *pre);
-                        }
-                    }
-                    if let Some(p) = ports.get(i) {
-                        meta(b, NFT_META_L4PROTO);
-                        cmp(b, NFT_CMP_EQ, &[p.proto]);
-                        if p.hi != 0 {
-                            payload(b, NFT_PAYLOAD_TRANSPORT_HEADER, 2, 2);
-                            if p.lo == p.hi {
-                                cmp(b, NFT_CMP_EQ, &p.lo.to_be_bytes());
-                            } else {
-                                cmp(b, NFT_CMP_GTE, &p.lo.to_be_bytes());
-                                cmp(b, NFT_CMP_LTE, &p.hi.to_be_bytes());
-                            }
-                        }
-                    }
-                    verdict(b, NFT_RETURN, None);
-                });
+            if ports.is_empty() {
+                allow_rule(&mut b, a, None, None);
+            }
+            for p in ports {
+                allow_rule(&mut b, a, None, Some(p));
             }
         }
         rule(&mut b, f, t, c.name.as_bytes(), |b| verdict(b, NF_DROP, None));
@@ -659,6 +743,30 @@ mod tests {
             assert!(contains(m[11].2, &NFT_RETURN.to_be_bytes()) && !contains(m[11].2, b"payload"));
             assert!(contains(m[12].2, b"immediate"));
         }
+    }
+
+    #[test]
+    fn peers_with_the_same_ports_become_a_set() {
+        let port = || alloc::vec![NpPort { proto: 6, lo: 80, hi: 80 }];
+        let peer = |n: u8| NpAllow { peer: Some((alloc::vec![10, 88, 0, n], 32)), ports: port() };
+        let mut allows: alloc::vec::Vec<NpAllow> = (1..=5).map(peer).collect();
+        allows.push(NpAllow { peer: Some((alloc::vec![10, 99, 0, 0], 16)), ports: port() }); // a prefix stays a rule
+        allows.push(NpAllow { peer: Some((alloc::vec![10, 88, 7, 7], 32)), ports: alloc::vec![] }); // other ports: alone
+        let ch = alloc::vec![NpChain { name: "i4_0".into(), ip: alloc::vec![10, 88, 0, 9], ingress: true, allows }];
+        let b = netpol_batch(PolFam::Inet, &ch);
+        let m = messages(b.bytes());
+        let t = |x: u16| (NFNL_SUBSYS_NFTABLES << 8) | x;
+        let types: alloc::vec::Vec<u16> = m.iter().map(|x| x.0).collect();
+        assert_eq!(types.iter().filter(|x| **x == t(9)).count(), 1, "one set");
+        assert_eq!(types.iter().filter(|x| **x == t(12)).count(), 1, "one element message");
+        // 5 elements; set rule + prefix rule + single-peer rule + drop + (ct, nd, jump) = rules
+        let set_msg = m.iter().find(|x| x.0 == t(12)).unwrap().2;
+        for n in 1..=5u8 {
+            assert!(contains(set_msg, &[10, 88, 0, n]));
+        }
+        assert!(contains(set_msg, b"i4_0-s1\0"));
+        let rules = m.iter().filter(|x| x.0 == t(6) && contains(x.2, b"lookup")).count();
+        assert_eq!(rules, 1);
     }
 
     #[test]

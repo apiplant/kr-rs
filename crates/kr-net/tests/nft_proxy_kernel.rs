@@ -61,6 +61,12 @@ fn apply() {
             let chains = match s {
                 // B accepts only A, on 9090 only.
                 "pol-a-9090" => vec![ingress_b(vec![allow_a(Some(9090))])],
+                // B accepts A and two other pods on 9090: three peers with the same ports become a set.
+                "pol-set" => vec![ingress_b(vec![
+                    allow_a(Some(9090)),
+                    NpAllow { peer: Some((vec![10, 88, 9, 1], 32)), ports: vec![NpPort { proto: 6, lo: 9090, hi: 9090 }] },
+                    NpAllow { peer: Some((vec![10, 88, 9, 2], 32)), ports: vec![NpPort { proto: 6, lo: 9090, hi: 9090 }] },
+                ])],
                 // B accepts nobody.
                 "pol-deny-all" => vec![ingress_b(vec![])],
                 // A may only talk to B (egress); B itself has no ingress policy.
