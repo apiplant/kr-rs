@@ -505,3 +505,6 @@
 
 263. **The event loop ran back-to-back requests of one connection in a single poll** — *mitigated*
     After each response the connection loop now yields when the poll has lasted 5 ms (`yield_if_long`); a controller's burst of PUTs on one connection had all its bytes buffered and could hold the loop for the whole burst (stall reports with the last phase `http: next request`).
+
+264. **NetworkPolicy tables had never been loaded into a kernel** — *verified* (part of #205; #165 with `KR_PROXY=nft`)
+    `tools/test/nft-proxy.sh` now also loads the `inet kr-netpol` batches into a real kernel (`unshare -Urn`, veth pods) and sends traffic: an allowed client reaches the pod, another client and an allowed client on another port are dropped, default deny drops everyone, an egress policy lets a pod reach only its peer; and through a ClusterIP of the nftables Service datapath the denied client is dropped while the allowed one gets through (the DNAT keeps the client address, which is #165). The netlink layout and the verdict/meta constants the batches were written with turned out right on the first run.

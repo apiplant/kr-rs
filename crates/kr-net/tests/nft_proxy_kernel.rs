@@ -2,6 +2,7 @@
 //! nf_tables and `unshare -Urn` (no real root): run `tools/test/nft-proxy.sh`, which builds the
 //! network namespaces and calls `apply` below with a scenario name.
 use kr_net::nft::proxy::*;
+use kr_net::nft::{NpAllow, NpChain, NpPort, PolFam};
 
 fn ip4(a: [u8; 4]) -> [u8; 16] {
     kr_sys::map4(a)
@@ -53,6 +54,23 @@ fn apply() {
             }])
         }
         "empty" => model(vec![]),
+        // NetworkPolicy tables (ADR-049) in the same kernel; the Service of "basic" next to them.
+        s if s.starts_with("pol-") => {
+            let allow_a = |port: Option<u16>| NpAllow { peer: Some((vec![10, 88, 0, 2], 32)), ports: port.map(|p| vec![NpPort { proto: 6, lo: p, hi: p }]).unwrap_or_default() };
+            let ingress_b = |allows: Vec<NpAllow>| NpChain { name: "i4_0".into(), ip: B1.to_vec(), ingress: true, allows };
+            let chains = match s {
+                // B accepts only A, on 9090 only.
+                "pol-a-9090" => vec![ingress_b(vec![allow_a(Some(9090))])],
+                // B accepts nobody.
+                "pol-deny-all" => vec![ingress_b(vec![])],
+                // A may only talk to B (egress); B itself has no ingress policy.
+                "pol-egress" => vec![NpChain { name: "e4_0".into(), ip: vec![10, 88, 0, 2], ingress: false, allows: vec![NpAllow { peer: Some((B1.to_vec(), 32)), ports: vec![] }] }],
+                other => panic!("unknown scenario {other:?}"),
+            };
+            kr_net::nft::ensure_netpol(PolFam::Inet, &chains).unwrap_or_else(|e| panic!("netpol batch refused: errno {}", e.0));
+            // The Service goes with it: policy decides after the DNAT, on the real client.
+            model(vec![Svc { v6: false, frontends: vec![Frontend::Addr { ip: ip4(CIP), proto: 6, port: 8080, policy: Policy::Plain }], backends: vec![be(B1, 9090, false)], affinity: false }])
+        }
         s => panic!("unknown scenario {s:?}"),
     };
     apply_model(&m);

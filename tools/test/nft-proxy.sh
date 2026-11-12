@@ -14,16 +14,17 @@ exec unshare -Urn bash -c '
 set -u
 fail=0
 check() { if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: got [$2], want [$3]"; fail=1; fi; }
-cleanup() { kill $A $B $C $SB $SC 2>/dev/null; }
+cleanup() { kill $A $B $C $D $SB $SC $SB2 2>/dev/null; }
 trap cleanup EXIT
 ip link set lo up
 sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
 unshare -n sleep 600 & A=$!
 unshare -n sleep 600 & B=$!
 unshare -n sleep 600 & C=$!
+unshare -n sleep 600 & D=$!
 sleep 0.3
 n=0
-for p in "$A:0" "$B:1" "$C:2"; do
+for p in "$A:0" "$B:1" "$C:2" "$D:3"; do
   pid=${p%:*}; i=${p#*:}
   ip link add v$i type veth peer name eth0 netns $pid
   ip addr add 10.88.$i.1/24 dev v$i; ip link set v$i up
@@ -62,9 +63,12 @@ nsenter -t $B -n python3 /tmp/srv.py B 9090 &
 SB=$!
 nsenter -t $C -n python3 /tmp/srv.py C 9090 &
 SC=$!
+nsenter -t $B -n python3 /tmp/srv.py B 9091 &
+SB2=$!
 sleep 0.5
 scenario() { KR_NFT_SCENARIO=$1 "$EXE" --ignored --exact apply >/dev/null 2>/tmp/apply.err || { echo "FAIL scenario $1: $(tail -2 /tmp/apply.err)"; fail=1; return 1; }; }
 client() { nsenter -t $A -n python3 /tmp/cli.py "$@"; }
+clientD() { nsenter -t $D -n python3 /tmp/cli.py "$@"; }
 
 scenario basic
 check "ClusterIP reaches the endpoint with the client address kept" "$(client 10.96.0.50 8080 1)" "B 10.88.0.2"
@@ -91,6 +95,19 @@ scenario local-one
 check "externalTrafficPolicy Local with a local endpoint works" "$(python3 /tmp/cli.py 192.0.2.1 30080 1 | cut -d" " -f1)" "B"
 check "...and keeps the client address (no masquerade)" "$(python3 /tmp/cli.py 192.0.2.1 30080 1 | cut -d" " -f2)" "192.0.2.1"
 
+# NetworkPolicy (ADR-049) in a real kernel, and with Services in front (#165).
+scenario pol-a-9090
+check "policy: the allowed client reaches the pod" "$(client 10.88.1.2 9090 1)" "B 10.88.0.2"
+check "policy: another client is dropped" "$(clientD 10.88.1.2 9090 1)" "error TimeoutError"
+check "policy: the allowed client on another port is dropped" "$(client 10.88.1.2 9091 1)" "error TimeoutError"
+check "policy through a ClusterIP: the allowed client (source kept by the DNAT)" "$(client 10.96.0.50 8080 1)" "B 10.88.0.2"
+check "policy through a ClusterIP: the other client is dropped (#165)" "$(clientD 10.96.0.50 8080 1)" "error TimeoutError"
+scenario pol-deny-all
+check "policy: default deny drops everyone" "$(client 10.88.1.2 9090 1)" "error TimeoutError"
+scenario pol-egress
+check "policy: egress to the allowed peer works" "$(client 10.88.1.2 9090 1 | cut -d" " -f1)" "B"
+check "policy: egress to another pod is dropped" "$(client 10.88.2.2 9090 1)" "error TimeoutError"
+nft delete table inet kr-netpol 2>/dev/null
 scenario basic
 conn_before=$(client 10.96.0.50 8080 1 | cut -d" " -f1)
 scenario v6
