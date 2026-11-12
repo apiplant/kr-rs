@@ -549,6 +549,7 @@ impl ApiServer {
         for (name, rules) in crate::rbac::bootstrap_roles() {
             let body = alloc::format!(r#"{{"metadata":{{"name":"{name}","labels":{{"kubernetes.io/bootstrapping":"rbac-defaults"}}}},"rules":{rules}}}"#);
             self.bootstrap_object(crr, None, name, "ClusterRole", &body);
+            self.reconcile_clusterrole(crr, name, rules);
         }
         for (name, role, subjects) in crate::rbac::bootstrap_bindings() {
             let body = alloc::format!(r#"{{"metadata":{{"name":"{name}","labels":{{"kubernetes.io/bootstrapping":"rbac-defaults"}}}},"roleRef":{{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"{role}"}},"subjects":{subjects}}}"#);
@@ -582,6 +583,34 @@ impl ApiServer {
                 self.ensure_root_ca(name);
             }
         }
+    }
+
+    /// Upstream's RBAC auto-reconcile: a default ClusterRole (label `kubernetes.io/bootstrapping:
+    /// rbac-defaults`, annotation `rbac.authorization.kubernetes.io/autoupdate` not `"false"`)
+    /// gains the rules of the current release that it lacks; nothing is removed.
+    fn reconcile_clusterrole(&self, res: &Resource, name: &str, rules: String) {
+        if !self.writable() {
+            return;
+        }
+        let key = res.key(None, name);
+        let Some(kv) = self.store.borrow().get(&key) else { return };
+        let Ok(mut o) = json::parse(&kv.value) else { return };
+        let default_role = o.pointer(&["metadata", "labels", "kubernetes.io/bootstrapping"]).and_then(Value::as_str) == Some("rbac-defaults");
+        let frozen = o.pointer(&["metadata", "annotations", "rbac.authorization.kubernetes.io/autoupdate"]).and_then(Value::as_str) == Some("false");
+        if !default_role || frozen {
+            return;
+        }
+        let Ok(Value::Array(want)) = json::parse(rules.as_bytes()) else { return };
+        let have: Vec<Value> = o.get("rules").and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+        let missing: Vec<Value> = want.into_iter().filter(|w| !have.contains(w)).collect();
+        if missing.is_empty() {
+            return;
+        }
+        let mut all = have;
+        all.extend(missing);
+        o.set("rules", Value::Array(all));
+        o.entry_object("metadata").set("resourceVersion", Value::String((self.store.borrow().revision() + 1).to_string()));
+        let _ = self.store.borrow_mut().update(&key, json::to_string(&o).into_bytes(), Some(kv.mod_rev));
     }
 
     /// Creates an object if missing (bootstrap data; never overwrites user changes).

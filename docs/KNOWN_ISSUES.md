@@ -145,6 +145,9 @@ ADR-047. Default `["secrets"]`; `plural` or `plural.group` (e.g. `configmaps`, `
 213. **Raft and API serving share one thread, so API load can cause leader elections** — *ADR-004, ADR-050, #126, #208*
     Election and heartbeat timers fire on the same executor that serves requests. A long synchronous step (#209–#212) can delay a heartbeat past the election timeout in a three-server cluster and cause a needless leader change. Mitigations to do, in order: measure the longest loop iteration (a watchdog that logs and counts stalls above 50 ms in a metric, valuable before and after any offload), give Raft heartbeats priority in the executor (run the Raft task first in each tick), and make election timeouts configurable (`--raft-election-timeout`), widening the default when stalls are observed. Then #208 removes the causes.
 
+214. **Default RBAC bindings, Roles and other bootstrap objects are not reconciled on upgrade** — *ADR-023*
+    Only default ClusterRoles gain missing rules at start (#215 in RESOLVED). Default ClusterRoleBindings (subjects), the `kube-system` Roles, PriorityClasses, the default StorageClass and APF objects are still created once and never updated, so changes in a newer release do not reach an existing cluster, and a deleted default role does come back but a modified binding does not. Upstream reconciles bindings' subjects and roles' rules the same way (`autoupdate`).
+
 # Accepted limitations (by design, or not planned for now)
 153. **No VolumeSnapshot support** — *missing compared with k3s*
     k3s can run the external snapshotter. kr ships no `VolumeSnapshot*` CRDs or controller and the CSI node side does not exercise snapshots; an external snapshot-controller with its CRDs may work but is untested.
