@@ -47,8 +47,6 @@ Ordered by impact. Size: S days, M a week or two, L more.
     k3s offers `--flannel-backend=wireguard-native` for encrypted pod traffic between nodes; kr has VXLAN and host-gw only (ADR-025). Needs: the netlink WireGuard family in kr-net (Curve25519/ChaCha20-Poly1305 are in kr-crypto), key exchange through node annotations.
 320. **Snapshots to S3-compatible storage** — *new*, M
     Scheduled snapshots exist (`--snapshot-interval`, `--snapshot-keep`); k3s can also upload to S3 (`etcd-snapshot --s3*`) and restore from it, the usual off-host backup in production. Needs: SigV4 signing (HMAC-SHA256 exists), a streaming PUT, list/prune by retention.
-321. **`kubectl get endpoints` has no ENDPOINTS column** — *new*, S
-    Only NAME and AGE are printed: the Table conversion for `Endpoints` is missing.
 322. **Embedded registry mirror** — *new, lower priority*, L
     k3s (1.29+) can share images peer to peer between nodes (`--embedded-registry`, Spegel). Not needed for production; listed so the gap is known.
 

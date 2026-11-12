@@ -637,3 +637,5 @@
 
 320. **Keys were copied by hand between HA servers** — *fixed* (part of #189, #156, #177, #188)
     A sealed key-sync record in the Raft log carries the CA files, `sa.key`/`sa-old.pem`, the tokens and the encryption config; every server applies it (atomic writes, live reload of encryption, SA signer and node-certificate CA) and acknowledges it (ADR-058). `kr pki rotate --ca` works in HA, `--service-account-key` and `secrets-encrypt rotate-key --online` replicate in two steps (read everywhere, then write), and the leader refuses a new write key until all voters can read it. `secrets-encrypt status` shows the cluster. Unit tests in `cluster/keysync.rs` (seal/open, tamper, ordering rule) and `encrypt.rs`.
+321. **`kubectl get endpoints` had no ENDPOINTS column** — *fixed*
+    Table conversion for `Endpoints` (printers.rs) prints upstream's `formatEndpoints`: up to three `ip:port` entries (IPv6 bracketed), then ` + N more...`, `<none>` without subsets.

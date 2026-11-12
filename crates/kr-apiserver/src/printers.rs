@@ -77,6 +77,44 @@ fn svc_ports(v: &Value) -> String {
     if out.is_empty() { "<none>".into() } else { out.join(",") }
 }
 
+/// `kubectl get endpoints` ENDPOINTS column (upstream `formatEndpoints`): at most three
+/// `ip:port` entries, then ` + N more...`.
+fn endpoints_list(v: &Value) -> String {
+    let subsets = v.get("subsets").and_then(Value::as_array).unwrap_or(&[]);
+    if subsets.is_empty() {
+        return "<none>".into();
+    }
+    let max = 3;
+    let (mut list, mut count): (alloc::vec::Vec<String>, usize) = (alloc::vec::Vec::new(), 0);
+    for ss in subsets {
+        let addrs = ss.get("addresses").and_then(Value::as_array).unwrap_or(&[]);
+        let ports = ss.get("ports").and_then(Value::as_array).unwrap_or(&[]);
+        let hp = |ip: String, port: Option<&Value>| match port {
+            None => ip,
+            Some(p) if ip.contains(':') => alloc::format!("[{ip}]:{}", s(p, &["port"])),
+            Some(p) => alloc::format!("{ip}:{}", s(p, &["port"])),
+        };
+        if ports.is_empty() {
+            for a in addrs {
+                count += 1;
+                if list.len() < max { list.push(hp(s(a, &["ip"]), None)); }
+            }
+        } else {
+            for p in ports {
+                for a in addrs {
+                    count += 1;
+                    if list.len() < max { list.push(hp(s(a, &["ip"]), Some(p))); }
+                }
+            }
+        }
+    }
+    let mut out = list.join(",");
+    if count > max {
+        out.push_str(&alloc::format!(" + {} more...", count - max));
+    }
+    out
+}
+
 fn or_none(x: String) -> String {
     if x.is_empty() { "<none>".into() } else { x }
 }
@@ -181,6 +219,7 @@ pub fn columns(kind: &str) -> &'static [Col] {
         "ReplicaSet" => &[("Desired", |v| n(v, &["spec", "replicas"]).to_string()), ("Current", |v| n(v, &["status", "replicas"]).to_string()), ("Ready", |v| n(v, &["status", "readyReplicas"]).to_string())],
         "StatefulSet" => &[("Ready", ready_of)],
         "Service" => &[("Type", |v| { let t = s(v, &["spec", "type"]); if t.is_empty() { "ClusterIP".into() } else { t } }), ("Cluster-IP", |v| or_none(s(v, &["spec", "clusterIP"]))), ("Ports", svc_ports)],
+        "Endpoints" => &[("Endpoints", endpoints_list)],
         "Namespace" => &[("Status", |v| { let p = s(v, &["status", "phase"]); if p.is_empty() { "Active".into() } else { p } })],
         "ConfigMap" | "Secret" => &[("Data", data_count)],
         "Node" => &[("Status", node_status), ("Roles", node_roles)],
@@ -313,6 +352,15 @@ pub fn human_duration(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn endpoints_column() {
+        let p = |x: &str| kr_fmt::json::parse(x.as_bytes()).unwrap();
+        assert_eq!(endpoints_list(&p("{}")), "<none>");
+        let v = p(r#"{"subsets":[{"addresses":[{"ip":"10.0.0.1"},{"ip":"10.0.0.2"}],"ports":[{"port":80},{"port":443}]}]}"#);
+        assert_eq!(endpoints_list(&v), "10.0.0.1:80,10.0.0.2:80,10.0.0.1:443 + 1 more...");
+        assert_eq!(endpoints_list(&p(r#"{"subsets":[{"addresses":[{"ip":"fd00::1"}],"ports":[{"port":80}]}]}"#)), "[fd00::1]:80");
+        assert_eq!(endpoints_list(&p(r#"{"subsets":[{"addresses":[{"ip":"1.1.1.1"}]}]}"#)), "1.1.1.1");
+    }
     #[test]
     fn durations_and_time() {
         assert_eq!(human_duration(5), "5s");
