@@ -57,13 +57,26 @@ pub enum PublicKey {
     Rsa(rsa::PublicKey),
 }
 
+/// Finds the precomputed table of a trusted P-256 key (65-byte uncompressed point), if its owner
+/// built one (trust anchors that verify many certificates; see [`p256::key_table`]).
+pub type KeyTables = fn(&[u8; 65]) -> Option<&'static p256::KeyTable>;
+
 impl PublicKey {
     /// Verifies `sig` over `msg` using the algorithm matching this key type.
     /// ECDSA signatures are DER-encoded; Ed25519 signatures are raw 64 bytes.
     pub fn verify(&self, alg: SigAlg, msg: &[u8], sig: &[u8]) -> bool {
+        self.verify_with(alg, msg, sig, None)
+    }
+
+    /// [`PublicKey::verify`], using the key's precomputed table when `tables` has one.
+    pub fn verify_with(&self, alg: SigAlg, msg: &[u8], sig: &[u8], tables: Option<KeyTables>) -> bool {
         match (self, alg) {
             (PublicKey::P256(pk), SigAlg::Ecdsa(h)) => {
-                ecc::sig_from_der(sig).is_some_and(|(r, s)| ecc::P256.verify_digest(pk, &h.digest(&[msg]), r, s))
+                let digest = h.digest(&[msg]);
+                match tables.and_then(|f| f(pk)) {
+                    Some(t) => ecc::sig_from_der(sig).is_some_and(|(r, s)| p256::verify_digest_table(pk, t, &digest, r, s)),
+                    None => ecc::sig_from_der(sig).is_some_and(|(r, s)| ecc::P256.verify_digest(pk, &digest, r, s)),
+                }
             }
             (PublicKey::P384(pk), SigAlg::Ecdsa(h)) => {
                 ecc::sig_from_der(sig).is_some_and(|(r, s)| ecc::P384.verify_digest(pk, &h.digest(&[msg]), r, s))
@@ -428,6 +441,11 @@ impl<'a> Certificate<'a> {
         issuer.verify(self.sig_alg, self.tbs, self.signature)
     }
 
+    /// [`Certificate::signed_by`] with optional precomputed key tables.
+    pub fn signed_by_with(&self, issuer: &PublicKey, tables: Option<KeyTables>) -> bool {
+        issuer.verify_with(self.sig_alg, self.tbs, self.signature, tables)
+    }
+
     /// RFC 6125-style host match against DNS SANs (one leftmost `*` label) or IP SANs.
     pub fn matches_host(&self, host: &[u8]) -> bool {
         if let Some(ip) = parse_ip(host) {
@@ -593,6 +611,11 @@ pub enum VerifyError {
 /// Verifies `chain[0]` (leaf) up to one of `roots` (DER), using `chain[1..]` as intermediates.
 /// Roots are trust anchors: their own signature and validity are checked only for expiry.
 pub fn verify_chain(chain: &[&[u8]], roots: &[&[u8]], now: i64, usage: Usage) -> core::result::Result<(), VerifyError> {
+    verify_chain_with(chain, roots, now, usage, None)
+}
+
+/// [`verify_chain`] using precomputed tables for the issuer keys that have one.
+pub fn verify_chain_with(chain: &[&[u8]], roots: &[&[u8]], now: i64, usage: Usage, tables: Option<KeyTables>) -> core::result::Result<(), VerifyError> {
     const MAX_DEPTH: usize = 5;
     let leaf_der = chain.first().ok_or(VerifyError::Parse)?;
     let leaf = Certificate::parse(leaf_der).map_err(|_| VerifyError::Parse)?;
@@ -627,7 +650,7 @@ pub fn verify_chain(chain: &[&[u8]], roots: &[&[u8]], now: i64, usage: Usage) ->
     for depth in 0..MAX_DEPTH {
         // Is `cur` signed by a trust anchor?
         for a in &anchors {
-            if a.subject == cur.issuer && a.public_key.as_ref().is_some_and(|k| cur.signed_by(k)) {
+            if a.subject == cur.issuer && a.public_key.as_ref().is_some_and(|k| cur.signed_by_with(k, tables)) {
                 if !in_time(a) {
                     return Err(VerifyError::Expired);
                 }
@@ -638,7 +661,7 @@ pub fn verify_chain(chain: &[&[u8]], roots: &[&[u8]], now: i64, usage: Usage) ->
         // Otherwise step to an intermediate.
         let next = pool
             .iter()
-            .find(|c| c.subject == cur.issuer && c.public_key.as_ref().is_some_and(|k| cur.signed_by(k)))
+            .find(|c| c.subject == cur.issuer && c.public_key.as_ref().is_some_and(|k| cur.signed_by_with(k, tables)))
             .ok_or(VerifyError::UnknownIssuer)?;
         if !in_time(next) {
             return Err(VerifyError::Expired);

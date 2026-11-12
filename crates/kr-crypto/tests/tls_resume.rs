@@ -268,3 +268,38 @@ fn handshake_cost_full_vs_resumed() {
     }
     println!("mutual-TLS handshake, both sides, per connection: full {:?}, resumed {:?}", full / n, resumed / n);
 }
+
+thread_local! {
+    static CA_TABLE: std::cell::RefCell<Option<(Vec<u8>, &'static kr_crypto::p256::KeyTable)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn ca_tables(pk: &[u8; 65]) -> Option<&'static kr_crypto::p256::KeyTable> {
+    CA_TABLE.with(|t| t.borrow().as_ref().filter(|(k, _)| k[..] == pk[..]).map(|(_, t)| *t))
+}
+
+/// Chain verification with a precomputed table for the CA key (#219): accepts what the plain path
+/// accepts and rejects a certificate signed by another CA.
+#[test]
+fn certificates_verify_with_a_ca_key_table() {
+    let p = pki(false);
+    let ca_cert = x509::Certificate::parse(&p.ca).unwrap();
+    let Some(x509::PublicKey::P256(pk)) = ca_cert.public_key else { panic!("P-256 CA") };
+    let table: &'static _ = Box::leak(Box::new(kr_crypto::p256::key_table(&pk).unwrap()));
+    CA_TABLE.with(|t| *t.borrow_mut() = Some((pk.to_vec(), table)));
+
+    let scfg = server(&p, ClientAuth::Required(vec![p.ca.clone()]), false, vec![]);
+    let ccfg = client(&p, true, vec![]);
+    let mut s = Connection::server(scfg.clone(), rng, NOW).with_key_tables(ca_tables);
+    let mut c = Connection::client(ccfg.clone(), b"api.kr.local", rng, NOW).with_key_tables(ca_tables);
+    pump(&mut c, &mut s, usize::MAX).unwrap();
+    assert!(!c.is_handshaking() && !s.is_handshaking());
+
+    // A client certificate issued by an unrelated CA with the same name is refused, tables or not.
+    let evil_key = SigningKey::P256(p256::SecretKey::from_bytes(&[9; 32]).unwrap());
+    let evil = x509::issue(&params(&p.ca_name, evil_key.public(), true, false, false, vec![]), &p.ca_name, &evil_key);
+    let evil_pki = Pki { ca: evil, ca_name: p.ca_name.clone(), ca_key: evil_key };
+    let bad_client = client(&evil_pki, true, vec![]);
+    let mut s = Connection::server(scfg, rng, NOW).with_key_tables(ca_tables);
+    let mut c = Connection::client(bad_client, b"api.kr.local", rng, NOW).with_key_tables(ca_tables);
+    assert!(pump(&mut c, &mut s, usize::MAX).is_err());
+}

@@ -61,6 +61,38 @@ static RESUMPTION: AtomicBool = AtomicBool::new(true);
 const TICKET_HOOKS: TicketHooks = TicketHooks { seal: |p, now| TICKET_KEYS.with(|k| k.seal(p, now, rng)), open: |t| TICKET_KEYS.with(|k| k.open(t)) };
 const SESSION_HOOKS: SessionHooks = SessionHooks { put: |k, s| SESSIONS.with(|c| c.put(k, s)), take: |k, now| SESSIONS.with(|c| c.take(k, now)) };
 
+/// Comb tables of the trust anchors' P-256 keys (ADR-051 follow-up, #219): the cluster CA key
+/// verifies every client and server certificate, so its table (~98 KB, ~1 ms to build) is kept
+/// for the life of the process. Only configured trust anchors are registered, never keys that a
+/// peer presents. `(DER digest, key, table)`.
+static KEY_TABLES: Spin<Vec<([u8; 32], [u8; 65], &'static kr_crypto::p256::KeyTable)>> = Spin::new(Vec::new());
+const MAX_KEY_TABLES: usize = 8;
+
+fn lookup_key_table(pk: &[u8; 65]) -> Option<&'static kr_crypto::p256::KeyTable> {
+    KEY_TABLES.with(|t| t.iter().find(|e| &e.1 == pk).map(|e| e.2))
+}
+
+/// Builds the tables of any trust anchor in `roots` that has none yet.
+fn register_roots(roots: &[Vec<u8>]) {
+    for der in roots {
+        let digest = kr_crypto::sha2::sha256(der);
+        if KEY_TABLES.with(|t| t.iter().any(|e| e.0 == digest) || t.len() >= MAX_KEY_TABLES) {
+            continue;
+        }
+        // A trust anchor that is not a P-256 certificate has no table and is parsed again next
+        // time (rare and cheap).
+        let Ok(cert) = kr_crypto::x509::Certificate::parse(der) else { continue };
+        let Some(kr_crypto::x509::PublicKey::P256(pk)) = cert.public_key else { continue };
+        let Some(table) = kr_crypto::p256::key_table(&pk) else { continue };
+        let table: &'static kr_crypto::p256::KeyTable = alloc::boxed::Box::leak(alloc::boxed::Box::new(table));
+        KEY_TABLES.with(|t| {
+            if !t.iter().any(|e| e.0 == digest) {
+                t.push((digest, pk, table));
+            }
+        });
+    }
+}
+
 /// Turns TLS 1.3 session resumption (ADR-051) on or off for connections made afterwards; on by default.
 pub fn set_resumption(enabled: bool) {
     RESUMPTION.store(enabled, Ordering::Relaxed);
@@ -78,12 +110,13 @@ pub struct TlsStream<T: Transport> {
 impl<T: Transport> TlsStream<T> {
     /// Client handshake to `server_name` (also checked against the certificate).
     pub async fn connect(inner: T, cfg: Rc<ClientConfig>, server_name: &str) -> Result<Self> {
+        register_roots(&cfg.roots);
         let conn = if RESUMPTION.load(Ordering::Relaxed) {
             Connection::client_with_sessions(cfg, server_name.as_bytes(), SESSION_HOOKS, rng, unix_now())
         } else {
             Connection::client(cfg, server_name.as_bytes(), rng, unix_now())
         };
-        Self::handshake(inner, conn).await
+        Self::handshake(inner, conn.with_key_tables(lookup_key_table)).await
     }
 
     /// Client handshake that accepts any server certificate (`Connection::client_insecure`).
@@ -94,12 +127,15 @@ impl<T: Transport> TlsStream<T> {
 
     /// Server handshake on an accepted connection.
     pub async fn accept(inner: T, cfg: Rc<ServerConfig>) -> Result<Self> {
+        if let kr_crypto::tls::ClientAuth::Optional(r) | kr_crypto::tls::ClientAuth::Required(r) = &cfg.client_auth {
+            register_roots(r);
+        }
         let conn = if RESUMPTION.load(Ordering::Relaxed) {
             Connection::server_with_tickets(cfg, TICKET_HOOKS, rng, unix_now())
         } else {
             Connection::server(cfg, rng, unix_now())
         };
-        Self::handshake(inner, conn).await
+        Self::handshake(inner, conn.with_key_tables(lookup_key_table)).await
     }
 
     async fn handshake(inner: T, conn: Connection) -> Result<Self> {

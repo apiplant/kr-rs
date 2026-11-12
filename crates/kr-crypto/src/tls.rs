@@ -662,6 +662,8 @@ pub struct Connection {
     chain_limit: i64,
     /// Server: the client advertised psk_dhe_ke, so it accepts tickets.
     client_takes_tickets: bool,
+    /// Precomputed tables of trusted keys for certificate verification (ADR-051 follow-up, #219).
+    key_tables: Option<x509::KeyTables>,
 }
 
 impl Connection {
@@ -709,6 +711,7 @@ impl Connection {
             res_master: [0; 32],
             chain_limit: 0,
             client_takes_tickets: false,
+            key_tables: None,
         }
     }
 
@@ -739,6 +742,12 @@ impl Connection {
         c.session_key = key;
         c.send_client_hello(false);
         c
+    }
+
+    /// Verify certificate chains with these precomputed key tables where they apply (trust anchors).
+    pub fn with_key_tables(mut self, tables: x509::KeyTables) -> Connection {
+        self.key_tables = Some(tables);
+        self
     }
 
     /// Whether this handshake resumed a session (no certificate exchange took place).
@@ -1367,7 +1376,7 @@ impl Connection {
                     ClientAuth::None => return fail(Alert::UnexpectedMessage),
                 };
                 let roots: Vec<&[u8]> = roots.iter().map(|c| &c[..]).collect();
-                x509::verify_chain(&refs, &roots, self.now, Usage::Client)
+                x509::verify_chain_with(&refs, &roots, self.now, Usage::Client, self.key_tables)
             }
             Role::Client { .. } if self.insecure => Ok(()),
             Role::Client { cfg, server_name, .. } => {
@@ -1377,7 +1386,7 @@ impl Connection {
                         roots.push(ca);
                     }
                 }
-                x509::verify_chain(&refs, &roots, self.now, Usage::Server(server_name))
+                x509::verify_chain_with(&refs, &roots, self.now, Usage::Server(server_name), self.key_tables)
             }
         };
         if let Err(e) = result {
