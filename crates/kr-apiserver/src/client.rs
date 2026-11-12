@@ -99,6 +99,9 @@ impl InProcess {
     }
 
     async fn call(&self, method: &str, path: &str, query: &str, ct: Option<&str>, body: &[u8]) -> Result<Value> {
+        // This call never suspends by itself: a controller loop of many calls would otherwise run
+        // as one poll of the event loop (stall watchdog, #213/#217).
+        kr_rt::exec::yield_if_long(5).await;
         // Allow "path?query" for convenience (e.g. delete with gracePeriodSeconds).
         let (path, query) = match path.split_once('?') {
             Some((p, q)) if query.is_empty() => (p, q),

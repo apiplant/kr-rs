@@ -911,6 +911,7 @@ impl ApiServer {
     }
 
     pub fn handle(&self, req: &Req) -> Reply {
+        kr_rt::exec::detail(req.method, req.path);
         let (reply, warnings) = self.handle_w(req);
         match reply {
             Reply::Json(code, body) if !warnings.is_empty() => {

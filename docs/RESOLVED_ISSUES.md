@@ -395,3 +395,6 @@
 
 217. **Kubelet pod sync was one uninterrupted poll of the event loop** — *fixed, to be confirmed by the stall log*
     With the in-process client every await in `sync_all` completes immediately, so syncing all pods (status computation, merge patches through the API, persist) ran as a single poll of 100–170 ms (stall log: last phase `sync_all: report_status`). `sync_all` now yields to the executor every 5 ms (`yield_now`), and `report_status`, the storage gc and the gone-pods step carry phase labels. Other loops that call the in-process client for many objects (controllers, ServiceLB, CSR, APF seeding) may have the same shape: check them if the stall log names them.
+
+218. **In-process API calls never yielded, so controller loops ran as one long poll** — *fixed*
+    `InProcess::call` (`client.rs`) now calls `exec::yield_if_long(5)`: when the current task poll has run for 5 ms it yields to the executor first. This covers every loop in the controllers, ServiceLB, CSR, APF seeding and the kubelet at once. Stall reports also print the request being served (`exec::detail`, set in `ApiServer::handle`) next to the phase label.
