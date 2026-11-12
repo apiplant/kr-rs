@@ -689,6 +689,21 @@ pub fn fstatfs_flags(fd: i32) -> Result<u64> {
     Ok(buf[10])
 }
 
+/// `statfs(2)` of a path: (block size, blocks, free blocks, blocks available to unprivileged
+/// users, inodes, free inodes).
+pub fn statfs(path: &[u8]) -> Result<[u64; 6]> {
+    #[cfg(target_arch = "x86_64")]
+    const STATFS: usize = 137;
+    #[cfg(target_arch = "aarch64")]
+    const STATFS: usize = 43;
+    let mut p = path.to_vec();
+    p.push(0);
+    let mut buf = [0u64; 15];
+    // SAFETY: `p` is NUL-terminated; buf is a writable, aligned 120-byte struct statfs.
+    check(unsafe { syscall2(STATFS, p.as_ptr() as usize, buf.as_mut_ptr() as usize) })?;
+    Ok([buf[1], buf[2], buf[3], buf[4], buf[5], buf[6]])
+}
+
 /// Sets O_NONBLOCK on one descriptor (fcntl F_GETFL/F_SETFL), leaving any peer end alone.
 pub fn set_nonblocking(fd: i32) -> Result<()> {
     #[cfg(target_arch = "x86_64")]

@@ -445,6 +445,8 @@ pub struct Credential {
     pub password: String,
     /// Docker `identitytoken`: an OAuth2 refresh token exchanged at the token endpoint.
     pub identity_token: Option<String>,
+    /// A static bearer token (`registries.yaml` `token`): sent as `Authorization: Bearer` as is.
+    pub token: Option<String>,
 }
 
 impl core::fmt::Debug for Credential {
@@ -456,6 +458,62 @@ impl core::fmt::Debug for Credential {
 impl Credential {
     fn basic_header(&self) -> String {
         format!("Basic {}", kr_fmt::base64::encode(format!("{}:{}", self.username, self.password).as_bytes()))
+    }
+}
+
+/// TLS connector for registries: trust anchors from PEM, an optional client certificate
+/// (`cert_pem` + `key_pem`, PKCS#8 or SEC1 P-256/Ed25519) and an optional "skip verification"
+/// mode. Built on `kr_crypto`'s client API, `kr-crypto` itself is untouched (ADR-044).
+pub struct RegConnector {
+    resolver: crate::dns::SystemResolver,
+    cfg: alloc::rc::Rc<kr_crypto::tls::ClientConfig>,
+    insecure: bool,
+}
+
+impl RegConnector {
+    pub fn new(roots_pem: &str, client: Option<(&str, &str)>, insecure: bool) -> Result<Self> {
+        use kr_crypto::x509;
+        let roots = x509::pem_decode_all(roots_pem, "CERTIFICATE").map_err(|_| Error::BadRef("bad CA bundle"))?;
+        let client_cert = match client {
+            None => None,
+            Some((cert, key)) => {
+                let chain = x509::pem_decode_all(cert, "CERTIFICATE").map_err(|_| Error::BadRef("bad client certificate"))?;
+                if chain.is_empty() {
+                    return Err(Error::BadRef("client certificate without a CERTIFICATE block"));
+                }
+                let k = if let Some(d) = x509::pem_decode_all(key, "PRIVATE KEY").ok().and_then(|v| v.into_iter().next()) {
+                    x509::private_key_from_pkcs8(&d)
+                } else if let Some(d) = x509::pem_decode_all(key, "EC PRIVATE KEY").ok().and_then(|v| v.into_iter().next()) {
+                    x509::private_key_from_sec1(&d)
+                } else {
+                    return Err(Error::BadRef("unsupported client key (need PKCS#8 or SEC1 EC)"));
+                };
+                Some((chain, k.map_err(|_| Error::BadRef("bad client key"))?))
+            }
+        };
+        let cfg = kr_crypto::tls::ClientConfig { pinned_ca: None, roots, client_cert, alpn: alloc::vec![b"http/1.1".to_vec()], tls12: true };
+        Ok(RegConnector { resolver: crate::dns::SystemResolver::system(), cfg: alloc::rc::Rc::new(cfg), insecure })
+    }
+}
+
+impl Connector for RegConnector {
+    type Conn = crate::tls::MaybeTls;
+    async fn connect(&self, url: &Url, timeout_ms: u64) -> Result<Self::Conn> {
+        use crate::tls::{MaybeTls, TlsStream};
+        let sock = crate::tcp::connect(&self.resolver, &url.host, url.port, timeout_ms).await?;
+        if url.scheme != crate::http1::Scheme::Https {
+            return Ok(MaybeTls::Plain(sock));
+        }
+        let cfg = self.cfg.clone();
+        let r = if self.insecure {
+            kr_rt::exec::timeout(timeout_ms, TlsStream::connect_insecure(sock, cfg, &url.host)).await
+        } else {
+            kr_rt::exec::timeout(timeout_ms, TlsStream::connect(sock, cfg, &url.host)).await
+        };
+        match r {
+            Ok(r) => r.map(MaybeTls::Tls),
+            Err(_) => Err(Error::Timeout),
+        }
     }
 }
 
@@ -609,7 +667,10 @@ impl<C: Connector> Registry<C> {
             if let Some(a) = accept {
                 hdrs.push(("Accept", a));
             }
+            let static_bearer = self.cred.as_ref().and_then(|c| c.token.as_ref()).filter(|t| crate::http1::head::valid_field_value(t.as_bytes())).map(|t| format!("Bearer {t}"));
             if let Some(b) = &bearer {
+                hdrs.push(("Authorization", b));
+            } else if let Some(b) = &static_bearer {
                 hdrs.push(("Authorization", b));
             } else if let Some(b) = &self.basic {
                 hdrs.push(("Authorization", b));
@@ -822,7 +883,7 @@ mod tests {
         assert_eq!(parse_challenge("Basic realm=\"x\"").unwrap().scheme, "Basic");
         let b = parse_challenge(r#"Basic realm="Registry, \"main\"", charset="UTF-8""#).unwrap();
         assert_eq!((b.param("realm"), b.param("charset")), (Some(r#"Registry, "main""#), Some("UTF-8")));
-        let c = Credential { username: "u".into(), password: "p".into(), identity_token: Some("t".into()) };
+        let c = Credential { username: "u".into(), password: "p".into(), identity_token: Some("t".into()), token: None };
         assert_eq!(c.basic_header(), "Basic dTpw");
         assert_eq!(format!("{c:?}"), "Credential(<redacted>)");
         assert_eq!(parse_challenge("Bearer").unwrap().params.len(), 0);

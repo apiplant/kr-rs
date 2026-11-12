@@ -3,15 +3,22 @@
 //! named [`va_name`] exists; the external-attacher sidecar fulfils it. Attachments this
 //! controller created (label [`LABEL`]) that are no longer wanted are deleted (the attacher
 //! detaches and drops its finalizer). Level-triggered, every 3 s.
+//!
+//! An unwanted attachment is kept while its node still lists the volume in
+//! `status.volumesInUse` (the kubelet has it mounted); only after [`MAX_WAIT_MS`] of waiting
+//! (upstream's 6 minute max-wait-for-unmount) is it deleted anyway.
 
 use crate::util::*;
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
+use core::cell::RefCell;
 use alloc::string::{String, ToString};
 use kr_apiserver::client::{Client, Result};
 use kr_fmt::json::Value;
 
 pub const LABEL: &str = "kr.io/attach-controller";
 const VAS: &str = "/apis/storage.k8s.io/v1/volumeattachments";
+/// How long a volume the node still reports in use blocks the detach.
+pub const MAX_WAIT_MS: u64 = 6 * 60 * 1000;
 const DRIVERS: &str = "/apis/storage.k8s.io/v1/csidrivers";
 
 /// Name of the VolumeAttachment for a volume on a node (as upstream: `csi-` + sha256 hex).
@@ -26,17 +33,32 @@ pub fn va_name(handle: &str, driver: &str, node: &str) -> String {
 }
 
 pub async fn run<C: Client + Clone + 'static>(c: C) {
+    let waiting = RefCell::new(BTreeMap::new());
     loop {
         kr_rt::exec::sleep(3_000).await;
-        let _ = tick(&c).await;
+        let _ = tick_at(&c, &waiting, kr_rt::exec::now_ms()).await;
     }
+}
+
+/// Whether the node of `va` still reports its volume as in use.
+async fn in_use<C: Client>(c: &C, va: &Value) -> bool {
+    let (node, pv) = (str_at(va, &["spec", "nodeName"]), str_at(va, &["spec", "source", "persistentVolumeName"]));
+    let (Ok(Some(node)), Ok(Some(pv))) = (get_opt(c, &alloc::format!("/api/v1/nodes/{node}")).await, get_opt(c, &alloc::format!("/api/v1/persistentvolumes/{pv}")).await) else { return false };
+    let vol = alloc::format!("kubernetes.io/csi/{}^{}", str_at(&pv, &["spec", "csi", "driver"]), str_at(&pv, &["spec", "csi", "volumeHandle"]));
+    node.pointer(&["status", "volumesInUse"]).and_then(Value::as_array).is_some_and(|a| a.iter().any(|v| v.as_str() == Some(vol.as_str())))
 }
 
 fn find<'a>(l: &'a [Value], ns: &str, n: &str) -> Option<&'a Value> {
     l.iter().find(|o| name(o) == n && namespace(o) == ns)
 }
 
+#[cfg(test)]
 async fn tick<C: Client>(c: &C) -> Result<()> {
+    tick_at(c, &RefCell::new(BTreeMap::new()), 0).await
+}
+
+/// `waiting`: attachment name -> when it was first found unwanted (ms).
+async fn tick_at<C: Client>(c: &C, waiting: &RefCell<BTreeMap<String, u64>>, now: u64) -> Result<()> {
     let pvs = items(&c.list("/api/v1/persistentvolumes", "").await?);
     let mut want: BTreeSet<String> = BTreeSet::new();
     let mut create = alloc::vec::Vec::new();
@@ -91,7 +113,13 @@ async fn tick<C: Client>(c: &C) -> Result<()> {
     }
     for va in existing {
         let ours = str_at(&va, &["metadata", "labels", LABEL]) == "true";
-        if ours && name(&va).starts_with("csi-") && !deleting(&va) && !want.contains(name(&va)) {
+        if want.contains(name(&va)) {
+            waiting.borrow_mut().remove(name(&va));
+        } else if ours && name(&va).starts_with("csi-") && !deleting(&va) {
+            let since = *waiting.borrow_mut().entry(name(&va).to_string()).or_insert(now);
+            if now.saturating_sub(since) < MAX_WAIT_MS && in_use(c, &va).await {
+                continue; // still mounted on the node: wait for the kubelet to unmount
+            }
             let _ = delete_ok(c, &alloc::format!("{VAS}/{}", name(&va))).await;
         }
     }
@@ -186,6 +214,45 @@ mod tests {
             wait_until("pod gone", || async { get_opt(&c, &alloc::format!("{PODS}/app")).await.unwrap().is_none() }).await;
             c.create(PODS, &pod("n1", "Succeeded")).await.unwrap();
             tick(&c).await.unwrap();
+            assert_eq!(vas(&c).await, 0);
+        });
+    }
+
+    #[test]
+    fn detach_waits_for_volumes_in_use() {
+        scenario(|c| async move {
+            setup(&c, CSI).await;
+            c.create("/api/v1/nodes", &v(r#"{"metadata":{"name":"n1"}}"#)).await.unwrap();
+            c.create(PODS, &pod("n1", "Running")).await.unwrap();
+            tick(&c).await.unwrap();
+            put_status(&c, "/api/v1/nodes/n1", |_| v(r#"{"volumesInUse":["kubernetes.io/csi/d.io^h1"]}"#)).await.unwrap();
+            c.delete(&alloc::format!("{PODS}/app")).await.unwrap();
+            wait_until("pod gone", || async { get_opt(&c, &alloc::format!("{PODS}/app")).await.unwrap().is_none() }).await;
+            let waiting = RefCell::new(BTreeMap::new());
+            tick_at(&c, &waiting, 1_000).await.unwrap();
+            tick_at(&c, &waiting, 1_000 + MAX_WAIT_MS - 1).await.unwrap();
+            assert_eq!(vas(&c).await, 1);
+            // The node stops reporting it: detach right away.
+            put_status(&c, "/api/v1/nodes/n1", |_| v(r#"{"volumesInUse":[]}"#)).await.unwrap();
+            tick_at(&c, &waiting, 2_000).await.unwrap();
+            assert_eq!(vas(&c).await, 0);
+        });
+    }
+
+    #[test]
+    fn detach_is_forced_after_the_max_wait() {
+        scenario(|c| async move {
+            setup(&c, CSI).await;
+            c.create("/api/v1/nodes", &v(r#"{"metadata":{"name":"n1"}}"#)).await.unwrap();
+            c.create(PODS, &pod("n1", "Running")).await.unwrap();
+            tick(&c).await.unwrap();
+            put_status(&c, "/api/v1/nodes/n1", |_| v(r#"{"volumesInUse":["kubernetes.io/csi/d.io^h1"]}"#)).await.unwrap();
+            c.delete(&alloc::format!("{PODS}/app")).await.unwrap();
+            wait_until("pod gone", || async { get_opt(&c, &alloc::format!("{PODS}/app")).await.unwrap().is_none() }).await;
+            let waiting = RefCell::new(BTreeMap::new());
+            tick_at(&c, &waiting, 1_000).await.unwrap();
+            assert_eq!(vas(&c).await, 1);
+            tick_at(&c, &waiting, 1_000 + MAX_WAIT_MS).await.unwrap();
             assert_eq!(vas(&c).await, 0);
         });
     }

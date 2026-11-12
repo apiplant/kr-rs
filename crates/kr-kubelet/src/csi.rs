@@ -24,6 +24,9 @@ const STAGE: &str = "/csi.v1.Node/NodeStageVolume";
 const UNSTAGE: &str = "/csi.v1.Node/NodeUnstageVolume";
 const PUBLISH: &str = "/csi.v1.Node/NodePublishVolume";
 const UNPUBLISH: &str = "/csi.v1.Node/NodeUnpublishVolume";
+const EXPAND: &str = "/csi.v1.Node/NodeExpandVolume";
+#[allow(dead_code)] // for the kubelet metrics endpoint (no caller yet)
+const STATS: &str = "/csi.v1.Node/NodeGetVolumeStats";
 const DISABLED: &str = "CSI volumes need a root kubelet";
 const NODEID_ANNOTATION: &str = "csi.volume.kubernetes.io/nodeid";
 const SLOW_MS: u64 = 120_000;
@@ -71,11 +74,12 @@ fn decode_plugin_info(b: &[u8]) -> Result<(String, String, String), ()> {
     Ok((t, n, e))
 }
 
-/// `NodeGetInfoResponse` -> (node id, topology segment keys).
-fn decode_node_info(b: &[u8]) -> Result<(String, Vec<String>), ()> {
-    let (mut id, mut keys) = (String::new(), Vec::new());
+/// `NodeGetInfoResponse` -> (node id, topology segment keys, max volumes per node).
+fn decode_node_info(b: &[u8]) -> Result<(String, Vec<String>, u64), ()> {
+    let (mut id, mut keys, mut max) = (String::new(), Vec::new(), 0);
     walk(b, |k, f| match k {
         1 => id = f.as_str().unwrap_or("").to_string(),
+        2 => max = f.as_varint().unwrap_or(0),
         3 => {
             let _ = walk(f.as_bytes().unwrap_or(&[]), |k, f| {
                 if k == 1 {
@@ -91,22 +95,75 @@ fn decode_node_info(b: &[u8]) -> Result<(String, Vec<String>), ()> {
     })?;
     keys.sort();
     keys.dedup();
-    Ok((id, keys))
+    Ok((id, keys, max))
 }
 
-/// Whether the node offers STAGE_UNSTAGE_VOLUME.
-fn decode_stage_cap(b: &[u8]) -> Result<bool, ()> {
-    let mut stage = false;
+/// `NodeGetCapabilitiesResponse` -> the `NodeServiceCapability.RPC.Type` values offered
+/// (1 STAGE_UNSTAGE_VOLUME, 2 GET_VOLUME_STATS, 3 EXPAND_VOLUME).
+fn decode_caps(b: &[u8]) -> Result<Vec<u64>, ()> {
+    let mut caps = Vec::new();
     walk(b, |k, f| {
         if k == 1 {
             let _ = walk(f.as_bytes().unwrap_or(&[]), |k, f| {
                 if k == 1 {
-                    let _ = walk(f.as_bytes().unwrap_or(&[]), |k, f| stage |= k == 1 && f.as_varint() == Some(1));
+                    let _ = walk(f.as_bytes().unwrap_or(&[]), |k, f| {
+                        if k == 1 {
+                            caps.extend(f.as_varint());
+                        }
+                    });
                 }
             });
         }
     })?;
-    Ok(stage)
+    Ok(caps)
+}
+
+/// `NodeGetVolumeStatsResponse` -> (bytes, inodes) as (available, total, used).
+#[allow(dead_code)] // for the kubelet metrics endpoint (no caller yet)
+fn decode_stats(b: &[u8]) -> Result<([u64; 3], [u64; 3]), ()> {
+    let (mut bytes, mut inodes) = ([0; 3], [0; 3]);
+    walk(b, |k, f| {
+        if k != 1 {
+            return;
+        }
+        let (mut v, mut unit) = ([0u64; 3], 0);
+        let _ = walk(f.as_bytes().unwrap_or(&[]), |k, f| match k {
+            1..=3 => v[k as usize - 1] = f.as_varint().unwrap_or(0),
+            4 => unit = f.as_varint().unwrap_or(0),
+            _ => {}
+        });
+        match unit {
+            1 => bytes = v,
+            2 => inodes = v,
+            _ => {}
+        }
+    })?;
+    Ok((bytes, inodes))
+}
+
+/// Usage of one volume mounted for a pod, for a (future) kubelet metrics endpoint
+/// (`kubelet_volume_stats_*`; `pod_uid` and `pv` identify the series).
+#[allow(dead_code)] // for the kubelet metrics endpoint (no caller yet)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VolumeStats {
+    pub pod_uid: String,
+    pub pv: String,
+    pub capacity_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+    pub inodes: u64,
+    pub inodes_used: u64,
+    pub inodes_free: u64,
+}
+
+/// Unique volume name as the kubelet reports it in `status.volumesInUse`.
+pub fn volume_name(driver: &str, handle: &str) -> String {
+    format!("kubernetes.io/csi/{driver}^{handle}")
+}
+
+fn bytes_of(v: Option<&Value>) -> Option<u64> {
+    let q = v.and_then(Value::as_str).and_then(|s| kr_fmt::quantity::Quantity::parse(s).ok())?;
+    u64::try_from(q.value()?).ok()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,6 +172,10 @@ struct Driver {
     node_id: String,
     topology_keys: Vec<String>,
     stage: bool,
+    stats: bool,
+    expand: bool,
+    /// `NodeGetInfo.max_volumes_per_node` (0: no limit reported).
+    max_volumes: u64,
     reg_sock: String,
     reg_inode: u64,
 }
@@ -129,6 +190,8 @@ pub struct Csi {
     staged: RefCell<BTreeSet<(String, String)>>,
     published: RefCell<BTreeSet<(String, String)>>,
     warned: RefCell<BTreeSet<String>>,
+    /// Last `volumesInUse` written to the node (None: never).
+    reported: RefCell<Option<Vec<String>>>,
     /// CSINode and the node annotation need to be rewritten.
     dirty: Cell<bool>,
 }
@@ -156,7 +219,7 @@ impl Csi {
     }
 
     fn with_root(root: Option<String>, node: &str) -> Rc<Csi> {
-        Rc::new(Csi { root, node: node.to_string(), drivers: RefCell::new(BTreeMap::new()), ignored: RefCell::new(BTreeSet::new()), staged: RefCell::new(BTreeSet::new()), published: RefCell::new(BTreeSet::new()), warned: RefCell::new(BTreeSet::new()), dirty: Cell::new(false) })
+        Rc::new(Csi { root, node: node.to_string(), drivers: RefCell::new(BTreeMap::new()), ignored: RefCell::new(BTreeSet::new()), staged: RefCell::new(BTreeSet::new()), published: RefCell::new(BTreeSet::new()), warned: RefCell::new(BTreeSet::new()), reported: RefCell::new(None), dirty: Cell::new(false) })
     }
 
     /// The kubelet directory when CSI is enabled.
@@ -185,6 +248,7 @@ impl Csi {
         let Some(root) = &self.root else { return };
         let _ = kr_runtime::store::mkdir_p(&format!("{root}/plugins_registry"), 0o750);
         let _ = kr_runtime::store::mkdir_p(&format!("{root}/plugins"), 0o750);
+        let mut n = 0u32;
         loop {
             if self.tick().await {
                 self.dirty.set(true);
@@ -192,6 +256,11 @@ impl Csi {
             if self.dirty.get() && self.sync_csinode(&c).await {
                 self.dirty.set(false);
             }
+            self.report_in_use(&c).await;
+            if n % 5 == 0 {
+                self.expand_pending(&c).await;
+            }
+            n = n.wrapping_add(1);
             sleep(2000).await;
         }
     }
@@ -257,15 +326,16 @@ impl Csi {
         let endpoint = if ep.is_empty() { sock.to_string() } else { ep };
         let ec = Client::connect_unix(endpoint.as_bytes()).await.map_err(|_| format!("cannot connect to {endpoint}"))?;
         let b = ec.unary(NODE_INFO, &[], FAST_MS).await.map_err(|s| format!("NodeGetInfo: {} ({})", s.message, s.code))?;
-        let (node_id, topology_keys) = decode_node_info(&b).map_err(|()| "malformed NodeGetInfoResponse".to_string())?;
+        let (node_id, topology_keys, max_volumes) = decode_node_info(&b).map_err(|()| "malformed NodeGetInfoResponse".to_string())?;
         if node_id.is_empty() {
             return Err("NodeGetInfo returned no node_id".to_string());
         }
         let b = ec.unary(NODE_CAPS, &[], FAST_MS).await.map_err(|s| format!("NodeGetCapabilities: {} ({})", s.message, s.code))?;
-        let stage = decode_stage_cap(&b).map_err(|()| "malformed NodeGetCapabilitiesResponse".to_string())?;
+        let caps = decode_caps(&b).map_err(|()| "malformed NodeGetCapabilitiesResponse".to_string())?;
+        let (stage, stats, expand) = (caps.contains(&1), caps.contains(&2), caps.contains(&3));
         self.notify(sock, true, "").await;
-        kr_rt::eprint(format!("kubelet: CSI driver {name} registered (node id {node_id}, stage {stage})\n").as_bytes());
-        Ok(Some((name, Driver { endpoint, node_id, topology_keys, stage, reg_sock: sock.to_string(), reg_inode: ino })))
+        kr_rt::eprint(format!("kubelet: CSI driver {name} registered (node id {node_id}, stage {stage}, stats {stats}, expand {expand}, max volumes {max_volumes})\n").as_bytes());
+        Ok(Some((name, Driver { endpoint, node_id, topology_keys, stage, stats, expand, max_volumes, reg_sock: sock.to_string(), reg_inode: ino })))
     }
 
     /// Rewrites the CSINode object and the node-id annotation. True on success.
@@ -274,7 +344,7 @@ impl Csi {
         let Ok(n) = c.get(&format!("/api/v1/nodes/{node}")).await else { return false };
         let uid = n.pointer(&["metadata", "uid"]).and_then(Value::as_str).unwrap_or("");
         let drivers: Vec<(String, Driver)> = self.drivers.borrow().iter().map(|(k, d)| (k.clone(), d.clone())).collect();
-        let list: Vec<String> = drivers.iter().map(|(k, d)| format!(r#"{{"name":{},"nodeID":{},"topologyKeys":[{}]}}"#, q(k), q(&d.node_id), d.topology_keys.iter().map(|t| q(t)).collect::<Vec<_>>().join(","))).collect();
+        let list: Vec<String> = drivers.iter().map(|(k, d)| format!(r#"{{"name":{},"nodeID":{},"topologyKeys":[{}]{}}}"#, q(k), q(&d.node_id), d.topology_keys.iter().map(|t| q(t)).collect::<Vec<_>>().join(","), if d.max_volumes > 0 { format!(r#","allocatable":{{"count":{}}}"#, d.max_volumes) } else { String::new() })).collect();
         let body = format!(r#"{{"apiVersion":"storage.k8s.io/v1","kind":"CSINode","metadata":{{"name":{nq},"ownerReferences":[{{"apiVersion":"v1","kind":"Node","name":{nq},"uid":{}}}]}},"spec":{{"drivers":[{}]}}}}"#, q(uid), list.join(","), nq = q(node));
         let Ok(mut obj) = json::parse(body.as_bytes()) else { return false };
         let path = format!("/apis/storage.k8s.io/v1/csinodes/{node}");
@@ -422,6 +492,137 @@ impl Csi {
         Ok(target)
     }
 
+
+    // -------------------------------------------------------------- accounting, resize, stats
+
+    /// Sorted unique names of the volumes some pod has recorded (published or being published,
+    /// until the unpublish succeeds). Read from disk so it survives a kubelet restart.
+    pub fn volumes_in_use(&self) -> Vec<String> {
+        let Some(root) = self.root.as_deref() else { return Vec::new() };
+        let mut v: Vec<String> = self.pod_uids().iter().flat_map(|u| Self::entries(root, u)).map(|(_, d, h)| volume_name(&d, &h)).collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// Writes `status.volumesInUse` of the node when it changed. The attach/detach controller
+    /// does not detach a volume listed there.
+    async fn report_in_use<C: Api>(&self, c: &C) {
+        let v = self.volumes_in_use();
+        if self.reported.borrow().as_ref() == Some(&v) {
+            return;
+        }
+        let list = format!("[{}]", v.iter().map(|n| q(n)).collect::<Vec<_>>().join(","));
+        let Ok(p) = json::parse(format!(r#"{{"status":{{"volumesInUse":{list}}}}}"#).as_bytes()) else { return };
+        if c.patch(&format!("/api/v1/nodes/{}/status", self.node), "application/merge-patch+json", &p).await.is_ok() {
+            *self.reported.borrow_mut() = Some(v);
+        }
+    }
+
+    /// Grows the filesystem of volumes whose claim waits for it: the external-resizer has
+    /// expanded the PV (claim condition `FileSystemResizePending`, PV capacity >= the request)
+    /// and the driver offers EXPAND_VOLUME. After `NodeExpandVolume` the claim's
+    /// `status.capacity` is set and the condition removed. Returns the number expanded.
+    pub async fn expand_pending<C: Api>(&self, c: &C) -> usize {
+        let Some(root) = self.root.as_deref() else { return 0 };
+        let mut done: BTreeSet<(String, String)> = BTreeSet::new();
+        for uid in self.pod_uids() {
+            for (pv_name, driver, handle) in Self::entries(root, &uid) {
+                let key = (driver.clone(), handle.clone());
+                let Ok(d) = self.driver(&driver) else { continue };
+                if !d.expand || done.contains(&key) {
+                    continue;
+                }
+                let Ok(pv) = c.get(&format!("/api/v1/persistentvolumes/{pv_name}")).await else { continue };
+                let g = |k: &str| pv.pointer(&["spec", "claimRef", k]).and_then(Value::as_str).unwrap_or("").to_string();
+                let (ns, claim) = (g("namespace"), g("name"));
+                if !safe_name(&ns) || !safe_name(&claim) {
+                    continue;
+                }
+                let path = format!("/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}");
+                let Ok(pvc) = c.get(&path).await else { continue };
+                let conds = pvc.pointer(&["status", "conditions"]).and_then(Value::as_array).unwrap_or(&[]);
+                let pending = conds.iter().any(|x| x.get("type").and_then(Value::as_str) == Some("FileSystemResizePending") && x.get("status").and_then(Value::as_str) == Some("True"));
+                let (Some(want), Some(have)) = (bytes_of(pvc.pointer(&["spec", "resources", "requests", "storage"])), bytes_of(pvc.pointer(&["status", "capacity", "storage"]))) else { continue };
+                if !pending || want <= have || bytes_of(pv.pointer(&["spec", "capacity", "storage"])).is_none_or(|p| p < want) {
+                    continue;
+                }
+                let base = format!("{root}/pods/{uid}/volumes/kubernetes.io~csi/{pv_name}");
+                let staging = format!("{root}/plugins/kubernetes.io/csi/{driver}/{}/globalmount", sha(&handle));
+                let vol_path = if d.stage { staging.clone() } else { format!("{base}/mount") };
+                let fs_type = Some(pv.pointer(&["spec", "csi", "fsType"]).and_then(Value::as_str).unwrap_or("").to_string()).filter(|f| !f.is_empty()).unwrap_or_else(|| "ext4".to_string());
+                let mut w = Writer::new();
+                w.string(1, &handle).string(2, &vol_path);
+                w.message(3, |w| {
+                    w.varint(1, want);
+                });
+                w.string(4, if d.stage { &staging } else { "" });
+                w.message(5, |w| {
+                    w.message(2, |w| {
+                        w.string(1, &fs_type);
+                    });
+                    w.message(3, |w| {
+                        w.varint(1, 1);
+                    });
+                });
+                let Ok(secrets) = Self::secrets(c, &pv, "nodeExpandSecretRef").await else { continue };
+                map_field(&mut w, 6, &secrets);
+                if let Err(e) = self.call(&d, &driver, EXPAND, w.as_bytes(), SLOW_MS).await {
+                    self.warn(&e);
+                    continue;
+                }
+                let rest: Vec<String> = conds.iter().filter(|x| x.get("type").and_then(Value::as_str) != Some("FileSystemResizePending")).map(json::to_string).collect();
+                let req = pvc.pointer(&["spec", "resources", "requests", "storage"]).and_then(Value::as_str).unwrap_or("");
+                let Ok(p) = json::parse(format!(r#"{{"status":{{"capacity":{{"storage":{}}},"conditions":[{}]}}}}"#, q(req), rest.join(",")).as_bytes()) else { continue };
+                match c.patch(&format!("{path}/status"), "application/merge-patch+json", &p).await {
+                    Ok(_) => {
+                        done.insert(key);
+                    }
+                    Err(e) => {
+                        self.warn(&format!("cannot update status of persistentvolumeclaim {ns}/{claim} after expanding {pv_name}: {} ({})", e.message, e.code));
+                    }
+                }
+            }
+        }
+        done.len()
+    }
+
+    /// Usage of every volume mounted for a pod: `NodeGetVolumeStats` when the driver offers
+    /// GET_VOLUME_STATS, otherwise `statfs` of the publish path. Volumes that cannot be read
+    /// are left out.
+    #[allow(dead_code)] // for the kubelet metrics endpoint (no caller yet)
+    pub async fn volume_stats(&self) -> Vec<VolumeStats> {
+        let Some(root) = self.root.as_deref() else { return Vec::new() };
+        let mut out = Vec::new();
+        for uid in self.pod_uids() {
+            for (pv, driver, handle) in Self::entries(root, &uid) {
+                let target = format!("{root}/pods/{uid}/volumes/kubernetes.io~csi/{pv}/mount");
+                let mut s = VolumeStats { pod_uid: uid.clone(), pv, ..Default::default() };
+                let via_driver = match self.driver(&driver) {
+                    Ok(d) if d.stats => {
+                        let mut w = Writer::new();
+                        w.string(1, &handle).string(2, &target);
+                        if d.stage {
+                            w.string(3, &format!("{root}/plugins/kubernetes.io/csi/{driver}/{}/globalmount", sha(&handle)));
+                        }
+                        self.call(&d, &driver, STATS, w.as_bytes(), FAST_MS).await.ok().and_then(|b| decode_stats(&b).ok())
+                    }
+                    _ => None,
+                };
+                if let Some(([avail, total, used], [ifree, itotal, iused])) = via_driver {
+                    (s.available_bytes, s.capacity_bytes, s.used_bytes, s.inodes_free, s.inodes, s.inodes_used) = (avail, total, used, ifree, itotal, iused);
+                } else if let Ok([bs, blocks, bfree, bavail, files, ffree]) = kr_sys::ns::statfs(target.as_bytes()) {
+                    (s.capacity_bytes, s.available_bytes, s.used_bytes) = (blocks * bs, bavail * bs, blocks.saturating_sub(bfree) * bs);
+                    (s.inodes, s.inodes_free, s.inodes_used) = (files, ffree, files.saturating_sub(ffree));
+                } else {
+                    continue;
+                }
+                out.push(s);
+            }
+        }
+        out
+    }
+
     // -------------------------------------------------------------- unmounting
 
     /// Every (pv dir name, driver, handle) recorded under a pod.
@@ -533,6 +734,11 @@ mod tests {
     type Calls = Rc<RefCell<Vec<(String, Vec<u8>)>>>;
 
     fn fake_driver(path: &str, stage: bool) -> Calls {
+        fake_driver_with(path, if stage { &[1] } else { &[] }, 0)
+    }
+
+    /// `caps`: node capability types offered; `max`: `max_volumes_per_node`.
+    fn fake_driver_with(path: &str, caps: &'static [u64], max: u64) -> Calls {
         let calls: Calls = Rc::new(RefCell::new(Vec::new()));
         let fd = kr_sys::ns::unix_listen(path.as_bytes()).unwrap();
         kr_sys::ns::set_nonblocking(fd.raw()).unwrap();
@@ -550,18 +756,31 @@ mod tests {
                             w.string(1, "CSIPlugin").string(2, "fake.csi");
                         }
                         NODE_INFO => {
-                            w.string(1, "node-id-1").message(3, |w| {
+                            w.string(1, "node-id-1");
+                            if max > 0 {
+                                w.varint(2, max);
+                            }
+                            w.message(3, |w| {
                                 w.message(1, |w| {
                                     w.string(1, "topology.fake/zone").string(2, "z1");
                                 });
                             });
                         }
-                        NODE_CAPS if stage => {
-                            w.message(1, |w| {
+                        NODE_CAPS => {
+                            for t in caps {
                                 w.message(1, |w| {
-                                    w.varint(1, 1);
+                                    w.message(1, |w| {
+                                        w.varint(1, *t);
+                                    });
                                 });
-                            });
+                            }
+                        }
+                        STATS => {
+                            for (unit, v) in [(1, [400, 1000, 600]), (2, [90, 100, 10])] {
+                                w.message(1, |w| {
+                                    w.varint(1, v[0]).varint(2, v[1]).varint(3, v[2]).varint(4, unit);
+                                });
+                            }
                         }
                         _ => {}
                     }
@@ -743,7 +962,111 @@ mod tests {
         assert_eq!(e, DISABLED);
         assert!(decode_plugin_info(&[0x0a, 0xff]).is_err());
         assert!(decode_node_info(&[0x1a, 9]).is_err());
-        assert!(decode_stage_cap(&[0xff]).is_err());
+        assert!(decode_caps(&[0xff]).is_err());
         block_on(async move { csi.unmount_pod("u").await });
+    }
+
+    #[test]
+    fn volumes_in_use_stats_and_limits() {
+        let _g = lock();
+        let root = tmpdir("inuse");
+        let calls = fake_driver_with(&format!("{root}/plugins_registry/fake.sock"), &[1, 2, 3], 7);
+        let csi = Csi::with_root(Some(root.clone()), "node1");
+        let mut fake = Fake::default();
+        fake.objs.insert("/api/v1/nodes/node1".into(), obj(r#"{"metadata":{"uid":"nuid"}}"#));
+        fake.objs.insert("/apis/storage.k8s.io/v1/csidrivers/fake.csi".into(), obj(r#"{"spec":{"attachRequired":false}}"#));
+        fake.objs.insert("/api/v1/namespaces/ns/secrets/sec".into(), obj(r#"{"data":{}}"#));
+        block_on(async move {
+            assert!(csi.tick().await);
+            let d = csi.driver("fake.csi").unwrap();
+            assert_eq!((d.stats, d.expand, d.max_volumes), (true, true, 7));
+            assert!(csi.sync_csinode(&fake).await);
+            assert!(fake.log.borrow()[0].2.contains(r#""allocatable":{"count":7}"#), "{}", fake.log.borrow()[0].2);
+
+            // Nothing mounted: an empty list is reported once.
+            csi.report_in_use(&fake).await;
+            csi.report_in_use(&fake).await;
+            let patches: Vec<String> = fake.log.borrow().iter().filter(|l| l.1.ends_with("/nodes/node1/status")).map(|l| l.2.clone()).collect();
+            assert_eq!(patches, [r#"{"status":{"volumesInUse":[]}}"#]);
+
+            csi.mount_pv(&fake, &pod("u1"), &pv(), false).await.unwrap();
+            csi.mount_pv(&fake, &pod("u2"), &pv(), false).await.unwrap();
+            assert_eq!(csi.volumes_in_use(), ["kubernetes.io/csi/fake.csi^vol-1"]);
+            csi.report_in_use(&fake).await;
+            let last = fake.log.borrow().last().unwrap().2.clone();
+            assert_eq!(last, r#"{"status":{"volumesInUse":["kubernetes.io/csi/fake.csi^vol-1"]}}"#);
+
+            let st = csi.volume_stats().await;
+            assert_eq!(st.len(), 2);
+            assert_eq!((st[0].pod_uid.as_str(), st[0].pv.as_str(), st[0].capacity_bytes, st[0].used_bytes, st[0].available_bytes), ("u1", "pvc-1", 1000, 600, 400));
+            assert_eq!((st[0].inodes, st[0].inodes_used, st[0].inodes_free), (100, 10, 90));
+            let req = calls.borrow().iter().find(|c| c.0 == STATS).unwrap().1.clone();
+            assert_eq!(field(&req, 1), "vol-1");
+            assert!(field(&req, 3).ends_with("/globalmount"));
+
+            // Still in use while one pod holds it; gone after both unmount.
+            csi.unmount_pod("u1").await;
+            assert_eq!(csi.volumes_in_use().len(), 1);
+            csi.unmount_pod("u2").await;
+            assert!(csi.volumes_in_use().is_empty());
+            csi.report_in_use(&fake).await;
+            assert_eq!(fake.log.borrow().last().unwrap().2, r#"{"status":{"volumesInUse":[]}}"#);
+        });
+    }
+
+    #[test]
+    fn stats_fall_back_to_statfs() {
+        let _g = lock();
+        let root = tmpdir("statfs");
+        let _calls = fake_driver_with(&format!("{root}/plugins_registry/fake.sock"), &[], 0);
+        let csi = Csi::with_root(Some(root.clone()), "node1");
+        let mut fake = Fake::default();
+        fake.objs.insert("/apis/storage.k8s.io/v1/csidrivers/fake.csi".into(), obj(r#"{"spec":{"attachRequired":false}}"#));
+        block_on(async move {
+            csi.tick().await;
+            let t = csi.mount_pv(&fake, &pod("u1"), &pv(), false).await.unwrap();
+            std::fs::create_dir_all(&t).unwrap(); // the fake driver mounts nothing
+            let st = csi.volume_stats().await;
+            assert_eq!(st.len(), 1);
+            assert!(st[0].capacity_bytes > 0 && st[0].used_bytes <= st[0].capacity_bytes && st[0].inodes > 0, "{:?}", st[0]);
+            assert_eq!(fake.log.borrow().iter().filter(|l| l.1.contains("allocatable")).count(), 0);
+            csi.unmount_pod("u1").await;
+        });
+    }
+
+    #[test]
+    fn expands_volume_once_the_resizer_is_done() {
+        let _g = lock();
+        let root = tmpdir("expand");
+        let calls = fake_driver_with(&format!("{root}/plugins_registry/fake.sock"), &[1, 3], 0);
+        let csi = Csi::with_root(Some(root.clone()), "node1");
+        let mut fake = Fake::default();
+        fake.objs.insert("/apis/storage.k8s.io/v1/csidrivers/fake.csi".into(), obj(r#"{"spec":{"attachRequired":false}}"#));
+        let pvj = r#"{"metadata":{"name":"pvc-1"},"spec":{"capacity":{"storage":"2Gi"},"claimRef":{"namespace":"ns","name":"data"},"csi":{"driver":"fake.csi","volumeHandle":"vol-1","fsType":"xfs"}}}"#;
+        fake.objs.insert("/api/v1/persistentvolumes/pvc-1".into(), obj(pvj));
+        let claim = |conds: &str, cap: &str| obj(&format!(r#"{{"spec":{{"resources":{{"requests":{{"storage":"2Gi"}}}}}},"status":{{"capacity":{{"storage":"{cap}"}},"conditions":[{conds}]}}}}"#));
+        let path = "/api/v1/namespaces/ns/persistentvolumeclaims/data";
+        let pend = r#"{"type":"FileSystemResizePending","status":"True"},{"type":"Other","status":"True"}"#;
+        block_on(async move {
+            csi.tick().await;
+            let mut fake = fake;
+            csi.mount_pv(&fake, &pod("u1"), &obj(pvj), false).await.unwrap();
+            // No pending condition, or already grown: nothing happens.
+            fake.objs.insert(path.into(), claim("", "1Gi"));
+            assert_eq!(csi.expand_pending(&fake).await, 0);
+            fake.objs.insert(path.into(), claim(pend, "2Gi"));
+            assert_eq!(csi.expand_pending(&fake).await, 0);
+            assert!(!names(&calls).contains(&"NodeExpandVolume".to_string()));
+
+            fake.objs.insert(path.into(), claim(pend, "1Gi"));
+            assert_eq!(csi.expand_pending(&fake).await, 1);
+            let req = calls.borrow().iter().find(|c| c.0 == EXPAND).unwrap().1.clone();
+            assert_eq!(field(&req, 1), "vol-1");
+            assert!(field(&req, 2).ends_with("/globalmount"));
+            assert_eq!(field(&fields(&req).into_iter().find(|f| f.0 == 3).unwrap().1, 1), (2u64 << 30).to_string());
+            let l = fake.log.borrow().iter().find(|l| l.0 == "patch" && l.1.ends_with("/status") && l.1.contains("persistentvolumeclaims")).unwrap().clone();
+            assert_eq!(l.2, r#"{"status":{"capacity":{"storage":"2Gi"},"conditions":[{"type":"Other","status":"True"}]}}"#);
+            csi.unmount_pod("u1").await;
+        });
     }
 }

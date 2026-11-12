@@ -97,7 +97,7 @@ fn drop_if_ip_changed(pki_dir: &str, file: &str, ip: [u8; 16], adv_check: bool) 
 }
 
 /// Creates the CA, the apiserver serving cert and the admin client cert if missing.
-fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
+pub(crate) fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
     let pki_dir = format!("{data}/pki");
     mkdir_p(&pki_dir)?;
     let adv = primary_addr();
@@ -189,7 +189,7 @@ fn rng(b: &mut [u8]) {
 /// HA mode (ADR-026): this server's Raft id (`server-id`, created once) and its
 /// `system:kr-server:<id>` certificate (`pki/server.pem`), used for the Raft transport and for
 /// forwarding writes to the leader.
-fn server_identity(data: &str, advertise: [u8; 16]) -> Result<u64, String> {
+pub(crate) fn server_identity(data: &str, advertise: [u8; 16]) -> Result<u64, String> {
     let id_path = pki::path(data, "server-id");
     let id = match fs::read_file(&id_path, 64).ok().and_then(|b| String::from_utf8(b).ok()).and_then(|s| s.trim().parse::<u64>().ok()) {
         Some(id) => id,
@@ -235,6 +235,10 @@ fn join_secrets(data: &str) -> Result<kr_apiserver::cluster::join::JoinSecrets, 
         let b = fs::read_file(&pki::path(data, f), 1 << 20).map_err(|e| format!("read {f}: errno {}", e.0))?;
         files.push((String::from(f), String::from_utf8(b).map_err(|_| format!("{f} is not UTF-8"))?));
     }
+    // Optional: the secrets-encryption key must be the same on every server (ADR-047).
+    if let Ok(b) = fs::read_file(&pki::path(data, kr_apiserver::encrypt::FILE), 1 << 20) {
+        files.push((String::from(kr_apiserver::encrypt::FILE), String::from_utf8(b).map_err(|_| "encryption config is not UTF-8")?));
+    }
     let tok = &files[4].1;
     let token_secret = tok.trim().split_once("::server:").map(|(_, s)| String::from(s)).ok_or("bad server-token")?;
     Ok(kr_apiserver::cluster::join::JoinSecrets { token_secret, files })
@@ -263,6 +267,9 @@ async fn join_cluster(server: &str, token: &str, data: &str) -> Result<Vec<(u64,
     for (f, mode) in JOIN_FILES {
         let c = files.get(f).and_then(kr_fmt::json::Value::as_str).ok_or(format!("join response lacks {f}"))?;
         pki::write_new(&pki::path(data, f), c.as_bytes(), mode)?;
+    }
+    if let Some(c) = files.get(kr_apiserver::encrypt::FILE).and_then(kr_fmt::json::Value::as_str) {
+        pki::write_new(&pki::path(data, kr_apiserver::encrypt::FILE), c.as_bytes(), 0o600)?;
     }
     let servers = v.get("servers").and_then(kr_fmt::json::Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
     Ok(servers
@@ -309,8 +316,34 @@ fn server_tls(pki_dir: &str) -> Result<(Rc<ServerConfig>, Rc<kr_crypto::tls::Cli
     Ok((srv, cli))
 }
 
+/// Reads the audit policy and Pod Security configuration and installs them; returns the audit
+/// writer (its flush timer starts inside the executor). `--audit-log-path off` disables auditing.
+fn audit_setup(data: &str, policy: Option<&str>, path: Option<&str>, max_mb: u64, backups: usize, psa: Option<&str>, api: &kr_apiserver::api::ApiServer) -> Result<Option<Rc<kr_apiserver::audit::Auditor>>, String> {
+    let read = |p: &str| -> Result<String, String> { String::from_utf8(fs::read_file(&[p.as_bytes(), &[0]].concat(), 1 << 20).map_err(|_| format!("cannot read {p}"))?).map_err(|_| format!("{p} is not UTF-8")) };
+    if let Some(p) = psa {
+        *api.audit.psa.borrow_mut() = kr_apiserver::psa::Config::parse(&read(p)?)?;
+    }
+    if max_mb == u64::MAX || backups == usize::MAX {
+        return Err(String::from("bad --audit-log-maxsize / --audit-log-maxbackup"));
+    }
+    let path = path.map(String::from).unwrap_or_else(|| format!("{data}/audit/audit.log"));
+    if path == "off" {
+        return Ok(None);
+    }
+    let policy = match policy {
+        Some(p) => kr_apiserver::audit::Policy::parse(&read(p)?)?,
+        None => kr_apiserver::audit::Policy::builtin(),
+    };
+    let a = Rc::new(kr_apiserver::audit::Auditor::open(policy, &path, max_mb, backups));
+    api.audit.set_auditor(a.clone());
+    Ok(Some(a))
+}
+
 pub fn main(mut args: Args) -> i32 {
     let (mut port, mut data, mut cluster_init) = (6443u16, None, false);
+    let (mut snap_every, mut snap_keep) = (None::<u64>, 5usize);
+    let mut enc_on = true;
+    let (mut audit_policy, mut audit_path, mut audit_max, mut audit_backup, mut psa_config) = (None::<String>, None::<String>, 100u64, 5usize, None::<String>);
     let (mut join_url, mut token, mut token_file): (Option<String>, Option<String>, Option<String>) = (None, None, None);
     while let Some(a) = args.next() {
         let v = args.next().and_then(|v| core::str::from_utf8(v).ok());
@@ -332,7 +365,25 @@ pub fn main(mut args: Args) -> i32 {
                 token = Some(String::from(v))
             }
             (b"--token-file", Some(v)) => token_file = Some(String::from(v)),
-            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]]"),
+            (b"--snapshot-interval", Some(v)) => match crate::snapshot::parse_duration(v) {
+                Some(s) => snap_every = Some(s),
+                None => return fail("bad --snapshot-interval (seconds, or 30s, 15m, 6h, 1d)"),
+            },
+            (b"--secrets-encryption", Some(v)) => match v {
+                "on" => enc_on = true,
+                "off" => enc_on = false,
+                _ => return fail("--secrets-encryption takes on or off"),
+            },
+            (b"--snapshot-keep", Some(v)) => match v.parse::<usize>() {
+                Ok(n) if n > 0 => snap_keep = n,
+                _ => return fail("bad --snapshot-keep"),
+            },
+            (b"--audit-policy-file", Some(v)) => audit_policy = Some(String::from(v)),
+            (b"--audit-log-path", Some(v)) => audit_path = Some(String::from(v)),
+            (b"--audit-log-maxsize", Some(v)) => audit_max = v.parse().unwrap_or(u64::MAX),
+            (b"--audit-log-maxbackup", Some(v)) => audit_backup = v.parse().unwrap_or(usize::MAX),
+            (b"--pod-security-config", Some(v)) => psa_config = Some(String::from(v)),
+            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h [--snapshot-keep 5]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--pod-security-config FILE]"),
         }
     }
     let data = data.unwrap_or_else(data_dir);
@@ -385,10 +436,16 @@ pub fn main(mut args: Args) -> i32 {
         let key = x509::private_key_from_pkcs8(&key_der).map_err(|_| "apiserver.key unsupported")?;
         let ca = load_pem(&pki_dir, "ca.pem", "CERTIFICATE")?;
         let tls = Rc::new(ServerConfig { cert_chain: chain, key, client_auth: ClientAuth::Optional(ca), alpn: alloc::vec![b"http/1.1".to_vec()] });
+        // A joining server gets the cluster's encryption config in the join flow, never its own.
+        let codec = crate::secrets_encrypt::load(&data, enc_on, join_url.is_none())?;
         let store = if ha {
-            kr_store::Store::replicated()
+            let mut s = kr_store::Store::replicated();
+            if let Some(c) = codec {
+                s.set_codec(c);
+            }
+            s
         } else {
-            kr_store::Store::open(&format!("{data}/db")).map_err(|_| String::from("cannot open the datastore"))?
+            kr_store::Store::open_with(&format!("{data}/db"), codec).map_err(|_| String::from("cannot open the datastore (wrong or missing secrets-encryption key?)"))?
         };
         Ok((tls, store))
     };
@@ -399,6 +456,11 @@ pub fn main(mut args: Args) -> i32 {
     let api = match kr_apiserver::api::ApiServer::new(store, pki::now, rng, format!("127.0.0.1:{port}")) {
         Ok(a) => Rc::new(a),
         Err(e) => return fail(&e.message),
+    };
+    // Audit log (ADR-046) and Pod Security configuration.
+    let auditor = match audit_setup(&data, audit_policy.as_deref(), audit_path.as_deref(), audit_max, audit_backup, psa_config.as_deref(), &api) {
+        Ok(a) => a,
+        Err(e) => return fail(&e),
     };
     // KR_POD_FAMILIES=4 | 6 | 4,6 (default): which address families pods and Services have. Set the
     // same on every server of an HA cluster; nodes follow from the podCIDRs they are given.
@@ -496,8 +558,16 @@ pub fn main(mut args: Args) -> i32 {
         Err(e) => return fail(&e),
     };
     let api_for_proxy = api.clone();
+    let snapshot_data = data.clone();
+    let manifest_client = kr_apiserver::client::InProcess::new(api.clone(), "manifests");
+    let manifest_dir = crate::manifests::dir(&data);
     match kr_rt::exec::block_on(async move {
+        if let Some(a) = auditor {
+            kr_apiserver::audit::spawn_flusher(a);
+        }
         let cfg = kr_controllers::Config { now: pki::now, ..kr_controllers::Config::default() };
+        // The CSR approver/signer issues with the cluster CA (absent: it does not run).
+        let csr_ca = pki::load_ca(&pki_dir).ok().map(|(name, key, _)| Rc::new(kr_controllers::csr::CaSigner { name, key, rng }));
         match ha_tasks {
             Some((c, l, srv_tls, id)) => {
                 if let Ok(l6) = kr_net::http1::server::listen6(kr_apiserver::cluster::transport::PORT, 64) {
@@ -511,16 +581,22 @@ pub fn main(mut args: Args) -> i32 {
                     kr_rt::exec::spawn(become_voter(c.clone(), url, pki_dir.clone(), me));
                 }
                 // Exactly one copy of the controllers and the scheduler: on the leader.
-                kr_rt::exec::spawn(c.while_leader(move || kr_controllers::run_all_with(controllers.clone(), cfg)));
+                kr_rt::exec::spawn(c.clone().while_leader(move || kr_controllers::run_all_with_ca(controllers.clone(), cfg, csr_ca.clone())));
+                kr_rt::exec::spawn(c.while_leader(move || crate::manifests::run(manifest_client.clone(), manifest_dir.clone())));
             }
             None => {
-                kr_rt::exec::spawn(kr_controllers::run_all_with(controllers, cfg));
+                kr_rt::exec::spawn(kr_controllers::run_all_with_ca(controllers, cfg, csr_ca));
+                kr_rt::exec::spawn(crate::manifests::run(manifest_client, manifest_dir));
             }
+        }
+        if let Some(every) = snap_every {
+            kr_rt::exec::spawn(crate::snapshot::schedule(snapshot_data, every, snap_keep));
         }
         let local: Option<Rc<dyn kr_apiserver::api::NodeProxy>> = kubelet.as_ref().map(|k| Rc::new(kr_kubelet::stream::Proxy(k.clone())) as Rc<dyn kr_apiserver::api::NodeProxy>);
         let local_dial: Option<Rc<dyn kr_apiserver::podproxy::PodDialer>> = kubelet.as_ref().map(|k| Rc::new(kr_kubelet::stream::Proxy(k.clone())) as Rc<dyn kr_apiserver::podproxy::PodDialer>);
         let router = Rc::new(kr_kubelet::remote::Router { local_node: local_node.clone(), local, tls: kubelet_client.clone(), local_dial });
         api_for_proxy.set_pod_dialer(router.clone());
+        kr_rt::exec::spawn(kr_apiserver::metrics::run(api_for_proxy.clone(), router.clone()));
         api_for_proxy.set_node_proxy(router);
         if let Some(k) = kubelet {
             kr_rt::exec::spawn(k.run());
@@ -559,6 +635,7 @@ pub fn cgroups_available() -> bool {
 /// The node agent embedded in the server (single-node mode).
 fn start_kubelet(api: &Rc<kr_apiserver::api::ApiServer>) -> Result<Rc<kr_kubelet::Kubelet<kr_apiserver::client::InProcess>>, String> {
     let store = kr_runtime::store::Store::open(None).map_err(|_| String::from("cannot open the image store"))?;
+    crate::ctr_import::import_startup(&store);
     let name = node_name();
     let cgroups = cgroups_available();
     let node_ip = primary_addr();

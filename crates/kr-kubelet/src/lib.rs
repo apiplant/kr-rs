@@ -23,12 +23,15 @@ mod adopt;
 pub mod cni;
 mod csi;
 pub mod deviceplugin;
+pub mod podresources;
 pub mod dns;
 pub mod egress;
+pub mod netpol;
 mod probe;
 pub mod proxy;
 pub mod remote;
 mod spec;
+pub mod stats;
 pub mod stream;
 
 use alloc::collections::BTreeMap;
@@ -330,6 +333,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         if self.devices.start() {
             kr_rt::eprint(alloc::format!("kubelet: device plugins register on {}/kubelet.sock\n", self.devices.dir()).as_bytes());
+            let me = self.clone();
+            podresources::start(&self.devices, Rc::new(move || me.pods.borrow().iter().map(|(uid, p)| podresources::PodInfo { uid: uid.clone(), ns: p.ns.clone(), name: p.name.clone(), ctrs: p.ctrs.iter().filter(|c| !c.eph).map(|c| c.name.clone()).collect() }).collect()));
         }
         if let Some(d) = self.csi.dir() {
             kr_rt::eprint(alloc::format!("kubelet: CSI drivers register on {d}/plugins_registry\n").as_bytes());
@@ -412,6 +417,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         if self.cfg.network {
             let me = self.clone();
             kr_rt::exec::spawn(async move { me.route_loop().await });
+            kr_rt::exec::spawn(netpol::run(self.c.clone(), self.cfg.node_name.clone()));
         }
         let hb = self.clone();
         kr_rt::exec::spawn(async move { node::heartbeat_loop(&hb.c, &hb.cfg, &hb.devices).await });
@@ -553,6 +559,14 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             if pressure {
                 self.evict_one();
                 self.notify.notify();
+            }
+            // Pods holding a device its plugin reports unhealthy fail (reason Evicted).
+            for (uid, msg) in self.devices.unhealthy_pods() {
+                let hit = self.pods.borrow_mut().get_mut(&uid).filter(|p| p.evicted.is_none() && p.failed_setup.is_none()).map(|p| p.evicted = Some(msg)).is_some();
+                if hit {
+                    self.kill_now(&uid);
+                    self.notify.notify();
+                }
             }
         }
     }

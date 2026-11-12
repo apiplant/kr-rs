@@ -55,6 +55,21 @@ pub fn decide(node: &str, a: &Attrs, body_name: Option<&str>, pods: &dyn Pods) -
             let used = pods.in_namespace(&a.namespace).iter().any(|p| bound_to(p, node) && references(p, kind, &a.name));
             if used { Decision::Allow } else { Decision::NoOpinion }
         }
+        ("", "persistentvolumeclaims", "status") => {
+            // The kubelet's status write after NodeExpandVolume (#170): only claims used by its pods.
+            if a.name.is_empty() {
+                return Decision::Deny;
+            }
+            let used = pods.in_namespace(&a.namespace).iter().any(|p| bound_to(p, node) && references(p, "persistentvolumeclaims", &a.name));
+            match (used, a.verb.as_str()) {
+                (true, "get" | "patch" | "update") => Decision::NoOpinion, // RBAC grants these
+                (true, _) | (false, "patch" | "update" | "create" | "delete" | "deletecollection") => Decision::Deny,
+                (false, _) => Decision::NoOpinion,
+            }
+        }
+        ("storage.k8s.io", "csinodes", "") if write => {
+            if target == node { Decision::NoOpinion } else { Decision::Deny }
+        }
         ("", "persistentvolumes", "") if !write => {
             // A PV is readable when its claim is used by a pod bound to this node. A missing PV
             // is allowed through (the handler answers 404; nothing leaks).
@@ -221,5 +236,24 @@ mod tests {
         assert_eq!(decide("n1", &attrs("update", "coordination.k8s.io", "leases", "", "kube-node-lease", "n2"), None, &p), Decision::Deny);
         assert_eq!(decide("n1", &attrs("create", "", "serviceaccounts", "token", "a", "sa1"), None, &p), Decision::Allow);
         assert_eq!(decide("n1", &attrs("create", "", "serviceaccounts", "token", "a", "default"), None, &p), Decision::Deny);
+    }
+
+    #[test]
+    fn pvc_status_and_csinode() {
+        let mut p = pods();
+        p.0.push(json::parse_str(r#"{"metadata":{"namespace":"a","name":"st"},"spec":{"nodeName":"n1","volumes":[{"name":"d","persistentVolumeClaim":{"claimName":"data"}}]}}"#).unwrap());
+        let d = |node: &str, v: &str, name: &str| decide(node, &attrs(v, "", "persistentvolumeclaims", "status", "a", name), None, &p);
+        assert_eq!(d("n1", "patch", "data"), Decision::NoOpinion); // RBAC allows
+        assert_eq!(d("n1", "update", "data"), Decision::NoOpinion);
+        assert_eq!(d("n2", "patch", "data"), Decision::Deny);
+        assert_eq!(d("n1", "patch", "other"), Decision::Deny);
+        assert_eq!(d("n1", "delete", "data"), Decision::Deny);
+        let c = |v: &str, name: &str, body: Option<&str>| decide("n1", &attrs(v, "storage.k8s.io", "csinodes", "", "", name), body, &p);
+        assert_eq!(c("update", "n1", None), Decision::NoOpinion);
+        assert_eq!(c("patch", "n2", None), Decision::Deny);
+        assert_eq!(c("delete", "n2", None), Decision::Deny);
+        assert_eq!(c("create", "", Some("n1")), Decision::NoOpinion);
+        assert_eq!(c("create", "", Some("n2")), Decision::Deny);
+        assert_eq!(c("get", "n2", None), Decision::NoOpinion);
     }
 }

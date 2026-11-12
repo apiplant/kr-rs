@@ -13,6 +13,7 @@ use kr_sys::{fs, ns, Errno};
 
 const USAGE: &[u8] = b"usage:
   kr pki ca <dir> [--cn name] [--days 3650]
+  kr pki rotate [--data DIR] [--port 6443] [--service-account-key]   (also: kr certificate rotate)
   kr pki issue <dir> <name> [--cn cn] [--org o]... [--dns name]... [--ip addr]... [--server] [--client] [--days 365]
 ";
 
@@ -20,6 +21,7 @@ pub fn main(mut args: Args) -> i32 {
     let r = match args.next() {
         Some(b"ca") => ca(args),
         Some(b"issue") => issue(args),
+        Some(b"rotate") => return crate::rotate::main(args),
         _ => Err(String::from("unknown subcommand")),
     };
     match r {

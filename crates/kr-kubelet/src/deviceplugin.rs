@@ -19,6 +19,7 @@ const REGISTER: &str = "/v1beta1.Registration/Register";
 const GET_OPTIONS: &str = "/v1beta1.DevicePlugin/GetDevicePluginOptions";
 const LIST_AND_WATCH: &str = "/v1beta1.DevicePlugin/ListAndWatch";
 const ALLOCATE: &str = "/v1beta1.DevicePlugin/Allocate";
+const PREFERRED: &str = "/v1beta1.DevicePlugin/GetPreferredAllocation";
 const PRE_START: &str = "/v1beta1.DevicePlugin/PreStartContainer";
 const INVALID_ARGUMENT: u32 = 3;
 
@@ -104,6 +105,36 @@ pub fn decode_devices(b: &[u8]) -> Result<Vec<(String, bool)>, ()> {
     Ok(out)
 }
 
+/// `ListAndWatchResponse` -> (device id, first NUMA node of its topology hint).
+pub fn decode_numa(b: &[u8]) -> Vec<(String, i64)> {
+    let mut out = Vec::new();
+    let _ = walk(b, |n, f| {
+        if n != 1 {
+            return;
+        }
+        let (mut id, mut node) = (String::new(), None);
+        let _ = walk(f.as_bytes().unwrap_or(&[]), |n, f| match n {
+            1 => id = f.as_str().unwrap_or("").to_string(),
+            3 => {
+                let _ = walk(f.as_bytes().unwrap_or(&[]), |n, f| {
+                    if n == 1 && node.is_none() {
+                        let _ = walk(f.as_bytes().unwrap_or(&[]), |n, f| {
+                            if n == 1 {
+                                node = f.as_varint().map(|v| v as i64);
+                            }
+                        });
+                    }
+                });
+            }
+            _ => {}
+        });
+        if let (false, Some(n)) = (id.is_empty(), node) {
+            out.push((id, n));
+        }
+    });
+    out
+}
+
 /// What one container gets from `Allocate` (and, merged, from CDI).
 #[derive(Default, Debug, PartialEq, Eq, Clone)]
 pub struct Grant {
@@ -178,6 +209,83 @@ pub fn decode_allocate(b: &[u8]) -> Result<Grant, ()> {
         }
     })?;
     first.unwrap_or(Err(()))
+}
+
+/// Every container response of an `AllocateResponse`, in order.
+pub fn decode_allocate_all(b: &[u8]) -> Result<Vec<Grant>, ()> {
+    let mut out = Vec::new();
+    let mut bad = false;
+    walk(b, |n, f| {
+        if n == 1 {
+            match decode_container_response(f.as_bytes().unwrap_or(&[])) {
+                Ok(g) => out.push(g),
+                Err(()) => bad = true,
+            }
+        }
+    })?;
+    if bad {
+        Err(())
+    } else {
+        Ok(out)
+    }
+}
+
+/// `AllocateRequest` with one container request per entry.
+fn encode_batch(containers: &[Vec<String>]) -> Vec<u8> {
+    let mut w = Writer::new();
+    for ids in containers {
+        w.message(1, |w| {
+            for i in ids {
+                w.string(1, i);
+            }
+        });
+    }
+    w.into_bytes()
+}
+
+/// `PreferredAllocationRequest` for one container: pick `size` of `available`.
+fn encode_preferred(available: &[String], size: usize) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.message(1, |w| {
+        for i in available {
+            w.string(1, i);
+        }
+        w.varint(3, size as u64);
+    });
+    w.into_bytes()
+}
+
+/// First container response of a `PreferredAllocationResponse`.
+fn decode_preferred(b: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = false;
+    let _ = walk(b, |n, f| {
+        if n == 1 && !seen {
+            seen = true;
+            let _ = walk(f.as_bytes().unwrap_or(&[]), |n, f| {
+                if n == 1 {
+                    out.push(f.as_str().unwrap_or("").to_string());
+                }
+            });
+        }
+    });
+    out
+}
+
+/// Picks `n` of the free devices (id, NUMA node or -1) when the plugin gave no preference: all on
+/// one NUMA node if some node has enough (the one with the fewest free devices that still fits,
+/// to keep big nodes whole), else the first ones.
+fn choose(free: &[(String, i64)], n: usize) -> Vec<String> {
+    let mut nodes: BTreeMap<i64, Vec<&String>> = BTreeMap::new();
+    for (id, node) in free {
+        if *node >= 0 {
+            nodes.entry(*node).or_default().push(id);
+        }
+    }
+    if let Some(best) = nodes.values().filter(|v| v.len() >= n).min_by_key(|v| v.len()) {
+        return best.iter().take(n).map(|s| (*s).clone()).collect();
+    }
+    free.iter().take(n).map(|d| d.0.clone()).collect()
 }
 
 fn encode_ids(ids: &[String], with_container: bool) -> Vec<u8> {
@@ -307,6 +415,8 @@ fn cdi_resolve(dirs: &[&str], names: &[String], g: &mut Grant) -> Result<(), Str
             return Err(format!("CDI device {n} requested by the device plugin is not defined in any spec under /etc/cdi or /var/run/cdi{skipped}"));
         }
     }
+    // Hooks run as root: refuse binaries others could have replaced (ADR-039, KNOWN_ISSUES #161).
+    kr_runtime::hooks::check_trusted(&g.hooks)?;
     if !g.bad_hooks.is_empty() {
         return Err(format!("CDI hooks that are not supported (stage must be createRuntime, createContainer, startContainer, poststart or poststop, and the path absolute): {}", g.bad_hooks.join(", ")));
     }
@@ -321,6 +431,13 @@ struct Res {
     sock: String,
     gen: u64,
     task: Option<JoinHandle<()>>,
+    /// The plugin implements `GetPreferredAllocation`.
+    preferred: bool,
+    /// A `ListAndWatch` stream is live (devices reported unhealthy by it are really unhealthy;
+    /// after a plugin restart they are only unknown).
+    connected: bool,
+    /// Device id -> NUMA node from the plugin's topology hint.
+    numa: BTreeMap<String, i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -346,6 +463,8 @@ pub struct Plugins {
     /// Bumped whenever the advertised device counts may have changed.
     gen: Cell<u64>,
     seq: Cell<u64>,
+    /// Open plugin connections by socket name, reused across `Allocate` calls.
+    conns: RefCell<BTreeMap<String, Rc<Client>>>,
 }
 
 fn valid_resource(n: &str) -> bool {
@@ -360,7 +479,7 @@ fn valid_endpoint(e: &str) -> bool {
 
 impl Plugins {
     pub fn new(dir: &str) -> Rc<Plugins> {
-        let p = Plugins { dir: dir.to_string(), enabled: Cell::new(false), st: RefCell::new(State::default()), gen: Cell::new(1), seq: Cell::new(0) };
+        let p = Plugins { dir: dir.to_string(), enabled: Cell::new(false), st: RefCell::new(State::default()), gen: Cell::new(1), seq: Cell::new(0), conns: RefCell::new(BTreeMap::new()) };
         p.load();
         Rc::new(p)
     }
@@ -495,11 +614,12 @@ impl Plugins {
             let mut st = self.st.borrow_mut();
             st.known.insert(name.clone());
             let devices = st.res.get(&name).map(|o| o.devices.iter().map(|(i, _)| (i.clone(), false)).collect()).unwrap_or_default();
-            st.res.insert(name.clone(), Res { devices, pre_start: r.options.pre_start_required, sock: r.endpoint.clone(), gen, task: None }).and_then(|o| o.task)
+            st.res.insert(name.clone(), Res { devices, pre_start: r.options.pre_start_required, sock: r.endpoint.clone(), gen, task: None, preferred: r.options.preferred_allocation, connected: false, numa: BTreeMap::new() }).and_then(|o| o.task)
         };
         if let Some(t) = old {
             t.abort();
         }
+        self.conns.borrow_mut().remove(&r.endpoint);
         self.persist();
         self.bump();
         let me = self.clone();
@@ -534,12 +654,20 @@ impl Plugins {
             return self.with_res(&name, gen, mark_unhealthy);
         };
         if let Some(o) = client.unary(GET_OPTIONS, &[], 5000).await.ok().and_then(|b| decode_options(&b).ok()) {
-            self.with_res(&name, gen, |r| r.pre_start |= o.pre_start_required);
+            self.with_res(&name, gen, |r| {
+                r.pre_start |= o.pre_start_required;
+                r.preferred |= o.preferred_allocation;
+            });
         }
         if let Ok(mut s) = client.server_stream(LIST_AND_WATCH, &[]).await {
             while let Some(Ok(m)) = s.next().await {
                 if let Ok(d) = decode_devices(&m) {
-                    self.with_res(&name, gen, |r| r.devices = d);
+                    let numa: BTreeMap<String, i64> = decode_numa(&m).into_iter().collect();
+                    self.with_res(&name, gen, |r| {
+                        r.devices = d;
+                        r.numa = numa;
+                        r.connected = true;
+                    });
                 }
             }
         }
@@ -580,9 +708,15 @@ impl Plugins {
         self.st.borrow().allocs.iter().find(|a| a.uid == uid && a.ctr == ctr && a.res == resource).map(|a| a.ids.clone()).unwrap_or_default()
     }
 
-    /// Reserves `n` devices for (uid, ctr): the ones it already holds, else healthy free ones.
-    /// Returns the ids, whether they are new, and the plugin socket and pre-start flag.
+    /// Reserves `n` devices for (uid, ctr): the ones it already holds, else `pick` (the plugin's
+    /// preference, if all of it is still free), else healthy free ones on one NUMA node if
+    /// possible. Returns the ids, whether they are new, and the plugin socket and pre-start flag.
+    #[cfg(test)]
     fn reserve(&self, uid: &str, ctr: &str, resource: &str, n: usize) -> Result<(Vec<String>, bool, String, bool), String> {
+        self.reserve_with(uid, ctr, resource, n, None)
+    }
+
+    fn reserve_with(&self, uid: &str, ctr: &str, resource: &str, n: usize, pick: Option<&[String]>) -> Result<(Vec<String>, bool, String, bool), String> {
         let (ids, new, sock, pre) = {
             let mut st = self.st.borrow_mut();
             let Some(r) = st.res.get(resource) else { return Err(format!("device plugin resource {resource} is not registered (yet)")) };
@@ -592,13 +726,17 @@ impl Plugins {
             }
             st.allocs.retain(|a| !(a.uid == uid && a.ctr == ctr && a.res == resource));
             let used: BTreeSet<&String> = st.allocs.iter().filter(|a| a.res == resource).flat_map(|a| a.ids.iter()).collect();
-            let free: Vec<String> = st.res[resource].devices.iter().filter(|d| d.1 && !used.contains(&d.0)).map(|d| d.0.clone()).take(n).collect();
+            let r = &st.res[resource];
+            let free: Vec<(String, i64)> = r.devices.iter().filter(|d| d.1 && !used.contains(&d.0)).map(|d| (d.0.clone(), r.numa.get(&d.0).copied().unwrap_or(-1))).collect();
             if free.len() < n {
-                let have = st.res[resource].devices.iter().filter(|d| d.1 && !used.contains(&d.0)).count();
-                return Err(format!("insufficient {resource}: requested {n}, {have} healthy and unallocated"));
+                return Err(format!("insufficient {resource}: requested {n}, {} healthy and unallocated", free.len()));
             }
-            st.allocs.push(Alloc { uid: uid.to_string(), ctr: ctr.to_string(), res: resource.to_string(), ids: free.clone() });
-            (free, true, sock, pre)
+            let chosen = match pick {
+                Some(p) if p.len() == n && p.iter().all(|i| free.iter().any(|f| f.0 == *i)) && p.iter().collect::<BTreeSet<_>>().len() == n => p.to_vec(),
+                _ => choose(&free, n),
+            };
+            st.allocs.push(Alloc { uid: uid.to_string(), ctr: ctr.to_string(), res: resource.to_string(), ids: chosen.clone() });
+            (chosen, true, sock, pre)
         };
         self.persist();
         Ok((ids, new, sock, pre))
@@ -609,19 +747,36 @@ impl Plugins {
         self.persist();
     }
 
+    /// Asks a plugin that implements `GetPreferredAllocation` which `n` of the free devices to
+    /// hand out (topology-aware choice). None if it does not, fails, or the container already
+    /// holds its devices.
+    async fn preferred(&self, uid: &str, ctr: &str, resource: &str, n: usize) -> Option<Vec<String>> {
+        let (sock, free) = {
+            let st = self.st.borrow();
+            let r = st.res.get(resource).filter(|r| r.preferred && r.connected)?;
+            if st.allocs.iter().any(|a| a.uid == uid && a.ctr == ctr && a.res == resource && a.ids.len() == n) {
+                return None;
+            }
+            let used: BTreeSet<&String> = st.allocs.iter().filter(|a| a.res == resource).flat_map(|a| a.ids.iter()).collect();
+            let free: Vec<String> = r.devices.iter().filter(|d| d.1 && !used.contains(&d.0)).map(|d| d.0.clone()).collect();
+            (r.sock.clone(), free)
+        };
+        if free.len() <= n {
+            return None;
+        }
+        let c = self.conn(&sock).await.ok()?;
+        let b = c.unary(PREFERRED, &encode_preferred(&free, n), 5000).await.ok()?;
+        Some(decode_preferred(&b))
+    }
+
     /// Allocates devices for one container and returns what to apply to it.
     pub async fn allocate(&self, uid: &str, ctr: &str, wants: &[(String, usize)]) -> Result<Grant, String> {
         let mut total = Grant::default();
         for (resource, n) in wants {
-            let (ids, new, sock, pre) = self.reserve(uid, ctr, resource, *n)?;
-            match self.call_plugin(&sock, &ids, pre).await {
-                Ok(g) => {
-                    total.envs.extend(g.envs);
-                    total.mounts.extend(g.mounts);
-                    total.devices.extend(g.devices);
-                    total.annotations.extend(g.annotations);
-                    total.cdi.extend(g.cdi);
-                }
+            let pick = self.preferred(uid, ctr, resource, *n).await;
+            let (ids, new, sock, pre) = self.reserve_with(uid, ctr, resource, *n, pick.as_deref())?;
+            match self.call_plugin(&sock, &[ids], pre).await.and_then(|mut v| v.pop().ok_or_else(|| String::from("empty AllocateResponse"))) {
+                Ok(g) => merge(&mut total, g),
                 Err(m) => {
                     if new {
                         self.unreserve(uid, ctr, resource);
@@ -630,6 +785,46 @@ impl Plugins {
                 }
             }
         }
+        self.resolve_cdi(total)
+    }
+
+    /// One `Allocate` call for several containers of a pod that limit the same `resource`
+    /// (`ctrs`: container name and device count), as upstream does. Grants come back in order.
+    pub async fn allocate_batch(&self, uid: &str, resource: &str, ctrs: &[(String, usize)]) -> Result<Vec<Grant>, String> {
+        let mut reserved: Vec<(Vec<String>, bool)> = Vec::new();
+        let (mut sock, mut pre) = (String::new(), false);
+        for (ctr, n) in ctrs {
+            let pick = self.preferred(uid, ctr, resource, *n).await;
+            match self.reserve_with(uid, ctr, resource, *n, pick.as_deref()) {
+                Ok((ids, new, s, p)) => {
+                    (sock, pre) = (s, p);
+                    reserved.push((ids, new));
+                }
+                Err(e) => {
+                    self.unreserve_new(uid, resource, ctrs, &reserved);
+                    return Err(e);
+                }
+            }
+        }
+        let ids: Vec<Vec<String>> = reserved.iter().map(|r| r.0.clone()).collect();
+        match self.call_plugin(&sock, &ids, pre).await {
+            Ok(v) if v.len() == ctrs.len() => v.into_iter().map(|g| self.resolve_cdi(g)).collect(),
+            r => {
+                self.unreserve_new(uid, resource, ctrs, &reserved);
+                Err(format!("device plugin {resource}: {}", r.err().unwrap_or_else(|| String::from("AllocateResponse does not match the request"))))
+            }
+        }
+    }
+
+    fn unreserve_new(&self, uid: &str, resource: &str, ctrs: &[(String, usize)], reserved: &[(Vec<String>, bool)]) {
+        for ((c, _), (_, new)) in ctrs.iter().zip(reserved) {
+            if *new {
+                self.unreserve(uid, c, resource);
+            }
+        }
+    }
+
+    fn resolve_cdi(&self, mut total: Grant) -> Result<Grant, String> {
         let cdi = core::mem::take(&mut total.cdi);
         if !cdi.is_empty() {
             let dirs = cdi_dirs();
@@ -638,18 +833,109 @@ impl Plugins {
         Ok(total)
     }
 
-    async fn call_plugin(&self, sock: &str, ids: &[String], pre_start: bool) -> Result<Grant, String> {
-        let path = format!("{}/{sock}", self.dir);
-        let c = Client::connect_unix(path.as_bytes()).await.map_err(|_| format!("cannot connect to {sock}"))?;
-        if pre_start {
-            c.unary(PRE_START, &encode_ids(ids, false), 10_000).await.map_err(|s| format!("PreStartContainer failed: {} ({})", s.message, s.code))?;
+    /// The connection to a plugin socket: reused while open.
+    async fn conn(&self, sock: &str) -> Result<Rc<Client>, String> {
+        let cached = self.conns.borrow().get(sock).filter(|c| !c.is_closed()).cloned();
+        if let Some(c) = cached {
+            return Ok(c);
         }
-        let b = c.unary(ALLOCATE, &encode_ids(ids, true), 10_000).await.map_err(|s| format!("Allocate failed: {} ({})", s.message, s.code))?;
-        decode_allocate(&b).map_err(|()| String::from("malformed AllocateResponse"))
+        let path = format!("{}/{sock}", self.dir);
+        let c = Rc::new(Client::connect_unix(path.as_bytes()).await.map_err(|_| format!("cannot connect to {sock}"))?);
+        self.conns.borrow_mut().insert(sock.to_string(), c.clone());
+        Ok(c)
+    }
+
+    /// `PreStartContainer` per container, then one `Allocate` with a request per container. A
+    /// stale cached connection is dropped and the call repeated once on a transport failure.
+    async fn call_plugin(&self, sock: &str, ids: &[Vec<String>], pre_start: bool) -> Result<Vec<Grant>, String> {
+        let mut last = String::new();
+        for _ in 0..2 {
+            let c = self.conn(sock).await?;
+            let mut r = Ok(Vec::new());
+            if pre_start {
+                for i in ids {
+                    if let Err(s) = c.unary(PRE_START, &encode_ids(i, false), 10_000).await {
+                        r = Err(("PreStartContainer", s));
+                        break;
+                    }
+                }
+            }
+            if r.is_ok() {
+                r = c.unary(ALLOCATE, &encode_batch(ids), 10_000).await.map_err(|s| ("Allocate", s));
+            }
+            match r {
+                Ok(b) => return decode_allocate_all(&b).map_err(|()| String::from("malformed AllocateResponse")),
+                Err((what, s)) => {
+                    last = format!("{what} failed: {} ({})", s.message, s.code);
+                    if s.code != grpc::UNAVAILABLE {
+                        return Err(last);
+                    }
+                    self.conns.borrow_mut().remove(sock);
+                }
+            }
+        }
+        Err(last)
+    }
+
+    /// Containers holding a device their plugin reported unhealthy (or no longer lists) on a live
+    /// `ListAndWatch`: (pod uid, container, resource, device ids). A plugin that is merely gone
+    /// (restart, upgrade) is not a reason: its devices are unknown, not broken.
+    pub fn unhealthy_holders(&self) -> Vec<(String, String, String, Vec<String>)> {
+        let st = self.st.borrow();
+        st.allocs
+            .iter()
+            .filter_map(|a| {
+                let r = st.res.get(&a.res).filter(|r| r.connected)?;
+                let bad: Vec<String> = a.ids.iter().filter(|i| !r.devices.iter().any(|d| d.0 == **i && d.1)).cloned().collect();
+                (!bad.is_empty()).then(|| (a.uid.clone(), a.ctr.clone(), a.res.clone(), bad))
+            })
+            .collect()
+    }
+
+    /// Per pod uid, the message for failing it because of [`Self::unhealthy_holders`].
+    pub fn unhealthy_pods(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (uid, ctr, res, ids) in self.unhealthy_holders() {
+            let m = format!("container {ctr} uses {res} device {} reported unhealthy by its device plugin", ids.join(","));
+            match out.iter_mut().find(|o| o.0 == uid) {
+                Some(o) => {
+                    o.1.push_str("; ");
+                    o.1.push_str(&m);
+                }
+                None => out.push((uid, m)),
+            }
+        }
+        out
+    }
+
+    /// Allocations as (pod uid, container, resource, device ids) for the PodResources
+    /// API.
+    pub fn holdings(&self) -> Vec<(String, String, String, Vec<String>)> {
+        self.st.borrow().allocs.iter().map(|a| (a.uid.clone(), a.ctr.clone(), a.res.clone(), a.ids.clone())).collect()
+    }
+
+    /// (resource, device id, NUMA node or -1) of every healthy device (allocatable).
+    pub fn allocatable_devices(&self) -> Vec<(String, String, i64)> {
+        let st = self.st.borrow();
+        st.res.iter().flat_map(|(n, r)| r.devices.iter().filter(|d| d.1).map(move |d| (n.clone(), d.0.clone(), r.numa.get(&d.0).copied().unwrap_or(-1)))).collect()
+    }
+
+    /// NUMA node of a device, -1 if unknown.
+    pub fn numa_of(&self, resource: &str, id: &str) -> i64 {
+        self.st.borrow().res.get(resource).and_then(|r| r.numa.get(id).copied()).unwrap_or(-1)
     }
 }
 
+fn merge(total: &mut Grant, g: Grant) {
+    total.envs.extend(g.envs);
+    total.mounts.extend(g.mounts);
+    total.devices.extend(g.devices);
+    total.annotations.extend(g.annotations);
+    total.cdi.extend(g.cdi);
+}
+
 fn mark_unhealthy(r: &mut Res) {
+    r.connected = false;
     for d in &mut r.devices {
         d.1 = false;
     }
@@ -788,8 +1074,21 @@ pub(crate) mod tests {
         assert!(!valid_endpoint("kubelet.sock"));
     }
 
+    /// Plugins with one resource: devices (id, healthy, NUMA node) and holdings (uid, ctr, ids).
+    pub(crate) fn plugins_with(res: &str, devs: &[(&str, bool, i64)], held: &[(&str, &str, &[&str])]) -> (Rc<Plugins>, String) {
+        let dir = tmpdir("with");
+        let p = Plugins::new(&dir);
+        let numa = devs.iter().filter(|d| d.2 >= 0).map(|d| (d.0.to_string(), d.2)).collect();
+        p.st.borrow_mut().res.insert(res.into(), Res { devices: devs.iter().map(|d| (d.0.to_string(), d.1)).collect(), pre_start: false, sock: "x.sock".into(), gen: 1, task: None, preferred: false, connected: true, numa });
+        p.st.borrow_mut().known.insert(res.into());
+        for (u, c, ids) in held {
+            p.st.borrow_mut().allocs.push(Alloc { uid: u.to_string(), ctr: c.to_string(), res: res.into(), ids: ids.iter().map(|i| i.to_string()).collect() });
+        }
+        (p, dir)
+    }
+
     fn with_devices(p: &Plugins, res: &str, devs: &[(&str, bool)]) {
-        p.st.borrow_mut().res.insert(res.into(), Res { devices: devs.iter().map(|(i, h)| (i.to_string(), *h)).collect(), pre_start: false, sock: "x.sock".into(), gen: 1, task: None });
+        p.st.borrow_mut().res.insert(res.into(), Res { devices: devs.iter().map(|(i, h)| (i.to_string(), *h)).collect(), pre_start: false, sock: "x.sock".into(), gen: 1, task: None, preferred: false, connected: true, numa: BTreeMap::new() });
         p.st.borrow_mut().known.insert(res.into());
     }
 
@@ -866,11 +1165,19 @@ pub(crate) mod tests {
         assert_eq!(g.envs, [("Z".into(), "9".into())]);
     }
 
+    static ALLOCATE_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    /// The payload of the first field of an encoded message.
+    fn walk_first(b: &[u8]) -> &[u8] {
+        Reader::new(b).next().unwrap().unwrap().as_bytes().unwrap()
+    }
+
     /// Fake plugin served in-process: 4 devices, Allocate answers per request.
     fn fake_plugin(path: &str, devs: Rc<RefCell<Vec<(&'static str, &'static str)>>>) {
         let fd = kr_sys::ns::unix_listen(path.as_bytes()).unwrap();
         kr_sys::ns::set_nonblocking(fd.raw()).unwrap();
         let l = Async::new(fd).unwrap();
+        let pref = path.contains("pref");
         spawn(grpc::serve(
             l,
             Rc::new(move |m: String, req: Vec<u8>, r: Responder| {
@@ -878,7 +1185,7 @@ pub(crate) mod tests {
                 async move {
                     match m.as_str() {
                         GET_OPTIONS => {
-                            let _ = r.send(&enc_options(&Options { pre_start_required: false, preferred_allocation: false })).await;
+                            let _ = r.send(&enc_options(&Options { pre_start_required: false, preferred_allocation: pref })).await;
                             r.finish(Status::ok()).await
                         }
                         LIST_AND_WATCH => {
@@ -887,19 +1194,48 @@ pub(crate) mod tests {
                             sleep(60_000).await;
                         }
                         ALLOCATE => {
-                            let mut ids = Vec::new();
+                            let mut w = Writer::new();
+                            let mut calls = 0;
                             let _ = walk(&req, |_, f| {
+                                calls += 1;
+                                let mut ids = Vec::new();
                                 let _ = walk(f.as_bytes().unwrap_or(&[]), |_, f| ids.push(f.as_str().unwrap_or("").to_string()));
+                                let g = Grant {
+                                    envs: vec![("FAKE_VISIBLE".into(), ids.join(","))],
+                                    mounts: vec![("/fake/lib".into(), "/tmp".into(), true)],
+                                    devices: ids.iter().map(|i| (std::format!("/dev/fake{i}"), std::format!("/dev/null"), "rw".into())).collect(),
+                                    annotations: vec![("k".into(), "v".into())],
+                                    cdi: vec![],
+                                    ..Default::default()
+                                };
+                                let e = enc_grant(&g);
+                                w.bytes(1, walk_first(&e));
                             });
-                            let g = Grant {
-                                envs: vec![("FAKE_VISIBLE".into(), ids.join(","))],
-                                mounts: vec![("/fake/lib".into(), "/tmp".into(), true)],
-                                devices: ids.iter().map(|i| (std::format!("/dev/fake{i}"), std::format!("/dev/null"), "rw".into())).collect(),
-                                annotations: vec![("k".into(), "v".into())],
-                                cdi: vec![],
-                                ..Default::default()
-                            };
-                            let _ = r.send(&enc_grant(&g)).await;
+                            ALLOCATE_CALLS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                            let _ = calls;
+                            let _ = r.send(w.as_bytes()).await;
+                            r.finish(Status::ok()).await
+                        }
+                        PREFERRED => {
+                            // Prefers the highest ids.
+                            let mut avail = Vec::new();
+                            let mut size = 0;
+                            let _ = walk(&req, |_, f| {
+                                let _ = walk(f.as_bytes().unwrap_or(&[]), |n, f| match n {
+                                    1 => avail.push(f.as_str().unwrap_or("").to_string()),
+                                    3 => size = f.as_varint().unwrap_or(0) as usize,
+                                    _ => {}
+                                });
+                            });
+                            avail.sort();
+                            avail.reverse();
+                            let mut w = Writer::new();
+                            w.message(1, |w| {
+                                for i in avail.iter().take(size) {
+                                    w.string(1, i);
+                                }
+                            });
+                            let _ = r.send(w.as_bytes()).await;
                             r.finish(Status::ok()).await
                         }
                         _ => r.finish(Status::new(grpc::UNIMPLEMENTED, "x")).await,
@@ -907,6 +1243,94 @@ pub(crate) mod tests {
                 }
             }),
         ));
+    }
+
+    #[test]
+    fn numa_choice_and_preference_codecs() {
+        let free: Vec<(String, i64)> = [("a", 0), ("b", 1), ("c", 1), ("d", 0), ("e", 0)].iter().map(|(i, n)| (i.to_string(), *n)).collect();
+        // Two devices fit on node 1 (the smaller node), three only on node 0.
+        assert_eq!(choose(&free, 2), ["b", "c"]);
+        assert_eq!(choose(&free, 3), ["a", "d", "e"]);
+        // No node fits four: first four. Unknown topology: first ones.
+        assert_eq!(choose(&free, 4), ["a", "b", "c", "d"]);
+        let unk: Vec<(String, i64)> = [("x", -1), ("y", -1)].iter().map(|(i, n)| (i.to_string(), *n)).collect();
+        assert_eq!(choose(&unk, 1), ["x"]);
+        // Topology in ListAndWatch.
+        let mut w = Writer::new();
+        w.message(1, |w| {
+            w.string(1, "g0").string(2, "Healthy").message(3, |w| {
+                w.message(1, |w| {
+                    w.int64(1, 1);
+                });
+            });
+        });
+        w.message(1, |w| {
+            w.string(1, "g1").string(2, "Healthy");
+        });
+        assert_eq!(decode_numa(w.as_bytes()), [("g0".to_string(), 1)]);
+        assert_eq!(decode_devices(w.as_bytes()).unwrap().len(), 2);
+        assert_eq!(encode_preferred(&["a".into(), "b".into()], 1), [0x0a, 8, 0x0a, 1, b'a', 0x0a, 1, b'b', 0x18, 1]);
+        let mut w = Writer::new();
+        w.message(1, |w| {
+            w.string(1, "b");
+        });
+        assert_eq!(decode_preferred(w.as_bytes()), ["b"]);
+        assert!(decode_preferred(&[]).is_empty());
+        // reserve honours a valid pick, ignores an invalid or duplicated one.
+        let (p, _d) = plugins_with("x.com/gpu", &[("a", true, 0), ("b", true, 0), ("c", true, 1)], &[]);
+        assert_eq!(p.reserve_with("u", "c1", "x.com/gpu", 1, Some(&["c".to_string()])).unwrap().0, ["c"]);
+        assert_eq!(p.reserve_with("u", "c2", "x.com/gpu", 1, Some(&["c".to_string()])).unwrap().0, ["a"]);
+        assert_eq!(p.reserve_with("u", "c3", "x.com/gpu", 1, Some(&["zz".to_string()])).unwrap().0, ["b"]);
+    }
+
+    #[test]
+    fn unhealthy_devices_name_their_holders() {
+        let (p, _d) = plugins_with("x.com/gpu", &[("a", true, -1), ("b", false, -1), ("c", true, -1)], &[("u1", "m", &["a"]), ("u2", "m", &["b", "c"]), ("u2", "n", &[])]);
+        assert_eq!(p.unhealthy_holders(), [("u2".to_string(), "m".to_string(), "x.com/gpu".to_string(), vec!["b".to_string()])]);
+        let pods = p.unhealthy_pods();
+        assert_eq!(pods.len(), 1);
+        assert!(pods[0].1.contains("x.com/gpu device b") && pods[0].1.contains("unhealthy"), "{:?}", pods);
+        // A device that vanished from the list counts; a plugin that is gone does not.
+        p.st.borrow_mut().res.get_mut("x.com/gpu").unwrap().devices.retain(|d| d.0 != "a");
+        assert_eq!(p.unhealthy_holders().len(), 2);
+        mark_unhealthy(p.st.borrow_mut().res.get_mut("x.com/gpu").unwrap());
+        assert!(p.unhealthy_holders().is_empty());
+    }
+
+    #[test]
+    fn preferred_allocation_batch_and_connection_reuse() {
+        let _g = lock();
+        let dir = tmpdir("batch");
+        let p = Plugins::new(&dir);
+        assert!(p.start());
+        let devs = Rc::new(RefCell::new(vec![("0", "Healthy"), ("1", "Healthy"), ("2", "Healthy"), ("3", "Healthy")]));
+        fake_plugin(&std::format!("{dir}/pref.sock"), devs);
+        let (p2, dir2) = (p.clone(), dir.clone());
+        block_on(async move {
+            let c = Client::connect_unix(std::format!("{dir2}/kubelet.sock").as_bytes()).await.unwrap();
+            let ok = RegisterRequest { version: "v1beta1".into(), endpoint: "pref.sock".into(), resource_name: "y.com/gpu".into(), options: Options::default() };
+            c.unary(REGISTER, &enc_register(&ok), 2000).await.unwrap();
+            for _ in 0..100 {
+                if p2.node_resources().first().is_some_and(|r| r.1 == 4) && p2.st.borrow().res["y.com/gpu"].preferred {
+                    break;
+                }
+                sleep(20).await;
+            }
+            // The plugin prefers the highest ids: that is what the container gets.
+            let g = p2.allocate("pod1", "a", &[("y.com/gpu".to_string(), 2)]).await.unwrap();
+            assert_eq!(g.envs, [("FAKE_VISIBLE".to_string(), "3,2".to_string())]);
+            // One Allocate call for two containers; the connection is shared.
+            let before = ALLOCATE_CALLS.load(core::sync::atomic::Ordering::SeqCst);
+            let gs = p2.allocate_batch("pod2", "y.com/gpu", &[("b".to_string(), 1), ("c".to_string(), 1)]).await.unwrap();
+            assert_eq!(ALLOCATE_CALLS.load(core::sync::atomic::Ordering::SeqCst), before + 1);
+            assert_eq!(gs.len(), 2);
+            assert_eq!(gs[0].envs, [("FAKE_VISIBLE".to_string(), "1".to_string())]);
+            assert_eq!(gs[1].envs, [("FAKE_VISIBLE".to_string(), "0".to_string())]);
+            assert_eq!(p2.conns.borrow().len(), 1);
+            // Not enough devices: nothing stays reserved.
+            assert!(p2.allocate_batch("pod3", "y.com/gpu", &[("b".to_string(), 1)]).await.is_err());
+            assert!(p2.allocated("pod3", "b", "y.com/gpu").is_empty());
+        });
     }
 
     #[test]

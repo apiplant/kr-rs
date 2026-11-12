@@ -40,14 +40,14 @@ fn header<'a>(h: &'a [(String, String)], name: &str) -> Option<&'a str> {
     h.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
 }
 
-async fn connect(tls: Rc<ClientConfig>, ip: [u8; 16]) -> Option<TlsStream<kr_rt::exec::Async<kr_sys::Fd>>> {
+pub(crate) async fn connect(tls: Rc<ClientConfig>, ip: [u8; 16]) -> Option<TlsStream<kr_rt::exec::Async<kr_sys::Fd>>> {
     let sock = kr_net::tcp::connect_addr(kr_net::tcp::SocketAddr { ip: kr_net::tcp::ip_addr16(ip), port: KUBELET_PORT }, 5000).await.ok()?;
     let name = kr_net::tcp::fmt_ip16(ip);
     kr_rt::exec::timeout(5000, TlsStream::connect(sock, tls, &name)).await.ok()?.ok()
 }
 
 /// Reads an HTTP response head; returns (status, chunked framing?, bytes after the head).
-async fn read_head<T: Transport>(t: &mut T) -> Option<(u16, bool, Vec<u8>)> {
+pub(crate) async fn read_head<T: Transport>(t: &mut T) -> Option<(u16, bool, Vec<u8>)> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
@@ -320,6 +320,10 @@ pub async fn serve(proxy: Rc<dyn NodeProxy>, node: String, tls: Rc<core::cell::R
             let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
             match parts.as_slice() {
                 ["pods", ns, pod, sub] => match proxy.pod_subresource(sub, ns, pod, &node, None, req.query(), &req.headers) {
+                    Ok(r) => r,
+                    Err(e) => Response::new(e.code, e.to_status_json().into_bytes()).with_header("Content-Type", "application/json"),
+                },
+                ["metrics", "resource"] | ["stats", "summary"] => match proxy.pod_subresource("metrics", parts[1], "", &node, None, "", &[]) {
                     Ok(r) => r,
                     Err(e) => Response::new(e.code, e.to_status_json().into_bytes()).with_header("Content-Type", "application/json"),
                 },

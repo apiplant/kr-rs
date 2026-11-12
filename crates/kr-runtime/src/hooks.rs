@@ -199,7 +199,80 @@ pub fn run_poststop(bundle: &[u8]) {
     let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("").as_bytes().to_vec();
     let log = open_log(bundle);
     let st = state(&id, "stopped", 0, bundle);
+    // The binary may have changed since the container started.
+    let (hooks, bad): (Vec<Hook>, Vec<Hook>) = hooks.into_iter().partition(|h| trust(&h.path).is_ok());
+    for h in &bad {
+        if let (Some(l), Err(e)) = (&log, trust(&h.path)) {
+            write_all(l.raw(), format!("kr: poststop hook refused: {e}\n").as_bytes());
+        }
+    }
     let _ = run_all(&hooks, &st, None, log.as_ref());
+}
+
+/// Whether a file owner is acceptable for a hook binary or a symlink on its way: root, or the
+/// current user (a rootless runtime can only be attacked by itself).
+fn owner_ok(uid: u32) -> bool {
+    uid == 0 || uid == ns::getuid()
+}
+
+/// Checks that hook binary `path` may be run: it and every symlink on the way must be owned by
+/// root (or the current user), the final file must be a regular file that is not group/world
+/// writable, and, when `KR_CDI_HOOK_DIRS` (colon-separated absolute directories) is set, the
+/// symlink-resolved path must lie below one of them. Returns the resolved path. Only the final
+/// path component is resolved; the directories above it are not inspected (KNOWN_ISSUES #161).
+pub fn trust(path: &[u8]) -> Result<Vec<u8>, String> {
+    trust_in(path, crate::store::env_var("KR_CDI_HOOK_DIRS").as_deref())
+}
+
+fn trust_in(path: &[u8], allow: Option<&str>) -> Result<Vec<u8>, String> {
+    let shown = String::from_utf8_lossy(path).into_owned();
+    let mut cur = path.to_vec();
+    for _ in 0..16 {
+        let mut c = cur.clone();
+        c.push(0);
+        let st = kr_sys::fs::newfstatat(ns::AT_FDCWD, &c, kr_sys::fs::AT_SYMLINK_NOFOLLOW).map_err(|e| format!("hook {shown}: cannot stat {} (errno {})", String::from_utf8_lossy(&cur), e.0))?;
+        if !owner_ok(st.uid) {
+            return Err(format!("hook {shown}: {} is not owned by root", String::from_utf8_lossy(&cur)));
+        }
+        if st.is_symlink() {
+            let mut buf = alloc::vec![0u8; 4096];
+            let n = kr_sys::fs::readlinkat(ns::AT_FDCWD, &c, &mut buf).map_err(|e| format!("hook {shown}: cannot read link (errno {})", e.0))?;
+            buf.truncate(n);
+            if buf.first() != Some(&b'/') {
+                let dir = cur.iter().rposition(|b| *b == b'/').map_or(0, |i| i + 1);
+                let mut t = cur[..dir].to_vec();
+                t.extend_from_slice(&buf);
+                buf = t;
+            }
+            cur = buf;
+            continue;
+        }
+        if st.file_type() != kr_sys::fs::S_IFREG {
+            return Err(format!("hook {shown}: {} is not a regular file", String::from_utf8_lossy(&cur)));
+        }
+        if st.mode & 0o022 != 0 {
+            return Err(format!("hook {shown}: {} is writable by group or others", String::from_utf8_lossy(&cur)));
+        }
+        if let Some(dirs) = allow {
+            let ok = dirs.split(':').filter(|d| d.starts_with('/')).any(|d| {
+                let d = d.trim_end_matches('/');
+                cur.starts_with(d.as_bytes()) && cur.get(d.len()) == Some(&b'/') && !cur.windows(3).any(|w| w == b"/..")
+            });
+            if !ok {
+                return Err(format!("hook {shown}: resolves to {}, outside KR_CDI_HOOK_DIRS", String::from_utf8_lossy(&cur)));
+            }
+        }
+        return Ok(cur);
+    }
+    Err(format!("hook {shown}: too many levels of symbolic links"))
+}
+
+/// The first hook of `hooks` that fails [`trust`], as an error message.
+pub fn check_trusted(hooks: &Hooks) -> Result<(), String> {
+    for h in hooks.create_runtime.iter().chain(&hooks.create_container).chain(&hooks.start_container).chain(&hooks.poststart).chain(&hooks.poststop) {
+        trust(&h.path)?;
+    }
+    Ok(())
 }
 
 /// Opens `<bundle>/hooks.log` for appending (close-on-exec).
@@ -371,6 +444,43 @@ mod tests {
         assert!(h.add("poststop", ok("/bin/true")));
         assert!(!h.add("nonsense", ok("/bin/true")));
         assert_eq!((h.create_container.len(), h.create_runtime.len()), (1, 1));
+    }
+
+    #[test]
+    fn hook_trust() {
+        let dir = format!("/tmp/kr-hooks-trust-{}", kr_sys::fs::getpid());
+        let _ = ns::mkdir(format!("{dir}\0").as_bytes(), 0o700);
+        let f = format!("{dir}/h");
+        let fz = format!("{f}\0");
+        drop(ns::open(fz.as_bytes(), ns::O_WRONLY | ns::O_CREAT, 0o700).unwrap());
+        let set = |m: u32| {
+            let fd = ns::open(fz.as_bytes(), ns::O_RDONLY, 0).unwrap();
+            kr_sys::fs::fchmod(fd.raw(), m).unwrap();
+        };
+        set(0o755);
+        assert_eq!(trust(f.as_bytes()).unwrap(), f.as_bytes());
+        set(0o775);
+        assert!(trust(f.as_bytes()).unwrap_err().contains("writable"));
+        set(0o757);
+        assert!(trust(f.as_bytes()).is_err());
+        set(0o755);
+        // A symlink resolves to its target, which is judged.
+        let l = format!("{dir}/l");
+        let _ = kr_sys::fs::symlinkat(b"h\0", ns::AT_FDCWD, format!("{l}\0").as_bytes());
+        assert_eq!(trust(l.as_bytes()).unwrap(), f.as_bytes());
+        set(0o777);
+        assert!(trust(l.as_bytes()).is_err());
+        set(0o755);
+        assert!(trust(b"/nonexistent/hook").is_err());
+        // Allow-list (env is process wide: only this test sets it).
+        assert!(trust_in(f.as_bytes(), Some("/usr/lib:/opt/")).unwrap_err().contains("KR_CDI_HOOK_DIRS"));
+        let ok = format!("/x:{dir}");
+        assert!(trust_in(f.as_bytes(), Some(&ok)).is_ok());
+        assert!(trust_in(l.as_bytes(), Some(&ok)).is_ok());
+        // A link leaving the allowed directory is judged by where it lands.
+        let out = format!("{dir}/out");
+        let _ = kr_sys::fs::symlinkat(b"/bin/sh\0", ns::AT_FDCWD, format!("{out}\0").as_bytes());
+        assert!(trust_in(out.as_bytes(), Some(&ok)).is_err());
     }
 
     #[test]

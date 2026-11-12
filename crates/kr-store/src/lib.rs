@@ -42,6 +42,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod bundle;
 pub mod wal;
 pub mod watch;
 
@@ -112,6 +113,16 @@ impl From<Errno> for Error {
     }
 }
 
+/// Transforms values at the persistence boundary (ADR-047): `encode` runs on the way into the
+/// log, snapshot images and replicated records, `decode` on the way back. In memory (and in watch
+/// events) values stay plain. `encode` returns `None` to store the value unchanged; `decode`
+/// returns `None` for a value stored unchanged, `Err` for one that cannot be decoded (the load or
+/// apply then fails with `Corrupt`: closed, never garbage).
+pub trait Codec {
+    fn encode(&self, key: &str, value: &[u8]) -> Option<Vec<u8>>;
+    fn decode(&self, key: &str, value: &[u8]) -> Result<Option<Vec<u8>>, ()>;
+}
+
 struct Persist {
     dir: Fd,
     log: Fd,
@@ -142,6 +153,7 @@ pub struct Store {
     held: VecDeque<Event>,
     /// Approximate size of a snapshot of the live data.
     live_bytes: u64,
+    codec: Option<Rc<dyn Codec>>,
 }
 
 fn path(name: &str) -> Vec<u8> {
@@ -190,6 +202,31 @@ impl Store {
             visible: u64::MAX,
             held: VecDeque::new(),
             live_bytes: 0,
+            codec: None,
+        }
+    }
+
+    /// Installs the value codec. Set it before loading data ([`Store::open_with`]) or before the
+    /// first replicated record is applied.
+    pub fn set_codec(&mut self, c: Rc<dyn Codec>) {
+        self.codec = Some(c);
+    }
+
+    fn enc<'a>(&self, key: &str, v: &'a [u8]) -> alloc::borrow::Cow<'a, [u8]> {
+        match self.codec.as_ref().and_then(|c| c.encode(key, v)) {
+            Some(e) => alloc::borrow::Cow::Owned(e),
+            None => alloc::borrow::Cow::Borrowed(v),
+        }
+    }
+
+    fn dec<'a>(&self, key: &str, v: &'a [u8]) -> Result<alloc::borrow::Cow<'a, [u8]>, Error> {
+        match &self.codec {
+            None => Ok(alloc::borrow::Cow::Borrowed(v)),
+            Some(c) => match c.decode(key, v) {
+                Ok(Some(d)) => Ok(alloc::borrow::Cow::Owned(d)),
+                Ok(None) => Ok(alloc::borrow::Cow::Borrowed(v)),
+                Err(()) => Err(Error::Corrupt("a stored value cannot be decrypted (wrong or missing key, or tampered data)")),
+            },
         }
     }
 
@@ -232,7 +269,8 @@ impl Store {
                     let key: Rc<str> = Rc::from(rec.key);
                     let prev = self.map.get(rec.key).cloned();
                     if rec.op == OP_PUT {
-                        self.apply_event(EventKind::Put, key, Rc::from(rec.val), rec.create_rev, prev);
+                        let val = self.dec(rec.key, rec.val)?;
+                        self.apply_event(EventKind::Put, key, Rc::from(&*val), rec.create_rev, prev);
                     } else {
                         let Some(prev) = prev else { return Err(Error::Corrupt("replicated delete of a missing key")) };
                         let value = prev.value.clone();
@@ -300,11 +338,21 @@ impl Store {
 
     /// A snapshot image of the live data (`KRSNAP` format, see the module docs).
     pub fn image(&self) -> Vec<u8> {
+        self.image_impl(true)
+    }
+
+    /// The image with values as they are in memory (never encoded): deterministic across servers,
+    /// for digests. Not for persistence.
+    pub fn plain_image(&self) -> Vec<u8> {
+        self.image_impl(false)
+    }
+
+    fn image_impl(&self, encode: bool) -> Vec<u8> {
         let mut snap = Vec::with_capacity(16 + self.live_bytes as usize);
         snap.extend_from_slice(wal::SNAP_MAGIC);
         snap.extend_from_slice(&self.rev.to_le_bytes());
         for kv in self.map.values() {
-            wal::encode(&mut snap, OP_PUT, kv.mod_rev, kv.create_rev, &kv.key, &kv.value);
+            wal::encode(&mut snap, OP_PUT, kv.mod_rev, kv.create_rev, &kv.key, &if encode { self.enc(&kv.key, &kv.value) } else { alloc::borrow::Cow::Borrowed(&*kv.value) });
         }
         snap
     }
@@ -314,6 +362,7 @@ impl Store {
     /// is left to propose.
     pub fn restore(&mut self, image: &[u8]) -> Result<(), Error> {
         let mut fresh = Store::empty();
+        fresh.codec = self.codec.clone();
         fresh.load_snapshot(image)?;
         self.map = core::mem::take(&mut fresh.map);
         self.live_bytes = fresh.live_bytes;
@@ -342,11 +391,29 @@ impl Store {
         Ok(())
     }
 
+    /// Rebuilds a store in memory from the bytes of a `snapshot` file and a `log` file, touching
+    /// no file (backups of a running server: a torn tail of `log` is ignored).
+    pub fn from_files(snapshot: Option<&[u8]>, log: &[u8]) -> Result<Store, Error> {
+        let mut st = Store::empty();
+        if let Some(s) = snapshot {
+            st.load_snapshot(s)?;
+        }
+        st.replay_log(log)?;
+        st.hist_floor = st.rev;
+        Ok(st)
+    }
+
     /// Opens (creating if missing) the store in `dir`, loading the snapshot and replaying the log.
     pub fn open(dir: &str) -> Result<Store, Error> {
+        Store::open_with(dir, None)
+    }
+
+    /// [`Store::open`] with a value codec active while loading and afterwards.
+    pub fn open_with(dir: &str, codec: Option<Rc<dyn Codec>>) -> Result<Store, Error> {
         mkdir_p(dir)?;
         let dirfd = fs::openat(AT_FDCWD, &path(dir), fs::O_RDONLY | fs::O_DIRECTORY | fs::O_CLOEXEC, 0)?;
         let mut st = Store::empty();
+        st.codec = codec;
         // A leftover temp file is an unfinished compaction; the old snapshot+log are intact.
         let _ = fs::unlinkat(dirfd.raw(), &path("snapshot.tmp"), 0);
 
@@ -396,7 +463,8 @@ impl Store {
                     if rec.op != OP_PUT || rec.rev > rev {
                         return Err(Error::Corrupt("bad snapshot record"));
                     }
-                    self.raw_put(rec.key, rec.val, rec.create_rev, rec.rev);
+                    let val = self.dec(rec.key, rec.val)?;
+                    self.raw_put(rec.key, &val, rec.create_rev, rec.rev);
                     off = rec.end;
                 }
                 Parsed::Torn => return Err(Error::Corrupt("truncated snapshot")),
@@ -421,7 +489,8 @@ impl Store {
                         return Err(Error::Corrupt("log revision gap"));
                     }
                     if rec.op == OP_PUT {
-                        self.raw_put(rec.key, rec.val, rec.create_rev, rec.rev);
+                        let val = self.dec(rec.key, rec.val)?;
+                        self.raw_put(rec.key, &val, rec.create_rev, rec.rev);
                     } else {
                         self.raw_delete(rec.key);
                     }
@@ -569,9 +638,10 @@ impl Store {
         prev: Option<Kv>,
     ) -> Result<Kv, Error> {
         let rev = self.rev + 1;
+        let stored = if kind == EventKind::Put && self.codec.is_some() && (self.persist.is_some() || self.repl.is_some()) { Some(self.enc(&key, &value).into_owned()) } else { None };
         for buf in [self.persist.as_mut().map(|p| &mut p.buf), self.repl.as_mut()].into_iter().flatten() {
             match kind {
-                EventKind::Put => wal::encode(buf, OP_PUT, rev, create_rev, &key, &value),
+                EventKind::Put => wal::encode(buf, OP_PUT, rev, create_rev, &key, stored.as_deref().unwrap_or(&value)),
                 EventKind::Delete => wal::encode(buf, OP_DELETE, rev, create_rev, &key, &[]),
             }
         }

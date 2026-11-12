@@ -49,12 +49,14 @@ pub mod job;
 pub mod mirror;
 pub mod attachdetach;
 pub mod crd;
+pub mod csr;
 pub mod namespace;
 pub mod nodelifecycle;
 pub mod pvc;
 pub mod quota;
 pub mod replicaset;
 pub mod scheduler;
+pub mod servicelb;
 pub mod statefulset;
 pub mod svm;
 pub mod util;
@@ -100,7 +102,13 @@ pub async fn run_all<C: Client + Clone + 'static>(c: C) {
 /// Like [`run_all`] with explicit timing. Dropping (or aborting) the returned future stops all
 /// controllers and their watchers.
 pub async fn run_all_with<C: Client + Clone + 'static>(c: C, cfg: Config) {
-    let _guard = util::Guard(alloc::vec![
+    run_all_with_ca(c, cfg, None).await
+}
+
+/// Like [`run_all_with`]; with the cluster CA the CertificateSigningRequest approver and signer
+/// ([`csr`]) runs too.
+pub async fn run_all_with_ca<C: Client + Clone + 'static>(c: C, cfg: Config, ca: Option<alloc::rc::Rc<csr::CaSigner>>) {
+    let mut guard = util::Guard(alloc::vec![
         spawn(scheduler::run(c.clone(), cfg)),
         spawn(replicaset::run(c.clone(), cfg)),
         spawn(replicaset::run_rc(c.clone(), cfg)),
@@ -118,9 +126,14 @@ pub async fn run_all_with<C: Client + Clone + 'static>(c: C, cfg: Config) {
         spawn(svm::run(c.clone(), cfg)),
         spawn(pvc::run(c.clone(), cfg)),
         spawn(nodelifecycle::run(c.clone(), cfg)),
+        spawn(servicelb::run(c.clone(), cfg)),
         spawn(attachdetach::run(c.clone())),
-        spawn(gc::run(c, cfg)),
+        spawn(gc::run(c.clone(), cfg)),
     ]);
+    if let Some(ca) = ca {
+        guard.0.push(spawn(csr::run(c, cfg, ca)));
+    }
+    let _guard = guard;
     // A never-woken future would let the executor free this task (and abort the guard).
     loop {
         kr_rt::exec::sleep(3_600_000).await;

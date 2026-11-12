@@ -265,6 +265,7 @@ pub fn main(mut args: Args) -> i32 {
         Ok(s) => s,
         Err(_) => return fail("cannot open the image store"),
     };
+    crate::ctr_import::import_startup(&store);
     let cfg = kr_kubelet::Config { node_name: name.clone(), root: String::from(store.root()), network: ns::getuid() == 0, cgroups: cgroups_available(), node_ip: ip, vxlan: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() != Some("host-gw"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env(), control_plane: false };
     let rotation = (remote.clone(), pki_dir.clone(), name.clone(), ip, tls.clone());
     let tracker = remote.clone();

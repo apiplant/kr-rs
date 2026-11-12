@@ -161,7 +161,7 @@ pub fn bootstrap_roles() -> Vec<(&'static str, String)> {
         (
             "system:node",
             alloc::format!(
-                "[{},{},{},{},{},{},{},{},{},{},{},{},{}]",
+                "[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]",
                 rule(&[""], &["pods", "services", "endpoints", "namespaces"], READ),
                 rule(&[""], &["pods"], &["delete"]),
                 rule(&[""], &["pods/status", "nodes/status"], &["get", "patch", "update"]),
@@ -174,7 +174,16 @@ pub fn bootstrap_roles() -> Vec<(&'static str, String)> {
                 rule(&[""], &["serviceaccounts"], &["get"]),
                 rule(&["certificates.k8s.io"], &["podcertificaterequests"], &["create", "get", "list", "watch", "delete"]),
                 rule(&["certificates.k8s.io"], &["clustertrustbundles"], READ),
-                nonres(&["/api", "/api/*", "/apis", "/apis/*", "/version", "/healthz"], &["get"])
+                nonres(&["/api", "/api/*", "/apis", "/apis/*", "/version", "/healthz"], &["get"]),
+                // Volumes (CSI, ADR-041): the claim status is further scoped by node_authz;
+                // a node writes only its own CSINode (node_authz denies the others).
+                rule(&[""], &["persistentvolumeclaims/status"], &["get", "patch", "update"]),
+                rule(&[""], &["persistentvolumes"], READ),
+                rule(&["storage.k8s.io"], &["volumeattachments", "csidrivers"], READ),
+                rule(&["storage.k8s.io"], &["csinodes"], &["get", "create", "update", "patch", "delete"]),
+                rule(&["storage.k8s.io"], &["storageclasses"], &["get", "list", "watch"]),
+                rule(&["node.k8s.io"], &["runtimeclasses"], READ),
+                rule(&["certificates.k8s.io"], &["certificatesigningrequests"], &["create", "get", "list", "watch"])
             ),
         ),
         ("system:service-account-issuer-discovery", alloc::format!("[{}]", nonres(&["/.well-known/openid-configuration", "/.well-known/openid-configuration/", "/openid/v1/jwks", "/openid/v1/jwks/"], &["get"]))),
@@ -191,6 +200,67 @@ pub fn bootstrap_bindings() -> Vec<(&'static str, &'static str, &'static str)> {
         ("system:service-account-issuer-discovery", "system:service-account-issuer-discovery", r#"[{"kind":"Group","apiGroup":"rbac.authorization.k8s.io","name":"system:serviceaccounts"}]"#),
         ("system:node", "system:node", r#"[{"kind":"Group","apiGroup":"rbac.authorization.k8s.io","name":"system:nodes"}]"#),
     ]
+}
+
+/// Validation of a `certificatesigningrequests/approval` or `/status` write (KNOWN_ISSUES
+/// #173), as upstream's strategies: only `Approved`/`Denied`/`Failed` conditions through
+/// `approval`, never both Approved and Denied, no change once a certificate is issued, and
+/// a new Approved/Denied needs the `approve` verb on the `signers` resource (name = signer
+/// or `<domain>/*`); `status` may not touch Approved/Denied. A `kube-apiserver-client` request
+/// naming `system:masters` can be approved by a `system:masters` member only. Err is
+/// (status code, message). `can` answers an authorization question for the caller.
+pub fn csr_update_check(sub: &str, old: &Value, new: &Value, masters: bool, can: &dyn Fn(&Attrs) -> bool) -> core::result::Result<(), (u16, String)> {
+    let conds = |v: &Value| -> Vec<(String, String)> {
+        let c = v.pointer(&["status", "conditions"]).and_then(Value::as_array).unwrap_or(&[]);
+        c.iter().map(|c| (c.get("type").and_then(Value::as_str).unwrap_or("").to_string(), c.get("status").and_then(Value::as_str).unwrap_or("").to_string())).collect()
+    };
+    let (oc, nc) = (conds(old), conds(new));
+    let issued = old.pointer(&["status", "certificate"]).and_then(Value::as_str).is_some_and(|c| !c.is_empty());
+    let decided = |c: &[(String, String)], t: &str| c.iter().any(|(ty, st)| ty == t && st == "True");
+    let added = |t: &str| nc.iter().any(|(ty, _)| ty == t) && !oc.iter().any(|(ty, _)| ty == t);
+    let changes = |t: &str| oc.iter().filter(|(ty, _)| ty == t).ne(nc.iter().filter(|(ty, _)| ty == t));
+    let bad = |m: &str| Err((422, m.to_string()));
+    if sub == "approval" {
+        if nc.iter().any(|(t, _)| !matches!(t.as_str(), "Approved" | "Denied" | "Failed")) {
+            return bad("status.conditions: only Approved, Denied and Failed conditions are allowed through approval");
+        }
+        if (decided(&nc, "Approved") && decided(&nc, "Denied")) || (nc.iter().any(|(t, _)| t == "Approved") && nc.iter().any(|(t, _)| t == "Denied")) {
+            return bad("status.conditions: Approved and Denied conditions are mutually exclusive");
+        }
+    } else if added("Approved") || added("Denied") || changes("Approved") || changes("Denied") {
+        return bad("status.conditions: Approved and Denied can only be set through the approval subresource");
+    }
+    if issued && oc != nc {
+        return bad("status.conditions: cannot update a CertificateSigningRequest whose certificate is issued");
+    }
+    if sub == "approval" && (added("Approved") || added("Denied")) {
+        let signer = old.pointer(&["spec", "signerName"]).and_then(Value::as_str).unwrap_or("");
+        let mut a = Attrs { verb: "approve".into(), api_group: "certificates.k8s.io".into(), resource: "signers".into(), name: signer.to_string(), resource_request: true, ..Default::default() };
+        let mut ok = can(&a);
+        if !ok {
+            if let Some((domain, _)) = signer.split_once('/') {
+                a.name = alloc::format!("{domain}/*");
+                ok = can(&a);
+            }
+        }
+        if !ok {
+            return Err((403, alloc::format!("user not permitted to approve requests with signerName \"{signer}\"")));
+        }
+        if added("Approved") && signer == "kubernetes.io/kube-apiserver-client" && !masters && csr_names_masters(old) {
+            return Err((403, "only system:masters may approve a client certificate for the system:masters group".to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// Does the PKCS#10 request in `spec.request` contain the string `system:masters` (a
+/// conservative stand-in for parsing the subject: any mention counts)? Unparsable counts as no.
+fn csr_names_masters(csr: &Value) -> bool {
+    let Some(b64) = csr.pointer(&["spec", "request"]).and_then(Value::as_str) else { return false };
+    let Ok(pem) = kr_fmt::base64::decode(b64) else { return false };
+    let Ok(ders) = kr_crypto::x509::pem_decode_all(&String::from_utf8_lossy(&pem), "CERTIFICATE REQUEST") else { return false };
+    let needle = b"system:masters";
+    ders.iter().any(|d| d.windows(needle.len()).any(|w| w == needle))
 }
 
 /// Maps an HTTP method to a Kubernetes verb.
@@ -248,5 +318,88 @@ mod tests {
         let anon = user("system:anonymous", &["system:unauthenticated"]);
         assert!(!allowed(&anon, &discovery, &crbs, &[], &lookup));
         assert!(allowed(&anon, &Attrs { verb: "get".into(), path: "/version".into(), ..Default::default() }, &crbs, &[], &lookup));
+    }
+
+    #[test]
+    fn node_role_volume_rules() {
+        let roles = bootstrap_roles();
+        let lookup = |kind: &str, _: &str, name: &str| -> Option<Vec<Value>> {
+            (kind == "ClusterRole").then(|| roles.iter().find(|(n, _)| *n == name).map(|(_, r)| parse_str(r).unwrap().as_array().unwrap().to_vec())).flatten()
+        };
+        let crbs: Vec<Value> = bootstrap_bindings().iter().map(|(n, r, s)| parse_str(&alloc::format!(r#"{{"metadata":{{"name":"{n}"}},"roleRef":{{"kind":"ClusterRole","name":"{r}"}},"subjects":{s}}}"#)).unwrap()).collect();
+        let node = user("system:node:n1", &["system:nodes", "system:authenticated"]);
+        let ok = |v: &str, g: &str, r: &str, sub: &str| {
+            let mut a = attrs(v, g, r, "");
+            a.subresource = sub.into();
+            allowed(&node, &a, &crbs, &[], &lookup)
+        };
+        assert!(ok("patch", "", "persistentvolumeclaims", "status"));
+        assert!(ok("update", "", "persistentvolumeclaims", "status"));
+        assert!(!ok("patch", "", "persistentvolumeclaims", ""));
+        for r in ["volumeattachments", "csidrivers"] {
+            assert!(ok("get", "storage.k8s.io", r, "") && ok("list", "storage.k8s.io", r, "") && ok("watch", "storage.k8s.io", r, ""));
+            assert!(!ok("create", "storage.k8s.io", r, ""));
+        }
+        for v in ["create", "update", "patch", "get", "delete"] {
+            assert!(ok(v, "storage.k8s.io", "csinodes", ""));
+        }
+        assert!(ok("get", "storage.k8s.io", "storageclasses", "") && !ok("delete", "storage.k8s.io", "storageclasses", ""));
+        assert!(ok("watch", "", "persistentvolumes", "") && !ok("delete", "", "persistentvolumes", ""));
+        assert!(ok("list", "node.k8s.io", "runtimeclasses", "") && !ok("create", "node.k8s.io", "runtimeclasses", ""));
+        for v in ["create", "get", "list", "watch"] {
+            assert!(ok(v, "certificates.k8s.io", "certificatesigningrequests", ""));
+        }
+        assert!(!ok("update", "certificates.k8s.io", "certificatesigningrequests", "approval"));
+        assert!(!ok("approve", "certificates.k8s.io", "signers", ""));
+    }
+
+    fn csr(signer: &str, conds: &str, cert: &str) -> Value {
+        parse_str(&alloc::format!(r#"{{"spec":{{"signerName":"{signer}","request":""}},"status":{{"conditions":{conds},"certificate":"{cert}"}}}}"#)).unwrap()
+    }
+
+    #[test]
+    fn csr_approval_rules() {
+        let none = |_: &Attrs| false;
+        let all = |_: &Attrs| true;
+        let only = |n: &'static str| move |a: &Attrs| a.verb == "approve" && a.resource == "signers" && a.name == n;
+        let approved = r#"[{"type":"Approved","status":"True"}]"#;
+        let old = csr("example.com/x", "[]", "");
+        let new = csr("example.com/x", approved, "");
+        assert!(csr_update_check("approval", &old, &new, false, &all).is_ok());
+        assert_eq!(csr_update_check("approval", &old, &new, false, &none).unwrap_err().0, 403);
+        assert!(csr_update_check("approval", &old, &new, false, &only("example.com/x")).is_ok());
+        assert!(csr_update_check("approval", &old, &new, false, &only("example.com/*")).is_ok());
+        assert_eq!(csr_update_check("approval", &old, &new, false, &only("other.com/*")).unwrap_err().0, 403);
+        // other condition types, Approved + Denied
+        let odd = csr("example.com/x", r#"[{"type":"Foo","status":"True"}]"#, "");
+        assert_eq!(csr_update_check("approval", &old, &odd, true, &all).unwrap_err().0, 422);
+        let both = csr("example.com/x", r#"[{"type":"Approved","status":"True"},{"type":"Denied","status":"True"}]"#, "");
+        assert_eq!(csr_update_check("approval", &old, &both, true, &all).unwrap_err().0, 422);
+        // issued: frozen
+        let issued = csr("example.com/x", approved, "AAAA");
+        let denied = csr("example.com/x", r#"[{"type":"Approved","status":"True"},{"type":"Failed","status":"True"}]"#, "AAAA");
+        assert_eq!(csr_update_check("approval", &issued, &denied, true, &all).unwrap_err().0, 422);
+        assert!(csr_update_check("approval", &issued, &issued, true, &all).is_ok());
+        // status cannot approve; can set the certificate
+        assert_eq!(csr_update_check("status", &old, &new, true, &all).unwrap_err().0, 422);
+        assert!(csr_update_check("status", &new, &csr("example.com/x", approved, "AAAA"), false, &none).is_ok());
+    }
+
+    #[test]
+    fn csr_masters_restriction() {
+        let k = kr_crypto::x509::pem_encode("CERTIFICATE REQUEST", b"\x30\x03subject system:masters");
+        let b64 = kr_fmt::base64::encode(k.as_bytes());
+        let mk = |signer: &str| parse_str(&alloc::format!(r#"{{"spec":{{"signerName":"{signer}","request":"{b64}"}},"status":{{"conditions":[]}}}}"#)).unwrap();
+        let ap = parse_str(r#"{"spec":{},"status":{"conditions":[{"type":"Approved","status":"True"}]}}"#).unwrap();
+        let mut new = mk("kubernetes.io/kube-apiserver-client");
+        new.set("status", ap.get("status").unwrap().clone());
+        let old = mk("kubernetes.io/kube-apiserver-client");
+        let all = |_: &Attrs| true;
+        assert_eq!(csr_update_check("approval", &old, &new, false, &all).unwrap_err().0, 403);
+        assert!(csr_update_check("approval", &old, &new, true, &all).is_ok());
+        // other signers are not restricted
+        let (old2, mut new2) = (mk("example.com/x"), mk("example.com/x"));
+        new2.set("status", ap.get("status").unwrap().clone());
+        assert!(csr_update_check("approval", &old2, &new2, false, &all).is_ok());
     }
 }

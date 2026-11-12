@@ -118,6 +118,8 @@ pub static RESOURCES: &[Resource] = &[
     r!("autoscaling", "v2", "HorizontalPodAutoscaler", "horizontalpodautoscalers", "horizontalpodautoscaler", true, ["hpa"], ["status"], ["all"]),
     r!("autoscaling", "v1", "HorizontalPodAutoscaler", "horizontalpodautoscalers", "horizontalpodautoscaler", true, ["hpa"], ["status"], ["all"]),
     r!("events.k8s.io", "v1", "Event", "events", "event", true, [], [], []),
+    r!("metrics.k8s.io", "v1beta1", "NodeMetrics", "nodes", "node", false, [], [], []),
+    r!("metrics.k8s.io", "v1beta1", "PodMetrics", "pods", "pod", true, [], [], []),
     r!("apiregistration.k8s.io", "v1", "APIService", "apiservices", "apiservice", false, [], ["status"], ["api-extensions"]),
     r!("storagemigration.k8s.io", "v1", "StorageVersionMigration", "storageversionmigrations", "storageversionmigration", false, [], ["status"], []),
     // rbac.authorization.k8s.io/v1

@@ -7,7 +7,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use kr_net::http1::{Client, Config};
 use kr_net::registry::{Descriptor, Reference, Registry};
-use kr_net::tls::TlsConnector;
+use crate::registries::{Registries, TlsCfg};
+use kr_net::registry::RegConnector;
 use kr_sys::fs::{self, AT_FDCWD};
 use kr_sys::Errno;
 
@@ -19,47 +20,44 @@ const MAX_CONFIG: u64 = 4 << 20;
 /// Default system trust store locations (Debian/Arch/Alpine, then Fedora/RHEL).
 const SYSTEM_BUNDLES: &[&[u8]] = &[b"/etc/ssl/certs/ca-certificates.crt\0", b"/etc/pki/tls/certs/ca-bundle.crt\0"];
 
-/// A registry client over TLS. Trust anchors: `$KR_CA_BUNDLE` (a PEM file; then loopback
-/// registries also use https), else the system bundle if present.
-fn registry() -> Result<Registry<TlsConnector>> {
-    let custom = crate::store::env_var("KR_CA_BUNDLE");
-    let pem = match &custom {
-        Some(path) => {
-            let mut p = path.as_bytes().to_vec();
-            p.push(0);
-            fs::read_file(&p, 4 << 20).map_err(|_| Error::Image("cannot read KR_CA_BUNDLE"))?
-        }
-        None => SYSTEM_BUNDLES.iter().find_map(|p| fs::read_file(p, 4 << 20).ok()).unwrap_or_default(),
+/// A registry client over TLS. Trust anchors: the system bundle (or `$KR_CA_BUNDLE`, a PEM file;
+/// then loopback registries also use https), plus the host's `registries.yaml` `ca_file`, with
+/// its client certificate and `insecure_skip_verify` (ADR-044).
+fn registry(tls: Option<&TlsCfg>) -> Result<Registry<RegConnector>> {
+    let read = |path: &str, what: &'static str| -> Result<String> {
+        let mut p = path.as_bytes().to_vec();
+        p.push(0);
+        let b = fs::read_file(&p, 4 << 20).map_err(|_| Error::Image(what))?;
+        String::from_utf8(b).map_err(|_| Error::Image("TLS file is not UTF-8 PEM"))
     };
-    let pem = core::str::from_utf8(&pem).map_err(|_| Error::Image("CA bundle is not UTF-8"))?;
-    let connector = TlsConnector::with_roots_pem(pem)?;
+    let custom = crate::store::env_var("KR_CA_BUNDLE");
+    let mut pem = match &custom {
+        Some(path) => read(path, "cannot read KR_CA_BUNDLE")?,
+        None => SYSTEM_BUNDLES.iter().find_map(|p| fs::read_file(p, 4 << 20).ok()).and_then(|b| String::from_utf8(b).ok()).unwrap_or_default(),
+    };
+    let mut loopback_tls = custom.is_some();
+    let mut client = None;
+    let mut insecure = false;
+    if let Some(t) = tls {
+        if let Some(ca) = &t.ca_file {
+            pem.push('\n');
+            pem.push_str(&read(ca, "cannot read registries.yaml ca_file")?);
+            loopback_tls = true;
+        }
+        match (&t.cert_file, &t.key_file) {
+            (Some(c), Some(k)) => client = Some((read(c, "cannot read registries.yaml cert_file")?, read(k, "cannot read registries.yaml key_file")?)),
+            (None, None) => {}
+            _ => return Err(Error::Image("registries.yaml: cert_file and key_file go together")),
+        }
+        insecure = t.insecure;
+        loopback_tls |= insecure || client.is_some();
+    }
+    let connector = RegConnector::new(&pem, client.as_ref().map(|(c, k)| (c.as_str(), k.as_str())), insecure)?;
     let mut reg = Registry::with_client(Client::with_connector(connector, Config::default()));
-    if custom.is_some() {
+    if loopback_tls {
         reg.tls_for_loopback();
     }
     Ok(reg)
-}
-
-/// The mirror for `registry` from `$KR_REGISTRY_MIRRORS` (`registry.k8s.io=http://10.0.0.1:5001,
-/// docker.io=https://cache:5000`): its `host[:port]` and whether it is plain http. Blobs are
-/// still verified against the digests in the manifest; the mirror is trusted for tag resolution
-/// only, like docker's `registry-mirrors`.
-fn mirror_for(registry: &str) -> Option<(String, bool)> {
-    let v = crate::store::env_var("KR_REGISTRY_MIRRORS")?;
-    v.split(',').find_map(|e| {
-        let (from, to) = e.trim().split_once('=')?;
-        if from != registry {
-            return None;
-        }
-        let (plain, host) = match to.split_once("://") {
-            Some(("http", h)) => (true, h),
-            Some(("https", h)) => (false, h),
-            Some(_) => return None,
-            None => (false, to),
-        };
-        let host = host.trim_end_matches('/');
-        (!host.is_empty()).then(|| (host.to_string(), plain))
-    })
 }
 
 pub async fn pull(store: &Store, image_ref: &str) -> Result<ImageId> {
@@ -84,26 +82,35 @@ async fn pull_full(store: &Store, image_ref: &str, creds: &[Cred], limits: &Limi
         }
     }
     let upstream = Reference::parse(image_ref)?;
-    let mut reg = registry()?;
-    // A configured mirror is tried first, anonymously; any failure falls back to upstream.
-    let mut resolved = None;
-    if let Some((host, plain)) = mirror_for(&upstream.registry) {
-        if plain {
-            reg.allow_plain_http(&host);
+    let regs = Registries::load()?;
+    // Mirrors first (in order, with their own credentials, never the pod's), then the
+    // upstream with the pod's credentials; the upstream's error is the one reported.
+    let mut chosen = None;
+    let mut last: Option<Error> = None;
+    for a in regs.attempts(&upstream.registry, &upstream.repository) {
+        let hcfg = regs.host_cfg(&a.host);
+        let mut reg = match registry(hcfg.map(|c| &c.tls)) {
+            Ok(r) => r,
+            Err(e) => {
+                last = Some(e);
+                continue;
+            }
+        };
+        if a.plain_http {
+            reg.allow_plain_http(&a.host);
         }
-        let m = Reference { registry: host, ..upstream.clone() };
-        if let Ok(image) = reg.resolve(&m).await {
-            resolved = Some((m, image));
+        let cfg_cred = hcfg.and_then(|c| c.auth.clone());
+        reg.set_credential(if a.is_mirror { cfg_cred } else { lookup(creds, &upstream.registry, &upstream.repository).cloned().or(cfg_cred) });
+        let r = Reference { registry: a.host.clone(), repository: a.repository.clone(), ..upstream.clone() };
+        match reg.resolve(&r).await {
+            Ok(image) => {
+                chosen = Some((reg, r, image));
+                break;
+            }
+            Err(e) => last = Some(e.into()),
         }
     }
-    let (r, image) = match resolved {
-        Some(x) => x,
-        None => {
-            reg.set_credential(lookup(creds, &upstream.registry, &upstream.repository).cloned());
-            let image = reg.resolve(&upstream).await?;
-            (upstream, image)
-        }
-    };
+    let Some((mut reg, r, image)) = chosen else { return Err(last.unwrap_or(Error::Image("no registry to pull from"))) };
     if image.manifest.layers.len() > MAX_LAYERS {
         return Err(Error::Image("too many layers"));
     }
@@ -139,10 +146,19 @@ async fn pull_full(store: &Store, image_ref: &str, creds: &[Cred], limits: &Limi
         ensure_blob(store, &mut reg, &r, l).await?;
     }
 
-    let dir = store.image_dir(&id)?;
+    install_image(store, &id, &image.raw, &cfg_json, &image.manifest.layers, &gz, &icfg.diff_ids, limits)?;
+    store.set_ref(image_ref, &id)?;
+    Ok(id)
+}
+
+/// Writes manifest + config for `id` and unpacks `layers` (already in the store) into its
+/// rootfs; shared by pulls and `import`. A concurrent installer that wins the rename is fine.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_image(store: &Store, id: &ImageId, manifest: &[u8], cfg_json: &[u8], layers: &[Descriptor], gz: &[bool], diff_ids: &[String], limits: &Limits) -> Result<()> {
+    let dir = store.image_dir(id)?;
     crate::store::mkdir_p(&dir, 0o755)?;
-    crate::store::write_file_atomic(&format!("{dir}/manifest.json"), &image.raw)?;
-    crate::store::write_file_atomic(&format!("{dir}/config.json"), &cfg_json)?;
+    crate::store::write_file_atomic(&format!("{dir}/manifest.json"), manifest)?;
+    crate::store::write_file_atomic(&format!("{dir}/config.json"), cfg_json)?;
 
     // Concurrent pulls of one image (other namespaces, other `kr ctr` processes) each unpack
     // into their own directory; the first rename wins.
@@ -154,7 +170,7 @@ async fn pull_full(store: &Store, image_ref: &str, creds: &[Cred], limits: &Limi
     let ctmp = cpath(&tmp)?;
     let dirfd = fs::openat(AT_FDCWD, &cpath(&dir)?, fs::O_PATH | fs::O_DIRECTORY | fs::O_CLOEXEC, 0).ctx("open image dir")?;
     fs::mkdirat(dirfd.raw(), &ctmp, 0o755).ctx("mkdir rootfs.tmp")?;
-    let built = build_rootfs(store, &image.manifest.layers, &gz, &icfg.diff_ids, &format!("{dir}/{tmp}"), limits);
+    let built = build_rootfs(store, layers, gz, diff_ids, &format!("{dir}/{tmp}"), limits);
     if let Err(e) = built {
         let _ = fs::remove_all(dirfd.raw(), &ctmp);
         return Err(e);
@@ -170,8 +186,7 @@ async fn pull_full(store: &Store, image_ref: &str, creds: &[Cred], limits: &Limi
             return Err(Error::Io("rename rootfs", e));
         }
     }
-    store.set_ref(image_ref, &id)?;
-    Ok(id)
+    Ok(())
 }
 
 /// Removes unpack directories of pulls whose process is gone (`rootfs.tmp-<pid>-<start>-<n>`,
@@ -227,7 +242,7 @@ fn build_rootfs(store: &Store, layers: &[Descriptor], gz: &[bool], diff_ids: &[S
 }
 
 /// Makes sure the blob is in the store, downloading and verifying it if absent or corrupt.
-async fn ensure_blob(store: &Store, reg: &mut Registry<TlsConnector>, r: &Reference, d: &Descriptor) -> Result<()> {
+async fn ensure_blob(store: &Store, reg: &mut Registry<RegConnector>, r: &Reference, d: &Descriptor) -> Result<()> {
     if !d.digest.is_sha256() {
         return Err(Error::Net(kr_net::Error::UnsupportedDigest));
     }

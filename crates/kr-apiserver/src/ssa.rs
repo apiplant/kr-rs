@@ -28,26 +28,48 @@ pub type Lists<'a> = &'a dyn Fn(&[&str]) -> ListKind;
 const ATOMIC_STRUCTS: &[&str] = &[
     "selector", "labelSelector", "namespaceSelector", "podSelector", "objectSelector", "nodeSelector", "preference",
     "fieldRef", "resourceFieldRef", "secretKeyRef", "configMapKeyRef", "fileKeyRef",
-    "scaleTargetRef", "claimRef", "dataSource", "dataSourceRef", "involvedObject", "regarding", "related",
+    "requiredDuringSchedulingIgnoredDuringExecution", "scaleTargetRef", "claimRef", "dataSource", "dataSourceRef", "involvedObject", "regarding", "related",
 ];
 
-/// List kinds of the built-in types, from the strategic merge patch tables.
+const CONTAINER_LISTS: &[&str] = &["containers", "initContainers", "ephemeralContainers"];
+
+/// List kinds of the built-in types, following the upstream OpenAPI markers
+/// (`+listType`, `+listMapKey`, `+mapType`, `+structType`) for the common fields. The strategic
+/// merge tables are only the starting point: they disagree with upstream for NetworkPolicy and
+/// EndpointSlice `ports`, node `taints`, `readinessGates`, namespace `spec.finalizers` and
+/// `topologySpreadConstraints` keys.
 pub fn builtin_lists(path: &[&str]) -> ListKind {
     let Some((field, parent)) = path.split_last() else { return ListKind::Atomic };
     if ATOMIC_STRUCTS.contains(field) {
         return ListKind::AtomicMap;
     }
-    if let Some(k) = crate::patch::merge_key(parent, field) {
-        let mut keys = alloc::vec![k.to_string()];
-        if *field == "ports" {
-            keys.push("protocol".to_string());
-        }
-        keys.sort();
-        ListKind::Map(keys)
-    } else if crate::patch::primitive_merge(field) {
-        ListKind::Set
-    } else {
-        ListKind::Atomic
+    let map = |keys: &[&str]| {
+        let mut k: Vec<String> = keys.iter().map(|s| s.to_string()).collect();
+        k.sort();
+        ListKind::Map(k)
+    };
+    let last = parent.last().copied().unwrap_or("");
+    match *field {
+        // metadata.finalizers is a set; Namespace spec.finalizers is atomic.
+        "finalizers" if last == "metadata" => ListKind::Set,
+        "finalizers" => ListKind::Atomic,
+        // Unsure: upstream marks these without a listType, so they are atomic.
+        "taints" | "readinessGates" => ListKind::Atomic,
+        "topologySpreadConstraints" => map(&["topologyKey", "whenUnsatisfiable"]),
+        "podIPs" | "hostIPs" => map(&["ip"]),
+        "claims" => map(&["name"]),
+        // Service.spec.ports (port+protocol); NetworkPolicy and Endpoints ports are atomic.
+        "ports" if parent.iter().any(|p| CONTAINER_LISTS.contains(p)) => map(&["containerPort", "protocol"]),
+        "ports" if last == "spec" => map(&["port", "protocol"]),
+        "ports" => ListKind::Atomic,
+        // Node status addresses are keyed by type; EndpointSlice endpoint addresses are a set.
+        "addresses" if last == "status" => map(&["type"]),
+        "addresses" if last == "endpoints" => ListKind::Set,
+        "addresses" => ListKind::Atomic,
+        f => match crate::patch::merge_key(parent, f) {
+            Some(k) => map(&[k]),
+            None => ListKind::Atomic,
+        },
     }
 }
 
@@ -661,6 +683,16 @@ pub fn apply(live: &Value, applied: &Value, mut entries: Vec<Entry>, manager: &s
         if contains(&sa, &l) || entries.iter().any(|e| !own(e) && contains(&e.fields, &l)) {
             continue;
         }
+        // Key fields go with their item; an item stays while another manager owns part of it.
+        if let Some(pk) = l.len().checked_sub(2).and_then(|i| l[i].strip_prefix("k:")) {
+            let is_key = l.last().and_then(|x| x.strip_prefix("f:")).is_some_and(|n| json::parse_str(pk).ok().is_some_and(|k| k.get(n).is_some()));
+            if is_key {
+                continue;
+            }
+        }
+        if l.last().is_some_and(|k| k == ".") && entries.iter().any(|e| !own(e) && contains(&e.fields, &l[..l.len() - 1])) {
+            continue;
+        }
         remove_at(&mut object, &l);
     }
     merge(&mut object, applied, &mut Vec::new(), lists);
@@ -777,5 +809,70 @@ mod tests {
         let r2 = ap(&r.object, r#"{"spec":{"containers":[{"name":"d","image":"j"}]}}"#, r.entries, "m", false).unwrap();
         let names: Vec<&str> = r2.object.pointer(&["spec", "containers"]).unwrap().as_array().unwrap().iter().filter_map(|c| c.get("name").and_then(Value::as_str)).collect();
         assert_eq!(names, ["x", "d"]);
+    }
+
+    fn crd_lists(schema: &'static Value) -> impl Fn(&[&str]) -> ListKind {
+        move |p| schema_lists(schema, p)
+    }
+
+    #[test]
+    fn two_managers_env_vars_and_removal() {
+        let live = j(r#"{"spec":{"containers":[{"name":"c","image":"i"}]}}"#);
+        let a = ap(&live, r#"{"spec":{"containers":[{"name":"c","image":"i","env":[{"name":"A","value":"1"}]}]}}"#, Vec::new(), "m1", false).unwrap();
+        let b = ap(&a.object, r#"{"spec":{"containers":[{"name":"c","env":[{"name":"B","value":"2"}]}]}}"#, a.entries, "m2", false).unwrap();
+        let env = b.object.pointer(&["spec", "containers"]).unwrap().as_array().unwrap()[0].get("env").unwrap().as_array().unwrap().len();
+        assert_eq!(env, 2);
+        let m2 = b.entries.iter().find(|e| e.manager == "m2").unwrap();
+        assert_eq!(to_string(&sort_keys(&m2.fields)), r#"{"f:spec":{"f:containers":{"k:{\"name\":\"c\"}":{".":{},"f:env":{"k:{\"name\":\"B\"}":{".":{},"f:name":{},"f:value":{}}},"f:name":{}}}}}"#);
+        // m1 drops its env var: only A goes, B and the container stay.
+        let c = ap(&b.object, r#"{"spec":{"containers":[{"name":"c","image":"i"}]}}"#, b.entries.clone(), "m1", false).unwrap();
+        let ct = c.object.pointer(&["spec", "containers"]).unwrap().as_array().unwrap()[0].clone();
+        let env = ct.get("env").unwrap().as_array().unwrap();
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].get("name").and_then(Value::as_str), Some("B"));
+        // Same env var, different value: conflict, then force takes it.
+        let err = ap(&c.object, r#"{"spec":{"containers":[{"name":"c","env":[{"name":"B","value":"9"}]}]}}"#, c.entries.clone(), "m1", false).unwrap_err();
+        assert!(err.contains(r#"conflict with "m2" using v1: .spec.containers[name="c"].env[name="B"].value"#), "{err}");
+        let f = ap(&c.object, r#"{"spec":{"containers":[{"name":"c","env":[{"name":"B","value":"9"}]}]}}"#, c.entries, "m1", true).unwrap();
+        assert!(f.entries.iter().find(|e| e.manager == "m2").is_none_or(|e| !contains(&e.fields, &["f:spec".to_string(), "f:containers".to_string(), "k:{\"name\":\"c\"}".to_string(), "f:env".to_string(), "k:{\"name\":\"B\"}".to_string(), "f:value".to_string()])));
+    }
+
+    #[test]
+    fn atomic_list_change_and_finalizer_sets() {
+        let live = j(r#"{"spec":{"tolerations":[{"key":"a"}]}}"#);
+        let a = ap(&live, r#"{"spec":{"tolerations":[{"key":"a"}]}}"#, Vec::new(), "m1", false).unwrap();
+        assert_eq!(to_string(&a.owned), r#"{"f:spec":{"f:tolerations":{}}}"#);
+        // m2 replaces the whole atomic list: conflict, forced replace.
+        assert!(ap(&a.object, r#"{"spec":{"tolerations":[{"key":"b"}]}}"#, a.entries.clone(), "m2", false).is_err());
+        let b = ap(&a.object, r#"{"spec":{"tolerations":[{"key":"b"}]}}"#, a.entries, "m2", true).unwrap();
+        assert_eq!(to_string(b.object.pointer(&["spec", "tolerations"]).unwrap()), r#"[{"key":"b"}]"#);
+        // finalizers: each manager owns its own values.
+        let f1 = ap(&j("{}"), r#"{"metadata":{"finalizers":["x"]}}"#, Vec::new(), "m1", false).unwrap();
+        let f2 = ap(&f1.object, r#"{"metadata":{"finalizers":["y"]}}"#, f1.entries, "m2", false).unwrap();
+        assert_eq!(to_string(f2.object.pointer(&["metadata", "finalizers"]).unwrap()), r#"["x","y"]"#);
+        assert_eq!(to_string(&f2.entries.iter().find(|e| e.manager == "m2").unwrap().fields), r#"{"f:metadata":{"f:finalizers":{"v:\"y\"":{}}}}"#);
+        let f3 = ap(&f2.object, r#"{"metadata":{"finalizers":[]}}"#, f2.entries, "m2", false).unwrap();
+        assert_eq!(to_string(f3.object.pointer(&["metadata", "finalizers"]).unwrap()), r#"["x"]"#);
+        // Namespace spec.finalizers is atomic; NetworkPolicy ports are atomic, Service ports keyed.
+        assert_eq!(builtin_lists(&["spec", "finalizers"]), ListKind::Atomic);
+        assert_eq!(builtin_lists(&["spec", "ingress", "ports"]), ListKind::Atomic);
+        assert_eq!(builtin_lists(&["spec", "ports"]), ListKind::Map(alloc::vec!["port".to_string(), "protocol".to_string()]));
+    }
+
+    #[test]
+    fn crd_list_map_two_managers() {
+        let schema: &'static Value = alloc::boxed::Box::leak(alloc::boxed::Box::new(j(r#"{"properties":{"spec":{"properties":{"items":{"type":"array","x-kubernetes-list-type":"map","x-kubernetes-list-map-keys":["id"],"items":{"properties":{"cfg":{"type":"object","x-kubernetes-map-type":"atomic"}}}},"tags":{"type":"array","x-kubernetes-list-type":"set"}}}}}"#)));
+        let l = crd_lists(schema);
+        let run = |live: &Value, a: &str, e: Vec<Entry>, m: &str| apply(live, &j(a), e, m, false, "v1", "t", &l, Scope::All);
+        let a = run(&j("{}"), r#"{"spec":{"items":[{"id":"1","cfg":{"a":1}}],"tags":["x"]}}"#, Vec::new(), "m1").unwrap();
+        assert_eq!(to_string(&a.owned), r#"{"f:spec":{"f:items":{"k:{\"id\":\"1\"}":{".":{},"f:id":{},"f:cfg":{}}},"f:tags":{"v:\"x\"":{}}}}"#);
+        let b = run(&a.object, r#"{"spec":{"items":[{"id":"2"}],"tags":["y"]}}"#, a.entries, "m2").unwrap();
+        assert_eq!(b.object.pointer(&["spec", "items"]).unwrap().as_array().unwrap().len(), 2);
+        assert_eq!(b.object.pointer(&["spec", "tags"]).unwrap().as_array().unwrap().len(), 2);
+        // m2 drops item 2: only its item is removed.
+        let c = run(&b.object, r#"{"spec":{"tags":["y"]}}"#, b.entries, "m2").unwrap();
+        assert_eq!(c.object.pointer(&["spec", "items"]).unwrap().as_array().unwrap().len(), 1);
+        // The atomic cfg conflicts as a whole.
+        assert!(run(&c.object, r#"{"spec":{"items":[{"id":"1","cfg":{"b":2}}]}}"#, c.entries, "m2").is_err());
     }
 }

@@ -2,14 +2,17 @@
 //! (lowest `matchingPrecedence`) into a `PriorityLevelConfiguration`. A level has a concurrency
 //! limit (its share of [`TOTAL_SEATS`]); requests over it wait in per-flow queues served round
 //! robin (`limitResponse: Queue`) or are refused with 429 (`Reject`, or a full queue, or a wait
-//! over [`MAX_WAIT_MS`]). The `Exempt` level never waits. Long-running requests (watches,
+//! over [`MAX_WAIT_MS`]). A request takes `width` seats (a LIST costs one seat per 100 objects it
+//! may return, at most [`MAX_WIDTH`]); a level may use seats other levels lend (`lendablePercent`)
+//! up to its `borrowingLimitPercent` while they are idle. The `Exempt` level never waits. Long-running requests (watches,
 //! exec/attach/port-forward/proxy, `kr` internals) and requests forwarded by another server are
 //! not subject to it. Responses carry `X-Kubernetes-PF-FlowSchema-UID` / `-PriorityLevel-UID`.
 
 use crate::api::{ApiServer, Req, User};
 use crate::object::ApiError;
+use crate::resources;
 use alloc::collections::{BTreeMap, VecDeque};
-use alloc::rc::Rc;
+use alloc::rc::{Rc, Weak};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
@@ -18,15 +21,21 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use kr_fmt::json::Value;
 
-/// Concurrent requests shared among the limited levels by `nominalConcurrencyShares`
-/// (upstream's default `--max-requests-inflight` + `--max-mutating-requests-inflight`).
-const TOTAL_SEATS: u64 = 600;
+/// Default concurrent seats shared among the limited levels by `nominalConcurrencyShares`
+/// (upstream's default `--max-requests-inflight` + `--max-mutating-requests-inflight`);
+/// `KR_APF_SEATS` overrides it.
+const DEFAULT_SEATS: u64 = 600;
+/// Most seats one request takes.
+const MAX_WIDTH: usize = 10;
+/// Objects per seat of a LIST.
+const OBJECTS_PER_SEAT: usize = 100;
 /// A queued request is refused after this long.
 const MAX_WAIT_MS: u64 = 15_000;
 /// The configuration is re-read at most this often.
 const RELOAD_MS: u64 = 1_000;
 
 struct Slot {
+    width: usize,
     granted: Cell<bool>,
     waker: RefCell<Option<Waker>>,
 }
@@ -46,7 +55,6 @@ impl Future for Wait {
 
 #[derive(Default)]
 struct LState {
-    in_flight: usize,
     queues: BTreeMap<String, VecDeque<Rc<Slot>>>,
     queued: usize,
     /// Round-robin position over the flow queues.
@@ -58,6 +66,13 @@ pub struct Level {
     uid: String,
     exempt: bool,
     limit: usize,
+    /// Seats of the limit other levels may borrow while idle.
+    lendable: usize,
+    /// Most seats above `limit` this level may borrow.
+    borrow_max: usize,
+    /// Seats in use.
+    inflight: Cell<usize>,
+    pool: Rc<Pool>,
     reject: bool,
     max_queued: usize,
     /// The settings this level was built from (a changed object builds a new level).
@@ -65,27 +80,66 @@ pub struct Level {
     state: RefCell<LState>,
 }
 
+/// The levels that lend and borrow seats among each other.
+#[derive(Default)]
+pub struct Pool {
+    levels: RefCell<Vec<Weak<Level>>>,
+}
+
+impl Pool {
+    /// Lendable seats that nobody uses: each level's lendable part, less what its own requests
+    /// occupy above its guaranteed seats, less what levels borrowed above their limit.
+    fn free(&self) -> usize {
+        let (mut cap, mut used) = (0usize, 0usize);
+        for l in self.levels.borrow().iter().filter_map(Weak::upgrade) {
+            let n = l.inflight.get();
+            cap += l.lendable;
+            used += n.saturating_sub(l.limit - l.lendable).min(l.lendable) + n.saturating_sub(l.limit);
+        }
+        cap.saturating_sub(used)
+    }
+}
+
 impl Level {
-    /// Hands the freed seat to the next queued request (round robin over flows).
-    fn release(&self) {
-        let mut st = self.state.borrow_mut();
-        st.in_flight = st.in_flight.saturating_sub(1);
-        self.dispatch(&mut st);
+    /// Whether `w` more seats are available: within the limit, or borrowed from idle lenders.
+    fn can_take(&self, w: usize) -> bool {
+        let new = self.inflight.get() + w;
+        if new <= self.limit {
+            return true;
+        }
+        let need = new - self.limit.max(self.inflight.get());
+        new - self.limit <= self.borrow_max && self.pool.free() >= need
+    }
+
+    /// Hands the freed seats to the next queued requests (round robin over flows), here and in
+    /// the levels that may now borrow what this one gave back.
+    fn release(&self, width: usize) {
+        self.inflight.set(self.inflight.get().saturating_sub(width));
+        self.dispatch(&mut self.state.borrow_mut());
+        let others: Vec<Rc<Level>> = self.pool.levels.borrow().iter().filter_map(Weak::upgrade).collect();
+        for o in others.iter().filter(|o| !core::ptr::eq(&***o, self)) {
+            if let Ok(mut st) = o.state.try_borrow_mut() {
+                o.dispatch(&mut st);
+            }
+        }
     }
 
     fn dispatch(&self, st: &mut LState) {
-        while st.in_flight < self.limit && st.queued > 0 {
+        while st.queued > 0 {
             let keys: Vec<String> = st.queues.keys().cloned().collect();
             let key = keys[st.rr % keys.len()].clone();
-            st.rr = st.rr.wrapping_add(1);
             let q = st.queues.get_mut(&key).unwrap();
+            if !q.front().is_some_and(|s| self.can_take(s.width)) {
+                break;
+            }
+            st.rr = st.rr.wrapping_add(1);
             let slot = q.pop_front();
             if q.is_empty() {
                 st.queues.remove(&key);
             }
             let Some(slot) = slot else { continue };
             st.queued -= 1;
-            st.in_flight += 1;
+            self.inflight.set(self.inflight.get() + slot.width);
             slot.granted.set(true);
             let waker = slot.waker.borrow_mut().take();
             if let Some(w) = waker {
@@ -96,12 +150,12 @@ impl Level {
 }
 
 /// A seat in a priority level, returned when dropped.
-pub struct Permit(Option<Rc<Level>>);
+pub struct Permit(Option<(Rc<Level>, usize)>);
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        if let Some(l) = self.0.take() {
-            l.release();
+        if let Some((l, w)) = self.0.take() {
+            l.release(w);
         }
     }
 }
@@ -151,11 +205,25 @@ struct Config {
 pub struct Apf {
     cfg: RefCell<Config>,
     loaded_ms: Cell<u64>,
+    /// Total seats (0 until `KR_APF_SEATS` is read).
+    seats: Cell<u64>,
+    pool: Rc<Pool>,
+}
+
+/// `KR_APF_SEATS`: a positive number, else the default.
+fn parse_seats(v: Option<&str>) -> u64 {
+    v.and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n > 0).unwrap_or(DEFAULT_SEATS)
+}
+
+fn env_seats() -> u64 {
+    let data = kr_sys::fs::read_file(b"/proc/self/environ\0", 4 << 20).unwrap_or_default();
+    let v = data.split(|&b| b == 0).find_map(|kv| kv.strip_prefix(b"KR_APF_SEATS="));
+    parse_seats(v.and_then(|v| core::str::from_utf8(v).ok()))
 }
 
 impl Default for Apf {
     fn default() -> Self {
-        Apf { cfg: RefCell::new(Config::default()), loaded_ms: Cell::new(0) }
+        Apf { cfg: RefCell::new(Config::default()), loaded_ms: Cell::new(0), seats: Cell::new(0), pool: Rc::new(Pool::default()) }
     }
 }
 
@@ -220,6 +288,7 @@ struct Info {
     sub: String,
     ns: String,
     path: String,
+    ver: String,
 }
 
 fn info(req: &Req) -> Info {
@@ -227,10 +296,15 @@ fn info(req: &Req) -> Info {
     let watch = req.query.split('&').any(|p| p == "watch=true" || p == "watch=1" || p == "watch");
     let (mut group, mut rest): (String, &[&str]) = (String::new(), &[]);
     let mut resource = true;
+    let mut ver = "";
     match segs.first().copied() {
-        Some("api") if segs.len() >= 3 => rest = &segs[2..],
+        Some("api") if segs.len() >= 3 => {
+            ver = segs[1];
+            rest = &segs[2..]
+        }
         Some("apis") if segs.len() >= 4 => {
             group = segs[1].to_string();
+            ver = segs[2];
             rest = &segs[3..];
         }
         _ => resource = false,
@@ -262,7 +336,7 @@ fn info(req: &Req) -> Info {
         "DELETE" => "delete",
         _ => "get",
     };
-    Info { verb, resource: resource && !res.is_empty(), group, res: res.to_string(), sub: sub.to_string(), ns, path: req.path.to_string() }
+    Info { verb, resource: resource && !res.is_empty(), group, res: res.to_string(), sub: sub.to_string(), ns, path: req.path.to_string(), ver: ver.to_string() }
 }
 
 fn subject_matches(s: &Subject, user: &User) -> bool {
@@ -314,6 +388,10 @@ impl Apf {
         let objs = api.wh_list(g, "v1", "prioritylevelconfigurations");
         let shares = |o: &Value| o.pointer(&["spec", "limited", "nominalConcurrencyShares"]).and_then(Value::as_u64).unwrap_or(30);
         let total: u64 = objs.iter().filter(|o| o.pointer(&["spec", "type"]).and_then(Value::as_str) == Some("Limited")).map(shares).sum::<u64>().max(1);
+        if self.seats.get() == 0 {
+            self.seats.set(env_seats());
+        }
+        let total_seats = self.seats.get();
         let mut cfg = self.cfg.borrow_mut();
         let mut levels = BTreeMap::new();
         for o in &objs {
@@ -321,19 +399,44 @@ impl Apf {
             let exempt = o.pointer(&["spec", "type"]).and_then(Value::as_str) == Some("Exempt");
             let lim = |k: &str| o.pointer(&["spec", "limited", "limitResponse", "queuing", k]).and_then(Value::as_u64);
             let reject = o.pointer(&["spec", "limited", "limitResponse", "type"]).and_then(Value::as_str) == Some("Reject");
-            let limit = (TOTAL_SEATS * shares(o)).div_ceil(total).max(1) as usize;
+            let limit = (total_seats * shares(o)).div_ceil(total).max(1) as usize;
+            let lendable = (limit * (o.pointer(&["spec", "limited", "lendablePercent"]).and_then(Value::as_u64).unwrap_or(0).min(100) as usize) / 100).min(limit);
+            let borrow_max = o.pointer(&["spec", "limited", "borrowingLimitPercent"]).and_then(Value::as_u64).map_or(usize::MAX, |p| limit.saturating_mul(p as usize) / 100);
             let max_queued = (lim("queues").unwrap_or(64) * lim("queueLengthLimit").unwrap_or(50)) as usize;
             let uid = o.pointer(&["metadata", "uid"]).and_then(Value::as_str).unwrap_or("").to_string();
-            let sig = alloc::format!("{uid}/{exempt}/{reject}/{limit}/{max_queued}");
+            let sig = alloc::format!("{uid}/{exempt}/{reject}/{limit}/{lendable}/{borrow_max}/{max_queued}");
             let level = match cfg.levels.get(name) {
                 Some(old) if old.sig == sig => old.clone(),
-                _ => Rc::new(Level { name: name.to_string(), uid, exempt, limit, reject, max_queued, sig, state: RefCell::new(LState::default()) }),
+                _ => {
+                    let inflight = Cell::new(cfg.levels.get(name).map_or(0, |o| o.inflight.get()));
+                    Rc::new(Level { name: name.to_string(), uid, exempt, limit, lendable, borrow_max, inflight, pool: self.pool.clone(), reject, max_queued, sig, state: RefCell::new(LState::default()) })
+                },
             };
             levels.insert(name.to_string(), level);
         }
+        *self.pool.levels.borrow_mut() = levels.values().filter(|l| !l.exempt).map(Rc::downgrade).collect();
         cfg.levels = levels;
         cfg.flows = flows;
     }
+}
+
+/// Seats a request takes: 1, except a LIST, which takes one per [`OBJECTS_PER_SEAT`] objects it
+/// may return (the stored count, bounded by `limit=`), at most [`MAX_WIDTH`].
+fn width_of(api: &ApiServer, i: &Info, req: &Req) -> usize {
+    if i.verb != "list" || !i.resource || !i.sub.is_empty() {
+        return 1;
+    }
+    let Some(r) = api.all_resources().into_iter().find(|r| r.group == i.group && r.version == i.ver && r.plural == i.res) else { return 1 };
+    let prefix = if i.ns.is_empty() { r.prefix() } else { alloc::format!("{}{}/", r.prefix(), i.ns) };
+    let mut n = api.store.borrow().count(&prefix);
+    if let Some(l) = req.query.split('&').find_map(|p| p.strip_prefix("limit=")).and_then(|v| v.parse::<usize>().ok()).filter(|&l| l > 0) {
+        n = n.min(l);
+    }
+    width_for(n)
+}
+
+fn width_for(objects: usize) -> usize {
+    objects.div_ceil(OBJECTS_PER_SEAT).clamp(1, MAX_WIDTH)
 }
 
 /// Classifies `req` and waits for a seat. `Ok` carries the permit (None when the request is not
@@ -364,11 +467,12 @@ pub async fn admit(api: &ApiServer, req: &Req<'_>) -> Result<(Permit, Option<(St
     let too_many = |why: &str| {
         ApiError::new(429, "TooManyRequests", alloc::format!("Too many requests ({why}), please try again later."))
     };
+    let width = width_of(api, &i, req).min(level.limit.max(1));
     let slot = {
         let mut st = level.state.borrow_mut();
-        if st.in_flight < level.limit && st.queued == 0 {
-            st.in_flight += 1;
-            return Ok((Permit(Some(level.clone())), Some(ids)));
+        if st.queued == 0 && level.can_take(width) {
+            level.inflight.set(level.inflight.get() + width);
+            return Ok((Permit(Some((level.clone(), width))), Some(ids)));
         }
         if level.reject {
             return Err(too_many(&alloc::format!("priority level {} is at its limit", level.name)));
@@ -376,7 +480,7 @@ pub async fn admit(api: &ApiServer, req: &Req<'_>) -> Result<(Permit, Option<(St
         if st.queued >= level.max_queued {
             return Err(too_many(&alloc::format!("the queue of priority level {} is full", level.name)));
         }
-        let slot = Rc::new(Slot { granted: Cell::new(false), waker: RefCell::new(None) });
+        let slot = Rc::new(Slot { width, granted: Cell::new(false), waker: RefCell::new(None) });
         st.queues.entry(flow_key.clone()).or_default().push_back(slot.clone());
         st.queued += 1;
         slot
@@ -395,12 +499,11 @@ pub async fn admit(api: &ApiServer, req: &Req<'_>) -> Result<(Permit, Option<(St
         }
         return Err(too_many(&alloc::format!("timed out waiting in priority level {}", level.name)));
     }
-    Ok((Permit(Some(level)), Some(ids)))
+    Ok((Permit(Some((level, width))), Some(ids)))
 }
 
 /// The suggested FlowSchemas and PriorityLevelConfigurations (created when missing).
 pub(crate) fn seed(api: &ApiServer) {
-    use crate::resources;
     let g = "flowcontrol.apiserver.k8s.io";
     let (Some(plr), Some(fsr)) = (resources::find(g, "v1", "prioritylevelconfigurations"), resources::find(g, "v1", "flowschemas")) else { return };
     let ann = r#""annotations":{"apf.kubernetes.io/autoupdate-spec":"true"}"#;
@@ -482,22 +585,75 @@ mod tests {
 
     #[test]
     fn freed_seats_go_to_flows_in_turn() {
-        let level = Rc::new(Level { name: "l".into(), uid: String::new(), exempt: false, limit: 1, reject: false, max_queued: 10, sig: String::new(), state: RefCell::new(LState::default()) });
-        let slot = || Rc::new(Slot { granted: Cell::new(false), waker: RefCell::new(None) });
+        let level = Rc::new(Level { name: "l".into(), uid: String::new(), exempt: false, limit: 1, lendable: 0, borrow_max: 0, inflight: Cell::new(0), pool: Rc::new(Pool::default()), reject: false, max_queued: 10, sig: String::new(), state: RefCell::new(LState::default()) });
+        let slot = || Rc::new(Slot { width: 1, granted: Cell::new(false), waker: RefCell::new(None) });
         let (a1, a2, b1) = (slot(), slot(), slot());
         {
             let mut st = level.state.borrow_mut();
-            st.in_flight = 1;
+            level.inflight.set(1);
             st.queues.entry("a".into()).or_default().extend([a1.clone(), a2.clone()]);
             st.queues.entry("b".into()).or_default().push_back(b1.clone());
             st.queued = 3;
         }
-        level.release(); // a1 first (flow "a"), then the other flow before a's second request
+        level.release(1); // a1 first (flow "a"), then the other flow before a's second request
         assert!(a1.granted.get() && !b1.granted.get() && !a2.granted.get());
-        level.release();
+        level.release(1);
         assert!(b1.granted.get() && !a2.granted.get());
-        level.release();
+        level.release(1);
         assert!(a2.granted.get());
-        assert_eq!(level.state.borrow().in_flight, 1);
+        assert_eq!(level.inflight.get(), 1);
+    }
+
+    fn lvl(pool: &Rc<Pool>, limit: usize, lendable: usize, borrow_max: usize) -> Rc<Level> {
+        let l = Rc::new(Level { name: "l".into(), uid: String::new(), exempt: false, limit, lendable, borrow_max, inflight: Cell::new(0), pool: pool.clone(), reject: false, max_queued: 10, sig: String::new(), state: RefCell::new(LState::default()) });
+        pool.levels.borrow_mut().push(Rc::downgrade(&l));
+        l
+    }
+
+    #[test]
+    fn list_width_follows_the_object_count() {
+        assert_eq!((width_for(0), width_for(100), width_for(101), width_for(550), width_for(100_000)), (1, 1, 2, 6, MAX_WIDTH));
+        let i = info(&req("GET", "/apis/apps/v1/namespaces/d/deployments", ""));
+        assert_eq!((i.ver.as_str(), i.verb), ("v1", "list"));
+        assert_eq!(info(&req("GET", "/api/v1/pods", "")).ver, "v1");
+    }
+
+    #[test]
+    fn seats_default_and_override() {
+        assert_eq!((parse_seats(None), parse_seats(Some("")), parse_seats(Some("0")), parse_seats(Some("x"))), (600, 600, 600, 600));
+        assert_eq!(parse_seats(Some(" 1200\n")), 1200);
+    }
+
+    #[test]
+    fn levels_borrow_idle_seats_and_give_them_back() {
+        let pool = Rc::new(Pool::default());
+        let a = lvl(&pool, 10, 0, usize::MAX); // lends nothing
+        let b = lvl(&pool, 10, 5, usize::MAX); // lends 5
+        let c = lvl(&pool, 10, 0, 3); // borrows at most 3
+        assert!(a.can_take(10));
+        // a may borrow b's 5 idle lendable seats, no more
+        assert!(a.can_take(15) && !a.can_take(16));
+        a.inflight.set(15);
+        assert!(!a.can_take(1)); // nothing left to borrow
+        assert!(!c.can_take(11)); // b's seats are all lent
+        // b uses its own non-lendable seats: lending is unaffected
+        b.inflight.set(5);
+        assert!(b.can_take(5) && !b.can_take(6));
+        // a gives back: c may borrow up to its own limit of 3
+        a.release(15);
+        assert!(c.can_take(13) && !c.can_take(14));
+        // a queued wide request waits for the lent seats and is granted on release
+        a.inflight.set(15);
+        let w = Rc::new(Slot { width: 3, granted: Cell::new(false), waker: RefCell::new(None) });
+        c.inflight.set(10);
+        {
+            let mut st = c.state.borrow_mut();
+            st.queues.entry("f".into()).or_default().push_back(w.clone());
+            st.queued = 1;
+        }
+        c.dispatch(&mut c.state.borrow_mut());
+        assert!(!w.granted.get()); // a holds all of b's lendable seats
+        a.release(5); // a is back within its limit: 5 seats free again
+        assert!(w.granted.get() && c.inflight.get() == 13);
     }
 }

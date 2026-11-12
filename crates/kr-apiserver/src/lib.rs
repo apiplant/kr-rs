@@ -11,6 +11,7 @@ extern crate std;
 
 pub mod admit;
 pub mod apf;
+pub mod audit;
 pub mod aggregator;
 pub mod api;
 pub mod client;
@@ -21,7 +22,9 @@ pub mod crd;
 pub mod defaults;
 pub mod discovery;
 pub mod durable;
+pub mod encrypt;
 pub mod fieldval;
+pub mod metrics;
 pub mod node_authz;
 pub mod object;
 pub mod openapi;

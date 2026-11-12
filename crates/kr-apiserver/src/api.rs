@@ -148,6 +148,10 @@ pub struct ApiServer {
     pub(crate) front: RefCell<Option<alloc::rc::Rc<crate::aggregator::FrontProxy>>>,
     /// Group versions served by extension API servers, from the availability probe.
     pub(crate) agg: RefCell<Vec<crate::aggregator::AggGroup>>,
+    /// Latest node/pod usage for `metrics.k8s.io` (see `metrics`).
+    pub metrics: crate::metrics::Cache,
+    /// Audit log writer and Pod Security configuration (ADR-046).
+    pub audit: crate::audit::Hub,
 }
 
 /// Default namespaces created on first start.
@@ -265,7 +269,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()) };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default() };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -883,6 +887,7 @@ impl ApiServer {
         let mode = if write { crate::fieldval::Mode::parse(Query::parse(req.query).ok().as_ref().and_then(|q| q.get("fieldValidation"))) } else { crate::fieldval::Mode::Ignore };
         self.fv_mode.set(mode);
         self.warnings.borrow_mut().clear();
+        self.audit.set_user(self, req, write);
         if !self.writable() && Self::mutates(req) {
             let leader = self.cluster.borrow().as_ref().and_then(|c| c.leader());
             return (Reply::err(not_leader(leader)), Vec::new());
@@ -1147,6 +1152,11 @@ impl ApiServer {
             _ => None,
         };
         self.check_authorized(req, &user, resource.as_ref(), &q, &segs)?;
+        if let ["apis", crate::metrics::GROUP, "v1beta1", rest @ ..] = segs.as_slice() {
+            if !rest.is_empty() {
+                return crate::metrics::serve(self, req.method, &q, rest);
+            }
+        }
         match path {
             "/healthz" | "/livez" | "/readyz" => return Ok(Reply::Json(200, String::from("\"ok\""))),
             "/version" => {
@@ -1809,7 +1819,7 @@ impl ApiServer {
     /// SHA-256 of the full store image (keys, values, revisions): equal on every HA server once
     /// they applied the same log.
     pub fn store_digest(&self) -> [u8; 32] {
-        kr_crypto::sha2::sha256(&self.store.borrow().image())
+        kr_crypto::sha2::sha256(&self.store.borrow().plain_image())
     }
 
     /// The store's current revision (a request that advanced it wrote something).
@@ -1999,6 +2009,9 @@ impl ApiServer {
                 (kv, old, new)
             }
         };
+        if let (true, Some(u), Some(sub @ ("approval" | "status"))) = (rt.res.plural == "certificatesigningrequests", &req.user, rt.sub.as_deref()) {
+            crate::rbac::csr_update_check(sub, &old, &new, is_masters(u), &|a| self.authorize(u, a, None)).map_err(|(c, m)| if c == 403 { ApiError::new(403, "Forbidden", m) } else { ApiError::invalid(m) })?;
+        }
         let (gv, mut t) = self.target(rt);
         t.api_version = &gv;
         let rev = self.store.borrow().revision() + 1;
@@ -3040,7 +3053,7 @@ impl ApiServer {
             }
         }
         let nsobj = self.wh_object("", "v1", "namespaces", None, ns);
-        let d = crate::psa::check(nsobj.as_ref(), spec, meta.unwrap_or(&Value::Null), !pod);
+        let d = crate::psa::check(&self.audit.psa.borrow(), &self.audit.user.borrow(), ns, nsobj.as_ref(), spec, meta.unwrap_or(&Value::Null), !pod);
         self.warnings.borrow_mut().extend(d.warnings);
         match d.deny {
             Some(msg) => Err(ApiError::new(403, "Forbidden", alloc::format!("pods {name:?} is forbidden: {msg}"))),

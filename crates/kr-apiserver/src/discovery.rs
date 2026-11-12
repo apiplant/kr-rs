@@ -21,7 +21,13 @@ fn strings(v: &[&str]) -> Value {
 const VERBS: &[&str] = &["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"];
 
 fn verbs(r: &Resource) -> &'static [&'static str] {
-    if REVIEWS.iter().any(|x| core::ptr::eq(x, r)) { &["create"] } else { VERBS }
+    if REVIEWS.iter().any(|x| core::ptr::eq(x, r)) {
+        &["create"]
+    } else if r.group == crate::metrics::GROUP {
+        &["get", "list"]
+    } else {
+        VERBS
+    }
 }
 
 fn resource_entries(r: &Resource) -> Vec<Value> {

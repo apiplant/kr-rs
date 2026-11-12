@@ -5,8 +5,13 @@ extern crate alloc;
 
 mod agent;
 mod ctr;
+mod ctr_import;
+mod manifests;
 mod pki;
+mod rotate;
+mod secrets_encrypt;
 mod server;
+mod snapshot;
 mod token;
 
 use alloc::rc::Rc;
@@ -82,6 +87,9 @@ fn kr_main(mut args: Args) -> i32 {
         }
         Some(b"ctr") => ctr::main(args),
         Some(b"pki") => pki::main(args),
+        Some(b"certificate") => pki::main(args),
+        Some(b"snapshot") => snapshot::main(args),
+        Some(b"secrets-encrypt") => secrets_encrypt::main(args),
         Some(b"server") => {
             sys::raise_nofile_limit();
             server::main(args)
@@ -96,7 +104,7 @@ fn kr_main(mut args: Args) -> i32 {
             0
         }
         _ => {
-            eprint(b"usage: kr <version | echo [port] | ctr ... | pki ... | server ... | agent ... | token create ... | sleep-test>\n");
+            eprint(b"usage: kr <version | echo [port] | ctr ... | pki ... | certificate rotate | snapshot save|restore ... | secrets-encrypt status|rotate-key|reencrypt|disable ... | server ... | agent ... | token create ... | sleep-test>\n");
             2
         }
     }

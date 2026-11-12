@@ -40,7 +40,9 @@ fn log_line(msg: &str) {
 pub async fn handle(api: &Rc<ApiServer>, req: Request) -> Response {
     let (t0, method, path) = (kr_rt::exec::now_ms(), req.method.clone(), alloc::string::String::from(req.path()));
     let pf = core::cell::RefCell::new(None);
+    let audit = crate::audit::begin(api, &req, user_from_certs(req.peer.client_certs.as_deref()));
     let mut resp = handle_inner(api, req, &pf).await;
+    crate::audit::finish(api, audit, &resp);
     if let Some((flow, level)) = pf.into_inner() {
         resp = resp.with_header("X-Kubernetes-PF-FlowSchema-UID", &flow).with_header("X-Kubernetes-PF-PriorityLevel-UID", &level);
     }

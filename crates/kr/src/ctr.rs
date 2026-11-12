@@ -13,6 +13,7 @@ use kr_sys::ns;
 
 const USAGE: &[u8] = b"usage:
   kr ctr pull <image>
+  kr ctr import <file.tar[.gz]>...
   kr ctr run [--memory 64Mi] [--cpus 500m] [--pids 64] [--user uid[:gid]] [--cdi vendor/class=name] <image> [--] [cmd args...]
   kr ctr run-dir [limits...] <rootfs> <state-dir> [--] <cmd> [args...]
 ";
@@ -22,6 +23,7 @@ const DEFAULT_PATH: &str = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/b
 pub fn main(mut args: Args) -> i32 {
     match args.next() {
         Some(b"pull") => pull(args),
+        Some(b"import") => crate::ctr_import::run(args),
         Some(b"run") => run(args),
         Some(b"run-dir") => run_dir(args),
         Some(b"pod-demo") => pod_demo(args),

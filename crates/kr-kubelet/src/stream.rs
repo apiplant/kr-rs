@@ -123,6 +123,9 @@ fn ws_request(target: &str, headers: &[(String, String)]) -> Request {
 
 impl<C: Client + Clone + 'static> NodeProxy for Proxy<C> {
     fn pod_subresource(&self, sub: &str, ns: &str, pod: &str, _node: &str, _node_ip: Option<[u8; 16]>, query: &str, headers: &[(String, String)]) -> Result<Response, ApiError> {
+        if sub == "metrics" {
+            return crate::stats::respond(&self.0, ns);
+        }
         let q = Query::parse(query);
         let v = self.view(ns, pod, q.get("container"))?;
         match sub {

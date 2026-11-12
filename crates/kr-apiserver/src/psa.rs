@@ -6,8 +6,10 @@
 //!
 //! Pods are checked on create and on updates that change their spec; `enforce` rejects them,
 //! `warn` adds a warning. Workload resources with a pod template only get warnings (and only for
-//! `enforce`/`warn` levels), as upstream. The `-version` labels are accepted and ignored (all
-//! checks are `latest`); there are no exemptions and no audit log (`audit` is accepted).
+//! `enforce`/`warn` levels), as upstream. `audit` violations become annotations of the audit
+//! event (`audit.rs`). The `<mode>-version` labels (`latest` or `v1.NN`) pin the checks whose
+//! rules changed over time (seccomp 1.19, restricted capabilities 1.22, hostProcess 1.23); a
+//! `PodSecurityConfiguration` ([`Config`]) gives per-mode defaults and exemptions (ADR-046).
 //!
 //! Messages follow upstream's wording, e.g. `violates PodSecurity "baseline:latest": host
 //! namespaces (hostNetwork=true), hostPort (container "c" uses hostPort 80)`.
@@ -20,6 +22,70 @@ use kr_fmt::json::Value;
 pub const ENFORCE: &str = "pod-security.kubernetes.io/enforce";
 pub const WARN: &str = "pod-security.kubernetes.io/warn";
 pub const AUDIT: &str = "pod-security.kubernetes.io/audit";
+const MODES: [&str; 3] = [ENFORCE, WARN, AUDIT];
+/// The newest minor version `latest` stands for (the server's own).
+const LATEST_MINOR: u32 = 37;
+
+/// A pinned policy version: `None` is `latest`.
+pub type Version = Option<u32>;
+
+/// `latest` or `v1.NN`.
+pub fn parse_version(v: &str) -> Option<Version> {
+    if v == "latest" {
+        return Some(None);
+    }
+    let n = v.strip_prefix("v1.")?;
+    if n.is_empty() || n.len() > 3 || !n.bytes().all(|b| b.is_ascii_digit()) || (n.len() > 1 && n.starts_with('0')) {
+        return None;
+    }
+    // Versions newer than the server are `latest`.
+    n.parse::<u32>().ok().map(|m| if m >= LATEST_MINOR { None } else { Some(m) })
+}
+
+/// The `PodSecurityConfiguration`: default level/version per mode (enforce, warn, audit) and
+/// exemptions.
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub defaults: [(Level, Version); 3],
+    pub users: Vec<String>,
+    pub runtime_classes: Vec<String>,
+    pub namespaces: Vec<String>,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config { defaults: [(Level::Privileged, None); 3], users: Vec::new(), runtime_classes: Vec::new(), namespaces: Vec::new() }
+    }
+}
+
+impl Config {
+    /// Parses `PodSecurityConfiguration` YAML, bare or as the `PodSecurity` plugin entry of an
+    /// `AdmissionConfiguration`.
+    pub fn parse(src: &str) -> Result<Config, String> {
+        let doc = kr_fmt::yaml::parse(src).map_err(|e| format!("pod security configuration: {e}"))?;
+        let mut doc = &doc;
+        if doc.get("kind").and_then(Value::as_str) == Some("AdmissionConfiguration") {
+            doc = doc.get("plugins").and_then(Value::as_array).unwrap_or(&[]).iter().find(|p| p.get("name").and_then(Value::as_str) == Some("PodSecurity")).and_then(|p| p.get("configuration")).ok_or("pod security configuration: no PodSecurity plugin in the AdmissionConfiguration")?;
+        }
+        if doc.get("kind").and_then(Value::as_str) != Some("PodSecurityConfiguration") {
+            return Err(String::from("pod security configuration: kind must be PodSecurityConfiguration"));
+        }
+        let mut c = Config::default();
+        for (i, mode) in ["enforce", "warn", "audit"].iter().enumerate() {
+            if let Some(l) = doc.pointer(&["defaults", mode]).and_then(Value::as_str) {
+                c.defaults[i].0 = parse(l).ok_or_else(|| format!("pod security configuration: defaults.{mode}: Invalid value: {l:?}: must be one of privileged, baseline, restricted"))?;
+            }
+            if let Some(v) = doc.pointer(&["defaults", &format!("{mode}-version")]).and_then(Value::as_str) {
+                c.defaults[i].1 = parse_version(v).ok_or_else(|| format!("pod security configuration: defaults.{mode}-version: Invalid value: {v:?}: must be latest or v1.NN"))?;
+            }
+        }
+        let list = |k: &str| doc.pointer(&["exemptions", k]).and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_str).map(String::from).collect::<Vec<_>>();
+        c.users = list("usernames");
+        c.runtime_classes = list("runtimeClasses");
+        c.namespaces = list("namespaces");
+        Ok(c)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Level {
@@ -47,12 +113,13 @@ fn parse(v: &str) -> Option<Level> {
     }
 }
 
-/// The level a namespace label selects: absent is privileged, invalid is restricted.
-fn level_of(ns: Option<&Value>, key: &str) -> Level {
-    match ns.and_then(|n| n.pointer(&["metadata", "labels", key])).and_then(Value::as_str) {
-        None => Level::Privileged,
-        Some(v) => parse(v).unwrap_or(Level::Restricted),
-    }
+/// The level and version a namespace selects for `mode` (index into [`MODES`]): the label, else
+/// the configured default. An invalid level is restricted (fail closed), an invalid version latest.
+fn level_of(cfg: &Config, ns: Option<&Value>, mode: usize) -> (Level, Version) {
+    let label = |k: &str| ns.and_then(|n| n.pointer(&["metadata", "labels", k])).and_then(Value::as_str);
+    let level = label(MODES[mode]).map(|v| parse(v).unwrap_or(Level::Restricted)).unwrap_or(cfg.defaults[mode].0);
+    let version = label(&format!("{}-version", MODES[mode])).map(|v| parse_version(v).unwrap_or(None)).unwrap_or(cfg.defaults[mode].1);
+    (level, version)
 }
 
 /// Namespace label validation: the three level labels must name a level.
@@ -61,6 +128,12 @@ pub fn validate_namespace(ns: &Value) -> Result<(), String> {
         if let Some(v) = ns.pointer(&["metadata", "labels", key]).and_then(Value::as_str) {
             if parse(v).is_none() {
                 return Err(format!("metadata.labels[{key}]: Invalid value: {v:?}: must be one of privileged, baseline, restricted"));
+            }
+        }
+        let vkey = format!("{key}-version");
+        if let Some(v) = ns.pointer(&["metadata", "labels", &vkey]).and_then(Value::as_str) {
+            if parse_version(v).is_none() {
+                return Err(format!("metadata.labels[{vkey}]: Invalid value: {v:?}: must be \"latest\" or \"v1.NN\""));
             }
         }
     }
@@ -114,6 +187,12 @@ fn caps(c: &Value, which: &str) -> Vec<String> {
 /// The checks of `level` that `spec` (a PodSpec, with `meta` the pod's metadata) fails, in
 /// upstream's order and wording.
 pub fn violations(level: Level, spec: &Value, meta: &Value) -> Vec<String> {
+    violations_at(level, None, spec, meta)
+}
+
+/// [`violations`] under the rules of Kubernetes minor version `ver` (`None`: latest).
+pub fn violations_at(level: Level, ver: Version, spec: &Value, meta: &Value) -> Vec<String> {
+    let since = |m: u32| ver.is_none_or(|v| v >= m);
     let mut out = Vec::new();
     if level == Level::Privileged {
         return out;
@@ -203,11 +282,11 @@ pub fn violations(level: Level, spec: &Value, meta: &Value) -> Vec<String> {
         out.push(format!("procMount ({} must not set securityContext.procMount to \"Unmasked\")", subject("container", &procmount)));
     }
     let mut unconfined: Vec<String> = Vec::new();
-    if s(spec, &["securityContext", "seccompProfile", "type"]) == "Unconfined" {
+    if since(19) && s(spec, &["securityContext", "seccompProfile", "type"]) == "Unconfined" {
         unconfined.push(String::from("pod"));
     }
     for c in &ctrs {
-        if s(c, &["securityContext", "seccompProfile", "type"]) == "Unconfined" {
+        if since(19) && s(c, &["securityContext", "seccompProfile", "type"]) == "Unconfined" {
             unconfined.push(format!("container {:?}", name(c)));
         }
     }
@@ -219,7 +298,7 @@ pub fn violations(level: Level, spec: &Value, meta: &Value) -> Vec<String> {
         out.push(format!("forbidden sysctls ({})", sysctls.join(", ")));
     }
     let hostprocess = truthy(spec, &["securityContext", "windowsOptions", "hostProcess"]) || ctrs.iter().any(|c| truthy(c, &["securityContext", "windowsOptions", "hostProcess"]));
-    if hostprocess {
+    if hostprocess && since(23) {
         out.push(String::from("hostProcess (pod or containers must not set securityContext.windowsOptions.hostProcess=true)"));
     }
     if level == Level::Baseline {
@@ -253,7 +332,7 @@ pub fn violations(level: Level, spec: &Value, meta: &Value) -> Vec<String> {
             }
         }
     }
-    if !caps_bad.is_empty() {
+    if since(22) && !caps_bad.is_empty() {
         out.push(format!("unrestricted capabilities ({})", caps_bad.join("; ")));
     }
     let pod_nonroot = spec.pointer(&["securityContext", "runAsNonRoot"]).and_then(Value::as_bool);
@@ -274,7 +353,7 @@ pub fn violations(level: Level, spec: &Value, meta: &Value) -> Vec<String> {
         let t = s(c, &["securityContext", "seccompProfile", "type"]);
         if t.is_empty() { !pod_sc } else { !sc_ok(t) && t != "Unconfined" }
     }).map(|c| name(c)).collect();
-    if !sc_missing.is_empty() {
+    if since(19) && !sc_missing.is_empty() {
         out.push(format!("seccompProfile (pod or {} must set securityContext.seccompProfile.type to \"RuntimeDefault\" or \"Localhost\")", subject("container", &sc_missing)));
     }
     out
@@ -285,30 +364,60 @@ pub struct Decision {
     /// Rejection message (`enforce` failed), for pods only.
     pub deny: Option<String>,
     pub warnings: Vec<String>,
+    /// Annotations for the audit event (`audit` violations, the enforced policy, exemptions).
+    pub audit: Vec<(String, String)>,
 }
 
-fn label(level: Level) -> String {
-    format!("{}:latest", level.name())
+fn label(level: Level, ver: Version) -> String {
+    match ver {
+        None => format!("{}:latest", level.name()),
+        Some(m) => format!("{}:v1.{m}", level.name()),
+    }
 }
 
 /// Checks a pod (`template == false`) or a workload's pod template against `ns` (the Namespace
-/// object; None for cluster-scoped or unknown namespaces, which are privileged).
-pub fn check(ns: Option<&Value>, spec: &Value, meta: &Value, template: bool) -> Decision {
-    let (enforce, warn) = (level_of(ns, ENFORCE), level_of(ns, WARN));
-    let mut d = Decision { deny: None, warnings: Vec::new() };
-    let ev = violations(enforce, spec, meta);
+/// object; None for cluster-scoped or unknown namespaces, which get the configured defaults),
+/// created by `user` in namespace `ns_name`.
+pub fn check(cfg: &Config, user: &str, ns_name: &str, ns: Option<&Value>, spec: &Value, meta: &Value, template: bool) -> Decision {
+    let mut d = Decision { deny: None, warnings: Vec::new(), audit: Vec::new() };
+    let rc = s(spec, &["runtimeClassName"]);
+    let exempt = if cfg.users.iter().any(|u| u == user) {
+        Some("user")
+    } else if cfg.namespaces.iter().any(|n| n == ns_name) {
+        Some("namespace")
+    } else if !rc.is_empty() && cfg.runtime_classes.iter().any(|r| r == rc) {
+        Some("runtimeClass")
+    } else {
+        None
+    };
+    if let Some(e) = exempt {
+        d.audit.push((String::from("pod-security.kubernetes.io/exempt"), e.to_string()));
+        return d;
+    }
+    let ((enforce, ev_), (warn, wv_), (audit, av_)) = (level_of(cfg, ns, 0), level_of(cfg, ns, 1), level_of(cfg, ns, 2));
+    let ev = violations_at(enforce, ev_, spec, meta);
+    if enforce > Level::Privileged {
+        d.audit.push((String::from("pod-security.kubernetes.io/enforce-policy"), label(enforce, ev_)));
+    }
     if !ev.is_empty() {
         if template {
-            d.warnings.push(format!("would violate PodSecurity {:?}: {}", label(enforce), ev.join(", ")));
+            d.warnings.push(format!("would violate PodSecurity {:?}: {}", label(enforce, ev_), ev.join(", ")));
         } else {
-            d.deny = Some(format!("violates PodSecurity {:?}: {}", label(enforce), ev.join(", ")));
+            d.deny = Some(format!("violates PodSecurity {:?}: {}", label(enforce, ev_), ev.join(", ")));
         }
     }
     // A warn level at or below a failing enforce level adds nothing new.
     if warn > enforce || ev.is_empty() {
-        let wv = violations(warn, spec, meta);
+        let wv = violations_at(warn, wv_, spec, meta);
         if !wv.is_empty() && !(template && warn == enforce) {
-            d.warnings.push(format!("would violate PodSecurity {:?}: {}", label(warn), wv.join(", ")));
+            d.warnings.push(format!("would violate PodSecurity {:?}: {}", label(warn, wv_), wv.join(", ")));
+        }
+    }
+    if audit > Level::Privileged {
+        let av = violations_at(audit, av_, spec, meta);
+        if !av.is_empty() {
+            d.audit.push((String::from("pod-security.kubernetes.io/audit-violations"), format!("would violate PodSecurity {:?}: {}", label(audit, av_), av.join(", "))));
+            d.audit.push((String::from("pod-security.kubernetes.io/audit"), label(audit, av_)));
         }
     }
     d
@@ -338,6 +447,58 @@ mod tests {
         v(&format!(r#"{{"metadata":{{"name":"n","labels":{labels}}}}}"#))
     }
 
+    fn chk(ns: Option<&Value>, spec: &Value, template: bool) -> Decision {
+        check(&Config::default(), "u", "n", ns, spec, &Value::Null, template)
+    }
+
+    #[test]
+    fn versions_and_pinning() {
+        assert_eq!(parse_version("latest"), Some(None));
+        assert_eq!(parse_version("v1.25"), Some(Some(25)));
+        assert_eq!(parse_version("v1.99"), Some(None));
+        assert_eq!(parse_version("1.25"), None);
+        assert_eq!(parse_version("v1.x"), None);
+        assert!(validate_namespace(&ns(r#"{"pod-security.kubernetes.io/warn-version":"bogus"}"#)).is_err());
+        let plain = v(r#"{"containers":[{"name":"c","securityContext":{"allowPrivilegeEscalation":false,"runAsNonRoot":true}}]}"#);
+        // Without drop=ALL (1.22) and seccomp (1.19) the pod passed restricted at older versions.
+        assert!(!violations_at(Level::Restricted, None, &plain, &Value::Null).is_empty());
+        assert!(violations_at(Level::Restricted, Some(18), &plain, &Value::Null).is_empty());
+        assert_eq!(violations_at(Level::Restricted, Some(20), &plain, &Value::Null).len(), 1);
+        let n = ns(r#"{"pod-security.kubernetes.io/enforce":"restricted","pod-security.kubernetes.io/enforce-version":"v1.18"}"#);
+        assert!(chk(Some(&n), &plain, false).deny.is_none());
+        let n = ns(r#"{"pod-security.kubernetes.io/enforce":"restricted","pod-security.kubernetes.io/enforce-version":"v1.20"}"#);
+        assert!(chk(Some(&n), &plain, false).deny.unwrap().contains("\"restricted:v1.20\""));
+    }
+
+    #[test]
+    fn config_defaults_and_exemptions() {
+        let src = "apiVersion: apiserver.config.k8s.io/v1\nkind: AdmissionConfiguration\nplugins:\n- name: PodSecurity\n  configuration:\n    apiVersion: pod-security.admission.config.k8s.io/v1\n    kind: PodSecurityConfiguration\n    defaults:\n      enforce: baseline\n      enforce-version: latest\n      audit: restricted\n    exemptions:\n      usernames: [admin]\n      runtimeClasses: [gvisor]\n      namespaces: [kube-system]\n";
+        let cfg = Config::parse(src).unwrap();
+        assert_eq!(cfg.defaults[0].0, Level::Baseline);
+        let spec = v(r#"{"hostNetwork":true,"containers":[{"name":"c"}]}"#);
+        // Unlabelled namespace: the default applies.
+        let d = check(&cfg, "u", "n", None, &spec, &Value::Null, false);
+        assert!(d.deny.is_some());
+        assert!(d.audit.iter().any(|(k, v)| k == "pod-security.kubernetes.io/audit" && v == "restricted:latest"));
+        assert!(d.audit.iter().any(|(k, v)| k.ends_with("audit-violations") && v.contains("would violate PodSecurity \"restricted:latest\"")));
+        // A label overrides the default.
+        let n = ns(r#"{"pod-security.kubernetes.io/enforce":"privileged"}"#);
+        assert!(check(&cfg, "u", "n", Some(&n), &spec, &Value::Null, false).deny.is_none());
+        // Exemptions.
+        for (user, nsn, rc, kind) in [("admin", "n", "", "user"), ("u", "kube-system", "", "namespace"), ("u", "n", "gvisor", "runtimeClass")] {
+            let mut sp = spec.clone();
+            if !rc.is_empty() {
+                sp.set("runtimeClassName", Value::String(rc.into()));
+            }
+            let d = check(&cfg, user, nsn, None, &sp, &Value::Null, false);
+            assert!(d.deny.is_none() && d.warnings.is_empty(), "{kind}");
+            assert_eq!(d.audit, [(String::from("pod-security.kubernetes.io/exempt"), kind.to_string())]);
+        }
+        assert!(Config::parse("kind: Other").is_err());
+        assert!(Config::parse("kind: PodSecurityConfiguration\ndefaults:\n  enforce: loud\n").is_err());
+        assert!(Config::parse("kind: PodSecurityConfiguration\ndefaults:\n  warn-version: v2\n").is_err());
+    }
+
     #[test]
     fn baseline_rejects_host_access() {
         let spec = v(r#"{"hostNetwork":true,"hostPID":true,"volumes":[{"name":"h","hostPath":{"path":"/"}}],"containers":[{"name":"c","securityContext":{"privileged":true,"capabilities":{"add":["NET_ADMIN","CHOWN"]}},"ports":[{"containerPort":80,"hostPort":80}]}]}"#);
@@ -352,7 +513,7 @@ mod tests {
                 "hostPort (container \"c\" uses hostPort 80)",
             ]
         );
-        let d = check(Some(&ns(r#"{"pod-security.kubernetes.io/enforce":"baseline"}"#)), &spec, &Value::Null, false);
+        let d = chk(Some(&ns(r#"{"pod-security.kubernetes.io/enforce":"baseline"}"#)), &spec, false);
         assert!(d.deny.unwrap().starts_with("violates PodSecurity \"baseline:latest\": host namespaces (hostNetwork=true, hostPID=true)"));
     }
 
@@ -378,19 +539,19 @@ mod tests {
     fn levels_from_labels() {
         let spec = v(r#"{"hostNetwork":true,"containers":[{"name":"c"}]}"#);
         // Unlabelled: privileged, nothing to say.
-        let d = check(Some(&ns("{}")), &spec, &Value::Null, false);
+        let d = chk(Some(&ns("{}")), &spec, false);
         assert!(d.deny.is_none() && d.warnings.is_empty());
         // Invalid level: restricted (fail closed), and the namespace itself is rejected.
         let bad = ns(r#"{"pod-security.kubernetes.io/enforce":"bogus"}"#);
-        assert!(check(Some(&bad), &spec, &Value::Null, false).deny.unwrap().contains("restricted:latest"));
+        assert!(chk(Some(&bad), &spec, false).deny.unwrap().contains("restricted:latest"));
         assert!(validate_namespace(&bad).is_err());
         // Warn only: admitted with a warning; templates never denied.
         let w = ns(r#"{"pod-security.kubernetes.io/warn":"baseline"}"#);
-        let d = check(Some(&w), &spec, &Value::Null, false);
+        let d = chk(Some(&w), &spec, false);
         assert!(d.deny.is_none());
         assert_eq!(d.warnings, ["would violate PodSecurity \"baseline:latest\": host namespaces (hostNetwork=true)"]);
         let e = ns(r#"{"pod-security.kubernetes.io/enforce":"baseline"}"#);
-        let d = check(Some(&e), &spec, &Value::Null, true);
+        let d = chk(Some(&e), &spec, true);
         assert!(d.deny.is_none() && d.warnings.len() == 1);
     }
 }

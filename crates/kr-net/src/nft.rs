@@ -319,6 +319,224 @@ pub fn delete_table(table: &[u8]) -> Result<(), Errno> {
     }
 }
 
+// ---- NetworkPolicy enforcement tables (kr-kubelet netpol, ADR-049) ----
+
+const NFPROTO_BRIDGE: u8 = 7; // NFPROTO_BRIDGE
+const NFT_META_PROTOCOL: u32 = 1; // NFT_META_PROTOCOL (ethertype, big-endian)
+const NFT_META_NFPROTO: u32 = 15; // NFT_META_NFPROTO
+const NFT_META_L4PROTO: u32 = 16; // NFT_META_L4PROTO
+const NFT_CMP_LTE: u32 = 3; // NFT_CMP_LTE
+const NFT_CMP_GTE: u32 = 5; // NFT_CMP_GTE
+const NFT_PAYLOAD_TRANSPORT_HEADER: u32 = 2; // NFT_PAYLOAD_TRANSPORT_HEADER
+const NFTA_VERDICT_CHAIN: u16 = 2; // NFTA_VERDICT_CHAIN
+const NF_DROP: u32 = 0; // NF_DROP
+const NFT_JUMP: u32 = -3i32 as u32; // NFT_JUMP
+const NFT_RETURN: u32 = -5i32 as u32; // NFT_RETURN
+
+/// Table family of a policy table: `inet` (routed traffic) or `bridge` (same-node pod traffic).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PolFam {
+    Inet,
+    Bridge,
+}
+
+/// One allowed port range of a rule: `proto` is the IP protocol number; `hi == 0` = every port.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NpPort {
+    pub proto: u8,
+    pub lo: u16,
+    pub hi: u16,
+}
+
+/// One allow rule: the peer network (`None` = any peer; address of 4 or 16 bytes + prefix) and
+/// the ports (empty = any protocol and port).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NpAllow {
+    pub peer: Option<(alloc::vec::Vec<u8>, u8)>,
+    pub ports: alloc::vec::Vec<NpPort>,
+}
+
+/// One pod's chain for one direction: packets to (`ingress`) or from the pod `ip` (4 or 16
+/// bytes) not matching an allow rule are dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NpChain {
+    pub name: alloc::string::String,
+    pub ip: alloc::vec::Vec<u8>,
+    pub ingress: bool,
+    pub allows: alloc::vec::Vec<NpAllow>,
+}
+
+pub const NETPOL_TABLE: &[u8] = b"kr-netpol";
+
+fn verdict(b: &mut NlBuf, code: u32, chain: Option<&[u8]>) {
+    expr_begin(b, b"immediate");
+    b.attr_u32_be(NFTA_IMMEDIATE_DREG, NFT_REG_VERDICT);
+    b.nest_begin(NFTA_IMMEDIATE_DATA);
+    b.nest_begin(NFTA_DATA_VERDICT);
+    b.attr_u32_be(NFTA_VERDICT_CODE, code);
+    if let Some(c) = chain {
+        b.attr_str(NFTA_VERDICT_CHAIN, c);
+    }
+    b.nest_end();
+    b.nest_end();
+    expr_end(b);
+}
+
+fn payload(b: &mut NlBuf, base: u32, off: u32, len: u32) {
+    expr_begin(b, b"payload");
+    b.attr_u32_be(NFTA_PAYLOAD_DREG, NFT_REG_1);
+    b.attr_u32_be(NFTA_PAYLOAD_BASE, base);
+    b.attr_u32_be(NFTA_PAYLOAD_OFFSET, off);
+    b.attr_u32_be(NFTA_PAYLOAD_LEN, len);
+    expr_end(b);
+}
+
+/// Restricts the rule to IPv4 or IPv6 packets (the network header offsets differ).
+fn family_guard(b: &mut NlBuf, fam: PolFam, v6: bool) {
+    if fam == PolFam::Bridge {
+        meta(b, NFT_META_PROTOCOL);
+        cmp(b, NFT_CMP_EQ, if v6 { &[0x86, 0xdd] } else { &[0x08, 0x00] });
+    } else {
+        meta(b, NFT_META_NFPROTO);
+        cmp(b, NFT_CMP_EQ, &[if v6 { NFPROTO_IPV6 } else { NFPROTO_IPV4 }]);
+    }
+}
+
+fn mask_of(prefix: u8, len: usize) -> alloc::vec::Vec<u8> {
+    (0..len).map(|i| match (prefix as i32 - 8 * i as i32).clamp(0, 8) {
+        0 => 0,
+        n => 0xffu8 << (8 - n),
+    }).collect()
+}
+
+/// Matches the address at `off` (4 or 16 bytes) against `addr/prefix`.
+fn addr_match(b: &mut NlBuf, off: u32, addr: &[u8], prefix: u8) {
+    payload(b, NFT_PAYLOAD_NETWORK_HEADER, off, addr.len() as u32);
+    if (prefix as usize) < addr.len() * 8 {
+        let mask = mask_of(prefix, addr.len());
+        bitwise_and(b, &mask);
+        let masked: alloc::vec::Vec<u8> = addr.iter().zip(&mask).map(|(a, m)| a & m).collect();
+        cmp(b, NFT_CMP_EQ, &masked);
+    } else {
+        cmp(b, NFT_CMP_EQ, addr);
+    }
+}
+
+/// (source, destination) offsets of the address fields in the IPv4/IPv6 header.
+fn offsets(v6: bool) -> (u32, u32) {
+    if v6 { (8, 24) } else { (12, 16) }
+}
+
+fn netpol_batch(fam: PolFam, chains: &[NpChain]) -> NlBuf {
+    let f = if fam == PolFam::Bridge { NFPROTO_BRIDGE } else { 1 /* NFPROTO_INET */ };
+    let t = NETPOL_TABLE;
+    let mut b = NlBuf::new();
+    batch_msg(&mut b, NFNL_MSG_BATCH_BEGIN);
+    new_table(&mut b, f, t, NLM_F_ACK | NLM_F_CREATE);
+    msg(&mut b, NFT_MSG_DELTABLE, NLM_F_ACK, f, 0);
+    b.attr_str(NFTA_TABLE_NAME, t);
+    b.end();
+    new_table(&mut b, f, t, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+    new_chain(&mut b, f, t, b"forward", b"filter", NF_INET_FORWARD, 0);
+    for c in chains {
+        // a regular chain (no hook)
+        msg(&mut b, NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE, f, 0);
+        b.attr_str(NFTA_CHAIN_TABLE, t);
+        b.attr_str(NFTA_CHAIN_NAME, c.name.as_bytes());
+        b.end();
+    }
+    // Replies of allowed connections.
+    rule(&mut b, f, t, b"forward", |b| {
+        expr_begin(b, b"ct");
+        b.attr_u32_be(NFTA_CT_DREG, NFT_REG_1);
+        b.attr_u32_be(NFTA_CT_KEY, NFT_CT_STATE);
+        expr_end(b);
+        bitwise_and(b, &CT_ESTABLISHED_RELATED.to_ne_bytes());
+        cmp(b, NFT_CMP_NEQ, &[0u8; 4]);
+        verdict_accept(b);
+    });
+    // Neighbour discovery (ICMPv6 133..=137) must keep working for selected pods.
+    rule(&mut b, f, t, b"forward", |b| {
+        family_guard(b, fam, true);
+        meta(b, NFT_META_L4PROTO);
+        cmp(b, NFT_CMP_EQ, &[58]);
+        payload(b, NFT_PAYLOAD_TRANSPORT_HEADER, 0, 1);
+        cmp(b, NFT_CMP_GTE, &[133]);
+        cmp(b, NFT_CMP_LTE, &[137]);
+        verdict_accept(b);
+    });
+    // Ingress chains first, then egress chains: a packet must pass both ("return" = allowed
+    // here, the base chain goes on).
+    for ingress in [true, false] {
+        for c in chains.iter().filter(|c| c.ingress == ingress) {
+            let v6 = c.ip.len() == 16;
+            let (src, dst) = offsets(v6);
+            rule(&mut b, f, t, b"forward", |b| {
+                family_guard(b, fam, v6);
+                addr_match(b, if ingress { dst } else { src }, &c.ip, (c.ip.len() * 8) as u8);
+                verdict(b, NFT_JUMP, Some(c.name.as_bytes()));
+            });
+        }
+    }
+    for c in chains {
+        let v6 = c.ip.len() == 16;
+        let (src, dst) = offsets(v6);
+        let peer_off = if c.ingress { src } else { dst };
+        for a in &c.allows {
+            let ports: &[NpPort] = &a.ports;
+            let n = ports.len().max(1);
+            for i in 0..n {
+                rule(&mut b, f, t, c.name.as_bytes(), |b| {
+                    if let Some((ad, pre)) = &a.peer {
+                        if *pre > 0 {
+                            addr_match(b, peer_off, ad, *pre);
+                        }
+                    }
+                    if let Some(p) = ports.get(i) {
+                        meta(b, NFT_META_L4PROTO);
+                        cmp(b, NFT_CMP_EQ, &[p.proto]);
+                        if p.hi != 0 {
+                            payload(b, NFT_PAYLOAD_TRANSPORT_HEADER, 2, 2);
+                            if p.lo == p.hi {
+                                cmp(b, NFT_CMP_EQ, &p.lo.to_be_bytes());
+                            } else {
+                                cmp(b, NFT_CMP_GTE, &p.lo.to_be_bytes());
+                                cmp(b, NFT_CMP_LTE, &p.hi.to_be_bytes());
+                            }
+                        }
+                    }
+                    verdict(b, NFT_RETURN, None);
+                });
+            }
+        }
+        rule(&mut b, f, t, c.name.as_bytes(), |b| verdict(b, NF_DROP, None));
+    }
+    batch_msg(&mut b, NFNL_MSG_BATCH_END);
+    b
+}
+
+/// Atomically replaces table `<fam> kr-netpol` with the pod chains (an empty list deletes it).
+pub fn ensure_netpol(fam: PolFam, chains: &[NpChain]) -> Result<(), Errno> {
+    if chains.is_empty() {
+        return delete_netpol(fam);
+    }
+    Netlink::open(NETLINK_NETFILTER)?.transact(&netpol_batch(fam, chains))
+}
+
+/// Deletes table `<fam> kr-netpol`; a missing table is success.
+pub fn delete_netpol(fam: PolFam) -> Result<(), Errno> {
+    let mut b = NlBuf::new();
+    batch_msg(&mut b, NFNL_MSG_BATCH_BEGIN);
+    msg(&mut b, NFT_MSG_DELTABLE, NLM_F_ACK, if fam == PolFam::Bridge { NFPROTO_BRIDGE } else { 1 }, 0);
+    b.attr_str(NFTA_TABLE_NAME, NETPOL_TABLE);
+    b.end();
+    batch_msg(&mut b, NFNL_MSG_BATCH_END);
+    match Netlink::open(NETLINK_NETFILTER)?.transact(&b) {
+        Err(Errno(2)) => Ok(()),
+        r => r,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +621,48 @@ mod tests {
         assert_eq!(netmask(24), [255, 255, 255, 0]);
         assert_eq!(netmask(32), [255; 4]);
         assert_eq!(netmask(20), [255, 255, 240, 0]);
+    }
+
+    #[test]
+    fn netpol_layout() {
+        let ch = alloc::vec![NpChain {
+            name: "i4_0".into(),
+            ip: alloc::vec![10, 88, 0, 5],
+            ingress: true,
+            allows: alloc::vec![
+                NpAllow { peer: Some((alloc::vec![10, 88, 0, 0], 16)), ports: alloc::vec![NpPort { proto: 6, lo: 80, hi: 80 }, NpPort { proto: 17, lo: 53, hi: 60 }] },
+                NpAllow { peer: None, ports: alloc::vec![] },
+            ],
+        }];
+        for fam in [PolFam::Inet, PolFam::Bridge] {
+            let b = netpol_batch(fam, &ch);
+            let m = messages(b.bytes());
+            let t = |x: u16| (NFNL_SUBSYS_NFTABLES << 8) | x;
+            let types: Vec<u16> = m.iter().map(|x| x.0).collect();
+            // begin, newtable, deltable, newtable, base chain, pod chain, ct, nd, jump, 2+1 allows + drop, end
+            let mut want = alloc::vec![0x10, t(0), t(2), t(0), t(3), t(3)];
+            want.extend([t(6); 7]);
+            want.push(0x11);
+            assert_eq!(types, want);
+            let fam_byte = if fam == PolFam::Bridge { 7 } else { 1 };
+            assert_eq!(m[4].2[16], fam_byte);
+            assert!(contains(m[8].2, b"i4_0\0")); // jump target
+            assert!(contains(m[8].2, &NFT_JUMP.to_be_bytes()));
+            assert!(contains(m[8].2, &[10, 88, 0, 5]));
+            // allow 1 / port 80: masked peer, port 80 BE; allow 1 / udp range; allow 2 = any
+            assert!(contains(m[9].2, &[255, 255, 0, 0]));
+            assert!(contains(m[9].2, &80u16.to_be_bytes()));
+            assert!(contains(m[10].2, &53u16.to_be_bytes()) && contains(m[10].2, &60u16.to_be_bytes()));
+            assert!(contains(m[10].2, &NFT_CMP_GTE.to_be_bytes()));
+            assert!(contains(m[11].2, &NFT_RETURN.to_be_bytes()) && !contains(m[11].2, b"payload"));
+            assert!(contains(m[12].2, b"immediate"));
+        }
+    }
+
+    #[test]
+    fn masks() {
+        assert_eq!(mask_of(20, 4), [255, 255, 240, 0]);
+        assert_eq!(mask_of(64, 16)[..9], [255, 255, 255, 255, 255, 255, 255, 255, 0]);
     }
 
     /// Needs root (CAP_NET_ADMIN); run in a privileged container with `--ignored`.
