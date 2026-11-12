@@ -553,3 +553,9 @@
 
 279. **A pod whose sandbox could not be built failed for good** — *fixed*
     Any `start_sandbox` error other than "no free IP" (a full disk writing `/etc/hosts`, a CNI error, a vanished file) set `failed_setup`, so the pod stayed `Failed` (`SandboxFailed`) and a ReplicaSet kept creating replacements. The kubelet now keeps the pod in `ContainerCreating`, emits one `FailedCreatePodSandBox` event per distinct message and retries every 10 s, as upstream. A container that cannot join a sandbox that has vanished (ESRCH) makes the kubelet drop the sandbox and build a new one.
+
+280. **ServiceLB ignored ExternalIPs and served clashing ports twice** — *fixed* (part of #174)
+    A node with `ExternalIP` addresses is published by those (else its InternalIPs), and of two LoadBalancer Services with the same protocol and port only the older (creation time, then namespace/name) gets an ingress.
+
+281. **Audit and PodSecurity configuration are read at start-up only** — *closed as upstream parity* (#186)
+    Upstream's kube-apiserver reads `--audit-policy-file` and the admission configuration at start-up too (and so does k3s); kr behaves the same, so a change needs a server restart.

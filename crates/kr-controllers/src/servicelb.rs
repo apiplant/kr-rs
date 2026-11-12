@@ -55,14 +55,44 @@ fn node_ready(n: &Value) -> bool {
     n.pointer(&["status", "conditions"]).and_then(Value::as_array).unwrap_or(&[]).iter().any(|c| str_at(c, &["type"]) == "Ready" && str_at(c, &["status"]) == "True")
 }
 
-fn internal_ips(n: &Value) -> Vec<String> {
-    n.pointer(&["status", "addresses"])
+/// The addresses a node is published with: its ExternalIPs when it has any, else its
+/// InternalIPs (as k3s ServiceLB does).
+fn node_ips(n: &Value) -> Vec<String> {
+    let of = |ty: &str| -> Vec<String> {
+        n.pointer(&["status", "addresses"]).and_then(Value::as_array).unwrap_or(&[]).iter().filter(|a| str_at(a, &["type"]) == ty).map(|a| str_at(a, &["address"]).to_string()).collect()
+    };
+    let ext = of("ExternalIP");
+    if ext.is_empty() { of("InternalIP") } else { ext }
+}
+
+/// (protocol, port) pairs of a Service's ports.
+fn lb_ports(svc: &Value) -> Vec<(String, i64)> {
+    svc.pointer(&["spec", "ports"])
         .and_then(Value::as_array)
         .unwrap_or(&[])
         .iter()
-        .filter(|a| str_at(a, &["type"]) == "InternalIP")
-        .map(|a| str_at(a, &["address"]).to_string())
+        .map(|p| (if str_at(p, &["protocol"]).is_empty() { "TCP".to_string() } else { str_at(p, &["protocol"]).to_string() }, p.get("port").and_then(Value::as_i64).unwrap_or(0)))
         .collect()
+}
+
+/// The LoadBalancer Services that lose a port clash: the nodes' proxies listen on one address per
+/// (protocol, port), so of two Services asking for the same one only the older (then the first by
+/// namespace/name) is served; the other gets no ingress, as with klipper-lb whose second pod
+/// stays Pending on the port.
+fn losers(svcs: &[Value]) -> BTreeSet<(String, String)> {
+    let mut lbs: Vec<&Value> = svcs.iter().filter(|s| ours(s) && !deleting(s) && str_at(s, &["spec", "type"]) == "LoadBalancer").collect();
+    lbs.sort_by_key(|s| (str_at(s, &["metadata", "creationTimestamp"]).to_string(), namespace(s).to_string(), name(s).to_string()));
+    let mut taken: BTreeSet<(String, i64)> = BTreeSet::new();
+    let mut out = BTreeSet::new();
+    for s in lbs {
+        let ports = lb_ports(s);
+        if ports.iter().any(|p| taken.contains(p)) {
+            out.insert((namespace(s).to_string(), name(s).to_string()));
+        } else {
+            taken.extend(ports);
+        }
+    }
+    out
 }
 
 /// Whether this controller owns the Service's load balancer.
@@ -87,7 +117,7 @@ fn addresses(svc: &Value, nodes: &[Value], slices: &[Value]) -> Vec<String> {
             }
         }
     }
-    let mut ips: Vec<String> = nodes.iter().filter(|n| node_ready(n) && !deleting(n) && (!local || with_endpoints.contains(name(n)))).flat_map(internal_ips).collect();
+    let mut ips: Vec<String> = nodes.iter().filter(|n| node_ready(n) && !deleting(n) && (!local || with_endpoints.contains(name(n)))).flat_map(|n| node_ips(n)).collect();
     ips.sort();
     ips.dedup();
     ips
@@ -101,8 +131,11 @@ pub async fn sync<C: Client>(c: &C) -> Result<()> {
     }
     let nodes = items(&c.list("/api/v1/nodes", "").await?);
     let slices = items(&c.list(&endpointslices(None), "").await?);
+    let clashing = losers(&svcs);
     for svc in svcs.iter().filter(|s| ours(s) && !deleting(s)) {
-        let want = if str_at(svc, &["spec", "type"]) == "LoadBalancer" {
+        let want = if clashing.contains(&(namespace(svc).to_string(), name(svc).to_string())) {
+            Vec::new()
+        } else if str_at(svc, &["spec", "type"]) == "LoadBalancer" {
             addresses(svc, &nodes, &slices)
         } else if ingress_of(svc) > 0 {
             Vec::new()
@@ -154,6 +187,21 @@ mod tests {
         ];
         assert_eq!(addresses(&svc, &nodes, &slices), ["10.0.0.2"]);
         assert!(addresses(&svc, &nodes, &[]).is_empty());
+    }
+
+    #[test]
+    fn external_addresses_win_over_internal_ones() {
+        let n = v(r#"{"metadata":{"name":"a"},"status":{"addresses":[{"type":"InternalIP","address":"10.0.0.1"},{"type":"ExternalIP","address":"203.0.113.9"}],"conditions":[{"type":"Ready","status":"True"}]}}"#);
+        let svc = v(r#"{"metadata":{"name":"s","namespace":"d"},"spec":{"type":"LoadBalancer"}}"#);
+        assert_eq!(addresses(&svc, &[n], &[]), ["203.0.113.9"]);
+    }
+
+    #[test]
+    fn the_older_service_keeps_a_clashing_port() {
+        let mk = |n: &str, ts: &str, port: i64, proto: &str| v(&alloc::format!(r#"{{"metadata":{{"name":"{n}","namespace":"d","creationTimestamp":"{ts}"}},"spec":{{"type":"LoadBalancer","ports":[{{"port":{port},"protocol":"{proto}"}}]}}}}"#));
+        let svcs = [mk("new", "2026-02-01T00:00:00Z", 80, "TCP"), mk("old", "2026-01-01T00:00:00Z", 80, "TCP"), mk("udp", "2026-03-01T00:00:00Z", 80, "UDP"), mk("other", "2026-03-01T00:00:00Z", 81, "TCP")];
+        let l = losers(&svcs);
+        assert_eq!(l.into_iter().map(|(_, n)| n).collect::<Vec<_>>(), ["new"]);
     }
 
     #[test]
