@@ -17,6 +17,7 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use kr_sys::ns::{self, CloneArgs};
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use crate::lsm::Lsm;
 use kr_sys::{Errno, Fd};
 
 use crate::cgroup::{Cgroup, Limits};
@@ -91,6 +92,8 @@ pub struct RunSpec<'a> {
     /// `Some(&[])` runs unconfined, any other program is a compiled `Localhost` profile
     /// (`seccomp::compile`). Ignored when `privileged`.
     pub seccomp: Option<&'a [kr_sys::ns::SockFilter]>,
+    /// AppArmor profile and SELinux labels (`lsm::resolve_*`); `&lsm::NONE` applies nothing.
+    pub lsm: &'a Lsm,
     /// Run in a user namespace (rootless). False = rootful (host userns), matching k3s default.
     pub userns: bool,
     /// OCI lifecycle hooks (CDI `hooks`); see `crate::hooks`. Use `hooks::NONE` for none.
@@ -136,6 +139,8 @@ pub struct ExecCtx {
     pub caps: Option<Vec<u32>>,
     /// The container's seccomp filter, with the meaning of [`RunSpec::seccomp`].
     pub seccomp: Option<Vec<kr_sys::ns::SockFilter>>,
+    /// The container's AppArmor profile and SELinux process label.
+    pub lsm: Lsm,
 }
 
 /// What `exec_in` needs to enter a running container.
@@ -266,7 +271,7 @@ pub fn exec_in(target: &ExecTarget, spec: &ExecSpec) -> Result<Running, RunError
         let ctx = &target.ctx;
         let user = if spec.user.is_empty() { &ctx.user[..] } else { spec.user };
         let groups = if spec.extra_groups.is_empty() { &ctx.groups[..] } else { spec.extra_groups };
-        let _ = drop_and_exec(spec.cwd, user, full_map, spec.argv, spec.env, groups, ctx.privileged, ctx.caps.as_deref(), ctx.seccomp.as_deref());
+        let _ = drop_and_exec(spec.cwd, user, full_map, spec.argv, spec.env, groups, ctx.privileged, ctx.caps.as_deref(), ctx.seccomp.as_deref(), &ctx.lsm);
         127
     })
 }
@@ -577,6 +582,7 @@ const STEPS: &[&str] = &[
     "read-only rootfs",
     "clone propagating volume",
     "run hook",
+    "apply AppArmor/SELinux label",
 ];
 
 /// Index of "run hook" in `STEPS`.
@@ -1422,6 +1428,14 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
         opts.pop();
         opts.extend_from_slice(b",userxattr\0");
     }
+    // SELinux: the label of the container's files (quoted: a level may hold commas).
+    let ctx_opt = spec.lsm.selinux_mount.as_ref().map(|l| alloc::format!("context=\"{l}\"").into_bytes());
+    if let Some(c) = &ctx_opt {
+        opts.pop();
+        opts.push(b',');
+        opts.extend_from_slice(c);
+        opts.push(0);
+    }
     let merged = cstr(&[spec.merged]);
     step!(2, ns::mount(Some(b"overlay\0"), &merged, Some(b"overlay\0"), 0, Some(&opts)));
 
@@ -1441,8 +1455,8 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
     step!(6, ns::mount(Some(b"proc\0"), b"/proc\0", Some(b"proc\0"), ns::MS_NOSUID | ns::MS_NODEV | ns::MS_NOEXEC, None));
 
     let _ = ns::mkdir(b"/dev\0", 0o755);
-    step!(7, ns::mount(Some(b"tmpfs\0"), b"/dev\0", Some(b"tmpfs\0"), ns::MS_NOSUID | ns::MS_NOEXEC, Some(b"mode=755,size=65536k\0")));
-    step!(8, populate_dev());
+    step!(7, ns::mount(Some(b"tmpfs\0"), b"/dev\0", Some(b"tmpfs\0"), ns::MS_NOSUID | ns::MS_NOEXEC, Some(&with_context(b"mode=755,size=65536k", ctx_opt.as_deref()))));
+    step!(8, populate_dev(ctx_opt.as_deref()));
     step!(20, mask_proc());
 
     // sysfs needs an owned netns; read-only. Some kernels/policies refuse it rootless: tolerate.
@@ -1484,7 +1498,7 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
             return (STEP_HOOK, f.errno());
         }
     }
-    drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups, spec.privileged, spec.caps, spec.seccomp)
+    drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups, spec.privileged, spec.caps, spec.seccomp, spec.lsm)
 }
 
 /// `createContainer` hooks. They run with the host root as their root and the container's whole
@@ -1508,7 +1522,7 @@ fn run_create_container_hooks(spec: &RunSpec, host_pid: i32, log: Option<&Fd>) -
 
 /// The common tail of every process start inside a container: cwd, user, capabilities,
 /// NO_NEW_PRIVS, seccomp, execve. Only returns on failure.
-fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env: &[Vec<u8>], extra_groups: &[u32], privileged: bool, caps: Option<&[u32]>, seccomp: Option<&[kr_sys::ns::SockFilter]>) -> (u8, Errno) {
+fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env: &[Vec<u8>], extra_groups: &[u32], privileged: bool, caps: Option<&[u32]>, seccomp: Option<&[kr_sys::ns::SockFilter]>, lsm: &Lsm) -> (u8, Errno) {
     macro_rules! step {
         ($i:expr, $e:expr) => {
             if let Err(e) = $e {
@@ -1546,6 +1560,8 @@ fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env:
     }
     if !privileged {
         step!(16, security::finish_drop(caps.unwrap_or(security::DEFAULT_CAPS)));
+        // Before NO_NEW_PRIVS and seccomp: both could stop the write or the transition.
+        step!(30, crate::lsm::apply_exec(lsm));
         step!(13, ns::prctl(ns::PR_SET_NO_NEW_PRIVS, 1));
         // Built before installing: the filter must be the last thing before execve.
         let default;
@@ -1637,7 +1653,18 @@ fn resolve_user(user: &[u8]) -> Result<Option<(u32, u32, Vec<u32>)>, Errno> {
 }
 
 /// Fresh /dev: device nodes are bind-mounted from the host (mknod is not allowed rootless).
-fn populate_dev() -> Result<(), Errno> {
+/// Mount data `base` plus the SELinux `context=` option, NUL-terminated.
+fn with_context(base: &[u8], ctx: Option<&[u8]>) -> Vec<u8> {
+    let mut v = base.to_vec();
+    if let Some(c) = ctx {
+        v.push(b',');
+        v.extend_from_slice(c);
+    }
+    v.push(0);
+    v
+}
+
+fn populate_dev(ctx: Option<&[u8]>) -> Result<(), Errno> {
     for name in [&b"null"[..], b"zero", b"full", b"random", b"urandom", b"tty"] {
         let target = cstr(&[b"/dev/", name]);
         let source = cstr(&[b"/.oldroot/dev/", name]);
@@ -1658,7 +1685,7 @@ fn populate_dev() -> Result<(), Errno> {
         let _ = ns::mkdir(dir, 0o755);
     }
     ns::mount(Some(b"devpts\0"), b"/dev/pts\0", Some(b"devpts\0"), ns::MS_NOSUID | ns::MS_NOEXEC, Some(b"newinstance,ptmxmode=0666,mode=620\0"))?;
-    ns::mount(Some(b"shm\0"), b"/dev/shm\0", Some(b"tmpfs\0"), ns::MS_NOSUID | ns::MS_NODEV | ns::MS_NOEXEC, Some(b"mode=1777,size=65536k\0"))?;
+    ns::mount(Some(b"shm\0"), b"/dev/shm\0", Some(b"tmpfs\0"), ns::MS_NOSUID | ns::MS_NODEV | ns::MS_NOEXEC, Some(&with_context(b"mode=1777,size=65536k", ctx)))?;
     Ok(())
 }
 

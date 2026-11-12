@@ -651,3 +651,6 @@
 
 325. **Images: manual removal (#130)** — *fixed*
     `kr ctr rmi <image|id>...` (reference, id or 12+ hex prefix) and `kr ctr rmi --prune`; both refuse images a container directory records (`images_in_use`), and `--prune` also sweeps blobs no manifest names older than an hour (`Store::sweep_blobs`). `kr ctr run` records its image; a record-less container directory older than the boot no longer stalls the garbage collector (ADR-057). Tests in `kr-runtime/tests/gc.rs`.
+
+326. **AppArmor and SELinux (#131)** — *fixed, not run on a host with either LSM (section B)*
+    `appArmorProfile` (container, pod, and the annotation `container.apparmor.security.beta.kubernetes.io/<name>`) and `seLinuxOptions` are applied: ADR-059. Left out: loading profiles (the host must have them), relabelling volumes, a default SELinux label for pods without options.

@@ -9,6 +9,7 @@ pub mod container;
 pub mod devfilter;
 pub mod gc;
 pub mod hooks;
+pub mod lsm;
 pub mod import;
 pub mod offload;
 pub mod network;

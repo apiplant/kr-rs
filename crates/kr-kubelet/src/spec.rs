@@ -44,7 +44,7 @@ pub fn exec_ctx(pod: &Value, ctr: &Value, image_user: &str, seccomp_dir: &str) -
         let names = |f: &str| -> Vec<&str> { c.get(f).and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_str).collect() };
         kr_runtime::security::resolve_caps(&names("add"), &names("drop")).ok()
     });
-    container::ExecCtx { user: user.into_bytes(), groups, privileged: ctr.pointer(&["securityContext", "privileged"]).and_then(Value::as_bool).unwrap_or(false), seccomp: seccomp_filter(pod, ctr, caps.as_deref(), seccomp_dir).ok().flatten(), caps }
+    container::ExecCtx { user: user.into_bytes(), groups, privileged: ctr.pointer(&["securityContext", "privileged"]).and_then(Value::as_bool).unwrap_or(false), seccomp: seccomp_filter(pod, ctr, caps.as_deref(), seccomp_dir).ok().flatten(), caps, lsm: lsm_for(pod, ctr, &LsmHost::probe()).unwrap_or_default() }
 }
 
 /// Directory of `Localhost` seccomp profiles: `<kubelet dir>/seccomp` as upstream
@@ -1373,5 +1373,110 @@ mod pem_tests {
         let both = alloc::format!("{a}{b}\n");
         let got = pem_certs([both.as_str(), a].into_iter());
         assert_eq!(got, [a, "-----BEGIN CERTIFICATE-----\nCCCC\n-----END CERTIFICATE-----\n"]);
+    }
+}
+
+/// Host facts the AppArmor and SELinux resolution depends on.
+pub struct LsmHost {
+    pub apparmor: bool,
+    pub profiles: Vec<String>,
+    pub selinux: bool,
+    pub selinux_default: Option<String>,
+    pub selinux_file_type: String,
+    pub mcs: String,
+    /// A rootless kubelet: the implicit RuntimeDefault profile is skipped (as containerd does
+    /// in a user namespace); an explicit profile is still applied.
+    pub rootless: bool,
+}
+
+impl LsmHost {
+    pub fn probe() -> LsmHost {
+        use kr_runtime::lsm;
+        let apparmor = lsm::apparmor_enabled();
+        let selinux = lsm::selinux_enabled();
+        let (selinux_default, selinux_file_type) = if selinux { lsm::default_labels() } else { (None, String::new()) };
+        LsmHost { apparmor, profiles: if apparmor { lsm::loaded_profiles() } else { Vec::new() }, selinux, selinux_default, selinux_file_type, mcs: if selinux { lsm::random_mcs() } else { String::new() }, rootless: kr_sys::fs::getuid() != 0 }
+    }
+}
+
+/// AppArmor profile and SELinux labels of a container (#131). AppArmor: the container's
+/// `securityContext.appArmorProfile`, else the deprecated annotation
+/// `container.apparmor.security.beta.kubernetes.io/<name>`, else the pod's field; unset means
+/// `RuntimeDefault` (as containerd), but a privileged container is then unconfined. SELinux:
+/// `seLinuxOptions` of the container, else the pod, when SELinux is enabled on the host (a no-op
+/// otherwise); nothing is applied when the pod sets no option.
+pub fn lsm_for(pod: &Value, ctr: &Value, host: &LsmHost) -> Result<kr_runtime::lsm::Lsm, String> {
+    use kr_runtime::lsm;
+    let privileged = ctr.pointer(&["securityContext", "privileged"]).and_then(Value::as_bool).unwrap_or(false);
+    let name = ctr.get("name").and_then(Value::as_str).unwrap_or("");
+    let ann = pod.pointer(&["metadata", "annotations", &alloc::format!("container.apparmor.security.beta.kubernetes.io/{name}")]).and_then(Value::as_str);
+    let field = ctr.pointer(&["securityContext", "appArmorProfile"]);
+    let (kind, local): (String, Option<String>) = if let Some(p) = field {
+        (p.get("type").and_then(Value::as_str).unwrap_or("").to_string(), p.get("localhostProfile").and_then(Value::as_str).map(String::from))
+    } else if let Some(a) = ann {
+        let (k, l) = lsm::parse_apparmor_annotation(a)?;
+        (k.to_string(), l.map(String::from))
+    } else if let Some(p) = pod.pointer(&["spec", "securityContext", "appArmorProfile"]) {
+        (p.get("type").and_then(Value::as_str).unwrap_or("").to_string(), p.get("localhostProfile").and_then(Value::as_str).map(String::from))
+    } else if privileged || host.rootless {
+        ("Unconfined".to_string(), None)
+    } else {
+        ("RuntimeDefault".to_string(), None)
+    };
+    let apparmor = lsm::resolve_apparmor(&kind, local.as_deref(), host.apparmor, &host.profiles)?;
+
+    let se = ctr.pointer(&["securityContext", "seLinuxOptions"]).or_else(|| if privileged { None } else { pod.pointer(&["spec", "securityContext", "seLinuxOptions"]) });
+    let (mut selinux_process, mut selinux_mount) = (None, None);
+    if let (Some(o), true) = (se, host.selinux) {
+        let f = |k: &str| o.get(k).and_then(Value::as_str).unwrap_or("");
+        let opts = lsm::SeOptions { user: f("user"), role: f("role"), type_: f("type"), level: f("level") };
+        let (p, m) = lsm::selinux_labels(&opts, host.selinux_default.as_deref(), &host.selinux_file_type, &host.mcs)?;
+        selinux_process = Some(p);
+        selinux_mount = Some(m);
+    }
+    Ok(lsm::Lsm { apparmor, selinux_process, selinux_mount })
+}
+
+#[cfg(test)]
+mod lsm_tests {
+    use super::*;
+
+    fn host(apparmor: bool, selinux: bool) -> LsmHost {
+        LsmHost { apparmor, profiles: alloc::vec!["docker-default".to_string(), "mine".to_string()], selinux, selinux_default: Some("system_u:system_r:container_t:s0".to_string()), selinux_file_type: "container_file_t".to_string(), mcs: "c1,c2".to_string(), rootless: false }
+    }
+    fn lsm(pod: &str, ctr: &str, h: &LsmHost) -> Result<kr_runtime::lsm::Lsm, String> {
+        let (p, c) = (kr_fmt::json::parse(pod.as_bytes()).unwrap(), kr_fmt::json::parse(ctr.as_bytes()).unwrap());
+        lsm_for(&p, &c, h)
+    }
+
+    #[test]
+    fn apparmor_precedence_and_defaults() {
+        let h = host(true, false);
+        let none = r#"{"spec":{}}"#;
+        assert_eq!(lsm(none, r#"{"name":"c"}"#, &h).unwrap().apparmor.as_deref(), Some("docker-default"));
+        assert_eq!(lsm(none, r#"{"name":"c","securityContext":{"privileged":true}}"#, &h).unwrap().apparmor, None);
+        let pod = r#"{"spec":{"securityContext":{"appArmorProfile":{"type":"Localhost","localhostProfile":"mine"}}}}"#;
+        assert_eq!(lsm(pod, r#"{"name":"c"}"#, &h).unwrap().apparmor.as_deref(), Some("mine"));
+        // The container's field beats the pod's.
+        assert_eq!(lsm(pod, r#"{"name":"c","securityContext":{"appArmorProfile":{"type":"Unconfined"}}}"#, &h).unwrap().apparmor, None);
+        // The annotation applies to its container only, and loses against the field.
+        let ann = r#"{"metadata":{"annotations":{"container.apparmor.security.beta.kubernetes.io/c":"localhost/mine"}},"spec":{}}"#;
+        assert_eq!(lsm(ann, r#"{"name":"c"}"#, &h).unwrap().apparmor.as_deref(), Some("mine"));
+        assert_eq!(lsm(ann, r#"{"name":"d"}"#, &h).unwrap().apparmor.as_deref(), Some("docker-default"));
+        assert_eq!(lsm(ann, r#"{"name":"c","securityContext":{"appArmorProfile":{"type":"Unconfined"}}}"#, &h).unwrap().apparmor, None);
+        assert!(lsm(ann, r#"{"name":"c"}"#, &host(false, false)).is_err(), "Localhost without AppArmor fails the container");
+        assert_eq!(lsm(none, r#"{"name":"c"}"#, &host(false, false)).unwrap().apparmor, None);
+    }
+
+    #[test]
+    fn selinux_only_when_enabled_and_asked() {
+        let pod = r#"{"spec":{"securityContext":{"seLinuxOptions":{"level":"s0:c5,c6"}}}}"#;
+        let l = lsm(pod, r#"{"name":"c"}"#, &host(false, true)).unwrap();
+        assert_eq!(l.selinux_process.as_deref(), Some("system_u:system_r:container_t:s0:c5,c6"));
+        assert_eq!(l.selinux_mount.as_deref(), Some("system_u:object_r:container_file_t:s0:c5,c6"));
+        assert_eq!(lsm(pod, r#"{"name":"c"}"#, &host(false, false)).unwrap(), kr_runtime::lsm::Lsm::default());
+        assert_eq!(lsm(r#"{"spec":{}}"#, r#"{"name":"c"}"#, &host(false, true)).unwrap().selinux_process, None);
+        let c = r#"{"name":"c","securityContext":{"seLinuxOptions":{"type":"spc_t"}}}"#;
+        assert_eq!(lsm(pod, c, &host(false, true)).unwrap().selinux_process.as_deref(), Some("system_u:system_r:spc_t:s0:c1,c2"));
     }
 }

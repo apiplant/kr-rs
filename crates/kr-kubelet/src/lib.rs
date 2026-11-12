@@ -1698,6 +1698,15 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 return;
             }
         };
+        // appArmorProfile and seLinuxOptions: a profile that is not loaded is a config error.
+        let lsm = match spec::lsm_for(pod, cspec.unwrap_or(&Value::Null), &spec::LsmHost::probe()) {
+            Ok(l) => l,
+            Err(m) => {
+                self.set_waiting(uid, i, "CreateContainerConfigError", m);
+                self.backoff(uid, i);
+                return;
+            }
+        };
         let ctx_user = built.user.clone().into_bytes();
         let ctx_groups = built.extra_groups.clone();
         let ctx_privileged = cspec.and_then(|c| c.pointer(&["securityContext", "privileged"])).and_then(Value::as_bool).unwrap_or(false);
@@ -1767,6 +1776,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             privileged: cspec.and_then(|c| c.pointer(&["securityContext", "privileged"])).and_then(Value::as_bool).unwrap_or(false),
             caps: caps.as_deref(),
             seccomp: seccomp.as_deref(),
+            lsm: &lsm,
             userns: {
                 let host_users = pod.pointer(&["spec", "hostUsers"]).and_then(Value::as_bool);
                 if kr_sys::ns::getuid() != 0 {
@@ -1842,7 +1852,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     c.resize_restart = false;
                     c.seq = seq;
                     c.signaller = Some(running.signaller());
-                    c.target = Some(running.target().with_ctx(container::ExecCtx { user: ctx_user, groups: ctx_groups, privileged: ctx_privileged, caps: caps.clone(), seccomp: seccomp.clone() }));
+                    c.target = Some(running.target().with_ctx(container::ExecCtx { user: ctx_user, groups: ctx_groups, privileged: ctx_privileged, caps: caps.clone(), seccomp: seccomp.clone(), lsm: lsm.clone() }));
                     c.state = CState::Running { started_at: started, id: cid.clone() };
                     c.proc = kr_runtime::network::proc_start(running.pid as u32).map(|st| (running.pid, st));
                     c.shim = running.shim_pid();
