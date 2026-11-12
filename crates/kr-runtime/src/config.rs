@@ -24,6 +24,86 @@ pub const DEFAULT_PATH: &str = "/etc/kr/config.yaml";
 /// Flags that take no value: `true` emits the bare flag, `false` nothing.
 const BOOL_FLAGS: &[&str] = &["cluster-init"];
 
+/// `disable-<name>: true` keys that k3s has as boolean flags.
+const DISABLE_BOOLS: &[&str] = &["network-policy", "helm-controller"];
+
+type Translate = fn(&str) -> Result<Option<String>, String>;
+
+/// Settings flags that become one `KR_*` variable each, with the translation of the k3s value.
+const SETTINGS: &[(&str, &str, Translate)] = &[
+    ("cluster-cidr", "KR_POD_CIDR", ipv4_entry),
+    ("service-cidr", "KR_SERVICE_CIDR", ipv4_entry),
+    ("cluster-domain", "KR_CLUSTER_DOMAIN", plain),
+    ("flannel-backend", "KR_NET_BACKEND", backend),
+    ("proxy-mode", "KR_PROXY", proxy),
+    ("max-pods", "KR_MAX_PODS", uint),
+    ("eviction-hard", "KR_EVICTION_MEMORY_AVAILABLE", eviction_hard),
+    ("image-gc-high-threshold", "KR_IMAGE_GC_HIGH", uint),
+    ("image-gc-low-threshold", "KR_IMAGE_GC_LOW", uint),
+    ("image-minimum-gc-age", "KR_IMAGE_GC_MIN_AGE", duration_secs),
+    ("node-eviction-rate", "KR_NODE_EVICTION_RATE", plain),
+    ("secondary-node-eviction-rate", "KR_SECONDARY_NODE_EVICTION_RATE", plain),
+    ("unhealthy-zone-threshold", "KR_UNHEALTHY_ZONE_THRESHOLD", plain),
+    ("large-cluster-size-threshold", "KR_LARGE_CLUSTER_SIZE_THRESHOLD", uint),
+    ("private-registry", "KR_REGISTRIES_YAML", plain),
+    ("kubelet-root-dir", "KR_KUBELET_DIR", plain),
+];
+
+fn plain(v: &str) -> Result<Option<String>, String> {
+    Ok(Some(v.to_string()))
+}
+
+fn uint(v: &str) -> Result<Option<String>, String> {
+    v.trim().parse::<u64>().map(|n| Some(n.to_string())).map_err(|_| alloc::format!("{v:?} is not a number"))
+}
+
+/// k3s takes `v4,v6` pairs; kr's own CIDRs are IPv4 (the IPv6 ones are derived), so the IPv4 entry.
+fn ipv4_entry(v: &str) -> Result<Option<String>, String> {
+    Ok(v.split(',').map(str::trim).find(|e| !e.is_empty() && !e.contains(':')).map(String::from))
+}
+
+fn backend(v: &str) -> Result<Option<String>, String> {
+    match v {
+        "vxlan" | "host-gw" | "wireguard" => Ok(Some(v.to_string())),
+        "wireguard-native" => Ok(Some("wireguard".to_string())),
+        _ => Err(alloc::format!("{v:?} is not supported (vxlan, host-gw, wireguard-native)")),
+    }
+}
+
+fn proxy(v: &str) -> Result<Option<String>, String> {
+    match v {
+        "userspace" | "nft" => Ok(Some(v.to_string())),
+        "nftables" => Ok(Some("nft".to_string())),
+        _ => Err(alloc::format!("{v:?} is not supported (userspace, nftables)")),
+    }
+}
+
+/// kubelet `--eviction-hard` (`memory.available<500Mi,nodefs.available<10%`): only the memory
+/// signal as an absolute quantity is implemented; other signals are ignored.
+fn eviction_hard(v: &str) -> Result<Option<String>, String> {
+    for e in v.split(',') {
+        if let Some(q) = e.trim().strip_prefix("memory.available<") {
+            if q.ends_with('%') {
+                return Err("memory.available as a percentage is not supported; use a quantity".to_string());
+            }
+            return Ok(Some(q.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// `120`, `90s`, `2m`, `1h` as seconds.
+fn duration_secs(v: &str) -> Result<Option<String>, String> {
+    let v = v.trim();
+    let (n, mul) = match v.as_bytes().last() {
+        Some(b's') => (&v[..v.len() - 1], 1),
+        Some(b'm') => (&v[..v.len() - 1], 60),
+        Some(b'h') => (&v[..v.len() - 1], 3600),
+        _ => (v, 1),
+    };
+    n.parse::<u64>().map(|n| Some((n * mul).to_string())).map_err(|_| alloc::format!("{v:?} is not a duration"))
+}
+
 /// Removes `--config FILE` / `--config=FILE` from `argv`; returns the path (explicit: the file
 /// must exist) from it, else `KR_CONFIG`, else the default.
 pub fn take_config_flag(argv: &mut Vec<String>, env: Option<String>) -> Result<(String, bool), String> {
@@ -107,10 +187,20 @@ pub fn to_args(merged: &[(String, Value)]) -> Result<Vec<String>, String> {
         if k == "config" {
             continue;
         }
+        // k3s spellings that are the same setting under another name.
+        let k = if k == "data-dir" { "data" } else { k.as_str() };
+        // `disable-<component>: true` (k3s) is `disable: <component>`.
+        if let Some(c) = k.strip_prefix("disable-").filter(|c| DISABLE_BOOLS.contains(c)) {
+            if matches!(v, Value::Bool(true)) || matches!(v, Value::String(s) if s == "true") {
+                out.push("--disable".to_string());
+                out.push(c.to_string());
+            }
+            continue;
+        }
         let flag = alloc::format!("--{k}");
         match v {
             Value::Null => {}
-            Value::Bool(b) if BOOL_FLAGS.contains(&k.as_str()) => {
+            Value::Bool(b) if BOOL_FLAGS.contains(&k) => {
                 if *b {
                     out.push(flag);
                 }
@@ -188,6 +278,10 @@ pub struct Install {
     pub node_ip: Option<String>,
     pub node_external_ip: Option<String>,
     pub disable: Vec<String>,
+    /// Translated `SETTINGS` flags: (variable, value).
+    pub settings: Vec<(&'static str, String)>,
+    /// Flags whose value could not be used; reported by the caller as a start error.
+    pub errors: Vec<String>,
 }
 
 impl Install {
@@ -201,7 +295,14 @@ impl Install {
             b"--node-ip" | b"-i" => self.node_ip = Some(value.to_string()),
             b"--node-external-ip" => self.node_external_ip = Some(value.to_string()),
             b"--disable" => self.disable.push(value.to_string()),
-            _ => return false,
+            _ => {
+                let Some((_, var, f)) = SETTINGS.iter().find(|(n, _, _)| flag.strip_prefix(b"--") == Some(n.as_bytes())) else { return false };
+                match f(value) {
+                    Ok(Some(v)) => self.settings.push((var, v)),
+                    Ok(None) => {}
+                    Err(e) => self.errors.push(alloc::format!("{}: {e}", String::from_utf8_lossy(flag))),
+                }
+            }
         }
         true
     }
@@ -221,6 +322,9 @@ impl Install {
         put("KR_NODE_IP", self.node_ip.clone());
         put("KR_NODE_EXTERNAL_IP", self.node_external_ip.clone());
         put("KR_DISABLE", (!self.disable.is_empty()).then(|| self.disable.join(",")));
+        for (k, val) in &self.settings {
+            v.push((*k, val.clone()));
+        }
         v
     }
 
@@ -320,5 +424,42 @@ mod tests {
         assert!(v.contains(&("KR_DISABLE", "servicelb,metrics-server".into())));
         assert!(v.contains(&("KR_NODE_NAME", "n".into())));
         assert_eq!(v.len(), 5);
+    }
+
+    fn setting(flag: &str, val: &str) -> (Vec<(&'static str, String)>, Vec<String>) {
+        let mut i = Install::default();
+        assert!(i.take(flag.as_bytes(), val));
+        (i.settings, i.errors)
+    }
+
+    #[test]
+    fn k3s_values_are_translated() {
+        let ok = |f: &str, v: &str| setting(f, v).0;
+        assert_eq!(ok("--flannel-backend", "wireguard-native"), [("KR_NET_BACKEND", "wireguard".to_string())]);
+        assert_eq!(ok("--flannel-backend", "host-gw"), [("KR_NET_BACKEND", "host-gw".to_string())]);
+        assert!(!setting("--flannel-backend", "ipsec").1.is_empty());
+        assert!(!setting("--flannel-backend", "none").1.is_empty());
+        assert_eq!(ok("--cluster-cidr", "fd00::/48, 10.42.0.0/16"), [("KR_POD_CIDR", "10.42.0.0/16".to_string())]);
+        assert!(ok("--service-cidr", "fd00::/112").is_empty());
+        assert_eq!(ok("--cluster-domain", "corp.local"), [("KR_CLUSTER_DOMAIN", "corp.local".to_string())]);
+        assert_eq!(ok("--proxy-mode", "nftables"), [("KR_PROXY", "nft".to_string())]);
+        assert!(!setting("--proxy-mode", "ipvs").1.is_empty());
+        assert_eq!(ok("--max-pods", "250"), [("KR_MAX_PODS", "250".to_string())]);
+        assert!(!setting("--max-pods", "lots").1.is_empty());
+        assert_eq!(ok("--eviction-hard", "nodefs.available<10%,memory.available<500Mi"), [("KR_EVICTION_MEMORY_AVAILABLE", "500Mi".to_string())]);
+        assert!(ok("--eviction-hard", "nodefs.available<10%").is_empty());
+        assert!(!setting("--eviction-hard", "memory.available<5%").1.is_empty());
+        assert_eq!(ok("--image-minimum-gc-age", "2m"), [("KR_IMAGE_GC_MIN_AGE", "120".to_string())]);
+        assert_eq!(ok("--image-gc-high-threshold", "90"), [("KR_IMAGE_GC_HIGH", "90".to_string())]);
+        assert_eq!(ok("--private-registry", "/etc/r.yaml"), [("KR_REGISTRIES_YAML", "/etc/r.yaml".to_string())]);
+        let mut i = Install::default();
+        i.take(b"--max-pods", "50");
+        assert!(i.vars().contains(&("KR_MAX_PODS", "50".into())));
+    }
+
+    #[test]
+    fn config_aliases() {
+        let a = run(&[], &[(DEFAULT_PATH, "data-dir: /d\ndisable-network-policy: true\ndisable-helm-controller: false\nflannel-backend: wireguard-native\n")], None).unwrap();
+        assert_eq!(a, s(&["--data", "/d", "--disable", "network-policy", "--flannel-backend", "wireguard-native"]));
     }
 }

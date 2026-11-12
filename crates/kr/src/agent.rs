@@ -250,7 +250,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
                 token = Some(v)
             }
             (b"--token-file", Some(v)) => token_file = Some(v),
-            (b"--data", Some(v)) => data = Some(v),
+            (b"--data" | b"--data-dir", Some(v)) => data = Some(v),
             _ => return fail("usage: kr agent --server https://HOST:6443 [--token-file FILE | --token TOKEN] [--data DIR] [--config FILE] [--node-name NAME] [--node-label K=V]... [--node-taint K=V:EFFECT]... [--node-ip IP] [--node-external-ip IP] [--disable network-policy|coredns]...   (or KR_TOKEN in the environment)"),
         }
     }

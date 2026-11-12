@@ -422,7 +422,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
                 Ok(p) => port = p,
                 Err(_) => return fail("bad --port"),
             },
-            (b"--data", Some(d)) => data = Some(String::from(d)),
+            (b"--data" | b"--data-dir", Some(d)) => data = Some(String::from(d)),
             (b"--cluster-init", v) => {
                 cluster_init = true;
                 if let Some(v) = v {
@@ -456,7 +456,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
             (b"--audit-log-format", Some(v)) if v == "json" || v == "legacy" => audit_legacy = v == "legacy",
             (b"--pod-security-config", Some(v)) => psa_config = Some(String::from(v)),
             (b"--helm-job-image", Some(v)) => helm_image = Some(String::from(v)),
-            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h [--snapshot-keep 5]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--pod-security-config FILE] [--config FILE] [--tls-san NAME]... [--node-name NAME] [--node-label K=V]... [--node-taint K=V:EFFECT]... [--node-ip IP] [--node-external-ip IP] [--disable COMPONENT]... [--helm-job-image IMAGE]"),
+            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h [--snapshot-keep 5]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--pod-security-config FILE] [--config FILE] [--tls-san NAME]... [--node-name NAME] [--node-label K=V]... [--node-taint K=V:EFFECT]... [--node-ip IP] [--node-external-ip IP] [--disable COMPONENT]... [--helm-job-image IMAGE] [--cluster-cidr CIDR] [--service-cidr CIDR] [--cluster-domain NAME] [--flannel-backend vxlan|host-gw|wireguard-native] [--proxy-mode userspace|nftables] [--max-pods N] [--private-registry FILE] (more keys: README, configuration file)"),
         }
     }
     if let Err(e) = crate::install::publish(&inst) {

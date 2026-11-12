@@ -43,6 +43,9 @@ fn var(name: &str) -> Option<String> {
 /// Validates what was configured (flags and environment alike), so a typo stops the start
 /// instead of being ignored.
 pub fn publish(inst: &Install) -> Result<(), String> {
+    if let Some(e) = inst.errors.first() {
+        return Err(e.clone());
+    }
     inst.publish();
     disabled()?;
     node_settings()?;

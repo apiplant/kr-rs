@@ -90,6 +90,25 @@ cluster-init: true
 | `--node-ip`, `--node-external-ip` | `KR_NODE_IP`, `KR_NODE_EXTERNAL_IP` | InternalIP (also the address servers advertise) and ExternalIP |
 | `--disable NAME` (repeatable, or comma separated) | `KR_DISABLE` | `servicelb`, `metrics-server`, `coredns`, `local-storage`, `network-policy`, `helm-controller`; `traefik` is accepted and ignored. Cluster DNS and network policy run on every node, so set `coredns` / `network-policy` on every node |
 
+More keys (flag or config key; each sets the `KR_*` variable shown, the flag wins over the file, the file over the variable):
+
+| Key | Env | Value |
+|---|---|---|
+| `cluster-cidr`, `service-cidr` | `KR_POD_CIDR`, `KR_SERVICE_CIDR` | `A.B.0.0/16`; in a `v4,v6` pair the IPv4 entry is used |
+| `cluster-domain` | `KR_CLUSTER_DOMAIN` | DNS domain (same on every node) |
+| `flannel-backend` | `KR_NET_BACKEND` | `vxlan`, `host-gw`, `wireguard-native` (= `wireguard`); other values stop the start |
+| `proxy-mode` | `KR_PROXY` | `userspace`, `nftables` |
+| `max-pods` | `KR_MAX_PODS` | default 110 |
+| `eviction-hard` | `KR_EVICTION_MEMORY_AVAILABLE` | `memory.available<500Mi`; other signals ignored, percentages refused |
+| `image-gc-high-threshold`, `image-gc-low-threshold`, `image-minimum-gc-age` | `KR_IMAGE_GC_HIGH`, `_LOW`, `_MIN_AGE` | percent, percent, `2m` / seconds |
+| `node-eviction-rate`, `secondary-node-eviction-rate`, `unhealthy-zone-threshold`, `large-cluster-size-threshold` | `KR_NODE_EVICTION_RATE`, `KR_SECONDARY_NODE_EVICTION_RATE`, `KR_UNHEALTHY_ZONE_THRESHOLD`, `KR_LARGE_CLUSTER_SIZE_THRESHOLD` | numbers, as for kube-controller-manager |
+| `private-registry` | `KR_REGISTRIES_YAML` | path of a k3s-format `registries.yaml` |
+| `kubelet-root-dir` | `KR_KUBELET_DIR` | default `/var/lib/kubelet` |
+| `data-dir`, `server`, `token`, `token-file` | (`--data`, `--server`, `--token`, `--token-file`; `KR_TOKEN`) | as in k3s; `data-dir` is an alias of `data` |
+| `disable-network-policy`, `disable-helm-controller` | `KR_DISABLE` | boolean config keys, same as `disable: [...]` |
+
+Variables with no k3s counterpart (`KR_WIREGUARD_PORT`, `KR_POD_FAMILIES`, `KR_PREFER_IPV6`, `KR_DEVICE_*`, `KR_RAFT_ELECTION_MS`, `KR_OFFLOAD_*`, `KR_TLS_RESUMPTION`, ...) stay environment-only.
+
 ### Useful environment variables
 
 | Variable | Effect |
