@@ -451,7 +451,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let listed = self.sync_all().await;
             if listed && !swept {
                 swept = true;
-                self.sweep_unclaimed();
+                self.sweep_unclaimed().await;
             }
             self.notify.wait(1000).await;
         }
@@ -459,7 +459,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
 
     /// After the first sync: kills the pods nobody adopted (deleted while the kubelet was down)
     /// and frees their IPs.
-    fn sweep_unclaimed(&self) {
+    async fn sweep_unclaimed(&self) {
         kr_rt::exec::phase("sweep: devices");
         let live: Vec<String> = self.pods.borrow().keys().cloned().collect();
         self.devices.retain_pods(&live);
@@ -467,15 +467,19 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let csi = self.csi.clone();
             kr_rt::exec::spawn(async move { csi.unmount_pod(&u).await });
         }
+        kr_rt::exec::yield_if_long(5).await;
         kr_rt::exec::phase("sweep: cgroups");
         if self.cfg.cgroups {
             kr_runtime::cgroup::kill_stale_pods(&|c| live.iter().any(|u| u.as_bytes() == c));
             kr_runtime::cgroup::prune_previous_base(&alloc::format!("{}/cgroup-base", self.cfg.root));
         }
+        kr_rt::exec::yield_if_long(5).await;
         kr_rt::exec::phase("sweep: kill_recorded");
         self.kill_recorded(&live);
+        kr_rt::exec::yield_if_long(5).await;
         kr_rt::exec::phase("sweep: remove_unclaimed_dirs");
-        self.remove_unclaimed_dirs(&live);
+        self.remove_unclaimed_dirs(&live).await;
+        kr_rt::exec::yield_if_long(5).await;
         kr_rt::exec::phase("sweep: ipam gc");
         let (pods, ctrs) = self.adopted.get();
         kr_rt::eprint(alloc::format!("kubelet: adopted {pods} pods ({ctrs} running containers) left by the previous run\n").as_bytes());
@@ -484,7 +488,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
 
     /// Removes the pod directories and container directories (overlay layers) of pods that are
     /// gone from the API, left by a run that ended before it could clean up.
-    fn remove_unclaimed_dirs(&self, live: &[String]) {
+    async fn remove_unclaimed_dirs(&self, live: &[String]) {
         let list = |sub: &str| -> Vec<String> {
             let dir = alloc::format!("{}/{sub}\0", self.cfg.root);
             let Ok(fd) = kr_sys::ns::open(dir.as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY, 0) else { return Vec::new() };
@@ -494,6 +498,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             if is_pod_uid(name.as_bytes()) && !live.contains(&name) {
                 let dir = alloc::format!("{}/pods/{name}", self.cfg.root);
                 let _ = self.maps.run_as_root(|| remove_tree(&dir));
+                kr_rt::exec::yield_if_long(5).await; // a pod directory can hold a whole rootfs
             }
         }
         // Container ids are `<pod uid>-<container>-<n>`.
@@ -501,6 +506,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let uid = name.get(..36).unwrap_or("");
             if name.len() > 37 && name.as_bytes()[36] == b'-' && is_pod_uid(uid.as_bytes()) && !live.iter().any(|l| l == uid) {
                 let _ = self.maps.run_as_root(|| self.store.delete_container(&name).is_ok());
+                kr_rt::exec::yield_if_long(5).await;
             }
         }
     }

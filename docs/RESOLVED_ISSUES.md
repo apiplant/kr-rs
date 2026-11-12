@@ -538,3 +538,6 @@
 
 274. **A kubelet could list every VolumeAttachment and PersistentVolume** — *fixed* (part of #207)
     List/watch of `volumeattachments` requires `fieldSelector=spec.nodeName=<node>` (or one own name); `persistentvolumes` lists/watches are denied unless limited to one name the node uses.
+
+275. **The kubelet's start-up sweep ran as one uninterrupted poll** — *fixed* (part of #215)
+    `sweep_unclaimed` is async and yields between its steps and after every removed pod/container directory.
