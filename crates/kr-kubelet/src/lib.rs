@@ -355,10 +355,12 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         let pn = self.podnet.get();
         if self.cfg.network {
+            kr_rt::exec::phase("run: setup_host");
             if let Err(e) = network::setup_host_with(&pn, self.fam.get()) {
                 kr_rt::eprint(alloc::format!("kubelet: network setup failed (errno {}); pods get no IP\n", e.0).as_bytes());
             }
         } else {
+            kr_rt::exec::phase("run: rootless network");
             if let Some(infra) = self.adopt_infra() {
                 *self.infra.borrow_mut() = Some(infra);
                 self.announce_rootless().await;
@@ -441,18 +443,23 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     /// After the first sync: kills the pods nobody adopted (deleted while the kubelet was down)
     /// and frees their IPs.
     fn sweep_unclaimed(&self) {
+        kr_rt::exec::phase("sweep: devices");
         let live: Vec<String> = self.pods.borrow().keys().cloned().collect();
         self.devices.retain_pods(&live);
         for u in self.csi.pod_uids().into_iter().filter(|u| !live.contains(u)) {
             let csi = self.csi.clone();
             kr_rt::exec::spawn(async move { csi.unmount_pod(&u).await });
         }
+        kr_rt::exec::phase("sweep: cgroups");
         if self.cfg.cgroups {
             kr_runtime::cgroup::kill_stale_pods(&|c| live.iter().any(|u| u.as_bytes() == c));
             kr_runtime::cgroup::prune_previous_base(&alloc::format!("{}/cgroup-base", self.cfg.root));
         }
+        kr_rt::exec::phase("sweep: kill_recorded");
         self.kill_recorded(&live);
+        kr_rt::exec::phase("sweep: remove_unclaimed_dirs");
         self.remove_unclaimed_dirs(&live);
+        kr_rt::exec::phase("sweep: ipam gc");
         let (pods, ctrs) = self.adopted.get();
         kr_rt::eprint(alloc::format!("kubelet: adopted {pods} pods ({ctrs} running containers) left by the previous run\n").as_bytes());
         network::gc(alloc::format!("{}/ipam", self.cfg.root).as_bytes(), |owner| if is_pod_uid(owner) { live.iter().any(|u| u.as_bytes() == owner) } else { network::owner_alive(owner) != Some(false) });
@@ -816,13 +823,19 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let uid = meta(pod, "uid").to_string();
             seen.push(uid.clone());
             if pod.pointer(&["metadata", "deletionTimestamp"]).is_some() {
+                kr_rt::exec::phase("sync_all: terminate");
                 self.terminate(&uid, pod).await;
             } else {
+                kr_rt::exec::phase("sync_all: sync_pod");
                 self.sync_pod(&uid, pod).await;
+                kr_rt::exec::phase("sync_all: apply_resize");
                 self.apply_resize(&uid, pod);
+                kr_rt::exec::phase("sync_all: run_probes");
                 self.run_probes(&uid, pod);
+                kr_rt::exec::phase("sync_all: refresh_volumes");
                 self.refresh_volumes(&uid, pod).await;
             }
+            kr_rt::exec::phase("sync_all: report_status");
             self.report_status(&uid, pod).await;
         }
         // Directories of deleted local-path PVs, every 30 s.
@@ -875,14 +888,17 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
 
     async fn sync_pod(self: &Rc<Self>, uid: &str, pod: &Value) {
         if !self.pods.borrow().contains_key(uid) {
+            kr_rt::exec::phase("sync_pod: admit");
             let mut rt = self.admit(uid, pod);
             if self.survives() {
+                kr_rt::exec::phase("sync_pod: try_adopt");
                 self.try_adopt(uid, pod, &mut rt);
             } else if self.cfg.cgroups {
                 // Pods do not survive here, so whatever a previous run left under this uid is stray.
                 kr_runtime::cgroup::kill_pod(uid);
             }
             self.pods.borrow_mut().insert(uid.to_string(), rt);
+            kr_rt::exec::phase("sync_pod: persist");
             self.persist(uid);
         }
         if self.pods.borrow()[uid].failed_setup.is_some() {
