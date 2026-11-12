@@ -632,6 +632,11 @@ pub struct Connection {
     peer_certs: Vec<Vec<u8>>,
     peer_key: Option<PublicKey>,
     cert_requested: bool,
+    /// Raw handshake messages kept for a TLS 1.2 client CertificateVerify.
+    log12: Vec<u8>,
+    log12_on: bool,
+    /// signature_algorithms of a TLS 1.2 CertificateRequest.
+    req_algs12: Vec<u16>,
     session_id: Vec<u8>,
     ccs_allowed: bool,
     /// Server: a HelloRetryRequest was sent, so the next ClientHello is the second.
@@ -668,6 +673,7 @@ pub struct Connection {
 
 impl Connection {
     fn base(role: Role, state: State, rng: Rng, now: i64) -> Connection {
+        let log12_on = matches!(&role, Role::Client { cfg, .. } if cfg.tls12 && cfg.client_cert.is_some());
         Connection {
             role,
             state,
@@ -691,6 +697,9 @@ impl Connection {
             peer_certs: Vec::new(),
             peer_key: None,
             cert_requested: false,
+            log12: Vec::new(),
+            log12_on,
+            req_algs12: Vec::new(),
             session_id: Vec::new(),
             ccs_allowed: true,
             hrr_sent: false,
@@ -1050,7 +1059,18 @@ impl Connection {
             (State::Cli12WaitCert, HT_CERTIFICATE) => self.cli12_certificate(msg, body),
             (State::Cli12WaitKeyExchange, HT_SERVER_KEY_EXCHANGE) => self.cli12_server_key_exchange(msg, body),
             (State::Cli12WaitDone, HT_CERTIFICATE_REQUEST) => {
-                self.transcript.update(msg);
+                // certificate_types<1..255>, supported_signature_algorithms<2..>, authorities<0..>
+                let mut r = Rd::new(body);
+                r.vec8()?;
+                let mut algs = Rd::new(r.vec16()?);
+                r.vec16()?;
+                r.done()?;
+                self.req_algs12.clear();
+                while !algs.b.is_empty() {
+                    let a = algs.u16()?;
+                    self.req_algs12.push(a);
+                }
+                self.tr_update(msg);
                 self.cert_requested = true;
                 Ok(())
             }
@@ -1108,8 +1128,17 @@ impl Connection {
         }
     }
 
+    /// Adds a handshake message to the transcript hash (and, while a TLS 1.2 client
+    /// certificate may be needed, to the raw log CertificateVerify signs).
+    fn tr_update(&mut self, msg: &[u8]) {
+        self.transcript.update(msg);
+        if self.log12_on {
+            self.log12.extend_from_slice(msg);
+        }
+    }
+
     fn send_hs(&mut self, msg: Vec<u8>) {
-        self.transcript.update(&msg);
+        self.tr_update(&msg);
         self.send_handshake_record(&msg);
     }
 
@@ -1253,7 +1282,7 @@ impl Connection {
         // Resumption: a ticket that opens, matches this configuration and has a valid binder.
         let psk_index = self.srv_try_psk(msg, &exts, &cfg)?;
         self.session_id = session_id.to_vec();
-        self.transcript.update(msg);
+        self.tr_update(msg);
         let share = if group == GROUP_X25519 { KeyShare::X25519(self.random32()) } else { KeyShare::P256(p256_key(self.rng)) };
         let shared = share.shared(peer_key)?;
         let random = self.random32();
@@ -1315,6 +1344,18 @@ impl Connection {
         Ok(())
     }
 
+    /// TLS 1.2 Certificate: no request context, no per-certificate extensions.
+    fn send_certificate12(&mut self, chain: &[Vec<u8>]) {
+        let m = handshake_msg(HT_CERTIFICATE, |m| {
+            put_vec(m, 3, |l| {
+                for c in chain {
+                    put_vec(l, 3, |x| x.extend_from_slice(c));
+                }
+            });
+        });
+        self.send_hs(m);
+    }
+
     fn send_certificate(&mut self, chain: &[Vec<u8>]) {
         let m = handshake_msg(HT_CERTIFICATE, |m| {
             m.push(0); // context
@@ -1330,7 +1371,14 @@ impl Connection {
 
     fn send_cert_verify(&mut self, key: &SigningKey, context: &[u8]) {
         let content = verify_content(context, &self.transcript_hash());
-        let sig = key.sign(&content);
+        let sig = match key {
+            // TLS 1.3 forbids PKCS#1 v1.5 here: RSASSA-PSS, salt as long as the hash.
+            SigningKey::Rsa(k) => {
+                let rng = self.rng;
+                k.sign_pss(crate::rsa::HashAlg::Sha256, &content, 32, &mut |b| rng(b)).unwrap_or_default()
+            }
+            _ => key.sign(&content),
+        };
         let m = handshake_msg(HT_CERTIFICATE_VERIFY, |m| {
             put_u16(m, sig_scheme(key));
             put_vec(m, 2, |s| s.extend_from_slice(&sig));
@@ -1355,7 +1403,7 @@ impl Connection {
             list.vec16()?; // extensions: ignored
             chain.push(cert.to_vec());
         }
-        self.transcript.update(msg);
+        self.tr_update(msg);
         let is_server = matches!(self.role, Role::Server(_));
         if chain.is_empty() {
             if !is_server {
@@ -1429,7 +1477,7 @@ impl Connection {
         if !key.verify(alg, &content, sig) {
             return fail(Alert::DecryptError);
         }
-        self.transcript.update(msg);
+        self.tr_update(msg);
         self.state = if is_server { State::SrvWaitFinished } else { State::CliWaitFinished };
         Ok(())
     }
@@ -1439,7 +1487,7 @@ impl Connection {
         if !ct_eq(&expect, body) {
             return fail(Alert::DecryptError);
         }
-        self.transcript.update(msg);
+        self.tr_update(msg);
         let k = self.pending_read.take();
         self.set_read(k);
         self.ccs_allowed = false;
@@ -1678,6 +1726,8 @@ impl Connection {
         if find_ext(&exts, EXT_SUPPORTED_VERSIONS).is_none() {
             return self.cli12_server_hello(msg, random, suite, &exts);
         }
+        self.log12_on = false;
+        self.log12 = Vec::new();
         if sid != &self.session_id[..] {
             return fail(Alert::IllegalParameter);
         }
@@ -1703,7 +1753,7 @@ impl Connection {
             self.transcript = Sha256::new();
             self.transcript.update(&[254, 0, 0, 32]);
             self.transcript.update(&ch1);
-            self.transcript.update(msg);
+            self.tr_update(msg);
             self.send_client_hello(true);
             return Ok(());
         }
@@ -1732,7 +1782,7 @@ impl Connection {
             }
             None => self.offered = None,
         }
-        self.transcript.update(msg);
+        self.tr_update(msg);
         self.derive_handshake(&shared);
         self.set_read(Some(RecordKeys::new(self.suite, self.s_hs)));
         // From here on our records (including alerts) use the client handshake keys; the
@@ -1759,7 +1809,7 @@ impl Connection {
             }
             self.alpn = Some(p.to_vec());
         }
-        self.transcript.update(msg);
+        self.tr_update(msg);
         self.state = if self.resumed { State::CliWaitFinished } else { State::CliWaitCertOrRequest };
         Ok(())
     }
@@ -1772,7 +1822,7 @@ impl Connection {
         if !ctx.is_empty() {
             return fail(Alert::IllegalParameter);
         }
-        self.transcript.update(msg);
+        self.tr_update(msg);
         self.cert_requested = true;
         self.state = State::CliWaitCert;
         Ok(())
@@ -1783,7 +1833,7 @@ impl Connection {
         if !ct_eq(&expect, body) {
             return fail(Alert::DecryptError);
         }
-        self.transcript.update(msg);
+        self.tr_update(msg);
         let (c_ap, s_ap) = self.app_secrets();
         if self.cert_requested {
             let Role::Client { cfg, .. } = &self.role else { unreachable!() };
@@ -1871,7 +1921,7 @@ impl Connection {
         self.ccs_allowed = false;
         self.suite = suite;
         self.server_random.copy_from_slice(random);
-        self.transcript.update(msg);
+        self.tr_update(msg);
         self.state = State::Cli12WaitCert;
         Ok(())
     }
@@ -1918,7 +1968,7 @@ impl Connection {
         }
         self.peer_key = leaf.public_key.clone();
         self.peer_certs = chain;
-        self.transcript.update(msg);
+        self.tr_update(msg);
         self.state = State::Cli12WaitKeyExchange;
         Ok(())
     }
@@ -1959,7 +2009,7 @@ impl Connection {
             return fail(Alert::DecryptError);
         }
         self.kx12 = Some((group, point.to_vec()));
-        self.transcript.update(msg);
+        self.tr_update(msg);
         self.state = State::Cli12WaitDone;
         Ok(())
     }
@@ -1968,10 +2018,29 @@ impl Connection {
         if !body.is_empty() {
             return fail(Alert::DecodeError);
         }
-        self.transcript.update(msg);
+        self.tr_update(msg);
+        let mut cert_verify: Option<u16> = None;
         if self.cert_requested {
-            // No client certificates over TLS 1.2: an empty list.
-            self.send_hs(handshake_msg(HT_CERTIFICATE, |m| put_vec(m, 3, |_| {})));
+            let Role::Client { cfg, .. } = &self.role else { unreachable!() };
+            let cfg = cfg.clone();
+            let offered = |s: u16| self.req_algs12.contains(&s);
+            // The scheme must match the key and be one the server listed (RFC 5246 7.4.4).
+            let pick = cfg.client_cert.as_ref().and_then(|(chain, key)| {
+                let scheme = match key {
+                    SigningKey::P256(_) => [SIG_ECDSA_P256_SHA256].into_iter().find(|&s| offered(s)),
+                    SigningKey::Ed25519(_) => [SIG_ED25519].into_iter().find(|&s| offered(s)),
+                    SigningKey::Rsa(_) => [SIG_RSA_PKCS1_SHA256, SIG_RSA_PSS_RSAE_SHA256].into_iter().find(|&s| offered(s)),
+                }?;
+                Some((chain, key, scheme))
+            });
+            match pick {
+                Some((chain, _, scheme)) => {
+                    self.send_certificate12(chain);
+                    cert_verify = Some(scheme);
+                }
+                // Nothing usable: an empty list (the server decides whether that is fatal).
+                None => self.send_hs(handshake_msg(HT_CERTIFICATE, |m| put_vec(m, 3, |_| {}))),
+            }
         }
         let (group, point) = self.kx12.take().ok_or(Error::Local(Alert::UnexpectedMessage))?;
         let share = if group == GROUP_P256 { KeyShare::P256(p256_key(self.rng)) } else {
@@ -1985,6 +2054,26 @@ impl Connection {
         self.send_hs(handshake_msg(HT_CLIENT_KEY_EXCHANGE, |m| put_vec(m, 1, |v| v.extend_from_slice(&ours))));
         // RFC 7627: master secret bound to the session hash (through ClientKeyExchange).
         let session_hash = self.transcript_hash();
+        if let Some(scheme) = cert_verify {
+            // RFC 5246 7.4.8: the signature covers every handshake message so far.
+            let Role::Client { cfg, .. } = &self.role else { unreachable!() };
+            let cfg = cfg.clone();
+            let key = &cfg.client_cert.as_ref().ok_or(Error::Local(Alert::InternalError))?.1;
+            let log = core::mem::take(&mut self.log12);
+            let rng = self.rng;
+            let sig = match key {
+                SigningKey::Rsa(k) if scheme == SIG_RSA_PSS_RSAE_SHA256 => k.sign_pss(crate::rsa::HashAlg::Sha256, &log, 32, &mut |b| rng(b)),
+                SigningKey::Rsa(k) => k.sign_pkcs1v15(crate::rsa::HashAlg::Sha256, &log, &mut |b| rng(b)),
+                _ => Some(key.sign(&log)),
+            }
+            .ok_or(Error::Local(Alert::InternalError))?;
+            self.send_hs(handshake_msg(HT_CERTIFICATE_VERIFY, |m| {
+                put_u16(m, scheme);
+                put_vec(m, 2, |s| s.extend_from_slice(&sig));
+            }));
+        }
+        self.log12_on = false;
+        self.log12 = Vec::new();
         prf12(&pms, b"extended master secret", &session_hash, &mut self.master12);
         crate::wipe(&mut pms);
         let chacha = is_chacha12(self.suite);
@@ -2014,7 +2103,7 @@ impl Connection {
         if !ct_eq(&expect, body) {
             return fail(Alert::DecryptError);
         }
-        self.transcript.update(msg);
+        self.tr_update(msg);
         crate::wipe(&mut self.master12);
         self.state = State::Established;
         Ok(())
@@ -2074,6 +2163,7 @@ fn sig_scheme(k: &SigningKey) -> u16 {
     match k {
         SigningKey::P256(_) => SIG_ECDSA_P256_SHA256,
         SigningKey::Ed25519(_) => SIG_ED25519,
+        SigningKey::Rsa(_) => SIG_RSA_PSS_RSAE_SHA256,
     }
 }
 

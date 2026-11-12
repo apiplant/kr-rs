@@ -239,10 +239,13 @@ fn fmt_ep(host: &str, plain: bool, prefix: &str, base: &str) -> String {
 
 enum Node {
     Char(u8),
-    Any,
+    /// `.`; true when it also matches a newline (`(?s)`).
+    Any(bool),
     Class(Vec<(u8, u8)>, bool),
-    Start,
-    End,
+    /// `^` (true: also after a newline, `(?m)`).
+    Start(bool),
+    /// `$` (true: also before a newline, `(?m)`).
+    End(bool),
     Group(usize, Vec<Vec<Node>>),
     /// `(?:...)`: grouping without a capture.
     NonCap(Vec<Vec<Node>>),
@@ -259,10 +262,33 @@ pub struct Regex {
 
 type Caps = Vec<Option<(usize, usize)>>;
 
+/// Go regexp flags (`(?i)`, `(?s)`, `(?m)`, `(?U)`), scoped to the enclosing group.
+#[derive(Clone, Copy, Default)]
+struct Flags {
+    i: bool,
+    s: bool,
+    m: bool,
+    u: bool,
+}
+
 struct P<'a> {
     s: &'a [u8],
     i: usize,
     groups: usize,
+    flags: Flags,
+}
+
+fn fold(r: &[(u8, u8)]) -> Vec<(u8, u8)> {
+    let mut out = r.to_vec();
+    for &(a, b) in r {
+        for c in a..=b {
+            if c.is_ascii_alphabetic() {
+                let o = c ^ 0x20;
+                out.push((o, o));
+            }
+        }
+    }
+    out
 }
 
 impl P<'_> {
@@ -286,24 +312,73 @@ impl P<'_> {
                     continue;
                 }
                 b'(' => {
-                    // `(?:`, `(?=` and `(?!` are supported; flags such as `(?i)` and look-behind are not.
-                    let kind = if self.s.get(self.i) == Some(&b'?') {
+                    // `(?:`, `(?=`, `(?!`, named groups and flags (`(?i)`, `(?s:...)`); look-behind is
+                    // refused (Go's RE2 has none either).
+                    let mut kind = b'(';
+                    let mut flags = self.flags;
+                    let mut scoped = false;
+                    if self.s.get(self.i) == Some(&b'?') {
                         let k = *self.s.get(self.i + 1)?;
-                        if !matches!(k, b':' | b'=' | b'!') {
-                            return None;
+                        match k {
+                            b':' | b'=' | b'!' => {
+                                self.i += 2;
+                                kind = k;
+                            }
+                            b'P' | b'<' => {
+                                // (?P<name>...) and (?<name>...): a capture group
+                                self.i += 2;
+                                if k == b'P' {
+                                    if self.s.get(self.i) != Some(&b'<') {
+                                        return None;
+                                    }
+                                    self.i += 1;
+                                }
+                                let end = self.s[self.i..].iter().position(|&b| b == b'>')?;
+                                let name = &self.s[self.i..self.i + end];
+                                if name.is_empty() || !name.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_') {
+                                    return None; // also rejects look-behind `(?<=` / `(?<!`
+                                }
+                                self.i += end + 1;
+                            }
+                            _ => {
+                                // flags: [imsU]*(-[imsU]*)? then ')' or ':'
+                                self.i += 1;
+                                let mut on = true;
+                                loop {
+                                    let f = *self.s.get(self.i)?;
+                                    self.i += 1;
+                                    match f {
+                                        b'i' => flags.i = on,
+                                        b's' => flags.s = on,
+                                        b'm' => flags.m = on,
+                                        b'U' => flags.u = on,
+                                        b'-' if on => on = false,
+                                        b')' | b':' => {
+                                            scoped = f == b':';
+                                            break;
+                                        }
+                                        _ => return None,
+                                    }
+                                }
+                                if !scoped {
+                                    // `(?i)` changes the flags for the rest of the enclosing group.
+                                    self.flags = flags;
+                                    continue;
+                                }
+                                kind = b':';
+                            }
                         }
-                        self.i += 2;
-                        k
-                    } else {
-                        b'('
-                    };
+                    }
                     let idx = if kind == b'(' {
                         self.groups += 1;
                         self.groups
                     } else {
                         0
                     };
+                    let saved = self.flags;
+                    self.flags = flags;
                     let inner = self.alt(depth + 1)?;
+                    self.flags = saved;
                     if self.s.get(self.i) != Some(&b')') {
                         return None;
                     }
@@ -314,12 +389,13 @@ impl P<'_> {
                         k => Node::Look(inner, k == b'!'),
                     }
                 }
-                b'^' => Node::Start,
-                b'$' => Node::End,
-                b'.' => Node::Any,
+                b'^' => Node::Start(self.flags.m),
+                b'$' => Node::End(self.flags.m),
+                b'.' => Node::Any(self.flags.s),
                 b'[' => self.class()?,
                 b'\\' => self.escape(false)?,
                 b'*' | b'+' | b'?' | b'{' => return None,
+                c if self.flags.i && c.is_ascii_alphabetic() => Node::Class(alloc::vec![(c, c), (c ^ 0x20, c ^ 0x20)], false),
                 c => Node::Char(c),
             };
             let (node, adv) = match self.s.get(self.i) {
@@ -338,9 +414,10 @@ impl P<'_> {
             self.i += adv;
             let node = match node {
                 Node::Repeat(n, min, max, _) if self.s.get(self.i) == Some(&b'?') => {
-                    self.i += 1; // lazy: `*?`, `+?`, `??`, `{n,m}?`
-                    Node::Repeat(n, min, max, true)
+                    self.i += 1; // `*?`, `+?`, `??`, `{n,m}?`: lazy (greedy under `(?U)`)
+                    Node::Repeat(n, min, max, !self.flags.u)
                 }
+                Node::Repeat(n, min, max, _) => Node::Repeat(n, min, max, self.flags.u),
                 n => n,
             };
             alts.last_mut()?.push(node);
@@ -375,7 +452,9 @@ impl P<'_> {
             b'S' => cls(&[(b' ', b' '), (b'\t', b'\r')], true),
             b'n' => Node::Char(b'\n'),
             b't' => Node::Char(b'\t'),
-            b'b' | b'B' | b'A' | b'z' | b'1'..=b'9' if !in_class => return None,
+            b'A' if !in_class => Node::Start(false),
+            b'z' if !in_class => Node::End(false),
+            b'b' | b'B' | b'1'..=b'9' if !in_class => return None,
             c if c.is_ascii_alphanumeric() => return None,
             c => Node::Char(c),
         })
@@ -392,6 +471,9 @@ impl P<'_> {
             let c = *self.s.get(self.i)?;
             self.i += 1;
             if c == b']' && !first {
+                if self.flags.i {
+                    r = fold(&r);
+                }
                 return Some(Node::Class(r, neg));
             }
             first = false;
@@ -424,13 +506,13 @@ impl P<'_> {
 fn single(n: &Node, s: &[u8], pos: usize) -> Option<usize> {
     match n {
         Node::Char(c) => (s.get(pos) == Some(c)).then_some(pos + 1),
-        Node::Any => (pos < s.len()).then_some(pos + 1),
+        Node::Any(nl) => (pos < s.len() && (*nl || s[pos] != b'\n')).then_some(pos + 1),
         Node::Class(r, neg) => {
             let c = *s.get(pos)?;
             (r.iter().any(|&(a, b)| a <= c && c <= b) != *neg).then_some(pos + 1)
         }
-        Node::Start => (pos == 0).then_some(pos),
-        Node::End => (pos == s.len()).then_some(pos),
+        Node::Start(m) => (pos == 0 || (*m && s[pos - 1] == b'\n')).then_some(pos),
+        Node::End(m) => (pos == s.len() || (*m && s[pos] == b'\n')).then_some(pos),
         _ => None,
     }
 }
@@ -505,7 +587,7 @@ fn rep(n: &Node, min: usize, max: usize, lazy: bool, count: usize, rest: &[Node]
 
 impl Regex {
     pub fn new(pat: &str) -> Option<Regex> {
-        let mut p = P { s: pat.as_bytes(), i: 0, groups: 0 };
+        let mut p = P { s: pat.as_bytes(), i: 0, groups: 0, flags: Flags::default() };
         let alts = p.alt(0)?;
         Some(Regex { alts, groups: p.groups })
     }
@@ -639,7 +721,39 @@ configs:
         assert_eq!(w.host_cfg("anything.io").unwrap().auth.as_ref().unwrap().username, "all");
         assert_eq!(w.host_cfg("cache.local").unwrap().auth.as_ref().unwrap().username, "own");
         assert!(Registries::parse("").unwrap().mirrors.is_empty());
-        assert!(Registries::parse("mirrors:\n  a:\n    rewrite:\n      \"(?i)x\": y\n").is_err());
+        assert!(Registries::parse("mirrors:\n  a:\n    rewrite:\n      \"(?i)x\": y\n").is_ok());
+        assert!(Registries::parse("mirrors:\n  a:\n    rewrite:\n      \"(?<=a)x\": y\n").is_err());
+    }
+
+    #[test]
+    /// Go regexp flags: scoping, negation, named groups and the `.`/`^`/`$` defaults.
+    fn flags() {
+        let rep = |re: &str, s: &str, to: &str| Regex::new(re).unwrap().replace(s, to);
+        // (?i): literals and classes, from the point of the flag to the end of the group
+        assert_eq!(rep("(?i)^Docker\\.io/(.*)$", "dOcKeR.IO/Lib/X", "m/\\1").unwrap(), "m/Lib/X");
+        assert_eq!(rep("^(?i)[a-c]+$", "AbC", "ok").unwrap(), "ok");
+        assert_eq!(rep("^(?i)[^a-c]+$", "ABC", "ok"), None);
+        assert_eq!(rep("^(?i:a)b$", "Ab", "ok").unwrap(), "ok");
+        assert_eq!(rep("^(?i:a)b$", "AB", "ok"), None);
+        assert_eq!(rep("^(a(?i)b)c$", "aBc", "ok").unwrap(), "ok");
+        assert_eq!(rep("^(a(?i)b)c$", "aBC", "ok"), None);
+        assert_eq!(rep("^(?i)a(?-i)b$", "Ab", "ok").unwrap(), "ok");
+        assert_eq!(rep("^(?i)a(?-i)b$", "AB", "ok"), None);
+        // (?s): `.` and a newline (Go: not by default)
+        assert_eq!(rep("^a.b$", "a\nb", "x"), None);
+        assert_eq!(rep("^(?s)a.b$", "a\nb", "x").unwrap(), "x");
+        // (?m): ^ and $ at lines; \A and \z always the text
+        assert_eq!(rep("^b$", "a\nb\nc", "X"), None);
+        assert_eq!(rep("(?m)^b$", "a\nb\nc", "X").unwrap(), "a\nX\nc");
+        assert_eq!(rep("(?m)\\Ab$", "a\nb", "X"), None);
+        assert_eq!(rep("(?m)a\\z", "a\nb", "X"), None);
+        // (?U): greedy and lazy swapped
+        assert_eq!(rep("a.*b", "aXbYb", "_").unwrap(), "_");
+        assert_eq!(rep("(?U)a.*b", "aXbYb", "_").unwrap(), "_Yb");
+        assert_eq!(rep("(?U)a.*?b", "aXbYb", "_").unwrap(), "_");
+        // combined flags and named groups
+        assert_eq!(rep("(?is)^A.B$", "a\nb", "ok").unwrap(), "ok");
+        assert_eq!(rep("^(?P<repo>[a-z]+)/(?<img>.*)$", "lib/x", "$2/$1").unwrap(), "x/lib");
     }
 
     #[test]
@@ -681,7 +795,7 @@ configs:
         assert!(Regex::new("^a(?=b)").unwrap().is_match("ab") && !Regex::new("^a(?=b)").unwrap().is_match("ac"));
         assert_eq!(Regex::new("a.*?b").unwrap().replace("aXbYb", "_").unwrap(), "_Yb".replace("Yb", "Yb"));
         assert_eq!(Regex::new("o").unwrap().replace("foo/bar-o", "0").unwrap(), "f00/bar-0");
-        assert!(Regex::new("(?i)x").is_none() && Regex::new("(?<=a)b").is_none() && Regex::new("(a").is_none() && Regex::new("a{2").is_none() && Regex::new("a{3,2}").is_none() && Regex::new("a{x}").is_none());
+        assert!(Regex::new("(?i)x").is_some() && Regex::new("(?<=a)b").is_none() && Regex::new("(?<!a)b").is_none() && Regex::new("(?z)x").is_none() && Regex::new("(?i").is_none() && Regex::new("(?i)*").is_none() && Regex::new("(?<=a)b").is_none() && Regex::new("(a").is_none() && Regex::new("a{2").is_none() && Regex::new("a{3,2}").is_none() && Regex::new("a{x}").is_none());
         let r = Regex::new("^lib/(a{2,3})-([0-9]{2})$").unwrap();
         assert_eq!(r.replace("lib/aaa-42", "\\2\\1").unwrap(), "42aaa");
         assert!(r.replace("lib/a-42", "x").is_none() && r.replace("lib/aaaa-42", "x").is_none() && r.replace("lib/aa-4", "x").is_none());

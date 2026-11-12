@@ -528,3 +528,89 @@ fn openssl_client_resumes_with_kr_server() {
     assert!(!outs[0].contains("Reused,"), "{}", outs[0]);
     assert!(outs[1].contains("Reused, TLSv1.3"), "second s_client did not report reuse:\n{}", outs[1]);
 }
+
+// ---- RSA client keys (#175): CertificateVerify with RSASSA-PSS (TLS 1.3) and PKCS#1 v1.5 / PSS (TLS 1.2) ----
+
+fn rsa_client_vs_s_server(tag: &str, tls13: bool, extra: &[&str]) {
+    let f = setup(tag, false);
+    let run = |args: &[&str]| assert!(Command::new("openssl").args(args).current_dir(&f.dir).output().unwrap().status.success(), "openssl {args:?}");
+    run(&["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "rcli.key", "-out", "rcli.pem", "-days", "1", "-subj", "/CN=rsa-client", "-addext", "extendedKeyUsage=clientAuth"]);
+    let cert = x509::pem_decode_all(&std::fs::read_to_string(f.dir.join("rcli.pem")).unwrap(), "CERTIFICATE").unwrap().remove(0);
+    let key = x509::private_key_from_pkcs8(&x509::pem_decode_all(&std::fs::read_to_string(f.dir.join("rcli.key")).unwrap(), "PRIVATE KEY").unwrap().remove(0)).unwrap();
+    assert!(matches!(key, SigningKey::Rsa(_)));
+    let port = free_port();
+    let mut srv = Command::new("openssl")
+        .args(["s_server", "-quiet", if tls13 { "-tls1_3" } else { "-tls1_2" }, "-accept", &port.to_string(), "-naccept", "1"])
+        .arg("-cert").arg(f.dir.join("srv.pem")).arg("-key").arg(f.dir.join("srv.key"))
+        .arg("-Verify").arg("1").arg("-CAfile").arg(f.dir.join("rcli.pem"))
+        .args(extra)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    let mut sock = (0..400).find_map(|_| { std::thread::sleep(Duration::from_millis(30)); TcpStream::connect(("127.0.0.1", port)).ok() }).expect("connect");
+    let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: vec![f.ca.clone()], client_cert: Some((vec![cert], key)), alpn: vec![], tls12: !tls13 });
+    let mut c = Connection::client(cfg, b"localhost", rng, now());
+    let mut stdout = srv.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut all = Vec::new();
+        let mut b = [0u8; 256];
+        while let Ok(n) = Read::read(&mut stdout, &mut b) {
+            if n == 0 {
+                break;
+            }
+            all.extend_from_slice(&b[..n]);
+            if all.windows(13).any(|w| w == b"hello from kr") {
+                break;
+            }
+        }
+        let _ = tx.send(all);
+    });
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drive(&mut c, &mut sock, |c| !c.is_handshaking());
+        c.write(b"hello from kr\n").unwrap();
+        drive(&mut c, &mut sock, |c| !c.has_output());
+        srv.stdin.as_mut().unwrap().write_all(b"hello from openssl\n").unwrap();
+        let mut got = Vec::new();
+        drive(&mut c, &mut sock, |c| {
+            let mut b = [0u8; 256];
+            let n = c.read(&mut b);
+            got.extend_from_slice(&b[..n]);
+            got.ends_with(b"\n")
+        });
+        assert_eq!(got, b"hello from openssl\n");
+    }));
+    if r.is_ok() {
+        c.close();
+        let _ = sock.write_all(&c.take_output());
+    } else {
+        let _ = srv.kill();
+    }
+    let out = rx.recv_timeout(Duration::from_secs(10)).unwrap_or_default();
+    let _ = srv.kill();
+    let o = srv.wait_with_output().unwrap();
+    if let Err(e) = r {
+        panic!("{e:?} s_server stderr: {}", String::from_utf8_lossy(&o.stderr));
+    }
+    assert!(String::from_utf8_lossy(&out).contains("hello from kr"), "s_server stdout: {} stderr: {}", String::from_utf8_lossy(&out), String::from_utf8_lossy(&o.stderr));
+}
+
+#[test]
+fn rsa_client_key_tls13() {
+    if have_openssl() {
+        rsa_client_vs_s_server("rsacli13", true, &[]);
+    }
+}
+
+#[test]
+fn rsa_client_key_tls12_pkcs1() {
+    if have_openssl() {
+        rsa_client_vs_s_server("rsacli12", false, &["-client_sigalgs", "RSA+SHA256"]);
+    }
+}
+
+#[test]
+fn rsa_client_key_tls12_pss() {
+    if have_openssl() {
+        rsa_client_vs_s_server("rsacli12pss", false, &["-client_sigalgs", "rsa_pss_rsae_sha256"]);
+    }
+}

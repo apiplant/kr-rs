@@ -6,7 +6,8 @@
 
 use crate::der::{self, Reader};
 use crate::rsa::{self, HashAlg};
-use crate::{ecc, ed25519, p256};
+use crate::sha2::Sha256;
+use crate::{ecc, ed25519, hmac, p256};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -689,6 +690,8 @@ fn check_ca(ca: &Certificate, depth: usize) -> core::result::Result<(), VerifyEr
 pub enum SigningKey {
     P256(p256::SecretKey),
     Ed25519(ed25519::SigningKey),
+    /// RSA (client authentication toward registries and similar; kr never issues RSA certificates).
+    Rsa(rsa::PrivateKey),
 }
 
 impl SigningKey {
@@ -696,6 +699,7 @@ impl SigningKey {
         match self {
             SigningKey::P256(k) => PublicKey::P256(k.public_key()),
             SigningKey::Ed25519(k) => PublicKey::Ed25519(k.public_key()),
+            SigningKey::Rsa(k) => PublicKey::Rsa(k.public().clone()),
         }
     }
 
@@ -703,6 +707,7 @@ impl SigningKey {
         match self {
             SigningKey::P256(_) => SigAlg::Ecdsa(HashAlg::Sha256),
             SigningKey::Ed25519(_) => SigAlg::Ed25519,
+            SigningKey::Rsa(_) => SigAlg::RsaPkcs1(HashAlg::Sha256),
         }
     }
 
@@ -714,6 +719,21 @@ impl SigningKey {
                 p256::sig_to_der(&r, &s)
             }
             SigningKey::Ed25519(k) => k.sign(msg).to_vec(),
+            // RSASSA-PKCS1-v1_5 / SHA-256; blinding randomness is derived from the key and message.
+            SigningKey::Rsa(k) => {
+                let mut ctr = 0u32;
+                let mut seed = [0u8; 32];
+                hmac::hmac::<Sha256>(&k.public().to_pkcs1(), msg, &mut seed);
+                let mut fill = |b: &mut [u8]| {
+                    for chunk in b.chunks_mut(32) {
+                        let mut o = [0u8; 32];
+                        hmac::hmac::<Sha256>(&seed, &ctr.to_be_bytes(), &mut o);
+                        ctr += 1;
+                        chunk.copy_from_slice(&o[..chunk.len()]);
+                    }
+                };
+                k.sign_pkcs1v15(HashAlg::Sha256, msg, &mut fill).unwrap_or_default()
+            }
         }
     }
 }
@@ -755,7 +775,14 @@ fn key_id(k: &PublicKey) -> [u8; 20] {
 
 fn write_sig_alg(out: &mut Vec<u8>, alg: SigAlg) {
     der::nested(out, der::SEQUENCE, |a| {
-        der::tlv(a, der::OID, if alg == SigAlg::Ed25519 { OID_ED25519 } else { OID_ECDSA_SHA256 });
+        match alg {
+            SigAlg::Ed25519 => der::tlv(a, der::OID, OID_ED25519),
+            SigAlg::RsaPkcs1(_) => {
+                der::tlv(a, der::OID, OID_SHA256_RSA);
+                der::tlv(a, 0x05, &[]);
+            }
+            _ => der::tlv(a, der::OID, OID_ECDSA_SHA256),
+        }
     });
 }
 
@@ -945,6 +972,7 @@ pub fn private_key_to_pkcs8(k: &SigningKey) -> Vec<u8> {
                 });
                 der::tlv(s, der::OCTET_STRING, &ec);
             }
+            SigningKey::Rsa(_) => unreachable!("kr does not write RSA private keys"),
             SigningKey::Ed25519(sk) => {
                 der::nested(s, der::SEQUENCE, |a| der::tlv(a, der::OID, OID_ED25519));
                 let mut inner = Vec::new();
@@ -983,6 +1011,7 @@ pub fn private_key_from_pkcs8(der_bytes: &[u8]) -> Result<SigningKey> {
             }
             p256::SecretKey::from_bytes(&sec1_scalar(key)?).map(SigningKey::P256).ok_or(Error)
         }
+        OID_RSA_ENCRYPTION => rsa::PrivateKey::from_pkcs1(key).map(SigningKey::Rsa).ok_or(Error),
         OID_ED25519 => {
             let mut k = Reader::new(key);
             let seed: [u8; 32] = k.read(der::OCTET_STRING)?.try_into().map_err(|_| Error)?;
@@ -990,6 +1019,11 @@ pub fn private_key_from_pkcs8(der_bytes: &[u8]) -> Result<SigningKey> {
         }
         _ => Err(Error),
     }
+}
+
+/// PKCS#1 `RSA PRIVATE KEY` (as written by `openssl genrsa` before 3.0 and `-traditional`).
+pub fn private_key_from_pkcs1(der_bytes: &[u8]) -> Result<SigningKey> {
+    rsa::PrivateKey::from_pkcs1(der_bytes).map(SigningKey::Rsa).ok_or(Error)
 }
 
 /// SEC1 `EC PRIVATE KEY` (as written by `openssl ecparam -genkey`), P-256 only.

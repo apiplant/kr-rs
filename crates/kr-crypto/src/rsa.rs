@@ -234,22 +234,67 @@ impl Mont {
         let mut x = vec![0u64; k];
         x[0] = 1;
         for _ in 0..128 * k {
-            m.double_mod(&mut x);
+            m.double_mod(&mut x, 0);
         }
         m.r2 = x;
         m
     }
 
-    fn double_mod(&self, x: &mut [u64]) {
-        let mut carry = 0u64;
+    /// x = (2x + bit) mod n for x < n.
+    fn double_mod(&self, x: &mut [u64], bit: u64) {
+        let mut carry = bit;
         for l in x.iter_mut() {
             let next = *l >> 63;
             *l = (*l << 1) | carry;
             carry = next;
         }
-        if carry == 1 || !lt_limbs(x, &self.n) {
-            sub_limbs(x, &self.n);
+        csub(x, &self.n, carry);
+    }
+
+    /// x mod n for an arbitrary-length x (bit-serial, so no division is needed).
+    fn reduce(&self, x: &[u64]) -> Vec<u64> {
+        let mut acc = vec![0u64; self.n.len()];
+        for l in x.iter().rev() {
+            for b in (0..64).rev() {
+                self.double_mod(&mut acc, (l >> b) & 1);
+            }
         }
+        acc
+    }
+
+    /// base^e mod n for a plain-form base < n and an exponent of fixed limb length: 4-bit
+    /// windows with a full-table constant-time lookup, so the work does not depend on e.
+    fn pow_big(&self, base: &[u64], e: &[u64]) -> Vec<u64> {
+        let k = self.n.len();
+        let mut one = vec![0u64; k];
+        one[0] = 1;
+        let bm = self.mul(base, &self.r2);
+        let mut table: Vec<Vec<u64>> = Vec::with_capacity(16);
+        table.push(self.mul(&one, &self.r2));
+        table.push(bm.clone());
+        for i in 2..16 {
+            let next = self.mul(&table[i - 1], &bm);
+            table.push(next);
+        }
+        let mut acc = table[0].clone();
+        for l in e.iter().rev() {
+            for w in (0..16).rev() {
+                for _ in 0..4 {
+                    acc = self.mul(&acc, &acc);
+                }
+                let idx = (l >> (4 * w)) & 15;
+                let mut sel = vec![0u64; k];
+                for (i, t) in table.iter().enumerate() {
+                    let x = i as u64 ^ idx;
+                    let mask = 0u64.wrapping_sub((x.wrapping_sub(1) & !x) >> 63);
+                    for (s, v) in sel.iter_mut().zip(t) {
+                        *s |= v & mask;
+                    }
+                }
+                acc = self.mul(&acc, &sel);
+            }
+        }
+        self.mul(&acc, &one)
     }
 
     fn mul(&self, a: &[u64], b: &[u64]) -> Vec<u64> {
@@ -279,9 +324,7 @@ impl Mont {
         }
         let hi = t[k];
         t.truncate(k);
-        if hi != 0 || !lt_limbs(&t, &self.n) {
-            sub_limbs(&mut t, &self.n);
-        }
+        csub(&mut t, &self.n, hi);
         t
     }
 
@@ -305,21 +348,276 @@ impl Mont {
     }
 }
 
-fn lt_limbs(a: &[u64], b: &[u64]) -> bool {
+/// a -= b when `force != 0` or a >= b (branch-free); `force` is the carry out of a's top limb.
+fn csub(a: &mut [u64], b: &[u64], force: u64) {
+    let mut t = a.to_vec();
+    let mut borrow = 0u64;
+    for i in 0..a.len() {
+        let (d1, b1) = t[i].overflowing_sub(b[i]);
+        let (d2, b2) = d1.overflowing_sub(borrow);
+        t[i] = d2;
+        borrow = (b1 | b2) as u64;
+    }
+    // a >= b iff the subtraction did not borrow.
+    let cond = (force != 0) as u64 | (borrow ^ 1);
+    let mask = 0u64.wrapping_sub(cond);
+    for i in 0..a.len() {
+        a[i] = (t[i] & mask) | (a[i] & !mask);
+    }
+}
+
+/// a - b mod m for a, b < m (equal limb counts).
+fn sub_mod(a: &[u64], b: &[u64], m: &[u64]) -> Vec<u64> {
+    let mut t = a.to_vec();
+    let mut borrow = 0u64;
+    for i in 0..t.len() {
+        let (d1, b1) = t[i].overflowing_sub(b[i]);
+        let (d2, b2) = d1.overflowing_sub(borrow);
+        t[i] = d2;
+        borrow = (b1 | b2) as u64;
+    }
+    let mask = 0u64.wrapping_sub(borrow);
+    let mut carry = 0u64;
+    for i in 0..t.len() {
+        let (s1, c1) = t[i].overflowing_add(m[i] & mask);
+        let (s2, c2) = s1.overflowing_add(carry);
+        t[i] = s2;
+        carry = (c1 | c2) as u64;
+    }
+    t
+}
+
+fn mul_nat(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let mut out = vec![0u64; a.len() + b.len()];
+    for (i, &x) in a.iter().enumerate() {
+        let mut c = 0u128;
+        for (j, &y) in b.iter().enumerate() {
+            let s = out[i + j] as u128 + x as u128 * y as u128 + c;
+            out[i + j] = s as u64;
+            c = s >> 64;
+        }
+        out[i + b.len()] = c as u64;
+    }
+    out
+}
+
+/// a += b (a at least as long as b); the carry out is dropped (callers size `a` to avoid it).
+fn add_nat(a: &mut [u64], b: &[u64]) {
+    let mut carry = 0u64;
+    for i in 0..a.len() {
+        let (s1, c1) = a[i].overflowing_add(b.get(i).copied().unwrap_or(0));
+        let (s2, c2) = s1.overflowing_add(carry);
+        a[i] = s2;
+        carry = (c1 | c2) as u64;
+    }
+}
+
+fn trim(mut v: Vec<u64>) -> Vec<u64> {
+    while v.len() > 1 && *v.last().unwrap() == 0 {
+        v.pop();
+    }
+    v
+}
+
+// ---- private keys and signing (RFC 8017) ----
+
+/// Source of random bytes for blinding and PSS salts.
+pub type FillRandom<'a> = &'a mut dyn FnMut(&mut [u8]);
+
+/// An RSA private key in CRT form (`RSAPrivateKey`, RFC 8017 A.1.2).
+///
+/// The private operation runs the two half-size exponentiations with a fixed-window,
+/// constant-time-table modexp (the work does not depend on the exponent bits), blinds the
+/// exponents (d_p + r(p-1), r random 64-bit) and checks the result with the public key before
+/// releasing a signature (so a fault cannot leak a factor).
+pub struct PrivateKey {
+    public: PublicKey,
+    p: Mont,
+    q: Mont,
+    dp: Vec<u64>,
+    dq: Vec<u64>,
+    qinv: Vec<u64>,
+}
+
+impl Drop for PrivateKey {
+    fn drop(&mut self) {
+        for v in [&mut self.p.n, &mut self.q.n, &mut self.dp, &mut self.dq, &mut self.qinv] {
+            for x in v.iter_mut() {
+                *x = 0;
+            }
+        }
+        core::hint::black_box(&self.dp);
+    }
+}
+
+fn strip(b: &[u8]) -> &[u8] {
+    let mut b = b;
+    while b.len() > 1 && b[0] == 0 {
+        b = &b[1..];
+    }
+    b
+}
+
+impl PrivateKey {
+    /// From the DER `RSAPrivateKey` (PEM label `RSA PRIVATE KEY`); two-prime keys only.
+    pub fn from_pkcs1(der_bytes: &[u8]) -> Option<PrivateKey> {
+        let mut r = Reader::new(der_bytes);
+        let mut s = r.sequence().ok()?;
+        r.finish().ok()?;
+        if s.small_uint().ok()? != 0 {
+            return None;
+        }
+        let n = strip(s.integer().ok()?);
+        let e = s.small_uint().ok()?;
+        let _d = s.integer().ok()?;
+        let p = strip(s.integer().ok()?);
+        let q = strip(s.integer().ok()?);
+        let dp = strip(s.integer().ok()?);
+        let dq = strip(s.integer().ok()?);
+        let qinv = strip(s.integer().ok()?);
+        s.finish().ok()?;
+        if n[0] == 0 || n[n.len() - 1] & 1 == 0 || e < 3 || e & 1 == 0 || e > u32::MAX as u64 {
+            return None;
+        }
+        let bits = n.len() * 8 - n[0].leading_zeros() as usize;
+        if !(1024..=8192).contains(&bits) || p.len() < 2 || q.len() < 2 || p[p.len() - 1] & 1 == 0 || q[q.len() - 1] & 1 == 0 {
+            return None;
+        }
+        let (pn, qn) = (Nat::from_be(p), Nat::from_be(q));
+        // n must be p*q.
+        if trim(mul_nat(&pn.0, &qn.0)) != trim(Nat::from_be(n).0) {
+            return None;
+        }
+        let (mp, mq) = (Mont::new(&pn), Mont::new(&qn));
+        let fit = |b: &[u8], m: &Mont| -> Option<Vec<u64>> {
+            let mut v = Nat::from_be(b).0;
+            v = trim(v);
+            if v.len() > m.n.len() {
+                return None;
+            }
+            v.resize(m.n.len(), 0);
+            if !lt_limbs_eq(&v, &m.n) {
+                return None;
+            }
+            Some(v)
+        };
+        // d_p, d_q may be as large as p-1, q-1; q^-1 is reduced mod p.
+        let dp = fit(dp, &mp)?;
+        let dq = fit(dq, &mq)?;
+        let qinv = fit(qinv, &mp)?;
+        // q * qinv == 1 mod p.
+        let qm = mp.reduce(&qn.0);
+        let one = mp.mul(&mp.mul(&qm, &mp.r2), &qinv);
+        if one[0] != 1 || one[1..].iter().any(|&x| x != 0) {
+            return None;
+        }
+        let public = PublicKey { n: n.to_vec(), e };
+        Some(PrivateKey { public, p: mp, q: mq, dp, dq, qinv })
+    }
+
+    pub fn public(&self) -> &PublicKey {
+        &self.public
+    }
+
+    /// c^d mod n by CRT; `c` is a big-endian block of the modulus length and must be < n.
+    fn private_op(&self, c: &[u8], rng: FillRandom) -> Option<Vec<u8>> {
+        let k = self.public.n.len();
+        if c.len() != k {
+            return None;
+        }
+        let n = Nat::from_be(&self.public.n);
+        let cn = Nat::from_be(c);
+        if !cn.lt(&n) {
+            return None;
+        }
+        let blind = |m: &Mont, d: &[u64], rng: &mut dyn FnMut(&mut [u8])| -> Vec<u64> {
+            let mut rb = [0u8; 8];
+            rng(&mut rb);
+            let r = u64::from_le_bytes(rb);
+            let mut pm1 = m.n.clone();
+            pm1[0] -= 1; // n is odd
+            let mut e = mul_nat(&pm1, &[r]);
+            e.push(0);
+            add_nat(&mut e, d);
+            e
+        };
+        let (cp, cq) = (self.p.reduce(&cn.0), self.q.reduce(&cn.0));
+        let m1 = self.p.pow_big(&cp, &blind(&self.p, &self.dp, rng));
+        let m2 = self.q.pow_big(&cq, &blind(&self.q, &self.dq, rng));
+        // h = qinv * (m1 - m2) mod p; m = m2 + h*q
+        let m2p = self.p.reduce(&m2);
+        let diff = sub_mod(&m1, &m2p, &self.p.n);
+        let h = self.p.mul(&self.p.mul(&self.qinv, &self.p.r2), &diff);
+        let mut m = mul_nat(&h, &self.q.n);
+        m.resize(m.len().max(m2.len()) + 1, 0);
+        add_nat(&mut m, &m2);
+        let out = Nat(m).to_be(k);
+        // Fault check: m^e must give c back.
+        let back = self.public.public_op(&out)?;
+        if !crate::ct_eq(&back, c) {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// RSASSA-PKCS1-v1_5 signature of `msg`.
+    pub fn sign_pkcs1v15(&self, hash: HashAlg, msg: &[u8], rng: FillRandom) -> Option<Vec<u8>> {
+        let k = self.public.n.len();
+        let digest = hash.digest(&[msg]);
+        let prefix = hash.digest_info_prefix();
+        let t_len = prefix.len() + digest.len();
+        if k < t_len + 11 {
+            return None;
+        }
+        let mut em = vec![0xffu8; k];
+        em[0] = 0;
+        em[1] = 1;
+        em[k - t_len - 1] = 0;
+        em[k - t_len..k - digest.len()].copy_from_slice(prefix);
+        em[k - digest.len()..].copy_from_slice(&digest);
+        self.private_op(&em, rng)
+    }
+
+    /// RSASSA-PSS signature (MGF1 with the same hash, salt length `salt_len`, usually the hash length).
+    pub fn sign_pss(&self, hash: HashAlg, msg: &[u8], salt_len: usize, rng: FillRandom) -> Option<Vec<u8>> {
+        let k = self.public.n.len();
+        let mod_bits = k * 8 - self.public.n[0].leading_zeros() as usize;
+        let em_bits = mod_bits - 1;
+        let em_len = em_bits.div_ceil(8);
+        let h_len = hash.len();
+        if em_len < h_len + salt_len + 2 {
+            return None;
+        }
+        let mut salt = vec![0u8; salt_len];
+        rng(&mut salt);
+        let m_hash = hash.digest(&[msg]);
+        let h = hash.digest(&[&[0u8; 8], &m_hash, &salt]);
+        let mut db = vec![0u8; em_len - h_len - 1];
+        let ps_len = em_len - h_len - salt_len - 2;
+        db[ps_len] = 1;
+        db[ps_len + 1..].copy_from_slice(&salt);
+        let mask = mgf1(hash, &h, db.len());
+        for (d, m) in db.iter_mut().zip(&mask) {
+            *d ^= m;
+        }
+        let unused = 8 * em_len - em_bits;
+        if unused > 0 {
+            db[0] &= 0xff >> unused;
+        }
+        let mut em = vec![0u8; k];
+        let off = k - em_len;
+        em[off..off + db.len()].copy_from_slice(&db);
+        em[off + db.len()..off + db.len() + h_len].copy_from_slice(&h);
+        em[k - 1] = 0xbc;
+        self.private_op(&em, rng)
+    }
+}
+
+fn lt_limbs_eq(a: &[u64], b: &[u64]) -> bool {
     for i in (0..a.len()).rev() {
         if a[i] != b[i] {
             return a[i] < b[i];
         }
     }
     false
-}
-
-fn sub_limbs(a: &mut [u64], b: &[u64]) {
-    let mut borrow = 0u64;
-    for i in 0..a.len() {
-        let (d1, b1) = a[i].overflowing_sub(b[i]);
-        let (d2, b2) = d1.overflowing_sub(borrow);
-        a[i] = d2;
-        borrow = (b1 | b2) as u64;
-    }
 }

@@ -485,8 +485,10 @@ impl RegConnector {
                     x509::private_key_from_pkcs8(&d)
                 } else if let Some(d) = x509::pem_decode_all(key, "EC PRIVATE KEY").ok().and_then(|v| v.into_iter().next()) {
                     x509::private_key_from_sec1(&d)
+                } else if let Some(d) = x509::pem_decode_all(key, "RSA PRIVATE KEY").ok().and_then(|v| v.into_iter().next()) {
+                    x509::private_key_from_pkcs1(&d)
                 } else {
-                    return Err(Error::BadRef("unsupported client key (need PKCS#8 or SEC1 EC)"));
+                    return Err(Error::BadRef("unsupported client key (need PKCS#8, PKCS#1 RSA or SEC1 EC)"));
                 };
                 Some((chain, k.map_err(|_| Error::BadRef("bad client key"))?))
             }
@@ -826,6 +828,14 @@ fn _assert_transport<T: Transport>() {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rsa_client_keys_load_in_both_pem_forms() {
+        let cert = include_str!("../../kr-crypto/tests/vectors/rsa/cert2048.pem");
+        for key in [include_str!("../../kr-crypto/tests/vectors/rsa/k2048.pem"), include_str!("../../kr-crypto/tests/vectors/rsa/k2048-pkcs8.pem")] {
+            assert!(RegConnector::new("", Some((cert, key)), false).is_ok());
+        }
+        assert!(RegConnector::new("", Some((cert, "-----BEGIN DSA PRIVATE KEY-----\nAAAA\n-----END DSA PRIVATE KEY-----\n")), false).is_err());
+    }
 
     #[test]
     fn credentials_never_go_to_a_plain_http_realm_of_a_tls_registry() {

@@ -21,8 +21,6 @@ Ordered by impact. Size: S days, M a week or two, L more.
     - `Audit-ID` is returned only when the request is audited (upstream returns it always); backups are named `audit-<UTC time>.log`, not compressed.
     - `ResponseComplete` is not recorded for upgraded connections (exec/attach/portforward, `101`), only `ResponseStarted`; no `requestObject` for them.
     - In-process audit covers writes only (reads of controllers would dominate the log) and has no source IP; requests forwarded between HA servers are audited by the receiving server only.
-175. **`registries.yaml`: RSA client keys and regex flags** — *ADR-027, ADR-044*, S–M
-    A registry that needs an RSA client key is unsupported (kr-crypto signs with P-256/Ed25519 only); common with corporate registries. `rewrite` refuses flags such as `(?i)` which Go's regexp (k3s) accepts. (Look-behind is refused, but Go's RE2 has none either: not a gap. Look-ahead goes beyond k3s.) Only one client certificate per registry config.
 146. **Server-side apply: generate the list/map table from OpenAPI** — *ADR-021, ADR-028*, M
     The table is name based, so uncommon fields may differ from structured-merge-diff (unsure: `secretRef`/`configMapRef` atomicity, `envFrom`, `volumeClaimTemplates`). Empty keyed/set lists own nothing; CRD list-map-key defaults are not applied before computing keys. No known workload is affected; compare against a real API server to find more.
 320. **Snapshots to S3-compatible storage** — *new*, M
