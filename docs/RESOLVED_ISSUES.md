@@ -377,3 +377,6 @@
 
 206a. **CSR `O=system:masters` check searched raw bytes** — *fixed* (residual stays as #206)
     `rbac::csr_organizations` parses the PKCS#10 subject (DER walker; UTF-8, printable, IA5, T61, BMP and universal strings), so a BMPString organization no longer bypasses the check and a CN that merely mentions the group no longer trips it. An unparsable request counts as naming the group (fail closed). Test: `csr_subject_parsing`.
+
+214. **Stale pod status after a merge patch (traefik "ContainerCreating" / "SandboxFailed")** — *fixed*
+    `report_status` sends a JSON merge patch, which keeps fields it omits: a rejected pod (`HostPortConflict`) kept the `ContainerCreating` container statuses written before the rejection, and a pod that later ran kept the `reason: SandboxFailed` / `message` of an earlier sandbox failure. The patch now sets `reason`, `message`, `containerStatuses` and `initContainerStatuses` to null when the kubelet no longer reports them (only for the three setup-failure reasons, so reasons set by other controllers survive). Found on the live cluster (`traefik-6c4b48bd8-*`). Takes effect after a kubelet restart on the new binary.

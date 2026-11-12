@@ -2041,6 +2041,23 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let mut status = status;
         if let Value::Object(f) = &mut status {
             f.push((String::from("qosClass"), Value::from(spec::qos_class(pod))));
+            // A merge patch keeps fields it omits: drop what an earlier status of this kubelet
+            // left behind (a failed sandbox's reason/message once the pod runs, the
+            // ContainerCreating statuses of a pod that was rejected).
+            let (h_reason, h_msg, h_cs, h_ics) = (f.iter().any(|(n, _)| n == "reason"), f.iter().any(|(n, _)| n == "message"), f.iter().any(|(n, _)| n == "containerStatuses"), f.iter().any(|(n, _)| n == "initContainerStatuses"));
+            let stale = matches!(pod.pointer(&["status", "reason"]).and_then(Value::as_str), Some("SandboxFailed" | "HostPortConflict" | "SysctlForbidden"));
+            if stale && !h_reason {
+                f.push((String::from("reason"), Value::Null));
+                if !h_msg {
+                    f.push((String::from("message"), Value::Null));
+                }
+            }
+            if !h_cs && pod.pointer(&["status", "containerStatuses"]).is_some() {
+                f.push((String::from("containerStatuses"), Value::Null));
+            }
+            if !h_ics && pod.pointer(&["status", "initContainerStatuses"]).is_some() {
+                f.push((String::from("initContainerStatuses"), Value::Null));
+            }
         }
         let patch = Value::Object(alloc::vec![(String::from("status"), status)]);
         if self.c.patch(&path, "application/merge-patch+json", &patch).await.is_ok() {
