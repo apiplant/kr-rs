@@ -507,11 +507,15 @@ pub(crate) fn seed(api: &ApiServer) {
     let g = "flowcontrol.apiserver.k8s.io";
     let (Some(plr), Some(fsr)) = (resources::find(g, "v1", "prioritylevelconfigurations"), resources::find(g, "v1", "flowschemas")) else { return };
     let ann = r#""annotations":{"apf.kubernetes.io/autoupdate-spec":"true"}"#;
-    api.bootstrap_object(plr, None, "exempt", "PriorityLevelConfiguration", &alloc::format!(r#"{{"metadata":{{"name":"exempt",{ann}}},"spec":{{"type":"Exempt","exempt":{{"nominalConcurrencyShares":0,"lendablePercent":0}}}}}}"#));
+    let put = |res, name: &str, kind: &str, body: String| {
+        api.bootstrap_object(res, None, name, kind, &body);
+        api.reconcile_spec(res, name, &body);
+    };
+    put(plr, "exempt", "PriorityLevelConfiguration", alloc::format!(r#"{{"metadata":{{"name":"exempt",{ann}}},"spec":{{"type":"Exempt","exempt":{{"nominalConcurrencyShares":0,"lendablePercent":0}}}}}}"#));
     // (name, shares, lendable %, queues, hand size, queue length limit); queues 0 = Reject.
     for (name, shares, lend, queues, hand) in [("node-high", 40, 25, 64, 6), ("system", 30, 33, 64, 6), ("leader-election", 10, 0, 16, 4), ("workload-high", 40, 50, 128, 6), ("workload-low", 100, 90, 128, 6), ("global-default", 20, 50, 128, 6), ("catch-all", 5, 0, 0, 0)] {
         let resp = if queues == 0 { r#"{"type":"Reject"}"#.to_string() } else { alloc::format!(r#"{{"type":"Queue","queuing":{{"queues":{queues},"handSize":{hand},"queueLengthLimit":50}}}}"#) };
-        api.bootstrap_object(plr, None, name, "PriorityLevelConfiguration", &alloc::format!(r#"{{"metadata":{{"name":"{name}",{ann}}},"spec":{{"type":"Limited","limited":{{"nominalConcurrencyShares":{shares},"lendablePercent":{lend},"limitResponse":{resp}}}}}}}"#));
+        put(plr, name, "PriorityLevelConfiguration", alloc::format!(r#"{{"metadata":{{"name":"{name}",{ann}}},"spec":{{"type":"Limited","limited":{{"nominalConcurrencyShares":{shares},"lendablePercent":{lend},"limitResponse":{resp}}}}}}}"#));
     }
     let all_res = r#"{"verbs":["*"],"apiGroups":["*"],"resources":["*"],"clusterScope":true,"namespaces":["*"]}"#;
     let all_non = r#"{"verbs":["*"],"nonResourceURLs":["*"]}"#;
@@ -537,7 +541,7 @@ pub(crate) fn seed(api: &ApiServer) {
     ];
     for (name, prec, level, dist, rules) in flows {
         let d = if dist.is_empty() { String::new() } else { alloc::format!(r#","distinguisherMethod":{{"type":"{dist}"}}"#) };
-        api.bootstrap_object(fsr, None, name, "FlowSchema", &alloc::format!(r#"{{"metadata":{{"name":"{name}",{ann}}},"spec":{{"priorityLevelConfiguration":{{"name":"{level}"}},"matchingPrecedence":{prec}{d},"rules":[{rules}]}}}}"#));
+        put(fsr, name, "FlowSchema", alloc::format!(r#"{{"metadata":{{"name":"{name}",{ann}}},"spec":{{"priorityLevelConfiguration":{{"name":"{level}"}},"matchingPrecedence":{prec}{d},"rules":[{rules}]}}}}"#));
     }
 }
 

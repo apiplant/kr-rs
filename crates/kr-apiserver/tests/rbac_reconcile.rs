@@ -89,3 +89,29 @@ fn metrics_endpoint_serves_the_loop_counters_to_admins_only() {
     assert!(matches!(get(User { name: "nobody".into(), groups: vec!["system:authenticated".into()] }), Reply::Json(403, _)));
     assert!(rules(&api, "system:monitoring").contains("/metrics"));
 }
+
+#[test]
+fn suggested_flow_control_objects_follow_the_release_unless_frozen_or_user_owned() {
+    let api = ApiServer::new(kr_store::Store::in_memory(), || 1_700_000_000, rng, "127.0.0.1".into()).unwrap();
+    let key = kr_crypto::p256::SecretKey::from_bytes(&[7; 32]).unwrap();
+    api.set_service_accounts(kr_apiserver::tokens::Signer::new(key), "CA".into()).unwrap();
+    let path = |n: &str| format!("/apis/flowcontrol.apiserver.k8s.io/v1/flowschemas/{n}");
+    let prec = |n: &str| call(&api, "GET", &path(n), "").1.pointer(&["spec", "matchingPrecedence"]).and_then(Value::as_i64).unwrap();
+    let set = |n: &str, ann: &str| {
+        let (_, cur) = call(&api, "GET", &path(n), "");
+        let rv = cur.pointer(&["metadata", "resourceVersion"]).and_then(Value::as_str).unwrap().to_string();
+        let mut spec = cur.get("spec").unwrap().clone();
+        spec.set("matchingPrecedence", Value::from(7777i64));
+        let body = format!(r#"{{"apiVersion":"flowcontrol.apiserver.k8s.io/v1","kind":"FlowSchema","metadata":{{"name":"{n}","resourceVersion":"{rv}",{ann}}},"spec":{}}}"#, json::to_string(&spec));
+        assert_eq!(call(&api, "PUT", &path(n), &body).0, 200);
+    };
+    let (ca, cb, cc) = (prec("catch-all"), prec("global-default"), prec("service-accounts"));
+    set("catch-all", r#""annotations":{"apf.kubernetes.io/autoupdate-spec":"true"}"#);
+    set("global-default", r#""annotations":{"apf.kubernetes.io/autoupdate-spec":"false"}"#);
+    set("service-accounts", r#""labels":{"mine":"yes"}"#);
+    api.bootstrap_all();
+    assert_eq!(prec("catch-all"), ca, "autoupdate-spec true: reset to the release");
+    assert_eq!(prec("global-default"), 7777, "autoupdate-spec false: left alone");
+    assert_eq!(prec("service-accounts"), 7777, "no annotation: the user's object");
+    let _ = (cb, cc);
+}

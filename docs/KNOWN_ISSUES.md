@@ -146,9 +146,6 @@ ADR-047. Default `["secrets"]`; `plural` or `plural.group` (e.g. `configmaps`, `
 213. **Raft and API serving share one thread: causes of stalls remain** — *ADR-004, ADR-050, #126, #208*
     The watchdog, heartbeat priority and configurable election timeout are in (RESOLVED 213a). What remains is removing the stalls themselves (#209–#212)  The stall counters are now served (RESOLVED 248).
 
-245. **Bootstrap objects other than RBAC are created once and never updated** — *ADR-023*
-    PriorityClasses, the default StorageClass, the ServiceCIDR and the APF objects are created when missing and not updated by a newer release (upstream reconciles only RBAC and APF's `autoupdate-spec` objects; the APF ones are not reconciled here). Low impact.
-
 215. **Other synchronous disk work remains on the event loop** — *ADR-050, #208*
     The device-plugin checkpoint, the rootless infra file and the CNI/IPAM/state files are written with fsync inline; the kubelet's cgroup, `/proc` and directory scans (sweep, adoption, `remove_unclaimed_dirs`) are synchronous too. Use `KR_STALL_WARN_MS` and the "last phase" label of the stall log to find which one matters on a given machine; the fix is the helper facility of #208 or moving the fsync to the durable-commit helper process (ADR-024).
 

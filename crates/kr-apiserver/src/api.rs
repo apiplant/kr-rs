@@ -733,6 +733,29 @@ impl ApiServer {
         let _ = self.store.borrow_mut().update(&key, json::to_string(&o).into_bytes(), Some(kv.mod_rev));
     }
 
+    /// Upstream's `apf.kubernetes.io/autoupdate-spec`: a suggested flow-control object whose
+    /// annotation is not `"false"` gets the spec of the current release (a changed spec is
+    /// replaced, metadata and status stay). Objects without the annotation are the user's.
+    pub(crate) fn reconcile_spec(&self, res: &Resource, name: &str, body: &str) {
+        if !self.writable() {
+            return;
+        }
+        let key = res.key(None, name);
+        let Some(kv) = self.store.borrow().get(&key) else { return };
+        let (Ok(mut o), Ok(want)) = (json::parse(&kv.value), json::parse(body.as_bytes())) else { return };
+        let auto = o.pointer(&["metadata", "annotations", "apf.kubernetes.io/autoupdate-spec"]).and_then(Value::as_str);
+        let Some(spec) = want.get("spec") else { return };
+        if auto == Some("false") || auto.is_none() || o.get("spec") == Some(spec) {
+            return;
+        }
+        o.set("spec", spec.clone());
+        let gen = o.pointer(&["metadata", "generation"]).and_then(Value::as_i64).unwrap_or(1) + 1;
+        let m = o.entry_object("metadata");
+        m.set("generation", Value::from(gen));
+        m.set("resourceVersion", Value::String((self.store.borrow().revision() + 1).to_string()));
+        let _ = self.store.borrow_mut().update(&key, json::to_string(&o).into_bytes(), Some(kv.mod_rev));
+    }
+
     /// Creates an object if missing (bootstrap data; never overwrites user changes).
     pub(crate) fn bootstrap_object(&self, res: &Resource, ns: Option<&str>, name: &str, kind: &str, body: &str) {
         if !self.writable() {

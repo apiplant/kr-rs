@@ -463,3 +463,6 @@
 
 249. **`kr-rt` unit tests failed under parallel runs** — *fixed* (test only)
     `freed_chunks_are_released` measures the process RSS, which the other tests of the crate (allocator stress, offload workers, executor) changed at the same time, so it failed on most workspace runs since the offload tests were added. The crate's tests now take a shared lock (`kr_rt::serial`) and run one at a time.
+
+250. **Suggested API priority and fairness objects were never updated on upgrade** — *fixed* (was #245; with #246 this closes #214)
+    A suggested PriorityLevelConfiguration or FlowSchema whose `apf.kubernetes.io/autoupdate-spec` annotation is not `"false"` gets the spec of the running release at start-up (metadata and status stay, `generation` rises); objects without the annotation are the user's and are left alone, as upstream does. The system PriorityClasses, the default StorageClass and the default ServiceCIDR stay create-if-missing: upstream does not reconcile them either (a StorageClass and a ServiceCIDR are cluster configuration the admin changes). Test: `rbac_reconcile.rs::suggested_flow_control_objects_follow_the_release_unless_frozen_or_user_owned`.
