@@ -346,7 +346,12 @@ pub fn main(mut args: Args) -> i32 {
     let (mut audit_policy, mut audit_path, mut audit_max, mut audit_backup, mut psa_config) = (None::<String>, None::<String>, 100u64, 5usize, None::<String>);
     let (mut join_url, mut token, mut token_file): (Option<String>, Option<String>, Option<String>) = (None, None, None);
     while let Some(a) = args.next() {
-        let v = args.next().and_then(|v| core::str::from_utf8(v).ok());
+        // `--flag=value` and `--flag value` are both accepted.
+        let (a, inline) = match a.iter().position(|&c| c == b'=') {
+            Some(i) if a.starts_with(b"--") => (&a[..i], Some(&a[i + 1..])),
+            _ => (a, None),
+        };
+        let v = inline.or_else(|| args.next()).and_then(|v| core::str::from_utf8(v).ok());
         match (a, v) {
             (b"--port", Some(p)) => match p.parse() {
                 Ok(p) => port = p,
@@ -565,7 +570,7 @@ pub fn main(mut args: Args) -> i32 {
         if let Some(a) = auditor {
             kr_apiserver::audit::spawn_flusher(a);
         }
-        let cfg = kr_controllers::Config { now: pki::now, ..kr_controllers::Config::default() };
+        let cfg = kr_controllers::Config { now: pki::now, evict: kr_controllers::nodelifecycle::Limits::from_lookup(kr_runtime::store::env_var), ..kr_controllers::Config::default() };
         // The CSR approver/signer issues with the cluster CA (absent: it does not run).
         let csr_ca = pki::load_ca(&pki_dir).ok().map(|(name, key, _)| Rc::new(kr_controllers::csr::CaSigner { name, key, rng }));
         match ha_tasks {

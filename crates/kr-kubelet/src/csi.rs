@@ -611,6 +611,8 @@ impl Csi {
                 };
                 if let Some(([avail, total, used], [ifree, itotal, iused])) = via_driver {
                     (s.available_bytes, s.capacity_bytes, s.used_bytes, s.inodes_free, s.inodes, s.inodes_used) = (avail, total, used, ifree, itotal, iused);
+                } else if !is_mount_point(&target) {
+                    continue; // nothing mounted there (a failed publish): statfs would report the parent filesystem
                 } else if let Ok([bs, blocks, bfree, bavail, files, ffree]) = kr_sys::ns::statfs(target.as_bytes()) {
                     (s.capacity_bytes, s.available_bytes, s.used_bytes) = (blocks * bs, bavail * bs, blocks.saturating_sub(bfree) * bs);
                     (s.inodes, s.inodes_free, s.inodes_used) = (files, ffree, files.saturating_sub(ffree));
@@ -1015,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_fall_back_to_statfs() {
+    fn stats_skip_unmounted_paths() {
         let _g = lock();
         let root = tmpdir("statfs");
         let _calls = fake_driver_with(&format!("{root}/plugins_registry/fake.sock"), &[], 0);
@@ -1026,12 +1028,21 @@ mod tests {
             csi.tick().await;
             let t = csi.mount_pv(&fake, &pod("u1"), &pv(), false).await.unwrap();
             std::fs::create_dir_all(&t).unwrap(); // the fake driver mounts nothing
-            let st = csi.volume_stats().await;
-            assert_eq!(st.len(), 1);
-            assert!(st[0].capacity_bytes > 0 && st[0].used_bytes <= st[0].capacity_bytes && st[0].inodes > 0, "{:?}", st[0]);
+            // Nothing is mounted at the publish path: statfs would describe the parent, so no stats.
+            assert!(csi.volume_stats().await.is_empty());
             assert_eq!(fake.log.borrow().iter().filter(|l| l.1.contains("allocatable")).count(), 0);
             csi.unmount_pod("u1").await;
         });
+    }
+
+    #[test]
+    fn mountinfo_matching() {
+        let info = b"36 25 0:30 / /var/lib/kr/pods/u1/mount rw - ext4 /dev/sda rw\n37 25 0:31 / /mnt/with\\040space rw - tmpfs t rw\n";
+        assert!(in_mountinfo(info, "/var/lib/kr/pods/u1/mount"));
+        assert!(in_mountinfo(info, "/mnt/with space/"));
+        assert!(!in_mountinfo(info, "/var/lib/kr/pods/u1"));
+        assert!(!in_mountinfo(info, "/var/lib/kr/pods/u1/mount/sub"));
+        assert!(is_mount_point("/proc"));
     }
 
     #[test]
@@ -1069,4 +1080,29 @@ mod tests {
             csi.unmount_pod("u1").await;
         });
     }
+}
+
+/// Whether `path` is a mount point (an exact mount point entry in /proc/self/mountinfo, so bind
+/// mounts within one filesystem count).
+fn is_mount_point(path: &str) -> bool {
+    kr_sys::fs::read_file(b"/proc/self/mountinfo\0", 1 << 22).map(|i| in_mountinfo(&i, path)).unwrap_or(false)
+}
+
+fn in_mountinfo(info: &[u8], path: &str) -> bool {
+    let want = path.trim_end_matches('/').as_bytes();
+    info.split(|&b| b == b'\n').any(|l| {
+        let Some(mp) = l.split(|&b| b == b' ').nth(4) else { return false };
+        let mut o = Vec::with_capacity(mp.len());
+        let mut i = 0;
+        while i < mp.len() {
+            if mp[i] == b'\\' && i + 3 < mp.len() && mp[i + 1..i + 4].iter().all(|b| (b'0'..=b'7').contains(b)) {
+                o.push((mp[i + 1] - b'0') * 64 + (mp[i + 2] - b'0') * 8 + (mp[i + 3] - b'0'));
+                i += 4;
+            } else {
+                o.push(mp[i]);
+                i += 1;
+            }
+        }
+        o == want
+    })
 }

@@ -82,6 +82,8 @@ pub struct Config {
     /// Unix time in seconds, for condition timestamps. The default always returns 0; the
     /// binary passes its real clock.
     pub now: fn() -> i64,
+    /// Node eviction knobs (`KR_NODE_EVICTION_RATE` and friends, read by the binary).
+    pub evict: nodelifecycle::Limits,
 }
 
 fn zero_clock() -> i64 {
@@ -90,7 +92,7 @@ fn zero_clock() -> i64 {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { resync_ms: 30_000, gc_ms: 5_000, backoff_ms: 1_000, retry_ms: 5_000, job_backoff_ms: 10_000, now: zero_clock }
+        Config { resync_ms: 30_000, gc_ms: 5_000, backoff_ms: 1_000, retry_ms: 5_000, job_backoff_ms: 10_000, now: zero_clock, evict: nodelifecycle::Limits::default() }
     }
 }
 

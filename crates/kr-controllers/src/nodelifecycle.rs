@@ -49,12 +49,48 @@ const BURST_MILLI: i64 = 1000;
 pub struct Limits {
     pub primary_milli: i64,
     pub secondary_milli: i64,
+    /// Percentage of unhealthy nodes that makes a zone partially disrupted.
+    pub unhealthy_percent: usize,
+    /// Zones up to this size stop evicting when partially disrupted.
+    pub large_cluster: usize,
 }
 
-impl Default for Limits {
-    fn default() -> Limits {
-        Limits { primary_milli: PRIMARY_RATE_MILLI, secondary_milli: SECONDARY_RATE_MILLI }
+impl Limits {
+    pub const fn default() -> Limits {
+        Limits { primary_milli: PRIMARY_RATE_MILLI, secondary_milli: SECONDARY_RATE_MILLI, unhealthy_percent: UNHEALTHY_PERCENT, large_cluster: LARGE_CLUSTER }
     }
+
+    /// The defaults overridden by `get(name)`: `KR_NODE_EVICTION_RATE` and
+    /// `KR_SECONDARY_NODE_EVICTION_RATE` (nodes per second, e.g. `0.1`), `KR_UNHEALTHY_ZONE_THRESHOLD`
+    /// (fraction, `0.55`) and `KR_LARGE_CLUSTER_SIZE_THRESHOLD` (nodes). Unparsable values are ignored.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Limits {
+        let mut l = Limits::default();
+        if let Some(v) = get("KR_NODE_EVICTION_RATE").as_deref().and_then(milli) {
+            l.primary_milli = v;
+        }
+        if let Some(v) = get("KR_SECONDARY_NODE_EVICTION_RATE").as_deref().and_then(milli) {
+            l.secondary_milli = v;
+        }
+        if let Some(v) = get("KR_UNHEALTHY_ZONE_THRESHOLD").as_deref().and_then(milli) {
+            if v <= 1000 {
+                l.unhealthy_percent = (v / 10) as usize;
+            }
+        }
+        if let Some(v) = get("KR_LARGE_CLUSTER_SIZE_THRESHOLD").and_then(|v| v.parse().ok()) {
+            l.large_cluster = v;
+        }
+        l
+    }
+}
+
+/// A non-negative decimal such as `0.05` in thousandths (extra digits are dropped).
+fn milli(s: &str) -> Option<i64> {
+    let (i, f) = s.split_once('.').unwrap_or((s, ""));
+    if i.is_empty() && f.is_empty() || !i.bytes().chain(f.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let frac: String = f.chars().chain("000".chars()).take(3).collect();
+    Some(i.parse::<i64>().unwrap_or(0).checked_mul(1000)? + frac.parse::<i64>().ok()?)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -65,10 +101,10 @@ pub enum ZoneState {
 }
 
 /// Classifies a zone from its healthy and unhealthy node counts (upstream's ComputeZoneState).
-pub fn zone_state(ready: usize, unready: usize) -> ZoneState {
+pub fn zone_state(l: &Limits, ready: usize, unready: usize) -> ZoneState {
     if ready == 0 && unready > 0 {
         ZoneState::Full
-    } else if unready >= 3 && unready * 100 >= UNHEALTHY_PERCENT * (ready + unready) {
+    } else if unready >= 3 && unready * 100 >= l.unhealthy_percent * (ready + unready) {
         ZoneState::Partial
     } else {
         ZoneState::Normal
@@ -79,7 +115,7 @@ pub fn zone_state(ready: usize, unready: usize) -> ZoneState {
 fn zone_rate(l: &Limits, st: ZoneState, size: usize, all_full: bool) -> i64 {
     match st {
         ZoneState::Normal => l.primary_milli,
-        ZoneState::Partial if size > LARGE_CLUSTER => l.secondary_milli,
+        ZoneState::Partial if size > l.large_cluster => l.secondary_milli,
         ZoneState::Partial => 0,
         ZoneState::Full if all_full => l.primary_milli,
         ZoneState::Full => 0,
@@ -105,10 +141,10 @@ impl Evictor {
                 e.1 += 1;
             }
         }
-        let all_full = !counts.is_empty() && counts.values().all(|&(r, u)| zone_state(r, u) == ZoneState::Full);
+        let all_full = !counts.is_empty() && counts.values().all(|&(r, u)| zone_state(l, r, u) == ZoneState::Full);
         self.rates.clear();
         for (z, &(r, u)) in &counts {
-            self.rates.insert(z.to_string(), zone_rate(l, zone_state(r, u), r + u, all_full));
+            self.rates.insert(z.to_string(), zone_rate(l, zone_state(l, r, u), r + u, all_full));
         }
         for (z, rate) in &self.rates {
             let b = self.zones.entry(z.clone()).or_insert((BURST_MILLI, now));
@@ -141,7 +177,7 @@ pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config) {
     loop {
         kr_rt::exec::sleep(5_000).await;
         if (cfg.now)() > 0 {
-            let _ = tick(&c, (cfg.now)(), &mut ev, &Limits::default()).await;
+            let _ = tick(&c, (cfg.now)(), &mut ev, &cfg.evict).await;
         }
     }
 }
@@ -309,18 +345,36 @@ mod tests {
     }
 
     #[test]
+    fn limits_from_env() {
+        let get = |k: &str| match k {
+            "KR_NODE_EVICTION_RATE" => Some(String::from("0.05")),
+            "KR_SECONDARY_NODE_EVICTION_RATE" => Some(String::from("junk")),
+            "KR_UNHEALTHY_ZONE_THRESHOLD" => Some(String::from("0.4")),
+            "KR_LARGE_CLUSTER_SIZE_THRESHOLD" => Some(String::from("10")),
+            _ => None,
+        };
+        let l = Limits::from_lookup(get);
+        assert_eq!((l.primary_milli, l.secondary_milli, l.unhealthy_percent, l.large_cluster), (50, SECONDARY_RATE_MILLI, 40, 10));
+        assert_eq!(zone_state(&l, 4, 3), ZoneState::Partial); // 43% >= 40%
+        assert_eq!(milli("2"), Some(2000));
+        assert_eq!(milli("0.1234"), Some(123));
+        assert_eq!(milli("-1"), None);
+        assert_eq!(milli(""), None);
+    }
+
+    #[test]
     fn zone_states() {
-        assert_eq!(zone_state(5, 0), ZoneState::Normal);
-        assert_eq!(zone_state(0, 0), ZoneState::Normal);
-        assert_eq!(zone_state(0, 1), ZoneState::Full);
-        assert_eq!(zone_state(1, 1), ZoneState::Normal); // fewer than 3 unhealthy
-        assert_eq!(zone_state(2, 2), ZoneState::Normal);
-        assert_eq!(zone_state(3, 3), ZoneState::Normal); // 50%
-        assert_eq!(zone_state(2, 3), ZoneState::Partial);
-        assert_eq!(zone_state(4, 3), ZoneState::Normal); // 3/7 = 42%
-        assert_eq!(zone_state(3, 4), ZoneState::Partial);
-        assert_eq!(zone_state(5, 3), ZoneState::Normal);
-        assert_eq!(zone_state(10, 3), ZoneState::Normal);
+        assert_eq!(zone_state(&Limits::default(), 5, 0), ZoneState::Normal);
+        assert_eq!(zone_state(&Limits::default(), 0, 0), ZoneState::Normal);
+        assert_eq!(zone_state(&Limits::default(), 0, 1), ZoneState::Full);
+        assert_eq!(zone_state(&Limits::default(), 1, 1), ZoneState::Normal); // fewer than 3 unhealthy
+        assert_eq!(zone_state(&Limits::default(), 2, 2), ZoneState::Normal);
+        assert_eq!(zone_state(&Limits::default(), 3, 3), ZoneState::Normal); // 50%
+        assert_eq!(zone_state(&Limits::default(), 2, 3), ZoneState::Partial);
+        assert_eq!(zone_state(&Limits::default(), 4, 3), ZoneState::Normal); // 3/7 = 42%
+        assert_eq!(zone_state(&Limits::default(), 3, 4), ZoneState::Partial);
+        assert_eq!(zone_state(&Limits::default(), 5, 3), ZoneState::Normal);
+        assert_eq!(zone_state(&Limits::default(), 10, 3), ZoneState::Normal);
     }
 
     #[test]

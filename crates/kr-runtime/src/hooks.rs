@@ -219,15 +219,35 @@ fn owner_ok(uid: u32) -> bool {
 /// root (or the current user), the final file must be a regular file that is not group/world
 /// writable, and, when `KR_CDI_HOOK_DIRS` (colon-separated absolute directories) is set, the
 /// symlink-resolved path must lie below one of them. Returns the resolved path. Only the final
-/// path component is resolved; the directories above it are not inspected (KNOWN_ISSUES #161).
+/// path component is resolved; every directory above each path visited must be owned by root (or
+/// the current user) and not group/world writable (a sticky directory such as /tmp passes).
 pub fn trust(path: &[u8]) -> Result<Vec<u8>, String> {
     trust_in(path, crate::store::env_var("KR_CDI_HOOK_DIRS").as_deref())
+}
+
+/// Every ancestor directory of `path` (symlinks in them are followed) is owned by root or the
+/// current user and is not writable by group/others, unless it has the sticky bit.
+fn dirs_ok(path: &[u8]) -> Result<(), String> {
+    for end in (0..path.len()).filter(|&i| path[i] == b'/') {
+        let mut d = if end == 0 { alloc::vec![b'/'] } else { path[..end].to_vec() };
+        let name = String::from_utf8_lossy(&d).into_owned();
+        d.push(0);
+        let st = kr_sys::fs::newfstatat(ns::AT_FDCWD, &d, 0).map_err(|e| format!("cannot stat {name} (errno {})", e.0))?;
+        if !owner_ok(st.uid) {
+            return Err(format!("directory {name} is not owned by root"));
+        }
+        if st.mode & 0o022 != 0 && st.mode & 0o1000 == 0 {
+            return Err(format!("directory {name} is writable by group or others"));
+        }
+    }
+    Ok(())
 }
 
 fn trust_in(path: &[u8], allow: Option<&str>) -> Result<Vec<u8>, String> {
     let shown = String::from_utf8_lossy(path).into_owned();
     let mut cur = path.to_vec();
     for _ in 0..16 {
+        dirs_ok(&cur).map_err(|e| format!("hook {shown}: {e}"))?;
         let mut c = cur.clone();
         c.push(0);
         let st = kr_sys::fs::newfstatat(ns::AT_FDCWD, &c, kr_sys::fs::AT_SYMLINK_NOFOLLOW).map_err(|e| format!("hook {shown}: cannot stat {} (errno {})", String::from_utf8_lossy(&cur), e.0))?;
@@ -471,6 +491,17 @@ mod tests {
         set(0o777);
         assert!(trust(l.as_bytes()).is_err());
         set(0o755);
+        // A group/world-writable parent directory (without the sticky bit) is refused.
+        let dz = format!("{dir}\0");
+        let chd = |m: u32| {
+            let fd = ns::open(dz.as_bytes(), ns::O_RDONLY, 0).unwrap();
+            kr_sys::fs::fchmod(fd.raw(), m).unwrap();
+        };
+        chd(0o777);
+        assert!(trust(f.as_bytes()).unwrap_err().contains("directory"));
+        chd(0o1777);
+        assert!(trust(f.as_bytes()).is_ok());
+        chd(0o700);
         assert!(trust(b"/nonexistent/hook").is_err());
         // Allow-list (env is process wide: only this test sets it).
         assert!(trust_in(f.as_bytes(), Some("/usr/lib:/opt/")).unwrap_err().contains("KR_CDI_HOOK_DIRS"));

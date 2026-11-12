@@ -350,3 +350,24 @@
 
 146. **Server-side apply ownership follows upstream list/map types** — *fixed* — *ADR-021, ADR-028*
     Ownership and merging of apply configurations are driven by list/map types, as in structured-merge-diff: CRDs use the schema markers (`x-kubernetes-list-type: atomic|set|map` with `x-kubernetes-list-map-keys`, `x-kubernetes-map-type: atomic|granular`); built-in types use a table (`builtin_lists` in `ssa.rs`) of the upstream OpenAPI markers instead of the strategic-merge tables. Set lists own one `v:` entry per value, atomic lists and atomic structs/maps (selectors, object references, `nodeSelector`, node affinity `required...`) are one field, keyed lists use `k:{...}` + `.`. Fixed divergences from the SMP tables: only `metadata.finalizers` is a set (Namespace `spec.finalizers` is atomic); NetworkPolicy/Endpoints `ports`, node `taints` and `readinessGates` are atomic; Service `ports` key is port+protocol; `topologySpreadConstraints` keys topologyKey+whenUnsatisfiable; node `status.addresses` keyed by type, EndpointSlice `addresses` a set; `podIPs`/`hostIPs` keyed by ip, `resources.claims` by name. Dropping an applied keyed item keeps it when another manager owns a part of it, and key fields are never removed on their own. Tests: two managers applying different env vars of one container (ownership, removal, conflict, force), atomic list replace, set finalizers, CRD list-type=map/set and atomic map.
+
+200. **RBAC: aggregated metrics reader** — *fixed*
+    Added ClusterRole `system:aggregated-metrics-reader` and inlined its rule (`metrics.k8s.io` pods/nodes get/list/watch) into `view`, `edit` and `admin` in `rbac.rs` (kr has no ClusterRole aggregation controller), so those users can run `kubectl top`. Test: `metrics_reader_in_view_edit_admin`.
+
+194. **`--flag=value` form for `kr server`** — *fixed*
+    `kr server` now accepts `--flag=value` as well as `--flag value` (`server.rs`, split at the first `=` of a `--` argument), so `--secrets-encryption=off` works. `off` still only stops creating a new config; an existing file is honored (use `kr secrets-encrypt disable`).
+
+168a. **Hook trust did not inspect parent directories** — *fixed* (the TOCTOU part stays as #168)
+    `hooks::trust` walks every ancestor directory of each visited path (`dirs_ok`): owned by root/current user and not group/world-writable unless sticky. Test: `hook_trust`.
+
+172a. **Eviction rate limits were constants** — *fixed* (residual stays as #172)
+    `Limits::from_lookup` (`nodelifecycle.rs`) reads `KR_NODE_EVICTION_RATE`, `KR_SECONDARY_NODE_EVICTION_RATE` (nodes/s), `KR_UNHEALTHY_ZONE_THRESHOLD` (fraction) and `KR_LARGE_CLUSTER_SIZE_THRESHOLD`; `kr server` passes them in `Config.evict`. Test: `limits_from_env`.
+
+190a. **`kr snapshot` omitted the encryption key** — *fixed* (the rest stays as #190)
+    `encryption-config.json` is in the `KEYS` and `STATE` lists of `snapshot.rs`; save archives it and restore writes it back with mode 0600.
+
+167a. **Unhealthy-device eviction had no grace period** — *fixed* (residual stays as #167)
+    `evict::DeviceGrace` fails a pod only after its device has been continuously unhealthy for `KR_DEVICE_UNHEALTHY_GRACE` seconds (default 30; 0 = immediately), so transient flaps do not kill pods. Test: `device_grace`.
+
+171. **CSI stats fallback described the parent filesystem** — *fixed*
+    The `statfs` fallback in `csi.rs` (`volume_stats`) now runs only when the publish path is an exact mount point in `/proc/self/mountinfo` (`is_mount_point`); an unmounted path (failed publish) yields no stats. Tests: `stats_skip_unmounted_paths`, `mountinfo_matching`.

@@ -69,7 +69,7 @@ pub(crate) fn rng(b: &mut [u8]) {
 }
 
 pub(crate) fn cfg() -> Config {
-    Config { resync_ms: 150, gc_ms: 60, backoff_ms: 30, retry_ms: 60, job_backoff_ms: 0, now: || CLOCK.load(Ordering::SeqCst) }
+    Config { resync_ms: 150, gc_ms: 60, backoff_ms: 30, retry_ms: 60, job_backoff_ms: 0, now: || CLOCK.load(Ordering::SeqCst), evict: crate::nodelifecycle::Limits::default() }
 }
 
 pub(crate) fn v(s: &str) -> Value {

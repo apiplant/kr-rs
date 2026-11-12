@@ -18,6 +18,27 @@ pub fn threshold_from_env() -> u64 {
         .unwrap_or(DEFAULT_MEMORY_AVAILABLE)
 }
 
+/// Seconds a device must stay unhealthy before its pods are failed (`KR_DEVICE_UNHEALTHY_GRACE`,
+/// default 30; 0 = immediately). A flapping device (transient XID) then does not kill pods.
+pub fn device_grace_ms() -> u64 {
+    kr_runtime::store::env_var("KR_DEVICE_UNHEALTHY_GRACE").and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(30).saturating_mul(1000)
+}
+
+/// Remembers since when pods have continuously held an unhealthy device.
+#[derive(Default)]
+pub struct DeviceGrace {
+    since: alloc::collections::BTreeMap<alloc::string::String, u64>,
+}
+
+impl DeviceGrace {
+    /// `bad` are the uids unhealthy right now: returns those unhealthy for at least `grace_ms`
+    /// and forgets the ones that recovered.
+    pub fn due(&mut self, bad: &[alloc::string::String], now_ms: u64, grace_ms: u64) -> alloc::vec::Vec<alloc::string::String> {
+        self.since.retain(|u, _| bad.contains(u));
+        bad.iter().filter(|u| now_ms.saturating_sub(*self.since.entry((*u).clone()).or_insert(now_ms)) >= grace_ms).cloned().collect()
+    }
+}
+
 /// Whether MemAvailable (KiB; None when unreadable) is below the threshold (bytes).
 pub fn under_pressure(available_ki: Option<u64>, threshold_bytes: u64) -> bool {
     available_ki.is_some_and(|a| a.saturating_mul(1024) < threshold_bytes)
@@ -114,5 +135,17 @@ mod tests {
         let mut be = c("be", "BestEffort", 10, 0);
         be.critical = true;
         assert!(pick(&[be]).is_none());
+    }
+
+    #[test]
+    fn device_grace() {
+        let mut g = DeviceGrace::default();
+        let a = alloc::vec![alloc::string::String::from("a")];
+        assert!(g.due(&a, 1000, 30_000).is_empty());
+        assert!(g.due(&a, 20_000, 30_000).is_empty());
+        assert!(g.due(&[], 25_000, 30_000).is_empty()); // recovered: forgotten
+        assert!(g.due(&a, 40_000, 30_000).is_empty()); // clock restarts
+        assert_eq!(g.due(&a, 70_000, 30_000), a);
+        assert_eq!(DeviceGrace::default().due(&a, 5, 0), a); // grace 0: immediately
     }
 }

@@ -120,6 +120,10 @@ fn nonres(urls: &[&str], verbs: &[&str]) -> String {
     alloc::format!(r#"{{"nonResourceURLs":[{}],"verbs":[{}]}}"#, q(urls), q(verbs))
 }
 
+fn metrics_rule() -> String {
+    rule(&["metrics.k8s.io"], &["pods", "nodes"], &["get", "list", "watch"])
+}
+
 const READ: &[&str] = &["get", "list", "watch"];
 const WRITE: &[&str] = &["create", "delete", "deletecollection", "patch", "update"];
 
@@ -131,27 +135,32 @@ pub fn bootstrap_roles() -> Vec<(&'static str, String)> {
     let batch = &["jobs", "cronjobs"];
     let view_core = &["pods", "pods/log", "pods/status", "replicationcontrollers", "services", "endpoints", "persistentvolumeclaims", "configmaps", "serviceaccounts", "events", "namespaces", "limitranges", "resourcequotas"];
     let edit = alloc::format!(
-        "[{},{},{},{},{},{}]",
+        "[{},{},{},{},{},{},{}]",
         rule(&[""], workloads_core, &all),
         rule(&["apps"], apps, &all),
         rule(&["batch"], batch, &all),
         rule(&["networking.k8s.io"], &["ingresses", "networkpolicies"], &all),
         rule(&["policy"], &["poddisruptionbudgets"], &all),
-        rule(&["discovery.k8s.io"], &["endpointslices"], READ)
+        rule(&["discovery.k8s.io"], &["endpointslices"], READ),
+        metrics_rule()
     );
     let admin = alloc::format!("{},{}]", &edit[..edit.len() - 1], rule(&["rbac.authorization.k8s.io"], &["roles", "rolebindings"], &all));
     let view = alloc::format!(
-        "[{},{},{},{}]",
+        "[{},{},{},{},{}]",
         rule(&[""], view_core, READ),
         rule(&["apps"], apps, READ),
         rule(&["batch"], batch, READ),
-        rule(&["networking.k8s.io", "policy", "discovery.k8s.io"], &["*"], READ)
+        rule(&["networking.k8s.io", "policy", "discovery.k8s.io"], &["*"], READ),
+        metrics_rule()
     );
     alloc::vec![
         ("cluster-admin", alloc::format!("[{},{}]", rule(&["*"], &["*"], &["*"]), nonres(&["*"], &["*"]))),
         ("admin", admin),
         ("edit", edit),
         ("view", view),
+        // Upstream aggregates this into view/edit/admin by label; kr has no aggregation
+        // controller, so the rule is inlined in those roles as well (KNOWN_ISSUES #200).
+        ("system:aggregated-metrics-reader", alloc::format!("[{}]", metrics_rule())),
         ("system:discovery", alloc::format!("[{}]", nonres(&["/api", "/api/*", "/apis", "/apis/*", "/healthz", "/livez", "/readyz", "/openapi", "/openapi/*", "/version", "/version/"], &["get"]))),
         ("system:auth-delegator", alloc::format!("[{},{}]", rule(&["authentication.k8s.io"], &["tokenreviews"], &["create"]), rule(&["authorization.k8s.io"], &["subjectaccessreviews"], &["create"]))),
         ("system:public-info-viewer", alloc::format!("[{}]", nonres(&["/healthz", "/livez", "/readyz", "/version", "/version/"], &["get"]))),
@@ -318,6 +327,15 @@ mod tests {
         let anon = user("system:anonymous", &["system:unauthenticated"]);
         assert!(!allowed(&anon, &discovery, &crbs, &[], &lookup));
         assert!(allowed(&anon, &Attrs { verb: "get".into(), path: "/version".into(), ..Default::default() }, &crbs, &[], &lookup));
+    }
+
+    #[test]
+    fn metrics_reader_in_view_edit_admin() {
+        for (n, r) in bootstrap_roles() {
+            if ["view", "edit", "admin", "system:aggregated-metrics-reader"].contains(&n) {
+                assert!(r.contains(r#""apiGroups":["metrics.k8s.io"],"resources":["pods","nodes"]"#), "{n}");
+            }
+        }
     }
 
     #[test]

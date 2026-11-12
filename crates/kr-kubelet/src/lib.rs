@@ -550,6 +550,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     /// Every 10 s: taint the node while MemAvailable is below the threshold and evict one pod.
     async fn eviction_loop(self: &Rc<Self>) {
         let mut state = evict::PressureState::default();
+        let mut grace = evict::DeviceGrace::default();
+        let grace_ms = evict::device_grace_ms();
         loop {
             kr_rt::exec::sleep(10_000).await;
             let pressure = evict::under_pressure(node::memory_available_ki(), self.cfg.eviction_memory_bytes);
@@ -561,7 +563,10 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 self.notify.notify();
             }
             // Pods holding a device its plugin reports unhealthy fail (reason Evicted).
-            for (uid, msg) in self.devices.unhealthy_pods() {
+            let unhealthy = self.devices.unhealthy_pods();
+            let bad: Vec<String> = unhealthy.iter().map(|u| u.0.clone()).collect();
+            let due = grace.due(&bad, now_ms(), grace_ms);
+            for (uid, msg) in unhealthy.into_iter().filter(|u| due.contains(&u.0)) {
                 let hit = self.pods.borrow_mut().get_mut(&uid).filter(|p| p.evicted.is_none() && p.failed_setup.is_none()).map(|p| p.evicted = Some(msg)).is_some();
                 if hit {
                     self.kill_now(&uid);
