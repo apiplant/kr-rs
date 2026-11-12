@@ -118,7 +118,16 @@ impl<T: Transport> Transport for TlsStream<T> {
 
     async fn write_all(&mut self, buf: &[u8]) -> Result<()> {
         self.flush().await?;
-        self.conn.write(buf).map_err(Error::Tls)?;
+        // Encrypting a multi-MB body (a large list, the OpenAPI document) in one call is one long
+        // poll of the event loop: seal and send it in slices, giving other tasks a turn whenever
+        // this poll has run for a few ms. The slices also bound the encrypted data held in memory.
+        for chunk in buf.chunks(64 * 1024) {
+            self.conn.write(chunk).map_err(Error::Tls)?;
+            if buf.len() > 64 * 1024 {
+                self.flush().await?;
+                kr_rt::exec::yield_if_long(5).await;
+            }
+        }
         self.flush().await
     }
 }
