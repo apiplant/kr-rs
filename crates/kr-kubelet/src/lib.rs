@@ -1086,12 +1086,14 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 .collect();
             (alloc::format!("{}/{}", p.dir, adopt::FILE), adopt::encode(&rec, &ctrs))
         };
-        // The write is atomic and fsyncs (about 100 ms on a busy disk, on the event loop): skip
+        // The write is atomic (about 100 ms with an fsync on a busy disk, on the event loop): skip
         // it when the record is already what is on disk (every adopted pod after a restart,
         // every sync that changed nothing).
         let same = kr_sys::fs::read_file(alloc::format!("{}\0", text.0).as_bytes(), 1 << 20).is_ok_and(|old| old == text.1.as_bytes());
         if !same {
-            let _ = kr_runtime::store::write_file_atomic(&text.0, text.1.as_bytes());
+            // No fsync: the record only matters when the kr process dies (the page cache
+            // survives that); after a reboot the pods are gone and nothing is adopted.
+            let _ = kr_runtime::store::write_file_atomic_nosync(&text.0, text.1.as_bytes());
         }
     }
 
