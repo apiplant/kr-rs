@@ -20,7 +20,7 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use kr_sys::{ns, Errno, Fd};
+use kr_sys::{fs, ns, Errno, Fd};
 
 /// Hooks time out after this long when they declare no timeout, so a stuck hook cannot hold a
 /// container (and the kubelet) forever.
@@ -361,6 +361,23 @@ pub fn run_one(h: &Hook, state: &[u8], root: Option<&[u8]>, log: Option<&Fd>) ->
     let mut envp: Vec<*const u8> = env_c.iter().map(|a| a.as_ptr()).collect();
     envp.push(core::ptr::null());
     let root_c = root.map(nul);
+    // The file that was checked is the file that runs: open it once (O_PATH), verify what the
+    // descriptor points at, and `execveat` that descriptor, so swapping the path in between
+    // changes nothing (#168). Inside a hook root the path means something else: plain `execve`.
+    let exe = if root.is_none() {
+        match fs::openat(ns::AT_FDCWD, &path, fs::O_PATH | fs::O_CLOEXEC, 0) {
+            Ok(fd) => {
+                let st = fs::fstat(fd.raw()).map_err(Fail::Start)?;
+                if st.file_type() != fs::S_IFREG || !owner_ok(st.uid) || st.mode & 0o022 != 0 {
+                    return Err(Fail::Exit(126));
+                }
+                Some(fd)
+            }
+            Err(_) => None, // missing: the exec below fails with 127 as before
+        }
+    } else {
+        None
+    };
     let null = if log.is_none() { ns::open(b"/dev/null\0", ns::O_WRONLY, 0).ok() } else { None };
 
     let mut pidfd: i32 = -1;
@@ -383,7 +400,14 @@ pub fn run_one(h: &Hook, state: &[u8], root: Option<&[u8]>, log: Option<&Fd>) ->
         if ns::chdir(b"/\0").is_err() {
             kr_sys::exit_group(126);
         }
-        let _ = ns::execve(&path, &argv, &envp);
+        if let Some(fd) = &exe {
+            // Not close-on-exec, or a script's interpreter could not reopen it.
+            if ns::clear_cloexec(fd.raw()).is_ok() {
+                let _ = ns::execveat_fd(fd.raw(), &argv, &envp);
+            }
+        } else {
+            let _ = ns::execve(&path, &argv, &envp);
+        }
         kr_sys::exit_group(127);
     }
     let pidfd = Fd(pidfd);
@@ -536,5 +560,29 @@ mod tests {
         assert_eq!(run_one(&missing, &st, None, None), Err(Fail::Exit(127)));
         let slow = Hook { path: b"/bin/sleep".to_vec(), args: alloc::vec![b"sleep".to_vec(), b"30".to_vec()], timeout: 1, ..Default::default() };
         assert_eq!(run_one(&slow, &st, None, None), Err(Fail::TimedOut));
+    }
+
+    #[test]
+    fn the_checked_file_is_the_file_that_runs() {
+        let dir = format!("/tmp/kr-hooks-exec-{}", kr_sys::fs::getpid());
+        let _ = ns::mkdir(format!("{dir}\0").as_bytes(), 0o700);
+        let script = format!("{dir}/hook.sh");
+        let w = |mode: u32, body: &str| {
+            let _ = kr_sys::fs::unlinkat(ns::AT_FDCWD, format!("{script}\0").as_bytes(), 0);
+            let fd = kr_sys::fs::openat(ns::AT_FDCWD, format!("{script}\0").as_bytes(), kr_sys::fs::O_WRONLY | kr_sys::fs::O_CREAT, mode).unwrap();
+            kr_sys::fs::write_all(fd.raw(), body.as_bytes()).unwrap();
+            let _ = kr_sys::fs::fchmod(fd.raw(), mode);
+        };
+        let st = state(b"c", "created", 7, b"/b");
+        let hook = Hook { path: script.clone().into_bytes(), ..Default::default() };
+        // A script (shebang) runs through the descriptor.
+        w(0o755, "#!/bin/sh\nexit 4\n");
+        assert_eq!(run_one(&hook, &st, None, None), Err(Fail::Exit(4)));
+        // The same file made group-writable is refused at run time, whatever trust() saw earlier.
+        w(0o775, "#!/bin/sh\nexit 0\n");
+        assert_eq!(run_one(&hook, &st, None, None), Err(Fail::Exit(126)));
+        // A directory is not a hook.
+        let d = Hook { path: dir.clone().into_bytes(), ..Default::default() };
+        assert_eq!(run_one(&d, &st, None, None), Err(Fail::Exit(126)));
     }
 }

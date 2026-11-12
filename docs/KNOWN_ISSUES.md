@@ -61,9 +61,6 @@ Related: #138 (topology), #139 (unhealthy devices), #140 (`PodResources`), #141 
 167. **Unhealthy-device eviction fails the pod without regard to restartPolicy or PodDisruptionBudgets** — *ADR-038*
     After the grace period (`KR_DEVICE_UNHEALTHY_GRACE`, default 30 s) the pod is failed (upstream does not evict at all). Failed pods are not restarted by the kubelet: a Deployment/Job controller replaces them, a bare pod stays Failed. `restartPolicy` and PodDisruptionBudgets are not honoured.
 
-168. **Hook trust has a small time-of-check window** — *ADR-039*
-    `trust` (`hooks.rs`) now also checks every directory above each path it visits (owned by root or the current user, not group/world-writable unless sticky). What remains: the check is not atomic with the `exec` for `createRuntime`/`createContainer`/`startContainer` hooks (`poststop` is rechecked at run time), so a user able to write a trusted directory can still swap the binary in between (only possible if the directory checks were bypassed by a root-owned writable mount). The ownership of a hook of a rootless runtime may also be the current user. Fix: open the binary `O_PATH` at check time and run it with `execveat`.
-
 169. **Preferred allocation and NUMA choice ignore `must_include` and multi-resource alignment** — *ADR-038*
     `GetPreferredAllocation` is always called with an empty `must_include_deviceIDs`, one container at a time, and devices of different resources (GPU and NIC) are not aligned on the same NUMA node (upstream's topology manager policies `best-effort`/`restricted`/`single-numa-node` are not implemented). A plugin's preferred answer is used only when all ids are still free.
 172. **Eviction rate limits count nodes and live in memory** — *ADR-037, ADR-042*
