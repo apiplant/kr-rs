@@ -28,18 +28,35 @@ pub const CLASS: &str = "kr.io/servicelb";
 pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config) {
     let q = Queue::new();
     let mut g = Guard::default();
+    let tr = alloc::rc::Rc::new(core::cell::RefCell::new(Tracker::default()));
     for path in [services(None), "/api/v1/nodes".to_string(), endpointslices(None)] {
-        let q2 = q.clone();
-        g.0.push(kr_rt::exec::spawn(watch_loop(c.clone(), path, String::new(), cfg, move |_, _| q2.add("*"))));
+        let (q2, tr2) = (q.clone(), tr.clone());
+        let kind = path.clone();
+        g.0.push(kr_rt::exec::spawn(watch_loop(c.clone(), path, String::new(), cfg, move |ev, o| {
+            let mut t = tr2.borrow_mut();
+            let keys = if kind.ends_with("/services") {
+                t.service(ev, o)
+            } else if kind.ends_with("/nodes") {
+                t.node(ev, o)
+            } else {
+                t.slice(o)
+            };
+            for k in keys {
+                q2.add(&k);
+            }
+        })));
     }
     let (c2, q2) = (c.clone(), q.clone());
     drive(
         &cfg,
         &q,
-        move |_| {
+        move |key| {
             let c = c2.clone();
             async move {
-                sync(&c).await?;
+                match key.split_once('/') {
+                    Some((ns, n)) => sync_one(&c, Some((ns, n))).await?,
+                    None => sync(&c).await?,
+                }
                 Ok(None)
             }
         },
@@ -49,6 +66,52 @@ pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config) {
         },
     )
     .await
+}
+
+/// Turns watch events into the queue keys that need re-evaluation: `ns/name` for one Service, `*`
+/// for all (a Ready node set or address change). Keeps a small cache to tell relevant events
+/// (a node heartbeat changes nothing that is published) from irrelevant ones, and to find the
+/// Services whose port clash outcome may change.
+#[derive(Default)]
+pub struct Tracker {
+    nodes: alloc::collections::BTreeMap<String, (bool, Vec<String>)>,
+    ports: alloc::collections::BTreeMap<String, Vec<(String, i64)>>,
+}
+
+impl Tracker {
+    pub fn service(&mut self, ev: &str, svc: &Value) -> Vec<String> {
+        let key = alloc::format!("{}/{}", namespace(svc), name(svc));
+        let mut out = alloc::vec![key.clone()];
+        let new = if ev == "DELETED" || str_at(svc, &["spec", "type"]) != "LoadBalancer" { Vec::new() } else { lb_ports(svc) };
+        let old = self.ports.get(&key).cloned().unwrap_or_default();
+        // Another Service holding or wanting one of these ports may win or lose it now.
+        for (k, ps) in &self.ports {
+            if *k != key && ps.iter().any(|p| old.contains(p) || new.contains(p)) {
+                out.push(k.clone());
+            }
+        }
+        if new.is_empty() {
+            self.ports.remove(&key);
+        } else {
+            self.ports.insert(key, new);
+        }
+        out
+    }
+
+    pub fn node(&mut self, ev: &str, n: &Value) -> Vec<String> {
+        let fp = (ev != "DELETED" && node_ready(n) && !deleting(n), if ev == "DELETED" { Vec::new() } else { node_ips(n) });
+        let changed = match self.nodes.get(name(n)) {
+            Some(old) => *old != fp,
+            None => fp.0,
+        };
+        if fp.0 { self.nodes.insert(name(n).to_string(), fp) } else { self.nodes.remove(name(n)) };
+        if changed { alloc::vec!["*".to_string()] } else { Vec::new() }
+    }
+
+    pub fn slice(&mut self, s: &Value) -> Vec<String> {
+        let svc = str_at(s, &["metadata", "labels", SERVICE_LABEL]);
+        if svc.is_empty() { Vec::new() } else { alloc::vec![alloc::format!("{}/{}", namespace(s), svc)] }
+    }
 }
 
 fn node_ready(n: &Value) -> bool {
@@ -125,14 +188,21 @@ fn addresses(svc: &Value, nodes: &[Value], slices: &[Value]) -> Vec<String> {
 
 /// One pass over all Services.
 pub async fn sync<C: Client>(c: &C) -> Result<()> {
+    sync_one(c, None).await
+}
+
+/// One pass over `only` (namespace, name) or, with `None`, over all Services. The port clashes
+/// are still computed from the whole list (a cheap in-memory list), but only the selected
+/// Services are written, and the EndpointSlices are read per namespace.
+pub async fn sync_one<C: Client>(c: &C, only: Option<(&str, &str)>) -> Result<()> {
     let svcs = items(&c.list(&services(None), "").await?);
     if !svcs.iter().any(|s| ours(s) && (str_at(s, &["spec", "type"]) == "LoadBalancer" || ingress_of(s) > 0)) {
         return Ok(());
     }
     let nodes = items(&c.list("/api/v1/nodes", "").await?);
-    let slices = items(&c.list(&endpointslices(None), "").await?);
+    let slices = items(&c.list(&endpointslices(only.map(|o| o.0)), "").await?);
     let clashing = losers(&svcs);
-    for svc in svcs.iter().filter(|s| ours(s) && !deleting(s)) {
+    for svc in svcs.iter().filter(|s| ours(s) && !deleting(s) && only.map_or(true, |(ns, n)| namespace(s) == ns && name(s) == n)) {
         let want = if clashing.contains(&(namespace(svc).to_string(), name(svc).to_string())) {
             Vec::new()
         } else if str_at(svc, &["spec", "type"]) == "LoadBalancer" {
@@ -202,6 +272,35 @@ mod tests {
         let svcs = [mk("new", "2026-02-01T00:00:00Z", 80, "TCP"), mk("old", "2026-01-01T00:00:00Z", 80, "TCP"), mk("udp", "2026-03-01T00:00:00Z", 80, "UDP"), mk("other", "2026-03-01T00:00:00Z", 81, "TCP")];
         let l = losers(&svcs);
         assert_eq!(l.into_iter().map(|(_, n)| n).collect::<Vec<_>>(), ["new"]);
+    }
+
+    #[test]
+    fn tracker_limits_work_to_affected_services() {
+        let lb = |n: &str, port: i64| v(&alloc::format!(r#"{{"metadata":{{"name":"{n}","namespace":"d"}},"spec":{{"type":"LoadBalancer","ports":[{{"port":{port}}}]}}}}"#));
+        let mut t = Tracker::default();
+        assert_eq!(t.service("ADDED", &lb("a", 80)), ["d/a"]);
+        assert_eq!(t.service("ADDED", &lb("b", 81)), ["d/b"]);
+        // A Service wanting a taken port re-evaluates the holder; an unrelated one does not.
+        assert_eq!(t.service("ADDED", &lb("c", 80)), ["d/c", "d/a"]);
+        // Deleting the holder frees the port for the others.
+        let mut out = t.service("DELETED", &lb("a", 80));
+        out.sort();
+        assert_eq!(out, ["d/a", "d/c"]);
+        assert_eq!(t.service("MODIFIED", &lb("b", 81)), ["d/b"]);
+        let s = v(r#"{"metadata":{"name":"s-1","namespace":"d","labels":{"kubernetes.io/service-name":"b"}}}"#);
+        assert_eq!(t.slice(&s), ["d/b"]);
+        assert!(t.slice(&v(r#"{"metadata":{"name":"x","namespace":"d"}}"#)).is_empty());
+    }
+
+    #[test]
+    fn tracker_ignores_node_heartbeats() {
+        let mut t = Tracker::default();
+        assert_eq!(t.node("ADDED", &node("a", "10.0.0.1", true)), ["*"]);
+        assert!(t.node("MODIFIED", &node("a", "10.0.0.1", true)).is_empty());
+        assert!(t.node("ADDED", &node("b", "10.0.0.2", false)).is_empty());
+        assert_eq!(t.node("MODIFIED", &node("a", "10.0.0.9", true)), ["*"]);
+        assert_eq!(t.node("MODIFIED", &node("a", "10.0.0.9", false)), ["*"]);
+        assert_eq!(t.node("DELETED", &node("b", "10.0.0.2", true)), Vec::<String>::new());
     }
 
     #[test]
