@@ -24,6 +24,29 @@ pub struct Built {
     pub hooks: kr_runtime::hooks::Hooks,
 }
 
+/// The identity of `kubectl exec` and exec probes in a container, from its spec (used for
+/// containers adopted after a restart; a started container passes what it was started with).
+/// `image_user` is the image's USER, unknown to an adopted container: such a container keeps
+/// the spec's `runAsUser` only.
+pub fn exec_ctx(pod: &Value, ctr: &Value, image_user: &str) -> container::ExecCtx {
+    let sc = |k: &str| ctr.pointer(&["securityContext", k]).or_else(|| pod.pointer(&["spec", "securityContext", k])).and_then(Value::as_i64);
+    let user = match (sc("runAsUser"), sc("runAsGroup")) {
+        (Some(u), Some(g)) => alloc::format!("{u}:{g}"),
+        (Some(u), None) => u.to_string(),
+        (None, Some(g)) => alloc::format!("{}:{g}", if image_user.is_empty() { "0" } else { image_user.split(':').next().unwrap_or("0") }),
+        (None, None) => String::from(image_user),
+    };
+    let mut groups: Vec<u32> = pod.pointer(&["spec", "securityContext", "supplementalGroups"]).and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_u64).map(|g| g as u32).collect();
+    if let Some(fg) = pod.pointer(&["spec", "securityContext", "fsGroup"]).and_then(Value::as_u64) {
+        groups.push(fg as u32);
+    }
+    let caps = ctr.pointer(&["securityContext", "capabilities"]).and_then(|c| {
+        let names = |f: &str| -> Vec<&str> { c.get(f).and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_str).collect() };
+        kr_runtime::security::resolve_caps(&names("add"), &names("drop")).ok()
+    });
+    container::ExecCtx { user: user.into_bytes(), groups, privileged: ctr.pointer(&["securityContext", "privileged"]).and_then(Value::as_bool).unwrap_or(false), caps }
+}
+
 /// Host file backing a container's terminationMessagePath.
 pub fn term_file(pod_dir: &str, name: &str) -> String {
     alloc::format!("{pod_dir}/{name}.term")

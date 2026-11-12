@@ -271,8 +271,8 @@ pub async fn run(spec: &Value, pod: &Value, ctr: &Value, ctr_target: &ExecTarget
             return false;
         }
         let env = exec_env(pod, ctr);
-        let user = ctr.pointer(&["securityContext", "runAsUser"]).and_then(Value::as_i64).map(|u| alloc::format!("{u}")).unwrap_or_default();
-        container::exec_in(ctr_target, &ExecSpec { argv: &argv, env: &env, cwd: b"/", user: user.as_bytes(), stdin: None, stdout: None, stderr: None, maps, extra_groups: &[], ctty: false })
+        // The user and capabilities are the container's own (the target carries them).
+        container::exec_in(ctr_target, &ExecSpec { argv: &argv, env: &env, cwd: b"/", user: b"", stdin: None, stdout: None, stderr: None, maps, extra_groups: &[], ctty: false })
     } else if let Some(g) = spec.get("grpc") {
         let (Some(target), Some(p)) = (pod_target, g.get("port").and_then(Value::as_u64).and_then(|v| u16::try_from(v).ok())) else { return false };
         let service = String::from(g.get("service").and_then(Value::as_str).unwrap_or(""));

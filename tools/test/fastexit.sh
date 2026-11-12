@@ -6,7 +6,7 @@ set -u
 cd "$(dirname "$0")/../.."
 KR=${KR:-$PWD/target/release/kr}
 T=$(mktemp -d); PORT=${PORT:-16445}
-trap 'systemctl --user stop kr-fastexit-test.scope >/dev/null 2>&1; rm -rf "$T"' EXIT
+trap 'systemctl --user stop kr-fastexit-test.scope >/dev/null 2>&1; systemctl --user reset-failed kr-fastexit-test.scope >/dev/null 2>&1; rm -rf "$T"' EXIT
 KR_ROOT=$T/root systemd-run --user --scope --unit=kr-fastexit-test -p Delegate=yes "$KR" server --port "$PORT" --data "$T/data" >"$T/srv.log" 2>&1 &
 export KUBECONFIG=$T/data/admin.kubeconfig
 for _ in $(seq 60); do kubectl get --raw /healthz >/dev/null 2>&1 && break; sleep 1; done

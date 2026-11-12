@@ -3,9 +3,6 @@
 Only work still to do lives here (open items, things to watch, accepted limits). Numbers are stable (other docs cite them); new items get the next number. When something is fixed, move it to `RESOLVED_ISSUES.md` with the commit.
 
 ## Open
-118. **`kubectl exec` processes get the default capability set**
-    `securityContext.capabilities` add/drop are applied to containers (2026-11-12), but exec'd processes still start with the default set. Privileged pods keep all capabilities and skip seccomp/no_new_privs, and kr runs rootful by default, so mknod/ipset/Calico work. `securityContext.capabilities` `add` / `drop` (with `ALL`) are honoured for non-privileged containers, but `kubectl exec` processes still get the default set, and device-node creation is still blocked in rootless (`KR_USERNS=1`) mode.
-
 126. **Single-threaded control plane** — *ADR-004, ADR-005*
     The API server, kubelet, controllers, scheduler, Service proxy and DNS share one executor thread (plus the fsync helper process, ADR-024), and the allocator is single-threaded. On a many-core server one core limits throughput and tail latency under load, where k3s spreads over all cores. Needs per-thread slabs or a lock in `kr-rt`, or sharding by process, before large clusters. Plan: ADR-045; the narrower, first step is offloading CPU-bound work (#208–#213, ADR-050).
 127. **Durability limits of in-process writers and watches** — *ADR-024*

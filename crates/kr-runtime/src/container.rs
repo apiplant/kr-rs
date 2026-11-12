@@ -120,15 +120,36 @@ pub struct Mount {
     pub prop: Prop,
 }
 
+/// Who a process started inside a container runs as: the container's own user, groups and
+/// capabilities, so `kubectl exec` and exec probes never get more than the container has.
+#[derive(Clone, Default, Debug)]
+pub struct ExecCtx {
+    /// `uid[:gid]` or a name, as for [`RunSpec::user`] (empty = root).
+    pub user: Vec<u8>,
+    pub groups: Vec<u32>,
+    pub privileged: bool,
+    /// `securityContext.capabilities` resolved; None = the default set.
+    pub caps: Option<Vec<u32>>,
+}
+
 /// What `exec_in` needs to enter a running container.
 #[derive(Clone)]
 pub struct ExecTarget {
+    ctx: Rc<ExecCtx>,
     pidfd: Rc<Fd>,
     cgroup: Option<i32>,
     /// The pod shares the host's network namespace (hostNetwork): never joined.
     host_net: bool,
     /// Whether the pod runs in a user namespace.
     pub userns: bool,
+}
+
+impl ExecTarget {
+    /// The identity processes started in this container take.
+    pub fn with_ctx(mut self, ctx: ExecCtx) -> ExecTarget {
+        self.ctx = Rc::new(ctx);
+        self
+    }
 }
 
 /// A process to start inside a running container.
@@ -235,7 +256,11 @@ pub fn exec_in(target: &ExecTarget, spec: &ExecSpec) -> Result<Running, RunError
             let _ = ns::setsid();
             let _ = ns::set_ctty(0);
         }
-        let _ = drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups, false, None);
+        // An empty user or group list means the container's own (see [`ExecCtx`]).
+        let ctx = &target.ctx;
+        let user = if spec.user.is_empty() { &ctx.user[..] } else { spec.user };
+        let groups = if spec.extra_groups.is_empty() { &ctx.groups[..] } else { spec.extra_groups };
+        let _ = drop_and_exec(spec.cwd, user, full_map, spec.argv, spec.env, groups, ctx.privileged, ctx.caps.as_deref());
         127
     })
 }
@@ -283,7 +308,7 @@ impl Sandbox {
 
     /// A target for joining the pod's network (probes); the sandbox owns the netns.
     pub fn target(&self) -> Result<ExecTarget, Errno> {
-        Ok(ExecTarget { pidfd: Rc::new(ns::pidfd_open(self.pid)?), cgroup: None, host_net: self.host_net, userns: self.userns })
+        Ok(ExecTarget { ctx: Rc::default(), pidfd: Rc::new(ns::pidfd_open(self.pid)?), cgroup: None, host_net: self.host_net, userns: self.userns })
     }
 
     /// Kills and reaps the sandbox (its namespaces disappear with the last member).
@@ -691,7 +716,7 @@ impl Running {
 
     /// A handle for running more processes inside this container (exec, probes).
     pub fn target(&self) -> ExecTarget {
-        ExecTarget { pidfd: self.pidfd.clone(), cgroup: self.cgroup_fd(), host_net: self.host_net, userns: self.userns }
+        ExecTarget { ctx: Rc::default(), pidfd: self.pidfd.clone(), cgroup: self.cgroup_fd(), host_net: self.host_net, userns: self.userns }
     }
 
     /// A container run by a shim of a previous run of this process, or `None` when `pid` is gone
