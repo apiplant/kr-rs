@@ -88,6 +88,8 @@ pub struct Config {
     pub evict: nodelifecycle::Limits,
     /// HorizontalPodAutoscaler evaluation period (upstream: 15 s).
     pub hpa_ms: u64,
+    /// Components turned off with `--disable` (ADR-060).
+    pub disabled: kr_apiserver::components::Disabled,
 }
 
 fn zero_clock() -> i64 {
@@ -96,7 +98,7 @@ fn zero_clock() -> i64 {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { resync_ms: 30_000, gc_ms: 5_000, backoff_ms: 1_000, retry_ms: 5_000, job_backoff_ms: 10_000, now: zero_clock, evict: nodelifecycle::Limits::default(), hpa_ms: 15_000 }
+        Config { resync_ms: 30_000, gc_ms: 5_000, backoff_ms: 1_000, retry_ms: 5_000, job_backoff_ms: 10_000, now: zero_clock, evict: nodelifecycle::Limits::default(), hpa_ms: 15_000, disabled: Default::default() }
     }
 }
 
@@ -132,11 +134,13 @@ pub async fn run_all_with_ca<C: Client + Clone + 'static>(c: C, cfg: Config, ca:
         spawn(svm::run(c.clone(), cfg)),
         spawn(pvc::run(c.clone(), cfg)),
         spawn(nodelifecycle::run(c.clone(), cfg)),
-        spawn(servicelb::run(c.clone(), cfg)),
         spawn(hpa::run(c.clone(), cfg)),
         spawn(attachdetach::run(c.clone(), cfg.now)),
         spawn(gc::run(c.clone(), cfg)),
     ]);
+    if !cfg.disabled.servicelb {
+        guard.0.push(spawn(servicelb::run(c.clone(), cfg)));
+    }
     if let Some(ca) = ca {
         guard.0.push(spawn(csr::run(c, cfg, ca)));
     }

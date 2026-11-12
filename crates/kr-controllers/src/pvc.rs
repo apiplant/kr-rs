@@ -52,7 +52,7 @@ pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config) {
         &q,
         move |_| {
             let c = c2.clone();
-            async move { sync(&c).await.map(|()| None) }
+            async move { sync(&c, !cfg.disabled.local_storage).await.map(|()| None) }
         },
         move || {
             q3.add("all");
@@ -94,7 +94,7 @@ fn claim_matches(pv: &Value, pvc: &Value) -> bool {
     r("name") == name(pvc) && r("namespace") == namespace(pvc) && (r("uid").is_empty() || r("uid") == uid(pvc))
 }
 
-async fn sync<C: Client>(c: &C) -> Result<()> {
+async fn sync<C: Client>(c: &C, provision: bool) -> Result<()> {
     let claims = items(&c.list(&pvcs(None), "").await?);
     let pod_list = items(&c.list(&pods(None), "").await?);
     let mut vols = items(&c.list(PVS, "").await?);
@@ -102,7 +102,7 @@ async fn sync<C: Client>(c: &C) -> Result<()> {
     let mut claims = claims;
     ephemeral_claims(c, &pod_list, &mut claims).await?;
     for pvc in &claims {
-        sync_pvc(c, pvc, &pod_list, &mut vols, &classes).await?;
+        sync_pvc(c, pvc, &pod_list, &mut vols, &classes, provision).await?;
     }
     for pv in &vols {
         sync_pv(c, pv, &claims).await?;
@@ -165,7 +165,7 @@ fn claim_ref(pvc: &Value) -> Value {
     ])
 }
 
-async fn sync_pvc<C: Client>(c: &C, pvc: &Value, pod_list: &[Value], vols: &mut Vec<Value>, classes: &[Value]) -> Result<()> {
+async fn sync_pvc<C: Client>(c: &C, pvc: &Value, pod_list: &[Value], vols: &mut Vec<Value>, classes: &[Value], provision: bool) -> Result<()> {
     let (ns, nm) = (namespace(pvc), name(pvc));
     let path = alloc::format!("{}/{nm}", pvcs(Some(ns)));
     let users: Vec<&Value> = pod_list.iter().filter(|p| !pod_terminal(p) && uses(p, ns, nm)).collect();
@@ -248,6 +248,9 @@ async fn sync_pvc<C: Client>(c: &C, pvc: &Value, pod_list: &[Value], vols: &mut 
         }
     }
     // Dynamic provisioning.
+    if !provision {
+        return Ok(());
+    }
     let Some(sc) = classes.iter().find(|k| name(k) == class && str_at(k, &["provisioner"]) == PROVISIONER) else { return Ok(()) };
     if volume_mode(pvc) == "Block" {
         return Ok(()); // a directory cannot back a block volume

@@ -157,6 +157,8 @@ pub struct ApiServer {
     pub(crate) apf: crate::apf::Apf,
     /// Address families of the pod network and of Services (`KR_POD_FAMILIES`).
     pod_families: core::cell::Cell<kr_net::tcp::Families>,
+    /// Components turned off with `--disable` (ADR-060).
+    disabled: core::cell::Cell<crate::components::Disabled>,
     /// `set_pod_families` was called (the environment names the families): it wins over the stored value.
     families_explicit: core::cell::Cell<bool>,
     /// `fieldValidation` of the request being handled (`Ignore` outside `handle`).
@@ -302,7 +304,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), enc_reload: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), oa_cache: RefCell::new(alloc::collections::BTreeMap::new()), parsed: RefCell::new(ParseCache::default()), defer_lists: core::cell::Cell::new(false), list_job: RefCell::new(None), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), agg_http: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default() };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), enc_reload: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), oa_cache: RefCell::new(alloc::collections::BTreeMap::new()), parsed: RefCell::new(ParseCache::default()), defer_lists: core::cell::Cell::new(false), list_job: RefCell::new(None), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), agg_http: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default(), disabled: Default::default() };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -695,7 +697,9 @@ impl ApiServer {
         self.bootstrap_managed(scr, "kubernetes", "ServiceCIDR", &r#"{"metadata":{"name":"kubernetes"},"spec":{"cidrs":["10.96.0.0/16"]},"status":{"conditions":[{"type":"Ready","status":"True","reason":"","message":"Kubernetes Service CIDR is ready","lastTransitionTime":"1970-01-01T00:00:00Z"}]}}"#.replace("10.96.0.0/16", &svc_cidr), &["spec"]);
         crate::apf::seed(self);
         let scr = resources::find("storage.k8s.io", "v1", "storageclasses").unwrap();
-        self.bootstrap_managed(scr, "local-path", "StorageClass", r#"{"metadata":{"name":"local-path","annotations":{"storageclass.kubernetes.io/is-default-class":"true"}},"provisioner":"kr.io/local-path","reclaimPolicy":"Delete","volumeBindingMode":"WaitForFirstConsumer"}"#, &["provisioner", "reclaimPolicy", "volumeBindingMode"]);
+        if !self.disabled.get().local_storage {
+            self.bootstrap_managed(scr, "local-path", "StorageClass", r#"{"metadata":{"name":"local-path","annotations":{"storageclass.kubernetes.io/is-default-class":"true"}},"provisioner":"kr.io/local-path","reclaimPolicy":"Delete","volumeBindingMode":"WaitForFirstConsumer"}"#, &["provisioner", "reclaimPolicy", "volumeBindingMode"]);
+        }
         let nsr = resources::find("", "v1", "namespaces").unwrap();
         let (namespaces, _) = self.store.borrow().list(&nsr.prefix(), None, 0);
         for kv in namespaces {
@@ -3168,6 +3172,11 @@ impl ApiServer {
         if let Some((ip, port)) = self.boot_services.get() {
             let _ = self.ensure_builtin_services(ip, port);
         }
+    }
+
+    /// Components turned off with `--disable`. Call before [`ApiServer::set_service_accounts`], which seeds the default StorageClass.
+    pub fn set_disabled(&self, d: crate::components::Disabled) {
+        self.disabled.set(d);
     }
 
     /// Sets the pod network's address families (default: dual stack). Call before nodes register

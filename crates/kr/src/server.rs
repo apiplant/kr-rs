@@ -14,7 +14,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use kr_crypto::tls::{ClientAuth, ServerConfig};
 use kr_crypto::x509::{self, CertParams, Name};
-use kr_rt::{eprint, print, Args};
+use kr_rt::{eprint, print};
 use kr_sys::{fs, ns, Errno};
 
 fn fail(msg: &str) -> i32 {
@@ -72,6 +72,9 @@ fn issue(dir: &str, file: &str, ca: &(Name, x509::SigningKey, Vec<u8>), subject:
 /// The node's primary address: IPv4 if the host has a route out, else IPv6 (`KR_PREFER_IPV6=1`
 /// picks IPv6 even on a dual-stack host: how the IPv6 underlay is tested).
 pub(crate) fn primary_addr() -> [u8; 16] {
+    if let Some(ip) = crate::install::node_ip() {
+        return ip;
+    }
     kr_sys::ns::route_source_any(kr_runtime::store::env_var("KR_PREFER_IPV6").is_some_and(|v| !v.is_empty() && v != "0"))
 }
 
@@ -105,6 +108,21 @@ pub(crate) fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
     for file in ["apiserver", "server", "kubelet-client"] {
         drop_if_ip_changed(&pki_dir, file, adv, routable && file != "kubelet-client");
     }
+    // --tls-san: the certificate is issued again when the set of names changed (ADR-060).
+    let mut sans = crate::install::tls_sans();
+    if let Some(e) = crate::install::external_ip() {
+        sans.push(kr_net::tcp::fmt_ip16(e));
+    }
+    sans.sort();
+    sans.dedup();
+    let want = sans.join("\n");
+    let marker = pki::path(&pki_dir, "apiserver.sans");
+    let have = fs::read_file(&marker, 1 << 20).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
+    if have != want {
+        for f in ["apiserver.pem", "apiserver.key"] {
+            let _ = fs::unlinkat(fs::AT_FDCWD, &pki::path(&pki_dir, f), 0);
+        }
+    }
     if !exists(&pki::path(&pki_dir, "ca.pem")) {
         pki::create_ca(&pki_dir, "kr-cluster-ca".into(), 3650)?;
     }
@@ -131,7 +149,17 @@ pub(crate) fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
         if let Some(h6) = kr_apiserver::api::host_ip6() {
             ips.push(h6.to_vec());
         }
+        for san in &sans {
+            match kr_net::tcp::parse_ip16(san) {
+                Some(ip) => ips.push(kr_net::tcp::ip_bytes16(ip)),
+                None => dns.push(san.clone()),
+            }
+        }
         issue(&pki_dir, "apiserver", &ca, name, true, false, dns, ips)?;
+        if have != want {
+            let _ = fs::unlinkat(fs::AT_FDCWD, &marker, 0);
+            pki::write_new(&marker, want.as_bytes(), 0o644)?;
+        }
     }
     if !exists(&pki::path(&pki_dir, "kubelet-client.pem")) {
         // Used by the API server to reach node agents' kubelets (logs/exec/port-forward).
@@ -355,7 +383,7 @@ pub fn ticket_secret(sa_key: &[u8; 32]) -> [u8; 32] {
     prk
 }
 
-pub fn main(mut args: Args) -> i32 {
+pub fn main(mut args: crate::install::Argv) -> i32 {
     if kr_runtime::store::env_var("KR_TLS_RESUMPTION").as_deref() == Some("off") {
         kr_net::tls::set_resumption(false);
     }
@@ -375,13 +403,19 @@ pub fn main(mut args: Args) -> i32 {
     let (mut audit_policy, mut audit_path, mut audit_max, mut audit_backup, mut psa_config) = (None::<String>, None::<String>, 100u64, 5usize, None::<String>);
     let (mut audit_legacy, mut audit_age) = (false, 0u64);
     let (mut join_url, mut token, mut token_file): (Option<String>, Option<String>, Option<String>) = (None, None, None);
+    let mut inst = crate::install::Install::default();
     while let Some(a) = args.next() {
         // `--flag=value` and `--flag value` are both accepted.
         let (a, inline) = match a.iter().position(|&c| c == b'=') {
             Some(i) if a.starts_with(b"--") => (&a[..i], Some(&a[i + 1..])),
             _ => (a, None),
         };
-        let v = inline.or_else(|| args.next()).and_then(|v| core::str::from_utf8(v).ok());
+        let v = if a == b"--cluster-init" { inline } else { inline.or_else(|| args.next()) }.and_then(|v| core::str::from_utf8(v).ok());
+        if let Some(val) = v {
+            if inst.take(a, val) {
+                continue;
+            }
+        }
         match (a, v) {
             (b"--port", Some(p)) => match p.parse() {
                 Ok(p) => port = p,
@@ -420,9 +454,13 @@ pub fn main(mut args: Args) -> i32 {
             (b"--audit-log-maxage", Some(v)) => audit_age = v.parse().unwrap_or(u64::MAX),
             (b"--audit-log-format", Some(v)) if v == "json" || v == "legacy" => audit_legacy = v == "legacy",
             (b"--pod-security-config", Some(v)) => psa_config = Some(String::from(v)),
-            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h [--snapshot-keep 5]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--pod-security-config FILE]"),
+            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h [--snapshot-keep 5]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--pod-security-config FILE] [--config FILE] [--tls-san NAME]... [--node-name NAME] [--node-label K=V]... [--node-taint K=V:EFFECT]... [--node-ip IP] [--node-external-ip IP] [--disable COMPONENT]..."),
         }
     }
+    if let Err(e) = crate::install::publish(&inst) {
+        return fail(&e);
+    }
+    let disabled = crate::install::disabled().unwrap_or_default();
     let data = data.unwrap_or_else(data_dir);
     if cluster_init && join_url.is_some() {
         return fail("--cluster-init starts a new cluster; --server joins an existing one");
@@ -494,6 +532,7 @@ pub fn main(mut args: Args) -> i32 {
         Ok(a) => Rc::new(a),
         Err(e) => return fail(&e.message),
     };
+    api.set_disabled(disabled);
     // `kr secrets-encrypt reload`: a new key or the plaintext switch applies without a restart.
     {
         let data = data.clone();
@@ -579,7 +618,7 @@ pub fn main(mut args: Args) -> i32 {
         return fail(&e.message);
     }
     print(format!("kr server: listening on https://0.0.0.0:{port}\nkr server: export KUBECONFIG={data}/admin.kubeconfig\n").as_bytes());
-    let kubelet = match start_kubelet(&api) {
+    let kubelet = match start_kubelet(&api, disabled) {
         Ok(k) => Some(k),
         Err(e) => {
             eprint(format!("kr server: kubelet disabled: {e}\n").as_bytes());
@@ -607,7 +646,7 @@ pub fn main(mut args: Args) -> i32 {
         if let Some(a) = auditor {
             kr_apiserver::audit::spawn_flusher(a);
         }
-        let cfg = kr_controllers::Config { now: pki::now, evict: kr_controllers::nodelifecycle::Limits::from_lookup(kr_runtime::store::env_var), ..kr_controllers::Config::default() };
+        let cfg = kr_controllers::Config { now: pki::now, evict: kr_controllers::nodelifecycle::Limits::from_lookup(kr_runtime::store::env_var), disabled, ..kr_controllers::Config::default() };
         // The CSR approver/signer issues with the cluster CA (absent: it does not run).
         let csr_ca = pki::load_ca(&pki_dir).ok().map(|(name, key, _)| Rc::new(kr_controllers::csr::CaSigner { name, key, rng }));
         match ha_tasks {
@@ -639,7 +678,9 @@ pub fn main(mut args: Args) -> i32 {
         let local_dial: Option<Rc<dyn kr_apiserver::podproxy::PodDialer>> = kubelet.as_ref().map(|k| Rc::new(kr_kubelet::stream::Proxy(k.clone())) as Rc<dyn kr_apiserver::podproxy::PodDialer>);
         let router = Rc::new(kr_kubelet::remote::Router { local_node: local_node.clone(), local, tls: kubelet_client.clone(), local_dial });
         api_for_proxy.set_pod_dialer(router.clone());
-        kr_rt::exec::spawn(kr_apiserver::metrics::run(api_for_proxy.clone(), router.clone()));
+        if !disabled.metrics_server {
+            kr_rt::exec::spawn(kr_apiserver::metrics::run(api_for_proxy.clone(), router.clone()));
+        }
         api_for_proxy.set_node_proxy(router);
         if let Some(k) = kubelet {
             kr_rt::exec::spawn(k.run());
@@ -653,7 +694,7 @@ pub fn main(mut args: Args) -> i32 {
 
 /// This machine's node name: the lowercased hostname, or "kr-node".
 pub fn node_name() -> String {
-    let name = hostname().to_ascii_lowercase();
+    let name = kr_runtime::store::env_var("KR_NODE_NAME").filter(|n| !n.is_empty()).unwrap_or_else(hostname).to_ascii_lowercase();
     if name.is_empty() || !kr_apiserver::object::is_dns_subdomain(&name) {
         "kr-node".into()
     } else {
@@ -676,13 +717,14 @@ pub fn cgroups_available() -> bool {
 }
 
 /// The node agent embedded in the server (single-node mode).
-fn start_kubelet(api: &Rc<kr_apiserver::api::ApiServer>) -> Result<Rc<kr_kubelet::Kubelet<kr_apiserver::client::InProcess>>, String> {
+fn start_kubelet(api: &Rc<kr_apiserver::api::ApiServer>, disabled: kr_apiserver::components::Disabled) -> Result<Rc<kr_kubelet::Kubelet<kr_apiserver::client::InProcess>>, String> {
     let store = kr_runtime::store::Store::open(None).map_err(|_| String::from("cannot open the image store"))?;
     crate::ctr_import::import_startup(&store, None);
     let name = node_name();
     let cgroups = cgroups_available();
     let node_ip = primary_addr();
-    let cfg = kr_kubelet::Config { node_name: name, root: String::from(store.root()), network: ns::getuid() == 0, cgroups, node_ip, vxlan: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() != Some("host-gw"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env(), control_plane: true };
+    let (labels, taints) = crate::install::node_settings()?;
+    let cfg = kr_kubelet::Config { labels, taints, external_ip: crate::install::external_ip(), disabled, node_name: name, root: String::from(store.root()), network: ns::getuid() == 0, cgroups, node_ip, vxlan: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() != Some("host-gw"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env(), control_plane: true };
     let client = kr_apiserver::client::InProcess::new(api.clone(), "kubelet");
     Ok(kr_kubelet::Kubelet::new(client, cfg, store))
 }

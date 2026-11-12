@@ -66,6 +66,30 @@ kr ctr pull docker.io/library/busybox
 kr ctr run --memory 64Mi --cpus 500m docker.io/library/busybox -- echo hello
 ```
 
+### Configuration file and install options
+
+`kr server` and `kr agent` read `/etc/kr/config.yaml` (or `--config FILE`, `KR_CONFIG`) when it exists, like k3s's `config.yaml`. Keys are the flag names without dashes; `config.yaml.d/*.yaml` next to it are merged over it in lexical order (a key replaces the earlier value, `key+` appends). Flags override the file, the file overrides the `KR_*` environment variables.
+
+```yaml
+# /etc/kr/config.yaml
+tls-san: [kube.example.com, 203.0.113.7]   # extra names/addresses in the API server certificate
+node-name: cp-1
+node-label: ["topology.kubernetes.io/zone=a"]
+node-taint: ["dedicated=control-plane:NoSchedule"]
+node-ip: 10.0.0.4
+node-external-ip: 203.0.113.7
+disable: [servicelb, metrics-server]
+cluster-init: true
+```
+
+| Flag (config key) | Env | Effect |
+|---|---|---|
+| `--tls-san NAME` (repeatable) | `KR_TLS_SAN` | added to the API server certificate; the certificate is issued again at start when the set changed (server only) |
+| `--node-name` | `KR_NODE_NAME` | node name (default: hostname) |
+| `--node-label K=V`, `--node-taint K=V:Effect` (repeatable) | `KR_NODE_LABELS`, `KR_NODE_TAINTS` (comma separated) | set when the node registers; later starts leave edits made with `kubectl` alone unless the configured set changed |
+| `--node-ip`, `--node-external-ip` | `KR_NODE_IP`, `KR_NODE_EXTERNAL_IP` | InternalIP (also the address servers advertise) and ExternalIP |
+| `--disable NAME` (repeatable, or comma separated) | `KR_DISABLE` | `servicelb`, `metrics-server`, `coredns`, `local-storage`, `network-policy`, `helm-controller`; `traefik` is accepted and ignored. Cluster DNS and network policy run on every node, so set `coredns` / `network-policy` on every node |
+
 ### Useful environment variables
 
 | Variable | Effect |

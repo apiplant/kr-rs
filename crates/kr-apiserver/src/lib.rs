@@ -16,6 +16,7 @@ pub mod aggregator;
 pub mod api;
 pub mod client;
 pub mod cluster;
+pub mod components;
 pub mod convert;
 pub mod cel;
 pub mod crd;

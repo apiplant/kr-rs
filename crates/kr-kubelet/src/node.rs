@@ -51,10 +51,11 @@ fn status(cfg: &Config, dp: &crate::deviceplugin::Plugins) -> String {
 {{"type":"MemoryPressure","status":"{mp}","reason":"{mp_reason}","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}},
 {{"type":"DiskPressure","status":"False","reason":"KubeletHasNoDiskPressure","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}},
 {{"type":"PIDPressure","status":"False","reason":"KubeletHasSufficientPID","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}}],
-"addresses":[{{"type":"InternalIP","address":"{ip}"}}{ip6},{{"type":"Hostname","address":"{name}"}}],
+"addresses":[{{"type":"InternalIP","address":"{ip}"}}{ip6}{ext},{{"type":"Hostname","address":"{name}"}}],
 "nodeInfo":{{"kubeletVersion":"v1.37.0-kr","kubeProxyVersion":"v1.37.0-kr","containerRuntimeVersion":"kr://0.0.1","kernelVersion":"{kernel}","osImage":"kr","operatingSystem":"linux","architecture":"{arch}","machineID":"","systemUUID":"","bootID":""}}}}"#,
         name = cfg.node_name,
         ip6 = kr_apiserver::api::host_ip6().filter(|a| *a != cfg.node_ip).map(|a| alloc::format!(r#",{{"type":"InternalIP","address":"{}"}}"#, kr_net::tcp::ipv6_string(a))).unwrap_or_default(),
+        ext = cfg.external_ip.map(|a| alloc::format!(r#",{{"type":"ExternalIP","address":"{}"}}"#, kr_net::tcp::fmt_ip16(a))).unwrap_or_default(),
         kernel = kernel.trim(),
         ip = kr_net::tcp::fmt_ip16(cfg.node_ip)
     )
@@ -68,7 +69,28 @@ pub async fn register<C: Client>(c: &C, cfg: &Config, dp: &crate::deviceplugin::
     let node = alloc::format!(
         r#"{{"apiVersion":"v1","kind":"Node","metadata":{{"name":"{name}","labels":{{"kubernetes.io/hostname":"{name}","kubernetes.io/os":"linux","kubernetes.io/arch":"{arch}"{role}}}}},"spec":{{}}}}"#
     );
-    let _ = c.create("/api/v1/nodes", &json::parse(node.as_bytes()).unwrap()).await;
+    let mut node = json::parse(node.as_bytes()).unwrap();
+    // Configured labels and taints go into the new Node itself, so that no pod is scheduled in
+    // the window before they exist.
+    let (labels, taints, ann) = crate::nodecfg::for_new_node(&cfg.labels, &cfg.taints);
+    for (k, v) in &labels {
+        node.entry_object("metadata").entry_object("labels").set(k, Value::from(v.as_str()));
+    }
+    for (k, v) in &ann {
+        node.entry_object("metadata").entry_object("annotations").set(k, Value::from(v.as_str()));
+    }
+    if !taints.is_empty() {
+        node.entry_object("spec").set("taints", Value::Array(taints.iter().map(crate::nodecfg::Taint::to_value).collect()));
+    }
+    if c.create("/api/v1/nodes", &node).await.is_err() {
+        // Registered before: apply the configuration only if it changed since.
+        let path = alloc::format!("/api/v1/nodes/{name}");
+        if let Ok(existing) = c.get(&path).await {
+            if let Some(patch) = crate::nodecfg::reconcile(&existing, &cfg.labels, &cfg.taints) {
+                let _ = c.patch(&path, "application/merge-patch+json", &patch).await;
+            }
+        }
+    }
     update_status(c, cfg, dp).await;
     renew_lease(c, cfg).await;
 }

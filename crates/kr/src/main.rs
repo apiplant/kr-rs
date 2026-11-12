@@ -7,6 +7,7 @@ mod agent;
 mod ctr;
 mod ctr_import;
 mod ctr_rmi;
+mod install;
 mod keysync;
 mod manifests;
 mod offload;
@@ -101,14 +102,20 @@ fn kr_main(mut args: Args) -> i32 {
                 return bad_config(&m);
             }
             sys::raise_nofile_limit();
-            server::main(args)
+            match install::Argv::load(args) {
+                Ok(a) => server::main(a),
+                Err(m) => bad_config(&m),
+            }
         }
         Some(b"agent") => {
             if let Err(m) = init_cidrs() {
                 return bad_config(&m);
             }
             sys::raise_nofile_limit();
-            agent::main(args)
+            match install::Argv::load(args) {
+                Ok(a) => agent::main(a),
+                Err(m) => bad_config(&m),
+            }
         }
         Some(b"token") => token::main(args),
         Some(b"sleep-test") => {
@@ -116,7 +123,7 @@ fn kr_main(mut args: Args) -> i32 {
             0
         }
         _ => {
-            eprint(b"usage: kr <version | echo [port] | ctr ... | pki ... | certificate rotate | snapshot save|restore ... | secrets-encrypt status|rotate-key|reencrypt|disable ... | server ... | agent ... | token create ... | sleep-test>\n");
+            eprint(b"usage: kr <version | echo [port] | ctr ... | pki ... | certificate rotate | snapshot save|restore ... | secrets-encrypt status|rotate-key|reencrypt|disable ... | server [--config FILE] ... | agent [--config FILE] ... | token create ... | sleep-test>\n");
             2
         }
     }

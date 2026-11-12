@@ -26,6 +26,7 @@ mod csi;
 pub mod deviceplugin;
 pub mod podresources;
 pub mod dns;
+pub mod nodecfg;
 pub mod egress;
 pub mod netpol;
 mod probe;
@@ -76,6 +77,14 @@ pub struct Config {
     pub eviction_memory_bytes: u64,
     /// The node also runs the control plane (`kr server`): it gets the control-plane role label.
     pub control_plane: bool,
+    /// `--node-label`: applied at registration (see [`nodecfg`]).
+    pub labels: Vec<(String, String)>,
+    /// `--node-taint`.
+    pub taints: Vec<nodecfg::Taint>,
+    /// `--node-external-ip`: reported as an ExternalIP address.
+    pub external_ip: Option<[u8; 16]>,
+    /// Components turned off with `--disable` (only `coredns` matters here; ADR-060).
+    pub disabled: kr_apiserver::components::Disabled,
 }
 
 fn now() -> i64 {
@@ -437,7 +446,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             Some(net) => {
                 let net = Rc::new(net);
                 kr_rt::exec::spawn(proxy::Proxy::new(self.c.clone(), net.clone(), self.cfg.node_name.clone()).run());
-                kr_rt::exec::spawn(dns::run(self.c.clone(), net, self.fam.get()));
+                if !self.cfg.disabled.coredns {
+                    kr_rt::exec::spawn(dns::run(self.c.clone(), net, self.fam.get()));
+                }
             }
             None => kr_rt::eprint(b"kubelet: no node network; Services are not proxied\n"),
         }

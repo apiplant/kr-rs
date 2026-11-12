@@ -191,6 +191,9 @@ pub struct ContainerDirs {
 /// Reads one variable from the process environment through `/proc/self/environ` (kr-rt has no
 /// environment accessor and the store only needs a handful of startup variables).
 pub fn env_var(name: &str) -> Option<String> {
+    if let Some(v) = override_of(name) {
+        return Some(v);
+    }
     let data = fs::read_file(b"/proc/self/environ\0", 4 << 20).ok()?;
     for kv in data.split(|&b| b == 0) {
         if let Some(i) = kv.iter().position(|&b| b == b'=') {
@@ -200,6 +203,27 @@ pub fn env_var(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+static OVERRIDES: core::sync::atomic::AtomicPtr<alloc::vec::Vec<(String, String)>> = core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+fn override_of(name: &str) -> Option<String> {
+    let p = OVERRIDES.load(core::sync::atomic::Ordering::Acquire);
+    // SAFETY: the table is only ever replaced by a leaked, never freed allocation (`set_override`).
+    let table = unsafe { p.as_ref() }?;
+    table.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+}
+
+/// Makes [`env_var`] return `value` for `name` from now on: how command-line flags and the
+/// configuration file (ADR-060) take precedence over the environment. Call it during start-up,
+/// before other tasks run (the process is single-threaded; the table is leaked on replacement).
+pub fn set_override(name: &str, value: &str) {
+    let p = OVERRIDES.load(core::sync::atomic::Ordering::Acquire);
+    // SAFETY: as in `override_of`.
+    let mut table = unsafe { p.as_ref() }.cloned().unwrap_or_default();
+    table.retain(|(k, _)| k != name);
+    table.push((name.to_string(), value.to_string()));
+    OVERRIDES.store(alloc::boxed::Box::leak(alloc::boxed::Box::new(table)), core::sync::atomic::Ordering::Release);
 }
 
 /// ADR-017 store root rules: `$KR_ROOT`; else `/var/lib/kr` for root; else

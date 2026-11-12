@@ -17,7 +17,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use kr_apiserver::client::{Client, Remote, RemoteAuth};
 use kr_crypto::x509::{self, SigningKey};
-use kr_rt::{eprint, print, Args};
+use kr_rt::{eprint, print};
 use kr_sys::{fs, ns};
 
 fn fail(msg: &str) -> i32 {
@@ -224,14 +224,25 @@ pub(crate) fn read_token_file(path: &str) -> Result<String, String> {
     String::from_utf8(b).map(|t| String::from(t.trim())).map_err(|_| format!("token file {path} is not UTF-8"))
 }
 
-pub fn main(mut args: Args) -> i32 {
+pub fn main(mut args: crate::install::Argv) -> i32 {
     crate::offload::start(false); // image unpacking in workers (ADR-052)
     if kr_runtime::store::env_var("KR_TLS_RESUMPTION").as_deref() == Some("off") {
         kr_net::tls::set_resumption(false);
     }
     let (mut server, mut token, mut token_file, mut data) = (None, None, None, None);
+    let mut inst = crate::install::Install::default();
     while let Some(a) = args.next() {
-        let v = args.next().and_then(|v| core::str::from_utf8(v).ok()).map(String::from);
+        // `--flag=value` and `--flag value` are both accepted.
+        let (a, inline) = match a.iter().position(|&c| c == b'=') {
+            Some(i) if a.starts_with(b"--") => (&a[..i], Some(&a[i + 1..])),
+            _ => (a, None),
+        };
+        let v = inline.or_else(|| args.next()).and_then(|v| core::str::from_utf8(v).ok()).map(String::from);
+        if let Some(val) = &v {
+            if inst.take(a, val) {
+                continue;
+            }
+        }
         match (a, v) {
             (b"--server", Some(v)) => server = Some(v),
             (b"--token", Some(v)) => {
@@ -240,9 +251,13 @@ pub fn main(mut args: Args) -> i32 {
             }
             (b"--token-file", Some(v)) => token_file = Some(v),
             (b"--data", Some(v)) => data = Some(v),
-            _ => return fail("usage: kr agent --server https://HOST:6443 [--token-file FILE | --token TOKEN] [--data DIR]   (or KR_TOKEN in the environment)"),
+            _ => return fail("usage: kr agent --server https://HOST:6443 [--token-file FILE | --token TOKEN] [--data DIR] [--config FILE] [--node-name NAME] [--node-label K=V]... [--node-taint K=V:EFFECT]... [--node-ip IP] [--node-external-ip IP] [--disable network-policy|coredns]...   (or KR_TOKEN in the environment)"),
         }
     }
+    if let Err(e) = crate::install::publish(&inst) {
+        return fail(&e);
+    }
+    let disabled = crate::install::disabled().unwrap_or_default();
     let Some(server) = server.map(|s| String::from(s.trim_end_matches('/'))) else { return fail("--server is required") };
     let data = data.unwrap_or_else(data_dir);
     let pki_dir = format!("{data}/pki");
@@ -253,12 +268,12 @@ pub fn main(mut args: Args) -> i32 {
         Some(v6) => v6.split(']').next().unwrap_or(""),
         None => rest.split(':').next().unwrap_or(""),
     };
-    let ip = kr_net::tcp::parse_ip16(host)
+    let ip = crate::install::node_ip().unwrap_or_else(|| kr_net::tcp::parse_ip16(host)
         .and_then(|d| match kr_sys::unmap4(d) {
             Some(v4) => ns::route_source(v4).ok().map(kr_sys::map4),
             None => ns::route_source6(d),
         })
-        .unwrap_or_else(crate::server::primary_addr);
+        .unwrap_or_else(crate::server::primary_addr));
     let joined = ns::open(&pki::path(&pki_dir, "node.pem"), ns::O_RDONLY, 0).is_ok();
     if !joined {
         let token = match (token, token_file) {
@@ -300,7 +315,11 @@ pub fn main(mut args: Args) -> i32 {
         Err(_) => return fail("cannot open the image store"),
     };
     crate::ctr_import::import_startup(&store, Some(&format!("{data}/images")));
-    let cfg = kr_kubelet::Config { node_name: name.clone(), root: String::from(store.root()), network: ns::getuid() == 0, cgroups: cgroups_available(), node_ip: ip, vxlan: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() != Some("host-gw"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env(), control_plane: false };
+    let (labels, taints) = match crate::install::node_settings() {
+        Ok(v) => v,
+        Err(e) => return fail(&e),
+    };
+    let cfg = kr_kubelet::Config { labels, taints, external_ip: crate::install::external_ip(), disabled, node_name: name.clone(), root: String::from(store.root()), network: ns::getuid() == 0, cgroups: cgroups_available(), node_ip: ip, vxlan: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() != Some("host-gw"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env(), control_plane: false };
     let rotation = (remote.clone(), pki_dir.clone(), name.clone(), ip, tls.clone());
     let tracker = remote.clone();
     let (ca_remote, ca_dir, ca_tls) = (remote.clone(), pki_dir.clone(), tls.clone());
