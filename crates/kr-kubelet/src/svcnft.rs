@@ -4,7 +4,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use kr_fmt::json::Value;
-use kr_net::nft::proxy::{Backend, Frontend, Model, Policy, Svc};
+use kr_net::nft::proxy::{Backend, Frontend, Limit, Model, Policy, Svc};
 
 type Ip = [u8; 16];
 
@@ -67,6 +67,26 @@ fn endpoints(svc: &Value, ep: Option<&Value>, slices: &[&Value], pname: &str, no
     out
 }
 
+/// `spec.loadBalancerSourceRanges` as (address, prefix over 128 bits); `None` when the Service
+/// has none (everyone may connect).
+fn source_ranges(s: &Value) -> Option<Vec<(Ip, u8)>> {
+    if s.pointer(&["spec", "type"]).and_then(Value::as_str) != Some("LoadBalancer") {
+        return None;
+    }
+    let list = s.pointer(&["spec", "loadBalancerSourceRanges"]).and_then(Value::as_array).filter(|a| !a.is_empty())?;
+    Some(
+        list.iter()
+            .filter_map(Value::as_str)
+            .filter_map(|c| {
+                let (a, p) = c.trim().split_once('/')?;
+                let ip = ip16(a)?;
+                let pre: u8 = p.parse().ok()?;
+                Some((ip, if is6(&ip) { pre.min(128) } else { 96 + pre.min(32) }))
+            })
+            .collect(),
+    )
+}
+
 pub fn build(svcs: &[Value], eps: &[Value], slices: &[Value], pods: &[Value], node: &str) -> Model {
     let by_name = |o: &Value| (alloc::string::String::from(meta(o, "namespace")), alloc::string::String::from(meta(o, "name")));
     let ep_of: BTreeMap<_, _> = eps.iter().map(|e| (by_name(e), e)).collect();
@@ -92,9 +112,13 @@ pub fn build(svcs: &[Value], eps: &[Value], slices: &[Value], pods: &[Value], no
         let local_only = s.pointer(&["spec", "externalTrafficPolicy"]).and_then(Value::as_str) == Some("Local");
         let ext_policy = if local_only { Policy::ExternalLocal } else { Policy::External };
         let mut externals: Vec<Ip> = str_list(s.pointer(&["spec", "externalIPs"])).filter_map(ip16).collect();
+        let mut ingress: Vec<Ip> = Vec::new();
         for ing in s.pointer(&["status", "loadBalancer", "ingress"]).and_then(Value::as_array).unwrap_or(&[]) {
-            externals.extend(ing.get("ip").and_then(Value::as_str).and_then(ip16));
+            let ip = ing.get("ip").and_then(Value::as_str).and_then(ip16);
+            externals.extend(ip);
+            ingress.extend(ip);
         }
+        let ranges = source_ranges(s);
         for p in s.pointer(&["spec", "ports"]).and_then(Value::as_array).unwrap_or(&[]) {
             let Some(proto) = proto_of(p.get("protocol").and_then(Value::as_str)) else { continue };
             let Some(port) = p.get("port").and_then(Value::as_u64).map(|p| p as u16) else { continue };
@@ -118,8 +142,14 @@ pub fn build(svcs: &[Value], eps: &[Value], slices: &[Value], pods: &[Value], no
                         frontends.push(Frontend::Local { v6, ip: None, proto, port: np, policy: ext_policy });
                     }
                 }
+                // loadBalancerSourceRanges restrict the load-balancer addresses (not the cluster IP,
+                // the external IPs or the node ports), as kube-proxy and klipper-lb do.
+                let limits: Vec<Limit> = match &ranges {
+                    Some(r) => ingress.iter().filter(|ip| is6(ip) == v6).map(|ip| Limit { ip: *ip, proto, port, ranges: r.iter().filter(|(a, _)| is6(a) == v6).copied().collect() }).collect(),
+                    None => Vec::new(),
+                };
                 if !frontends.is_empty() && !backends.is_empty() {
-                    out.push(Svc { v6, frontends, backends, affinity });
+                    out.push(Svc { v6, frontends, backends, affinity, limits });
                 }
             }
         }
@@ -157,6 +187,7 @@ fn host_ports(pods: &[Value], node: &str, out: &mut Vec<Svc>) {
                         frontends: alloc::vec![Frontend::Local { v6: is6(pip), ip: host_ip, proto, port: hp as u16, policy: Policy::Plain }],
                         backends: alloc::vec![Backend { ip: *pip, port: cp as u16, local: true }],
                         affinity: false,
+                        ..Default::default()
                     });
                 }
             }

@@ -559,3 +559,6 @@
 
 281. **Audit and PodSecurity configuration are read at start-up only** — *closed as upstream parity* (#186)
     Upstream's kube-apiserver reads `--audit-policy-file` and the admission configuration at start-up too (and so does k3s); kr behaves the same, so a change needs a server restart.
+
+282. **Load-balancer addresses were not served in userspace mode and `loadBalancerSourceRanges` was ignored** — *fixed* (part of #174)
+    The userspace proxy now listens on a Service's `externalIPs` and its `status.loadBalancer.ingress` addresses at the Service port (before, only the node port was served, so the published ServiceLB address did not answer), and both datapaths enforce `spec.loadBalancerSourceRanges` on the load-balancer addresses: userspace drops connections and datagrams from outside the ranges at accept; nftables jumps to a per-address chain that returns for local sources and listed ranges and drops the rest (`Svc.limits`). Checked against a real kernel (`tools/test/nft-proxy.sh`, scenarios `lb-ranges`, `lb-ranges-prefix`) and by a unit test of the range match.

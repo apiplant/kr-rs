@@ -247,6 +247,42 @@ struct Backends {
     eps: Vec<(Ip, u16)>,
     rr: Cell<usize>,
     affinity: bool,
+    /// `loadBalancerSourceRanges` of a load-balancer address: (ranges as address + prefix over
+    /// 128 bits, the listening address). Clients outside the ranges are dropped, except loopback
+    /// and the node's own address. `None`: anyone.
+    allow: Option<(Vec<(Ip, u8)>, Ip)>,
+}
+
+impl Backends {
+    fn permits(&self, client: Ip) -> bool {
+        let Some((ranges, own)) = &self.allow else { return true };
+        client == *own || client == kr_sys::map4([127, 0, 0, 1]) || client == kr_net::tcp::parse_ipv6("::1").unwrap_or([0; 16]) || ranges.iter().any(|(net, pre)| prefix_match(client, *net, *pre))
+    }
+}
+
+fn prefix_match(ip: Ip, net: Ip, pre: u8) -> bool {
+    let bits = pre.min(128) as usize;
+    let (full, rest) = (bits / 8, bits % 8);
+    ip[..full] == net[..full] && (rest == 0 || (ip[full] ^ net[full]) >> (8 - rest) == 0)
+}
+
+/// `spec.loadBalancerSourceRanges` as (address, prefix over 128 bits).
+fn source_ranges(s: &Value) -> Option<Vec<(Ip, u8)>> {
+    if s.pointer(&["spec", "type"]).and_then(Value::as_str) != Some("LoadBalancer") {
+        return None;
+    }
+    let list = s.pointer(&["spec", "loadBalancerSourceRanges"]).and_then(Value::as_array).filter(|a| !a.is_empty())?;
+    Some(
+        list.iter()
+            .filter_map(Value::as_str)
+            .filter_map(|c| {
+                let (a, p) = c.trim().split_once('/')?;
+                let ip = ip16(a)?;
+                let pre: u8 = p.parse().ok()?;
+                Some((ip, if kr_sys::unmap4(ip).is_some() { 96 + pre.min(32) } else { pre.min(128) }))
+            })
+            .collect(),
+    )
 }
 
 impl Backends {
@@ -418,7 +454,7 @@ impl<C: Client + Clone + 'static> Proxy<C> {
                         }
                     }
                 }
-                let mk = |eps: &Vec<(Ip, u16)>| Backends { eps: eps.clone(), rr: Cell::new(0), affinity };
+                let mk = |eps: &Vec<(Ip, u16)>| Backends { eps: eps.clone(), rr: Cell::new(0), affinity, allow: None };
                 // No ready endpoint, no listener: the connection is refused all the same, and the
                 // port stays free for a host-network pod that listens on it (Calico's typha binds
                 // 0.0.0.0:5473 for the Service with that ClusterIP and port; a specific-address
@@ -433,6 +469,22 @@ impl<C: Client + Clone + 'static> Proxy<C> {
                 if let (true, Some(np)) = (want6, p.get("nodePort").and_then(Value::as_u64)) {
                     desired.insert(Key { proto, ip: [0; 16], port: np as u16, host: true }, mk(&list));
                 }
+                // External IPs and load-balancer addresses (the nodes' own, from ServiceLB): this
+                // node listens on them when it holds the address (the bind fails otherwise and is
+                // retried). The source ranges apply to the load-balancer addresses only.
+                let ext = s.pointer(&["spec", "externalIPs"]).and_then(Value::as_array).unwrap_or(&empty).iter().filter_map(Value::as_str).filter_map(ip16);
+                let ing = s.pointer(&["status", "loadBalancer", "ingress"]).and_then(Value::as_array).unwrap_or(&empty).iter().filter_map(|i| i.get("ip").and_then(Value::as_str)).filter_map(ip16);
+                let ranges = source_ranges(s);
+                for (ip, limited) in ext.map(|ip| (ip, false)).chain(ing.map(|ip| (ip, true))) {
+                    if (kr_sys::unmap4(ip).is_none()) != want6 {
+                        continue;
+                    }
+                    let mut b = mk(&list);
+                    if let (true, Some(r)) = (limited, &ranges) {
+                        b.allow = Some((r.clone(), ip));
+                    }
+                    desired.insert(Key { proto, ip, port: port as u16, host: true }, b);
+                }
             }
             }
         }
@@ -446,6 +498,7 @@ impl<C: Client + Clone + 'static> Proxy<C> {
                 let mut lb = l.backends.borrow_mut();
                 lb.eps = b.eps;
                 lb.affinity = b.affinity;
+                lb.allow = b.allow;
                 continue;
             }
             let fd = if k.host { local_op(OP_LISTEN, k.proto, k.ip, k.port).and_then(|f| f.ok_or(Errno(5))) } else { self.net.listen(k.proto, k.ip, k.port) };
@@ -493,11 +546,11 @@ fn host_port_listeners(pods: &[Value], desired: &mut BTreeMap<Key, Backends>) {
                 // An IPv6 hostIP is served by the pod's IPv6 address, anything else by IPv4.
                 if let (None, Some(pip)) = (v6_host, pip) {
                     let ip = kr_sys::map4(host_ip.and_then(ip4).unwrap_or([0; 4]));
-                    desired.insert(Key { proto, ip, port: hp as u16, host: true }, Backends { eps: alloc::vec![(kr_sys::map4(pip), cp as u16)], rr: Cell::new(0), affinity: false });
+                    desired.insert(Key { proto, ip, port: hp as u16, host: true }, Backends { eps: alloc::vec![(kr_sys::map4(pip), cp as u16)], rr: Cell::new(0), affinity: false, allow: None });
                 }
                 if let Some(p6) = pip6 {
                     if host_ip.is_none() || v6_host.is_some() {
-                        desired.insert(Key { proto, ip: v6_host.unwrap_or([0; 16]), port: hp as u16, host: true }, Backends { eps: alloc::vec![(p6, cp as u16)], rr: Cell::new(0), affinity: false });
+                        desired.insert(Key { proto, ip: v6_host.unwrap_or([0; 16]), port: hp as u16, host: true }, Backends { eps: alloc::vec![(p6, cp as u16)], rr: Cell::new(0), affinity: false, allow: None });
                     }
                 }
             }
@@ -519,8 +572,11 @@ async fn tcp_loop(listener: Async<Fd>, backends: Rc<RefCell<Backends>>, net: Rc<
         };
         let (b, n) = (backends.clone(), net.clone());
         kr_rt::exec::spawn(async move {
-            // The peer address only matters for ClientIP affinity.
+            // The peer address matters for ClientIP affinity and for source ranges.
             let peer = client_ip(&client).unwrap_or([0; 16]);
+            if !b.borrow().permits(peer) {
+                return; // dropping the socket closes it
+            }
             let count = b.borrow().eps.len().max(1);
             for attempt in 0..count.min(3) {
                 let Some((ip, port)) = b.borrow().pick(peer, attempt) else { return };
@@ -597,6 +653,9 @@ async fn udp_loop(listener: Async<Fd>, backends: Rc<RefCell<Backends>>, net: Rc<
             let now = kr_rt::exec::now_ms();
             // Expire idle sessions (60 s).
             sessions.borrow_mut().retain(|_, s| now.saturating_sub(s.last.get()) < 60_000);
+            if !backends.borrow().permits(cip) {
+                continue;
+            }
             let key = (cip, cport);
             if !sessions.borrow().contains_key(&key) {
                 let Some((ip, port)) = backends.borrow().pick(cip, 0) else { continue };
@@ -634,6 +693,24 @@ impl Drop for UdpSession {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_ranges_match_by_prefix_and_never_lock_out_the_node() {
+        let svc: Value = kr_fmt::json::parse_str(r#"{"spec":{"type":"LoadBalancer","loadBalancerSourceRanges":["203.0.113.0/24","198.51.100.7/32","2001:db8::/32"]}}"#).unwrap();
+        let ranges = source_ranges(&svc).unwrap();
+        let own = kr_sys::map4([192, 0, 2, 1]);
+        let b = Backends { allow: Some((ranges, own)), ..Default::default() };
+        assert!(b.permits(kr_sys::map4([203, 0, 113, 200])));
+        assert!(b.permits(kr_sys::map4([198, 51, 100, 7])));
+        assert!(!b.permits(kr_sys::map4([198, 51, 100, 8])));
+        assert!(!b.permits(kr_sys::map4([203, 0, 114, 1])));
+        assert!(b.permits(kr_net::tcp::parse_ipv6("2001:db8:1::5").unwrap()));
+        assert!(!b.permits(kr_net::tcp::parse_ipv6("2001:db9::1").unwrap()));
+        assert!(b.permits(own) && b.permits(kr_sys::map4([127, 0, 0, 1])), "the node itself is not restricted");
+        assert!(Backends::default().permits(kr_sys::map4([8, 8, 8, 8])), "no ranges: everyone");
+        let plain: Value = kr_fmt::json::parse_str(r#"{"spec":{"type":"ClusterIP","loadBalancerSourceRanges":["10.0.0.0/8"]}}"#).unwrap();
+        assert!(source_ranges(&plain).is_none(), "ranges only restrict LoadBalancer Services");
+    }
+
     use super::*;
     #[test]
     fn host_ports_desired() {

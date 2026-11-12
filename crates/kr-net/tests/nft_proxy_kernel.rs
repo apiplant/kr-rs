@@ -33,15 +33,15 @@ fn apply() {
                 Frontend::Local { v6: false, ip: None, proto: 6, port: 30080, policy: Policy::External },
             ],
             backends: vec![be(B1, 9090, false)],
-            affinity: false,
+            affinity: false, ..Default::default()
         }]),
         // Two endpoints: traffic spreads over both; with affinity one client sticks to one.
-        "spread" => model(vec![Svc { v6: false, frontends: vec![Frontend::Addr { ip: ip4(CIP), proto: 6, port: 8080, policy: Policy::Plain }], backends: vec![be(B1, 9090, false), be(B2, 9090, false)], affinity: false }]),
-        "affinity" => model(vec![Svc { v6: false, frontends: vec![Frontend::Addr { ip: ip4(CIP), proto: 6, port: 8080, policy: Policy::Plain }], backends: vec![be(B1, 9090, false), be(B2, 9090, false)], affinity: true }]),
+        "spread" => model(vec![Svc { v6: false, frontends: vec![Frontend::Addr { ip: ip4(CIP), proto: 6, port: 8080, policy: Policy::Plain }], backends: vec![be(B1, 9090, false), be(B2, 9090, false)], affinity: false, ..Default::default() }]),
+        "affinity" => model(vec![Svc { v6: false, frontends: vec![Frontend::Addr { ip: ip4(CIP), proto: 6, port: 8080, policy: Policy::Plain }], backends: vec![be(B1, 9090, false), be(B2, 9090, false)], affinity: true, ..Default::default() }]),
         // externalTrafficPolicy: Local with no endpoint on this node: dropped.
-        "local-none" => model(vec![Svc { v6: false, frontends: vec![Frontend::Local { v6: false, ip: None, proto: 6, port: 30080, policy: Policy::ExternalLocal }], backends: vec![be(B1, 9090, false)], affinity: false }]),
+        "local-none" => model(vec![Svc { v6: false, frontends: vec![Frontend::Local { v6: false, ip: None, proto: 6, port: 30080, policy: Policy::ExternalLocal }], backends: vec![be(B1, 9090, false)], affinity: false, ..Default::default() }]),
         // The endpoint is local: served, no masquerade.
-        "local-one" => model(vec![Svc { v6: false, frontends: vec![Frontend::Local { v6: false, ip: None, proto: 6, port: 30080, policy: Policy::ExternalLocal }], backends: vec![be(B1, 9090, true)], affinity: false }]),
+        "local-one" => model(vec![Svc { v6: false, frontends: vec![Frontend::Local { v6: false, ip: None, proto: 6, port: 30080, policy: Policy::ExternalLocal }], backends: vec![be(B1, 9090, true)], affinity: false, ..Default::default() }]),
         // IPv6: a ClusterIP and a NodePort towards an IPv6 endpoint.
         "v6" => {
             let c6 = [0xfd, 0, 0, 0x96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x50];
@@ -50,9 +50,25 @@ fn apply() {
                 v6: true,
                 frontends: vec![Frontend::Addr { ip: c6, proto: 6, port: 8080, policy: Policy::Plain }, Frontend::Local { v6: true, ip: None, proto: 6, port: 30080, policy: Policy::External }],
                 backends: vec![Backend { ip: b6, port: 9090, local: false }],
-                affinity: false,
+                affinity: false, ..Default::default()
             }])
         }
+        // A load-balancer address that only pod A (10.88.0.2/32) may use; the host is never restricted.
+        "lb-ranges" => model(vec![Svc {
+            v6: false,
+            frontends: vec![Frontend::Addr { ip: ip4([198, 51, 100, 9]), proto: 6, port: 80, policy: Policy::External }],
+            backends: vec![be(B1, 9090, false)],
+            limits: vec![Limit { ip: ip4([198, 51, 100, 9]), proto: 6, port: 80, ranges: vec![(ip4([10, 88, 0, 2]), 96 + 32)] }],
+            ..Default::default()
+        }]),
+        // The same with a /24 that holds A and not D, and a second range elsewhere.
+        "lb-ranges-prefix" => model(vec![Svc {
+            v6: false,
+            frontends: vec![Frontend::Addr { ip: ip4([198, 51, 100, 9]), proto: 6, port: 80, policy: Policy::External }],
+            backends: vec![be(B1, 9090, false)],
+            limits: vec![Limit { ip: ip4([198, 51, 100, 9]), proto: 6, port: 80, ranges: vec![(ip4([192, 0, 2, 0]), 96 + 24), (ip4([10, 88, 0, 0]), 96 + 24)] }],
+            ..Default::default()
+        }]),
         "empty" => model(vec![]),
         // NetworkPolicy tables (ADR-049) in the same kernel; the Service of "basic" next to them.
         s if s.starts_with("pol-") => {
@@ -75,7 +91,7 @@ fn apply() {
             };
             kr_net::nft::ensure_netpol(PolFam::Inet, &chains).unwrap_or_else(|e| panic!("netpol batch refused: errno {}", e.0));
             // The Service goes with it: policy decides after the DNAT, on the real client.
-            model(vec![Svc { v6: false, frontends: vec![Frontend::Addr { ip: ip4(CIP), proto: 6, port: 8080, policy: Policy::Plain }], backends: vec![be(B1, 9090, false)], affinity: false }])
+            model(vec![Svc { v6: false, frontends: vec![Frontend::Addr { ip: ip4(CIP), proto: 6, port: 8080, policy: Policy::Plain }], backends: vec![be(B1, 9090, false)], affinity: false, ..Default::default() }])
         }
         s => panic!("unknown scenario {s:?}"),
     };
@@ -93,6 +109,7 @@ fn big(n: u32, backends: u8) -> Model {
             frontends: vec![Frontend::Addr { ip: ip4([10, 96, (i >> 8) as u8, i as u8]), proto: 6, port: 443, policy: Policy::Plain }, Frontend::Local { v6: false, ip: None, proto: 6, port: 30000 + (i % 2000) as u16, policy: Policy::External }],
             backends: (0..backends).map(|j| be([10, 88, j + 1, 2], 8443, false)).collect(),
             affinity: i % 2 == 0,
+            ..Default::default()
         })
         .collect();
     model(svcs)
@@ -111,7 +128,7 @@ fn apply_sequence() {
         d.apply(&m).unwrap(); // unchanged: nothing sent
     }
     // The end state serves 10.96.0.1:443 from 10.88.{1,2,3}.2.
-    d.apply(&model(vec![Svc { v6: false, frontends: vec![Frontend::Addr { ip: ip4(CIP), proto: 6, port: 8080, policy: Policy::Plain }], backends: vec![be(B1, 9090, false)], affinity: false }])).unwrap();
+    d.apply(&model(vec![Svc { v6: false, frontends: vec![Frontend::Addr { ip: ip4(CIP), proto: 6, port: 8080, policy: Policy::Plain }], backends: vec![be(B1, 9090, false)], affinity: false, ..Default::default() }])).unwrap();
 }
 
 

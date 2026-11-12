@@ -119,6 +119,15 @@ scenario v6
 check "IPv6 ClusterIP keeps the client address" "$(client fd00:96::50 8080 1)" "B fd00:88::2"
 ip -6 addr add 2001:db8::1/128 dev lo nodad
 check "IPv6 NodePort works and is masqueraded" "$(python3 /tmp/cli.py 2001:db8::1 30080 1 | cut -d" " -f1)" "B"
+ip route add local 198.51.100.0/24 dev lo
+scenario lb-ranges
+check "source ranges: a listed client reaches the load-balancer address" "$(client 198.51.100.9 80 1 | cut -d" " -f1)" "B"
+check "source ranges: an unlisted client is dropped" "$(clientD 198.51.100.9 80 1)" "error TimeoutError"
+check "source ranges: the host itself is not restricted" "$(python3 /tmp/cli.py 198.51.100.9 80 1 | cut -d" " -f1)" "B"
+check "source ranges: the cluster-wide path of the same pod is unaffected" "$(clientD 10.88.1.2 9090 1 | cut -d" " -f1)" "B"
+scenario lb-ranges-prefix
+check "source ranges with prefixes: a client inside a /24 is served" "$(client 198.51.100.9 80 1 | cut -d" " -f1)" "B"
+check "source ranges with prefixes: a client outside is dropped" "$(clientD 198.51.100.9 80 1)" "error TimeoutError"
 scenario empty
 check "removing the service stops the DNAT" "$(client 10.96.0.50 8080 1)" "error ConnectionRefusedError"
 if KR_NFT_SCENARIO= "$EXE" --ignored --exact apply_sequence --nocapture >/tmp/seq.out 2>&1; then echo "ok   generations: 40, 500, 3, 0, 3000 (a batch larger than the socket buffer) and 10 Services in a row"; grep services /tmp/seq.out | tr "\n" " "; echo; else echo "FAIL generations: $(tail -3 /tmp/seq.out)"; fail=1; fi

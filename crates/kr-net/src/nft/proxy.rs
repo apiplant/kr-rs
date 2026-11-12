@@ -48,6 +48,7 @@ const NFTA_FIB_DREG: u16 = 1; // NFTA_FIB_DREG
 const NFTA_FIB_RESULT: u16 = 2; // NFTA_FIB_RESULT
 const NFTA_FIB_FLAGS: u16 = 3; // NFTA_FIB_FLAGS
 const NFT_FIB_RESULT_ADDRTYPE: u32 = 3; // NFT_FIB_RESULT_ADDRTYPE
+const NFTA_FIB_F_SADDR: u32 = 1; // NFTA_FIB_F_SADDR
 const NFTA_FIB_F_DADDR: u32 = 2; // NFTA_FIB_F_DADDR
 const RTN_LOCAL: u32 = 2; // RTN_LOCAL
 const NFT_PAYLOAD_TRANSPORT: u32 = 2; // NFT_PAYLOAD_TRANSPORT_HEADER
@@ -83,8 +84,19 @@ pub struct Backend {
     pub local: bool,
 }
 
-/// One Service port in one address family.
+/// `loadBalancerSourceRanges` of one load-balancer address: connections to `ip:proto:port` from
+/// outside these networks (16-byte addresses, prefix over 128 bits) are dropped, except those from
+/// this host. An empty list drops every outside client.
 #[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Limit {
+    pub ip: [u8; 16],
+    pub proto: u8,
+    pub port: u16,
+    pub ranges: alloc::vec::Vec<([u8; 16], u8)>,
+}
+
+/// One Service port in one address family.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Svc {
     pub v6: bool,
     pub frontends: alloc::vec::Vec<Frontend>,
@@ -92,6 +104,8 @@ pub struct Svc {
     /// `sessionAffinity: ClientIP`: the same client address picks the same endpoint while the
     /// endpoint set is unchanged.
     pub affinity: bool,
+    /// Source restrictions of load-balancer addresses among `frontends`.
+    pub limits: alloc::vec::Vec<Limit>,
 }
 
 /// Everything the table is built from.
@@ -364,7 +378,48 @@ fn emit_service(b: &mut NlBuf, g: u32, i: usize, s: &Svc, m: &Model) {
         add_rule(b, &xname, |b| jump(b, &name));
     }
     let services = alloc::format!("g{g}services");
+    for (k, l) in s.limits.iter().enumerate() {
+        let lim = alloc::format!("g{g}r{i}_{k}");
+        chain(b, &lim, None);
+        // Clients on this host are never restricted (the traffic of the node itself to its own
+        // address is not what the ranges are for).
+        add_rule(b, &lim, |b| {
+            expr_begin(b, b"fib");
+            b.attr_u32_be(NFTA_FIB_DREG, NFT_REG_1);
+            b.attr_u32_be(NFTA_FIB_RESULT, NFT_FIB_RESULT_ADDRTYPE);
+            b.attr_u32_be(NFTA_FIB_FLAGS, NFTA_FIB_F_SADDR);
+            expr_end(b);
+            cmp(b, NFT_CMP_EQ, &RTN_LOCAL.to_ne_bytes());
+            verdict(b, NFT_RETURN, None);
+        });
+        for (ad, pre) in &l.ranges {
+            let a = addr_bytes(ad, v6);
+            let plen = if v6 { *pre } else { pre.saturating_sub(96) };
+            add_rule(b, &lim, |b| {
+                payload(b, NFT_PAYLOAD_NETWORK_HEADER, if v6 { 8 } else { 12 }, a.len() as u32);
+                if (plen as usize) < a.len() * 8 {
+                    let mask = mask_of(plen, a.len());
+                    bitwise_and(b, &mask);
+                    let masked: alloc::vec::Vec<u8> = a.iter().zip(&mask).map(|(x, m)| x & m).collect();
+                    cmp(b, NFT_CMP_EQ, &masked);
+                } else {
+                    cmp(b, NFT_CMP_EQ, &a);
+                }
+                verdict(b, NFT_RETURN, None);
+            });
+        }
+        add_rule(b, &lim, |b| verdict(b, NF_DROP, None));
+    }
     for f in &s.frontends {
+        if let Frontend::Addr { ip, proto, port, .. } = f {
+            if let Some(k) = s.limits.iter().position(|l| l.ip == *ip && l.proto == *proto && l.port == *port) {
+                let lim = alloc::format!("g{g}r{i}_{k}");
+                add_rule(b, &services, |b| {
+                    match_dest(b, f);
+                    jump(b, &lim);
+                });
+            }
+        }
         let target = match policy_of(f) {
             Policy::Plain => &name,
             Policy::External => &xname,
@@ -388,6 +443,9 @@ fn chain_names(g: u32, m: &Model) -> alloc::vec::Vec<alloc::string::String> {
         }
         if wants(s, Policy::External) {
             v.push(alloc::format!("g{g}x{i}"));
+        }
+        for k in 0..s.limits.len() {
+            v.push(alloc::format!("g{g}r{i}_{k}"));
         }
     }
     v
