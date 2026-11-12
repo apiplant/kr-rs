@@ -432,12 +432,6 @@ impl Hub {
     pub fn set_auditor(&self, a: Rc<Auditor>) {
         *self.auditor.borrow_mut() = Some(a);
     }
-    /// Resolves the caller of a write, only when the configuration exempts users.
-    pub(crate) fn set_user(&self, api: &ApiServer, req: &Req, write: bool) {
-        if write && !self.psa.borrow().users.is_empty() {
-            *self.user.borrow_mut() = api.authenticate(req).map(|u| u.name).unwrap_or_default();
-        }
-    }
     fn auditor(&self) -> Option<Rc<Auditor>> {
         self.auditor.borrow().clone()
     }

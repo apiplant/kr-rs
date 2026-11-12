@@ -177,6 +177,17 @@ pub const SAFE_SYSCTLS: [&str; 12] = [
     "net.ipv4.tcp_rmem",
     "net.ipv4.tcp_wmem",
 ];
+/// First Kubernetes minor version whose baseline policy allows the sysctl (None: never).
+fn sysctl_since(n: &str) -> Option<u32> {
+    Some(match n {
+        "kernel.shm_rmid_forced" | "net.ipv4.ip_local_port_range" | "net.ipv4.tcp_syncookies" | "net.ipv4.ping_group_range" => 0,
+        "net.ipv4.ip_unprivileged_port_start" => 22,
+        "net.ipv4.ip_local_reserved_ports" => 27,
+        "net.ipv4.tcp_keepalive_time" | "net.ipv4.tcp_fin_timeout" | "net.ipv4.tcp_keepalive_intvl" | "net.ipv4.tcp_keepalive_probes" => 29,
+        "net.ipv4.tcp_rmem" | "net.ipv4.tcp_wmem" => 33,
+        _ => return None,
+    })
+}
 const SELINUX_TYPES: [&str; 4] = ["container_t", "container_init_t", "container_kvm_t", "container_engine_t"];
 const RESTRICTED_VOLUMES: [&str; 8] = ["configMap", "csi", "downwardAPI", "emptyDir", "ephemeral", "persistentVolumeClaim", "projected", "secret"];
 
@@ -238,7 +249,8 @@ pub fn violations_at(level: Level, ver: Version, spec: &Value, meta: &Value) -> 
         out.push(format!("hostPort ({})", ports.join(", ")));
     }
     let mut apparmor: Vec<String> = Vec::new();
-    let aa_ok = |t: &str| matches!(t, "" | "RuntimeDefault" | "Localhost");
+    // The appArmorProfile fields exist since 1.30; before, only the annotations are checked.
+    let aa_ok = |t: &str| !since(30) || matches!(t, "" | "RuntimeDefault" | "Localhost");
     if !aa_ok(s(spec, &["securityContext", "appArmorProfile", "type"])) {
         apparmor.push(format!("pod must not set securityContext.appArmorProfile.type to {:?}", s(spec, &["securityContext", "appArmorProfile", "type"])));
     }
@@ -261,7 +273,7 @@ pub fn violations_at(level: Level, ver: Version, spec: &Value, meta: &Value) -> 
     let check_se = |who: String, sc: Option<&Value>, out: &mut Vec<String>| {
         let Some(o) = sc.and_then(|x| x.get("seLinuxOptions")) else { return };
         let t = s(o, &["type"]);
-        if !t.is_empty() && !SELINUX_TYPES.contains(&t) {
+        if !t.is_empty() && !SELINUX_TYPES.iter().enumerate().any(|(i, x)| *x == t && (i < 3 || since(31))) {
             out.push(format!("{who} set forbidden securityContext.seLinuxOptions: type {t:?}"));
         }
         for f in ["user", "role"] {
@@ -293,7 +305,7 @@ pub fn violations_at(level: Level, ver: Version, spec: &Value, meta: &Value) -> 
     if !unconfined.is_empty() {
         out.push(format!("seccompProfile ({} must not set securityContext.seccompProfile.type to \"Unconfined\")", unconfined.join(" and ")));
     }
-    let sysctls: Vec<String> = spec.pointer(&["securityContext", "sysctls"]).and_then(Value::as_array).unwrap_or(&[]).iter().map(|x| s(x, &["name"]).to_string()).filter(|n| !SAFE_SYSCTLS.contains(&n.as_str())).collect();
+    let sysctls: Vec<String> = spec.pointer(&["securityContext", "sysctls"]).and_then(Value::as_array).unwrap_or(&[]).iter().map(|x| s(x, &["name"]).to_string()).filter(|n| !sysctl_since(n).is_some_and(|m| since(m))).collect();
     if !sysctls.is_empty() {
         out.push(format!("forbidden sysctls ({})", sysctls.join(", ")));
     }
@@ -317,7 +329,10 @@ pub fn violations_at(level: Level, ver: Version, spec: &Value, meta: &Value) -> 
     if !restricted_vols.is_empty() {
         out.push(format!("restricted volume types ({})", restricted_vols.join(", ")));
     }
-    let ape: Vec<String> = ctrs.iter().filter(|c| c.pointer(&["securityContext", "allowPrivilegeEscalation"]).and_then(Value::as_bool) != Some(false)).map(|c| name(c)).collect();
+    // Windows pods are exempt from the allowPrivilegeEscalation, capabilities and seccomp
+    // checks of `restricted` since 1.25.
+    let win = since(25) && s(spec, &["os", "name"]) == "windows";
+    let ape: Vec<String> = ctrs.iter().filter(|_| !win).filter(|c| c.pointer(&["securityContext", "allowPrivilegeEscalation"]).and_then(Value::as_bool) != Some(false)).map(|c| name(c)).collect();
     if !ape.is_empty() {
         out.push(format!("allowPrivilegeEscalation != false ({} must set securityContext.allowPrivilegeEscalation=false)", subject("container", &ape)));
     }
@@ -332,7 +347,7 @@ pub fn violations_at(level: Level, ver: Version, spec: &Value, meta: &Value) -> 
             }
         }
     }
-    if since(22) && !caps_bad.is_empty() {
+    if since(22) && !win && !caps_bad.is_empty() {
         out.push(format!("unrestricted capabilities ({})", caps_bad.join("; ")));
     }
     let pod_nonroot = spec.pointer(&["securityContext", "runAsNonRoot"]).and_then(Value::as_bool);
@@ -353,7 +368,7 @@ pub fn violations_at(level: Level, ver: Version, spec: &Value, meta: &Value) -> 
         let t = s(c, &["securityContext", "seccompProfile", "type"]);
         if t.is_empty() { !pod_sc } else { !sc_ok(t) && t != "Unconfined" }
     }).map(|c| name(c)).collect();
-    if since(19) && !sc_missing.is_empty() {
+    if since(19) && !win && !sc_missing.is_empty() {
         out.push(format!("seccompProfile (pod or {} must set securityContext.seccompProfile.type to \"RuntimeDefault\" or \"Localhost\")", subject("container", &sc_missing)));
     }
     out
@@ -468,6 +483,25 @@ mod tests {
         assert!(chk(Some(&n), &plain, false).deny.is_none());
         let n = ns(r#"{"pod-security.kubernetes.io/enforce":"restricted","pod-security.kubernetes.io/enforce-version":"v1.20"}"#);
         assert!(chk(Some(&n), &plain, false).deny.unwrap().contains("\"restricted:v1.20\""));
+    }
+
+    #[test]
+    fn version_dependent_rules() {
+        let sys = |n: &str| v(&format!(r#"{{"securityContext":{{"sysctls":[{{"name":"{n}","value":"1"}}]}}}}"#));
+        let m = &v("{}");
+        for (name, since) in [("net.ipv4.ip_unprivileged_port_start", 22), ("net.ipv4.ip_local_reserved_ports", 27), ("net.ipv4.tcp_keepalive_time", 29)] {
+            assert!(!violations_at(Level::Baseline, Some(since - 1), &sys(name), m).is_empty(), "{name} before {since}");
+            assert!(violations_at(Level::Baseline, None, &sys(name), m).is_empty());
+        }
+        let aa = v(r#"{"securityContext":{"appArmorProfile":{"type":"Unconfined"}}}"#);
+        assert!(violations_at(Level::Baseline, Some(29), &aa, m).is_empty());
+        assert!(!violations_at(Level::Baseline, Some(30), &aa, m).is_empty());
+        let se = v(r#"{"securityContext":{"seLinuxOptions":{"type":"container_engine_t"}}}"#);
+        assert!(!violations_at(Level::Baseline, Some(30), &se, m).is_empty());
+        assert!(violations_at(Level::Baseline, Some(31), &se, m).is_empty());
+        let win = v(r#"{"os":{"name":"windows"},"containers":[{"name":"c","securityContext":{"runAsNonRoot":true}}]}"#);
+        assert!(violations_at(Level::Restricted, Some(24), &win, m).iter().any(|x| x.contains("allowPrivilegeEscalation")));
+        assert!(!violations_at(Level::Restricted, Some(25), &win, m).iter().any(|x| x.contains("allowPrivilegeEscalation") || x.contains("capabilities") || x.contains("seccomp")));
     }
 
     #[test]

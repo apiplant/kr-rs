@@ -1154,7 +1154,6 @@ impl ApiServer {
         let mode = if write { crate::fieldval::Mode::parse(Query::parse(req.query).ok().as_ref().and_then(|q| q.get("fieldValidation"))) } else { crate::fieldval::Mode::Ignore };
         self.fv_mode.set(mode);
         self.warnings.borrow_mut().clear();
-        self.audit.set_user(self, req, write);
         if !self.writable() && Self::mutates(req) {
             let leader = self.cluster.borrow().as_ref().and_then(|c| c.leader());
             return (Reply::err(not_leader(leader)), Vec::new());
@@ -1402,6 +1401,10 @@ impl ApiServer {
     fn route(&self, req: &Req) -> R<Reply> {
         let path = req.path.trim_end_matches('/');
         let user = self.authenticate(req)?;
+        // Pod Security user exemptions: reuse this authentication (no second token check).
+        if matches!(req.method, "POST" | "PUT" | "PATCH") && !self.audit.psa.borrow().users.is_empty() {
+            self.audit.user.borrow_mut().clone_from(&user.name);
+        }
         // Node bootstrap endpoints (outside RBAC: the CA is public; join checks its caller).
         if path == "/cacerts" && req.method == "GET" {
             let pem = self.ca.borrow().as_ref().map(|(_, _, der)| kr_crypto::x509::pem_encode("CERTIFICATE", der)).ok_or_else(|| ApiError::not_found("cacerts", "ca"))?;

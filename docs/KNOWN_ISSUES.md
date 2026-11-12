@@ -39,8 +39,6 @@ Ordered by impact. Size: S days, M a week or two, L more.
     A registry that needs an RSA client key is unsupported (kr-crypto signs with P-256/Ed25519 only); common with corporate registries. `rewrite` refuses flags such as `(?i)` which Go's regexp (k3s) accepts. (Look-behind is refused, but Go's RE2 has none either: not a gap. Look-ahead goes beyond k3s.) Only one client certificate per registry config.
 146. **Server-side apply: generate the list/map table from OpenAPI** — *ADR-021, ADR-028*, M
     The table is name based, so uncommon fields may differ from structured-merge-diff (unsure: `secretRef`/`configMapRef` atomicity, `envFrom`, `volumeClaimTemplates`). Empty keyed/set lists own nothing; CRD list-map-key defaults are not applied before computing keys. No known workload is affected; compare against a real API server to find more.
-185. **Pod Security version pinning** — *ADR-029, ADR-046*, S
-    Only seccomp, restricted capabilities and hostProcess are version dependent; other rule changes (1.25 baseline sysctl/AppArmor lists, early restricted volume types) are evaluated as latest. Exemptions by `runtimeClassName` ignore RuntimeClass defaulting. `exemptions.usernames` costs an extra authentication per write.
 319. **WireGuard pod-network encryption** — *new*, M
     k3s offers `--flannel-backend=wireguard-native` for encrypted pod traffic between nodes; kr has VXLAN and host-gw only (ADR-025). Needs: the netlink WireGuard family in kr-net (Curve25519/ChaCha20-Poly1305 are in kr-crypto), key exchange through node annotations.
 320. **Snapshots to S3-compatible storage** — *new*, M

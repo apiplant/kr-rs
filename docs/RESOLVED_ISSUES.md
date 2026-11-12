@@ -642,3 +642,6 @@
 
 206. **CSR approval validation** — *fixed (ADR-042)*
     `kube-apiserver-client` CSRs naming `system:masters` or a group bound to `cluster-admin` can only be approved by a `system:masters` member; violations are field errors (`CertificateSigningRequest.certificates.k8s.io "n" is invalid: status.conditions: ...`); a `status.certificate` chain must start with an end-entity certificate and each issuer must be the next subject; apply requests go through the same `update_ex` check, and applying to `approval`/`status` of a missing CSR is 404 instead of creating it.
+
+185. **Pod Security version pinning** — *fixed (ADR-029, ADR-046)*
+    Version-gated rules added: baseline sysctl list (1.22/1.27/1.29/1.33 additions), AppArmor fields (1.30), `container_engine_t` SELinux type (1.31), Windows pods exempt from the restricted allowPrivilegeEscalation/capabilities/seccomp checks (1.25). `exemptions.usernames` reuses the request's authentication (no second token check). RuntimeClass exemptions match `spec.runtimeClassName` after RuntimeClass admission (Kubernetes has no default RuntimeClass, so there is nothing else to default).
