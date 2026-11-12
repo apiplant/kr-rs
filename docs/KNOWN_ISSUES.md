@@ -14,8 +14,6 @@ Ordered by impact. Size: S days, M a week or two, L more.
     The CA, service-account key and encryption config now replicate through the Raft log (RESOLVED 320). Left: the Docker script `tools/test/ha.sh keysync` has not been run; HTTPS/Raft listeners need a rolling restart after a CA step (no hot reload of listener trust); `finish` of a CA rotation cannot tell whether every node renewed its certificates (hence `--yes`); `secrets-encrypt status` has no per-key object counts for the cluster; `kr pki rotate` without `admin.kubeconfig` assumes port 6443 unless `--port`.
 11. **aarch64 on real hardware, and CI** — L
     k3s ships arm64 as a first-class target. Cross-built kr binaries run only under qemu-user (`tools/test/aarch64.sh`), where namespaces, cgroups, clone3 and mounts do not work, so the kubelet/runtime/apiserver paths have never run on aarch64. Needs a real arm64 host and a CI job.
-146. **Server-side apply: generate the list/map table from OpenAPI** — *ADR-021, ADR-028*, M
-    The table is name based, so uncommon fields may differ from structured-merge-diff (unsure: `secretRef`/`configMapRef` atomicity, `envFrom`, `volumeClaimTemplates`). Empty keyed/set lists own nothing; CRD list-map-key defaults are not applied before computing keys. No known workload is affected; compare against a real API server to find more.
 322. **Embedded registry mirror** — *new, lower priority*, L
     k3s (1.29+) can share images peer to peer between nodes (`--embedded-registry`, Spegel). Not needed for production; listed so the gap is known.
 

@@ -14,7 +14,7 @@ any other mismatch.
 
 Run:  python3 -I tools/gen_k8s_proto_schema.py --fetch SCRATCH_DIR     (download, then generate)
       python3 -I tools/gen_k8s_proto_schema.py SCRATCH_DIR             (reuse downloaded files)
-SCRATCH_DIR must be outside the repository.
+SCRATCH_DIR must be outside the repository (or under target/).
 """
 import os, re, sys, urllib.request
 
@@ -60,7 +60,7 @@ SPECIAL = {
 # Packages whose JSON names are taken from the types.go tags (`$ref`, `x-kubernetes-...`).
 JSON_NAMES_FROM_GO = {APIEXT}
 # Groups outside k8s.io/api (storagemigration): served as JSON only.
-JSON_ONLY_GROUPS = set()
+JSON_ONLY_GROUPS = {"metrics.k8s.io"}
 # Extra top-level kinds beyond resources.rs: (apiVersion, kind, message).
 EXTRA_ROOTS = [("v1", "DeleteOptions", META + ".DeleteOptions"),
                ("autoscaling/v1", "Scale", "k8s.io.api.autoscaling.v1.Scale"),
@@ -143,6 +143,13 @@ def resolve(t, pkg):
 # (no `omitempty`, not `+optional`) string fields, both keyed by (message, field number).
 ENUM_FIELDS = {}
 REQUIRED_FIELDS = set()
+# Structured-merge-diff markers: per field (message, number) a dict with `listType`, `mapType`,
+# `structType` and `keys` (`+listMapKey`); messages whose type is `+structType=atomic`; and the
+# `+default` of fields (key defaults).
+MARKERS = {}
+ATOMIC_MSGS = set()
+DEFAULTS = {}
+MARKER_RE = re.compile(r"\s*//\s*\+(listType|mapType|structType|listMapKey|default)=(.*\S)")
 
 
 def go_enums(path):
@@ -167,17 +174,24 @@ def parse_go(path, package):
     enums = go_enums(path)
     optional = False
     curname = None
+    pending = []
     for line in open(path):
         if line.strip().startswith("//"):
             if "+optional" in line:
                 optional = True
+            mk = MARKER_RE.match(line)
+            if mk:
+                pending.append((mk.group(1), mk.group(2)))
             continue
+        marks, pending = pending, []
         m = re.match(r"type (\w+) struct", line)
         if m:
             cur = {}
             curname = package + "." + m.group(1)
             out[curname] = cur
             optional = False
+            if ("structType", "atomic") in marks:
+                ATOMIC_MSGS.add(curname)
             continue
         if line.startswith("}"):
             cur = None
@@ -196,6 +210,16 @@ def parse_go(path, package):
         inline = "inline" in parts[1:] or (embedded and parts[0] == "")
         pointer = bool(re.match(r"\s*\w+\s+\*", line))
         cur[int(pb.group(1))] = (parts[0] or None, inline, pointer or "omitempty" not in parts[1:])
+        if marks:
+            mk = {"keys": []}
+            for k, v in marks:
+                if k == "listMapKey":
+                    mk["keys"].append(v)
+                elif k == "default":
+                    DEFAULTS[(curname, int(pb.group(1)))] = v
+                else:
+                    mk[k] = v
+            MARKERS[(curname, int(pb.group(1)))] = mk
         gt = re.match(r"\s*\w+\s+(\*?\[?\]?\*?[\w.]+)\s+`", line)
         base = gt.group(1) if gt else ""
         if not inline and gt and base in enums:
@@ -265,8 +289,8 @@ def main():
     if len(args) != 1:
         sys.exit(__doc__)
     scratch = os.path.abspath(args[0])
-    if os.path.commonpath([scratch, os.path.abspath(REPO)]) == os.path.abspath(REPO):
-        sys.exit("SCRATCH_DIR must be outside the repository")
+    if os.path.commonpath([scratch, os.path.abspath(REPO)]) == os.path.abspath(REPO) and not scratch.startswith(os.path.join(os.path.abspath(REPO), "target") + os.sep):
+        sys.exit("SCRATCH_DIR must be outside the repository (or under target/)")
     os.makedirs(scratch, exist_ok=True)
     if do_fetch:
         fetch(scratch)
@@ -361,6 +385,39 @@ def main():
     for av, kind, full in rts:
         w("    (\"%s\", \"%s\", %d),\n" % (av, kind, index[full]))
     w("];\n\n")
+    lists = []
+    pb_fields = {m: {num: (t, rep) for num, _, t, rep in protos[m]} for m in order}
+    for m in order:
+        for num, (t, rep) in sorted(pb_fields[m].items()):
+            mk = MARKERS.get((m, num), {})
+            inline = gos.get(m, {}).get(num, (None, False, True))[1]
+            if rep:
+                lt = mk.get("listType", "atomic")
+                if lt == "map":
+                    keys = sorted(mk["keys"])
+                    assert keys, "listType=map without keys: %s.%d" % (m, num)
+                    spec = []
+                    for kn in keys:  # a key field with a `+default` is `name=<json>` (scalars only)
+                        d = None
+                        for knum, (kj, _, _) in gos.get(index_name(t), {}).items():
+                            if kj == kn and (index_name(t), knum) in DEFAULTS:
+                                d = DEFAULTS[(index_name(t), knum)]
+                                assert d.startswith('"') or d.isdigit() or d in ("true", "false"), (m, num, kn, d)
+                                assert "," not in d and '\\' not in d, (m, num, kn, d)
+                        spec.append(kn if d is None else kn + "=" + d.replace('"', '\\"'))
+                    keys = spec
+                    lists.append((index[m], num, 1, ",".join(keys)))
+                elif lt == "set":
+                    lists.append((index[m], num, 2, ""))
+                else:
+                    assert lt == "atomic", (m, num, lt)
+            elif not inline:
+                atomic = mk.get("structType") == "atomic" or mk.get("mapType") == "atomic"
+                if mk.get("structType") != "granular" and mk.get("mapType") != "granular" and not isinstance(t, tuple) and t in ATOMIC_MSGS:
+                    atomic = True
+                if atomic:
+                    lists.append((index[m], num, 3, ""))
+    lists.sort()
     enums = sorted((index[m], num, "|".join(v)) for (m, num), v in ENUM_FIELDS.items() if m in index and m not in SPECIAL.values())
     w("/// Allowed values of `+enum` string fields: (message, field number, values joined by `|`), sorted.\n")
     w("pub static ENUMS: [(u16, u16, &str); %d] = [\n" % len(enums))
@@ -372,12 +429,23 @@ def main():
     w("pub static REQUIRED: [(u16, u16); %d] = [" % len(req))
     w(", ".join("(%d, %d)" % r for r in req))
     w("];\n")
+    w("\n\n/// Server-side apply list and map types from the `+listType`, `+listMapKey`, `+mapType` and `+structType`\n")
+    w("/// markers: (message, field number, kind, keys), sorted. Kind 1: associative list (comma separated sorted\n")
+    w("/// keys), 2: set, 3: atomic struct or map. Fields not listed are granular; lists not listed are atomic.\n")
+    w("pub static LISTS: [(u16, u16, u8, &str); %d] = [\n" % len(lists))
+    for mi, num, kd, keys in lists:
+        w("    (%d, %d, %d, \"%s\"),\n" % (mi, num, kd, keys))
+    w("];\n")
     text = "".join(o)
     with open(OUT, "w") as fh:
         fh.write(text)
     data_bytes = len(fields) * 8 + len(starts) * 2 + len(names) + len(maps) * 8 + len(rts) * 36
     print("wrote %s: %d bytes of source, %d messages, %d fields, ~%d bytes of static data, %d warnings"
           % (OUT, len(text), len(order), len(fields), data_bytes, warnings))
+
+
+def index_name(t):
+    return t if isinstance(t, str) else None
 
 
 def scalar_or_msg(t, index):

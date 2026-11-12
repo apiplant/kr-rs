@@ -7,6 +7,7 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use crate::proto_schema as ps;
 use kr_fmt::json::{self, Value};
 
 /// How a list is merged and owned.
@@ -33,6 +34,7 @@ const ATOMIC_STRUCTS: &[&str] = &[
 
 const CONTAINER_LISTS: &[&str] = &["containers", "initContainers", "ephemeralContainers"];
 
+/// Name based fallback for built-in kinds without generated tables ([`generated_lists`] serves the rest).
 /// List kinds of the built-in types, following the upstream OpenAPI markers
 /// (`+listType`, `+listMapKey`, `+mapType`, `+structType`) for the common fields. The strategic
 /// merge tables are only the starting point: they disagree with upstream for NetworkPolicy and
@@ -73,6 +75,77 @@ pub fn builtin_lists(path: &[&str]) -> ListKind {
     }
 }
 
+/// Message index of the top-level kind `kind` of `api_version` (`v1`, `apps/v1`, ...) in the
+/// generated tables.
+pub fn root_message(api_version: &str, kind: &str) -> Option<u16> {
+    ps::KINDS.iter().find(|k| k.0 == api_version && k.1 == kind).map(|k| k.2)
+}
+
+fn field_name(f: &ps::Field) -> &'static str {
+    &ps::NAMES[f.name_off as usize..f.name_off as usize + f.name_len as usize]
+}
+
+/// The field `name` of message `m`, looking through inlined (embedded) messages; with the message
+/// that declares it.
+fn find_field(m: u16, name: &str) -> Option<(u16, &'static ps::Field)> {
+    for f in &ps::FIELDS[ps::MSG_START[m as usize] as usize..ps::MSG_START[m as usize + 1] as usize] {
+        if f.kind & ps::F_INLINE != 0 {
+            if let Some(r) = find_field(f.arg, name) {
+                return Some(r);
+            }
+        } else if field_name(f) == name {
+            return Some((m, f));
+        }
+    }
+    None
+}
+
+/// List kinds of a built-in type from the generated tables (`tools/gen_k8s_proto_schema.py`, from
+/// the upstream `+listType` / `+listMapKey` / `+mapType` / `+structType` markers, i.e. the data
+/// behind upstream's OpenAPI `x-kubernetes-*` extensions). `root` is [`root_message`]; `path`
+/// the field names from the object (map keys count as names, list items as their list's name).
+/// An unknown field is atomic.
+pub fn generated_lists(root: u16, path: &[&str]) -> ListKind {
+    enum Cur {
+        Msg(u16),
+        /// A map field: the next name is a key; the values are this message, if any.
+        Map(Option<u16>),
+        End,
+    }
+    let mut cur = Cur::Msg(root);
+    let mut last = None;
+    for name in path {
+        match cur {
+            Cur::Msg(m) => {
+                let Some((owner, f)) = find_field(m, name) else { return ListKind::Atomic };
+                last = Some((owner, f.num));
+                cur = match f.kind & ps::K_MASK {
+                    ps::K_MESSAGE => Cur::Msg(f.arg),
+                    ps::K_MAP => {
+                        let (_, _, vk, va) = ps::MAPS[f.arg as usize];
+                        Cur::Map((vk & ps::K_MASK == ps::K_MESSAGE).then_some(va))
+                    }
+                    _ => Cur::End,
+                };
+            }
+            Cur::Map(v) => {
+                last = None;
+                cur = v.map_or(Cur::End, Cur::Msg);
+            }
+            Cur::End => return ListKind::Atomic,
+        }
+    }
+    let Some(key) = last else { return ListKind::Atomic };
+    match ps::LISTS.binary_search_by(|e| (e.0, e.1).cmp(&key)) {
+        Ok(i) => match ps::LISTS[i].2 {
+            1 => ListKind::Map(ps::LISTS[i].3.split(',').map(String::from).collect()),
+            2 => ListKind::Set,
+            _ => ListKind::AtomicMap,
+        },
+        Err(_) => ListKind::Atomic,
+    }
+}
+
 /// List kinds from a CRD's openAPI schema (`x-kubernetes-list-type`).
 pub fn schema_lists(schema: &Value, path: &[&str]) -> ListKind {
     let mut s = schema;
@@ -92,6 +165,13 @@ pub fn schema_lists(schema: &Value, path: &[&str]) -> ListKind {
         Some("map") => {
             let mut keys: Vec<String> = s.get("x-kubernetes-list-map-keys").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
             keys.sort();
+            // A key property with a `default` has it when an item omits it (`name=<json>`).
+            let item = s.get("items");
+            for k in keys.iter_mut() {
+                if let Some(d) = item.and_then(|i| i.get("properties")).and_then(|p| p.get(k.as_str())).and_then(|p| p.get("default")) {
+                    *k = alloc::format!("{k}={}", json::to_string(d));
+                }
+            }
             if keys.is_empty() {
                 ListKind::Atomic
             } else {
@@ -123,16 +203,29 @@ fn is_empty(v: &Value) -> bool {
     v.as_object().is_some_and(|o| o.is_empty())
 }
 
-/// The key object (`{"name":"c"}`) identifying a map-list element.
+/// A list-map key as `name` or `name=<json default>`.
+fn key_spec(k: &str) -> (&str, Option<Value>) {
+    match k.split_once('=') {
+        Some((n, d)) => (n, json::parse_str(d).ok()),
+        None => (k, None),
+    }
+}
+
+/// The key object (`{"name":"c"}`) identifying a map-list element; a key the item omits takes
+/// its schema default (`protocol` is `TCP` where no default is known).
 fn item_key(item: &Value, keys: &[String]) -> Option<Value> {
     let mut o = Vec::new();
     for k in keys {
-        let v = match item.get(k) {
+        let (name, def) = key_spec(k);
+        let v = match item.get(name) {
             Some(v) => v.clone(),
-            None if k == "protocol" => Value::from("TCP"),
-            None => return None,
+            None => match def {
+                Some(d) => d,
+                None if name == "protocol" => Value::from("TCP"),
+                None => return None,
+            },
         };
-        o.push((k.clone(), v));
+        o.push((name.to_string(), v));
     }
     Some(Value::Object(o))
 }
@@ -141,7 +234,7 @@ fn key_matches(item: &Value, key: &Value) -> bool {
     key.as_object().is_some_and(|ks| {
         ks.iter().all(|(k, v)| match item.get(k) {
             Some(x) => x == v,
-            None => k == "protocol" && v.as_str() == Some("TCP"),
+            None => (k == "protocol" && v.as_str() == Some("TCP")) || v.as_str() == Some(""),
         })
     })
 }
@@ -186,6 +279,8 @@ fn walk(v: &Value, old: Option<&Value>, names: &mut Vec<String>, lists: Lists, s
             let nm: Vec<&str> = names.iter().map(String::as_str).collect();
             match lists(&nm) {
                 ListKind::Atomic | ListKind::AtomicMap => (old != Some(v)).then(empty),
+                // An empty set or keyed list is a value like any empty collection: owned as a leaf.
+                ListKind::Set | ListKind::Map(_) if items.is_empty() => (old != Some(v)).then(empty),
                 ListKind::Set => {
                     let prev = old.and_then(Value::as_array).unwrap_or(&[]);
                     let out: Vec<(String, Value)> = items.iter().filter(|i| !prev.contains(i)).map(|i| (alloc::format!("v:{}", json::to_string(i)), empty())).collect();
@@ -196,7 +291,7 @@ fn walk(v: &Value, old: Option<&Value>, names: &mut Vec<String>, lists: Lists, s
                     let mut out = Vec::new();
                     for it in items {
                         let Some(key) = item_key(it, &keys) else { continue };
-                        let before = prev.iter().find(|p| key_matches(p, &key));
+                        let before = prev.iter().find(|p| item_key(p, &keys).as_ref() == Some(&key));
                         let mut node = Vec::new();
                         if before.is_none() {
                             node.push((".".to_string(), empty()));
@@ -561,7 +656,7 @@ fn merge(target: &mut Value, applied: &Value, names: &mut Vec<String>, lists: Li
                             list.push(it.clone());
                             continue;
                         };
-                        match list.iter().position(|e| key_matches(e, &key)) {
+                        match list.iter().position(|e| item_key(e, keys).as_ref() == Some(&key)) {
                             Some(i) => {
                                 let mut e = core::mem::replace(&mut list[i], Value::Null);
                                 merge(&mut e, it, names, lists);
@@ -650,6 +745,13 @@ pub fn apply(live: &Value, applied: &Value, mut entries: Vec<Entry>, manager: &s
             for l in leaves(&sa) {
                 if l.last().is_some_and(|k| k == ".") || !contains(&e.fields, &l) {
                     continue;
+                }
+                // An empty set or keyed list changes none of the items others own.
+                if resolve(applied, &l).and_then(Value::as_array).is_some_and(<[Value]>::is_empty) {
+                    let nm: Vec<&str> = l.iter().filter_map(|k| k.strip_prefix("f:")).collect();
+                    if matches!(lists(&nm), ListKind::Set | ListKind::Map(_)) {
+                        continue;
+                    }
                 }
                 if resolve(live, &l) != resolve(applied, &l) {
                     paths.push(path_string(&l));
@@ -874,5 +976,79 @@ mod tests {
         assert_eq!(c.object.pointer(&["spec", "items"]).unwrap().as_array().unwrap().len(), 1);
         // The atomic cfg conflicts as a whole.
         assert!(run(&c.object, r#"{"spec":{"items":[{"id":"1","cfg":{"b":2}}]}}"#, c.entries, "m2").is_err());
+    }
+
+    fn gen(av: &str, kind: &str, path: &[&str]) -> ListKind {
+        generated_lists(root_message(av, kind).unwrap_or_else(|| panic!("no kind {kind}")), path)
+    }
+
+    fn keys(k: &[&str]) -> ListKind {
+        ListKind::Map(k.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// The generated table agrees with the markers in k8s.io/api v0.37.0 (the source of upstream's
+    /// OpenAPI `x-kubernetes-list-type`, `x-kubernetes-list-map-keys`, `x-kubernetes-map-type`).
+    #[test]
+    fn generated_lists_follow_the_upstream_markers() {
+        let pod = |p: &[&str]| gen("v1", "Pod", p);
+        // The fields #146 was unsure about.
+        assert_eq!(pod(&["spec", "containers", "envFrom"]), ListKind::Atomic);
+        assert_eq!(pod(&["spec", "containers", "envFrom", "secretRef"]), ListKind::Atomic, "granular struct, not an atomic one");
+        assert_eq!(pod(&["spec", "containers", "envFrom", "configMapRef"]), ListKind::Atomic);
+        assert_eq!(gen("apps/v1", "StatefulSet", &["spec", "volumeClaimTemplates"]), ListKind::Atomic);
+        assert_eq!(pod(&["spec", "containers", "env", "valueFrom", "secretKeyRef"]), ListKind::AtomicMap);
+        assert_eq!(pod(&["spec", "containers", "env", "valueFrom", "configMapKeyRef"]), ListKind::AtomicMap);
+        // Keyed and set lists.
+        assert_eq!(pod(&["spec", "containers"]), keys(&["name"]));
+        assert_eq!(pod(&["spec", "initContainers", "env"]), keys(&["name"]));
+        assert_eq!(pod(&["spec", "containers", "ports"]), keys(&["containerPort", "protocol=\"TCP\""]));
+        assert_eq!(pod(&["spec", "containers", "volumeMounts"]), keys(&["mountPath"]));
+        assert_eq!(pod(&["spec", "volumes"]), keys(&["name"]));
+        assert_eq!(pod(&["spec", "imagePullSecrets"]), keys(&["name=\"\""]));
+        assert_eq!(pod(&["spec", "topologySpreadConstraints"]), keys(&["topologyKey", "whenUnsatisfiable"]));
+        assert_eq!(pod(&["status", "conditions"]), keys(&["type"]));
+        assert_eq!(pod(&["status", "podIPs"]), keys(&["ip"]));
+        assert_eq!(pod(&["metadata", "finalizers"]), ListKind::Set);
+        assert_eq!(pod(&["metadata", "ownerReferences"]), keys(&["uid"]));
+        // Atomic lists and maps.
+        assert_eq!(pod(&["spec", "tolerations"]), ListKind::Atomic);
+        assert_eq!(pod(&["spec", "readinessGates"]), ListKind::Atomic);
+        assert_eq!(pod(&["spec", "nodeSelector"]), ListKind::AtomicMap);
+        assert_eq!(pod(&["metadata", "labels"]), ListKind::Atomic);
+        assert_eq!(pod(&["metadata", "labels", "app"]), ListKind::Atomic);
+        assert_eq!(pod(&["spec", "affinity", "nodeAffinity", "requiredDuringSchedulingIgnoredDuringExecution"]), ListKind::AtomicMap);
+        assert_eq!(pod(&["spec", "unknownField"]), ListKind::Atomic);
+        assert_eq!(gen("apps/v1", "Deployment", &["spec", "selector"]), ListKind::AtomicMap);
+        assert_eq!(gen("apps/v1", "Deployment", &["spec", "template", "spec", "containers"]), keys(&["name"]));
+        assert_eq!(gen("apps/v1", "Deployment", &["spec", "template", "spec", "containers", "ports"]), keys(&["containerPort", "protocol=\"TCP\""]));
+        assert_eq!(gen("v1", "Service", &["spec", "ports"]), keys(&["port", "protocol=\"TCP\""]));
+        assert_eq!(gen("v1", "Service", &["spec", "selector"]), ListKind::AtomicMap);
+        assert_eq!(gen("v1", "Node", &["spec", "taints"]), ListKind::Atomic);
+        assert_eq!(gen("v1", "Node", &["status", "addresses"]), keys(&["type"]));
+        assert_eq!(gen("v1", "Namespace", &["spec", "finalizers"]), ListKind::Atomic);
+        assert_eq!(gen("networking.k8s.io/v1", "NetworkPolicy", &["spec", "ingress", "ports"]), ListKind::Atomic);
+        assert_eq!(gen("discovery.k8s.io/v1", "EndpointSlice", &["endpoints", "addresses"]), ListKind::Set);
+        assert_eq!(root_message("v1", "NoSuchKind"), None);
+    }
+
+    #[test]
+    fn empty_set_and_keyed_lists_are_owned_and_do_not_conflict() {
+        let l = |p: &[&str]| gen("v1", "Pod", p);
+        let owned = fields(&j(r#"{"metadata":{"finalizers":[]},"spec":{"containers":[],"tolerations":[]}}"#), None, &l, Scope::All);
+        assert_eq!(to_string(&owned), r#"{"f:metadata":{"f:finalizers":{}},"f:spec":{"f:containers":{},"f:tolerations":{}}}"#);
+        // No change when the list was already empty.
+        assert!(is_empty(&fields(&j(r#"{"metadata":{"finalizers":[]}}"#), Some(&j(r#"{"metadata":{"finalizers":[]}}"#)), &l, Scope::All)));
+    }
+
+    #[test]
+    fn crd_list_map_key_defaults_are_applied_to_keys() {
+        let schema: &'static Value = alloc::boxed::Box::leak(alloc::boxed::Box::new(j(r#"{"properties":{"spec":{"properties":{"ports":{"type":"array","x-kubernetes-list-type":"map","x-kubernetes-list-map-keys":["port","proto"],"items":{"properties":{"port":{"type":"integer"},"proto":{"type":"string","default":"TCP"},"x":{"type":"string"}}}}}}}}"#)));
+        let l = crd_lists(schema);
+        assert_eq!(schema_lists(schema, &["spec", "ports"]), keys(&["port", "proto=\"TCP\""]));
+        // An item without `proto` has the same key as one that spells the default out.
+        let a = apply(&j("{}"), &j(r#"{"spec":{"ports":[{"port":80,"x":"a"}]}}"#), Vec::new(), "m1", false, "v1", "t", &l, Scope::All).unwrap();
+        assert_eq!(to_string(&a.owned), r#"{"f:spec":{"f:ports":{"k:{\"port\":80,\"proto\":\"TCP\"}":{".":{},"f:port":{},"f:x":{}}}}}"#);
+        let b = apply(&a.object, &j(r#"{"spec":{"ports":[{"port":80,"proto":"TCP","x":"b"}]}}"#), a.entries, "m1", false, "v1", "t", &l, Scope::All).unwrap();
+        assert_eq!(b.object.pointer(&["spec", "ports"]).unwrap().as_array().unwrap().len(), 1);
     }
 }

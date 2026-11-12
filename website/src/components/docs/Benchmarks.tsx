@@ -23,8 +23,7 @@ export function DocsBenchmarks() {
         <P>
           For scale, the binary contains the TLS 1.3 stack, X.509, the HTTP/1.1 and WebSocket stacks, the Raft and
           storage engines, the OCI runtime, the API server with its generated protobuf tables, and the controllers.
-          The binary was 2.87 MB (x86_64) and 2.32 MB (aarch64) in October 2026 and has grown with the later features; size is watched before each
-          large addition.
+          Size is watched before each large addition.
         </P>
       </Section>
 

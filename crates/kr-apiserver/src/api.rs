@@ -2263,7 +2263,13 @@ impl ApiServer {
                 Some(s) => f(&|p| crate::ssa::schema_lists(s, p)),
                 None => f(&|_| crate::ssa::ListKind::Atomic),
             },
-            None => f(&crate::ssa::builtin_lists),
+            None => {
+                let av = if rt.res.group.is_empty() { rt.res.version.to_string() } else { alloc::format!("{}/{}", rt.res.group, rt.res.version) };
+                match crate::ssa::root_message(&av, rt.res.kind) {
+                    Some(root) => f(&move |p| crate::ssa::generated_lists(root, p)),
+                    None => f(&crate::ssa::builtin_lists),
+                }
+            }
         }
     }
 
