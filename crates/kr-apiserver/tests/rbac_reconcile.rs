@@ -115,3 +115,37 @@ fn suggested_flow_control_objects_follow_the_release_unless_frozen_or_user_owned
     assert_eq!(prec("service-accounts"), 7777, "no annotation: the user's object");
     let _ = (cb, cc);
 }
+
+#[test]
+fn managed_bootstrap_objects_are_adopted_then_follow_the_release_unless_frozen() {
+    let api = ApiServer::new(kr_store::Store::in_memory(), || 1_700_000_000, rng, "127.0.0.1".into()).unwrap();
+    let key = kr_crypto::p256::SecretKey::from_bytes(&[7; 32]).unwrap();
+    api.set_service_accounts(kr_apiserver::tokens::Signer::new(key), "CA".into()).unwrap();
+    let path = |n: &str| format!("/apis/scheduling.k8s.io/v1/priorityclasses/{n}");
+    let get = |n: &str| call(&api, "GET", &path(n), "").1;
+    let desc = |n: &str| get(n).get("description").and_then(Value::as_str).unwrap().to_string();
+    let put = |n: &str, ann: &str, d: &str| {
+        let cur = get(n);
+        let rv = cur.pointer(&["metadata", "resourceVersion"]).and_then(Value::as_str).unwrap().to_string();
+        let v = cur.get("value").and_then(Value::as_i64).unwrap();
+        let pp = cur.get("preemptionPolicy").and_then(Value::as_str).map(|p| format!(r#""preemptionPolicy":"{p}","#)).unwrap_or_default();
+        let body = format!(r#"{{"apiVersion":"scheduling.k8s.io/v1","kind":"PriorityClass","metadata":{{"name":"{n}","resourceVersion":"{rv}"{ann}}},"value":{v},{pp}"description":"{d}"}}"#);
+        let r = call(&api, "PUT", &path(n), &body);
+        assert_eq!(r.0, 200, "{}", json::to_string(&r.1));
+    };
+    let original = desc("system-node-critical");
+    // From an earlier release: no annotation. It is adopted, not overwritten.
+    put("system-node-critical", "", "edited");
+    put("system-cluster-critical", r#","annotations":{"kr.io/autoupdate":"false"}"#, "mine");
+    api.bootstrap_all();
+    assert_eq!(desc("system-node-critical"), "edited");
+    assert_eq!(get("system-node-critical").pointer(&["metadata", "annotations", "kr.io/autoupdate"]).and_then(Value::as_str), Some("true"));
+    // Now managed: the next start restores the release's text.
+    api.bootstrap_all();
+    assert_eq!(desc("system-node-critical"), original);
+    assert_eq!(desc("system-cluster-critical"), "mine");
+    for r in [("storage.k8s.io", "storageclasses", "local-path"), ("networking.k8s.io", "servicecidrs", "kubernetes")] {
+        let o = call(&api, "GET", &format!("/apis/{}/v1/{}/{}", r.0, r.1, r.2), "").1;
+        assert_eq!(o.pointer(&["metadata", "annotations", "kr.io/autoupdate"]).and_then(Value::as_str), Some("true"), "{}", r.1);
+    }
+}

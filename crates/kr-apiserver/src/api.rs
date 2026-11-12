@@ -655,16 +655,16 @@ impl ApiServer {
         }
         let pcr = resources::find("scheduling.k8s.io", "v1", "priorityclasses").unwrap();
         for (name, value) in [("system-node-critical", 2_000_001_000i64), ("system-cluster-critical", 2_000_000_000)] {
-            let body = alloc::format!(r#"{{"metadata":{{"name":"{name}"}},"value":{value},"description":"Used for system critical pods that must not be moved from their current node."}}"#);
-            self.bootstrap_object(pcr, None, name, "PriorityClass", &body);
+            let body = alloc::format!(r#"{{"metadata":{{"name":"{name}"}},"value":{value},"preemptionPolicy":"PreemptLowerPriority","description":"Used for system critical pods that must not be moved from their current node."}}"#);
+            self.bootstrap_managed(pcr, name, "PriorityClass", &body, &["value", "preemptionPolicy", "description"]);
         }
         // The default ServiceCIDR (the allocator's range) and the mandatory API priority and
         // fairness objects ([`crate::apf`]).
         let scr = resources::find("networking.k8s.io", "v1", "servicecidrs").unwrap();
-        self.bootstrap_object(scr, None, "kubernetes", "ServiceCIDR", r#"{"metadata":{"name":"kubernetes"},"spec":{"cidrs":["10.96.0.0/16"]},"status":{"conditions":[{"type":"Ready","status":"True","reason":"","message":"Kubernetes Service CIDR is ready","lastTransitionTime":"1970-01-01T00:00:00Z"}]}}"#);
+        self.bootstrap_managed(scr, "kubernetes", "ServiceCIDR", r#"{"metadata":{"name":"kubernetes"},"spec":{"cidrs":["10.96.0.0/16"]},"status":{"conditions":[{"type":"Ready","status":"True","reason":"","message":"Kubernetes Service CIDR is ready","lastTransitionTime":"1970-01-01T00:00:00Z"}]}}"#, &["spec"]);
         crate::apf::seed(self);
         let scr = resources::find("storage.k8s.io", "v1", "storageclasses").unwrap();
-        self.bootstrap_object(scr, None, "local-path", "StorageClass", r#"{"metadata":{"name":"local-path","annotations":{"storageclass.kubernetes.io/is-default-class":"true"}},"provisioner":"kr.io/local-path","reclaimPolicy":"Delete","volumeBindingMode":"WaitForFirstConsumer"}"#);
+        self.bootstrap_managed(scr, "local-path", "StorageClass", r#"{"metadata":{"name":"local-path","annotations":{"storageclass.kubernetes.io/is-default-class":"true"}},"provisioner":"kr.io/local-path","reclaimPolicy":"Delete","volumeBindingMode":"WaitForFirstConsumer"}"#, &["provisioner", "reclaimPolicy", "volumeBindingMode"]);
         let nsr = resources::find("", "v1", "namespaces").unwrap();
         let (namespaces, _) = self.store.borrow().list(&nsr.prefix(), None, 0);
         for kv in namespaces {
@@ -753,6 +753,49 @@ impl ApiServer {
         let m = o.entry_object("metadata");
         m.set("generation", Value::from(gen));
         m.set("resourceVersion", Value::String((self.store.borrow().revision() + 1).to_string()));
+        let _ = self.store.borrow_mut().update(&key, json::to_string(&o).into_bytes(), Some(kv.mod_rev));
+    }
+
+    /// The release-managed bootstrap objects that are not RBAC or flow control (system
+    /// PriorityClasses, the default StorageClass and ServiceCIDR). Created with the annotation
+    /// `kr.io/autoupdate: "true"`; while it is not `"false"`, the listed fields of the current
+    /// release replace the stored ones at start-up (annotations and labels of the admin stay, so
+    /// a default-class annotation moved to another StorageClass is not undone). An object from an
+    /// earlier release has no annotation: it only gets it now, so the next release applies.
+    pub(crate) fn bootstrap_managed(&self, res: &Resource, name: &str, kind: &str, body: &str, fields: &[&str]) {
+        if !self.writable() {
+            return;
+        }
+        let Ok(mut want) = json::parse(body.as_bytes()) else { return };
+        want.entry_object("metadata").entry_object("annotations").set("kr.io/autoupdate", Value::from("true"));
+        let body = json::to_string(&want);
+        self.bootstrap_object(res, None, name, kind, &body);
+        let key = res.key(None, name);
+        let Some(kv) = self.store.borrow().get(&key) else { return };
+        let Ok(mut o) = json::parse(&kv.value) else { return };
+        let mark = o.pointer(&["metadata", "annotations", "kr.io/autoupdate"]).and_then(Value::as_str).map(String::from);
+        let mut changed = false;
+        match mark.as_deref() {
+            Some("false") => return,
+            None => {
+                o.entry_object("metadata").entry_object("annotations").set("kr.io/autoupdate", Value::from("true"));
+                changed = true;
+            }
+            Some(_) => {
+                for f in fields {
+                    if let Some(v) = want.get(f) {
+                        if o.get(f) != Some(v) {
+                            o.set(f, v.clone());
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            return;
+        }
+        o.entry_object("metadata").set("resourceVersion", Value::String((self.store.borrow().revision() + 1).to_string()));
         let _ = self.store.borrow_mut().update(&key, json::to_string(&o).into_bytes(), Some(kv.mod_rev));
     }
 
