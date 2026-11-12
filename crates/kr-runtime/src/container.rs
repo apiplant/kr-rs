@@ -1751,6 +1751,34 @@ pub struct ShimIo<'a> {
 /// holds the stdin socket / pty master open (handed out on a unix socket, see `ShimIo::io_sock`).
 /// The container keeps its death signal, so killing the shim kills it.
 pub fn start_detached(spec: &RunSpec, exit_path: &[u8], io: &ShimIo) -> Result<Running, RunError> {
+    let p = start_detached_begin(spec, exit_path, io)?;
+    let rep = p.rep.as_ref().expect("fresh");
+    let mut head = [0u8; 9];
+    if read_full(rep, &mut head) != 9 {
+        return Err(RunError { step: "shim", errno: Errno(5) });
+    }
+    let mut name = Vec::new();
+    if head[0] != 0 {
+        name = alloc::vec![0u8; u32::from_le_bytes([head[5], head[6], head[7], head[8]]) as usize];
+        read_full(rep, &mut name);
+    }
+    p.complete(head, &name)
+}
+
+/// A shim that was forked and is setting the container up; [`DetachedPending::finish`] waits for
+/// its report without blocking the event loop.
+pub struct DetachedPending {
+    rep: Option<Fd>,
+    /// (cgroup parent, container id) when the container has resource limits.
+    cgroup: Option<(Vec<u8>, Vec<u8>)>,
+    host_net: bool,
+    userns: bool,
+    exit_path: Vec<u8>,
+}
+
+/// Forks the shim (double fork) and returns at once; the container is set up in the child. The
+/// caller awaits [`DetachedPending::finish`]. `start_detached` is this plus a blocking wait.
+pub fn start_detached_begin(spec: &RunSpec, exit_path: &[u8], io: &ShimIo) -> Result<DetachedPending, RunError> {
     init_exe_fd();
     let (rep_r, rep_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     // Double fork: the shim is nobody's child to reap, and has its own session.
@@ -1770,24 +1798,57 @@ pub fn start_detached(spec: &RunSpec, exit_path: &[u8], io: &ShimIo) -> Result<R
     }
     drop(rep_w);
     let _ = ns::wait4(tmp);
-    let mut head = [0u8; 9];
-    if read_full(&rep_r, &mut head) != 9 {
-        return Err(RunError { step: "shim", errno: Errno(5) });
+    Ok(DetachedPending {
+        rep: Some(rep_r),
+        cgroup: if spec.limits.is_empty() { None } else { Some((spec.cgroup_parent.to_vec(), spec.id.to_vec())) },
+        host_net: spec.sandbox.is_some_and(|s| s.host_net),
+        userns: spec.userns,
+        exit_path: exit_path.to_vec(),
+    })
+}
+
+impl DetachedPending {
+    /// Waits (asynchronously) for the shim's report: the container's pid, or the step that failed.
+    pub async fn finish(mut self) -> Result<Running, RunError> {
+        let fd = self.rep.take().expect("fresh");
+        let _ = ns::set_nonblocking(fd.raw());
+        let rep = kr_rt::exec::Async::new(fd).map_err(err("register shim pipe"))?;
+        let mut head = [0u8; 9];
+        if read_exact_async(&rep, &mut head).await != 9 {
+            return Err(RunError { step: "shim", errno: Errno(5) });
+        }
+        let mut name = Vec::new();
+        if head[0] != 0 {
+            name = alloc::vec![0u8; u32::from_le_bytes([head[5], head[6], head[7], head[8]]) as usize];
+            read_exact_async(&rep, &mut name).await;
+        }
+        self.complete(head, &name)
     }
-    let word = |o: usize| u32::from_le_bytes([head[o], head[o + 1], head[o + 2], head[o + 3]]);
-    if head[0] != 0 {
-        // Failure: errno, then the step name's length and bytes.
-        let errno = Errno(word(1) as i32);
-        let mut name = alloc::vec![0u8; word(5) as usize];
-        read_full(&rep_r, &mut name);
-        let step: &'static str = alloc::boxed::Box::leak(String::from_utf8_lossy(&name).into_owned().into_boxed_str());
-        return Err(RunError { step, errno });
+
+    fn complete(&self, head: [u8; 9], name: &[u8]) -> Result<Running, RunError> {
+        let word = |o: usize| u32::from_le_bytes([head[o], head[o + 1], head[o + 2], head[o + 3]]);
+        if head[0] != 0 {
+            // Failure: errno, then the step name's length and bytes.
+            let step: &'static str = alloc::boxed::Box::leak(String::from_utf8_lossy(name).into_owned().into_boxed_str());
+            return Err(RunError { step, errno: Errno(word(1) as i32) });
+        }
+        let (pid, shim) = (word(1) as i32, word(5) as i32);
+        // The shim has not reaped the container, so the pid cannot have been recycled.
+        let pidfd = ns::pidfd_open(pid).map_err(err("pidfd_open"))?;
+        let cgroup = self.cgroup.as_ref().and_then(|(parent, id)| Cgroup::open_in(parent, id).ok());
+        Ok(Running { pid, pidfd: Rc::new(pidfd), cgroup, host_net: self.host_net, userns: self.userns, exit_file: Some(cstr(&[&self.exit_path])), shim })
     }
-    let (pid, shim) = (word(1) as i32, word(5) as i32);
-    // The shim has not reaped the container, so the pid cannot have been recycled.
-    let pidfd = ns::pidfd_open(pid).map_err(err("pidfd_open"))?;
-    let cgroup = if spec.limits.is_empty() { None } else { Cgroup::open_in(spec.cgroup_parent, spec.id).ok() };
-    Ok(Running { pid, pidfd: Rc::new(pidfd), cgroup, host_net: spec.sandbox.is_some_and(|s| s.host_net), userns: spec.userns, exit_file: Some(cstr(&[exit_path])), shim })
+}
+
+async fn read_exact_async(fd: &kr_rt::exec::Async<Fd>, buf: &mut [u8]) -> usize {
+    let mut n = 0;
+    while n < buf.len() {
+        match fd.read(&mut buf[n..]).await {
+            Ok(0) | Err(_) => break,
+            Ok(k) => n += k,
+        }
+    }
+    n
 }
 
 /// The shim: runs in a forked copy of the kubelet, so it keeps the whole spec in memory.

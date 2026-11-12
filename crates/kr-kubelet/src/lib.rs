@@ -1610,14 +1610,23 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let keep_fds: Vec<i32> = io_fd.map(|(f, _)| f).into_iter().collect();
         let exit_path = alloc::format!("{pod_dir}/{cid}.exit");
         let tty_log = alloc::format!("{pod_dir}/{name}.log");
-        let r = if detached {
+        // A detached start forks the shim and returns; the shim reports once the container is set
+        // up (overlay mount, hooks, exec: 50-130 ms), awaited below so that wait does not stall
+        // the event loop. No `RefCell` borrow is held across it.
+        let (begun, started) = if detached {
             let io_sock = alloc::format!("{pod_dir}/{name}.io");
             let io = container::ShimIo { keep_fds: &keep_fds, tty_master: tty_pair.as_ref().map(|(m, _)| m.raw()), tty_log: tty_log.as_bytes(), io_fd: io_fd.map(|(f, _)| f), io_sock: io_sock.as_bytes() };
-            container::start_detached(&run, exit_path.as_bytes(), &io)
+            (Some(container::start_detached_begin(&run, exit_path.as_bytes(), &io)), None)
         } else {
-            container::start(&run)
+            (None, Some(container::start(&run)))
         };
         drop(pods);
+        let r = match (begun, started) {
+            (Some(Ok(pending)), _) => pending.finish().await,
+            (Some(Err(e)), _) => Err(e),
+            (None, Some(r)) => r,
+            (None, None) => unreachable!(),
+        };
         drop(log);
         if r.is_ok() {
             let key = alloc::format!("{pod_dir}/{name}");
