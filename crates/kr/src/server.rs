@@ -325,12 +325,12 @@ fn server_tls(pki_dir: &str) -> Result<(Rc<ServerConfig>, Rc<kr_crypto::tls::Cli
 
 /// Reads the audit policy and Pod Security configuration and installs them; returns the audit
 /// writer (its flush timer starts inside the executor). `--audit-log-path off` disables auditing.
-fn audit_setup(data: &str, policy: Option<&str>, path: Option<&str>, max_mb: u64, backups: usize, psa: Option<&str>, api: &kr_apiserver::api::ApiServer) -> Result<Option<Rc<kr_apiserver::audit::Auditor>>, String> {
+fn audit_setup(data: &str, policy: Option<&str>, path: Option<&str>, max_mb: u64, backups: usize, fmt: (bool, u64), psa: Option<&str>, api: &kr_apiserver::api::ApiServer) -> Result<Option<Rc<kr_apiserver::audit::Auditor>>, String> {
     let read = |p: &str| -> Result<String, String> { String::from_utf8(fs::read_file(&[p.as_bytes(), &[0]].concat(), 1 << 20).map_err(|_| format!("cannot read {p}"))?).map_err(|_| format!("{p} is not UTF-8")) };
     if let Some(p) = psa {
         *api.audit.psa.borrow_mut() = kr_apiserver::psa::Config::parse(&read(p)?)?;
     }
-    if max_mb == u64::MAX || backups == usize::MAX {
+    if max_mb == u64::MAX || backups == usize::MAX || fmt.1 == u64::MAX {
         return Err(String::from("bad --audit-log-maxsize / --audit-log-maxbackup"));
     }
     let path = path.map(String::from).unwrap_or_else(|| format!("{data}/audit/audit.log"));
@@ -342,6 +342,7 @@ fn audit_setup(data: &str, policy: Option<&str>, path: Option<&str>, max_mb: u64
         None => kr_apiserver::audit::Policy::builtin(),
     };
     let a = Rc::new(kr_apiserver::audit::Auditor::open(policy, &path, max_mb, backups));
+    a.set_format(fmt.0, fmt.1);
     api.audit.set_auditor(a.clone());
     Ok(Some(a))
 }
@@ -372,6 +373,7 @@ pub fn main(mut args: Args) -> i32 {
     let (mut snap_every, mut snap_keep) = (None::<u64>, 5usize);
     let mut enc_on = true;
     let (mut audit_policy, mut audit_path, mut audit_max, mut audit_backup, mut psa_config) = (None::<String>, None::<String>, 100u64, 5usize, None::<String>);
+    let (mut audit_legacy, mut audit_age) = (false, 0u64);
     let (mut join_url, mut token, mut token_file): (Option<String>, Option<String>, Option<String>) = (None, None, None);
     while let Some(a) = args.next() {
         // `--flag=value` and `--flag value` are both accepted.
@@ -415,6 +417,8 @@ pub fn main(mut args: Args) -> i32 {
             (b"--audit-log-path", Some(v)) => audit_path = Some(String::from(v)),
             (b"--audit-log-maxsize", Some(v)) => audit_max = v.parse().unwrap_or(u64::MAX),
             (b"--audit-log-maxbackup", Some(v)) => audit_backup = v.parse().unwrap_or(usize::MAX),
+            (b"--audit-log-maxage", Some(v)) => audit_age = v.parse().unwrap_or(u64::MAX),
+            (b"--audit-log-format", Some(v)) if v == "json" || v == "legacy" => audit_legacy = v == "legacy",
             (b"--pod-security-config", Some(v)) => psa_config = Some(String::from(v)),
             _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h [--snapshot-keep 5]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--pod-security-config FILE]"),
         }
@@ -496,7 +500,7 @@ pub fn main(mut args: Args) -> i32 {
         api.set_encryption_reloader(Rc::new(move || crate::secrets_encrypt::load(&data, false, false)));
     }
     // Audit log (ADR-046) and Pod Security configuration.
-    let auditor = match audit_setup(&data, audit_policy.as_deref(), audit_path.as_deref(), audit_max, audit_backup, psa_config.as_deref(), &api) {
+    let auditor = match audit_setup(&data, audit_policy.as_deref(), audit_path.as_deref(), audit_max, audit_backup, (audit_legacy, audit_age), psa_config.as_deref(), &api) {
         Ok(a) => a,
         Err(e) => return fail(&e),
     };

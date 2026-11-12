@@ -141,6 +141,9 @@ impl InProcess {
             },
             None => self.api.handle(&req),
         };
+        if let Reply::Json(code, b) = &reply {
+            crate::audit::record_internal(&self.api, &req, &self.user, *code, b);
+        }
         Self::reply_to_result(reply)
     }
 

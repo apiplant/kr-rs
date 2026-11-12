@@ -645,3 +645,6 @@
 
 185. **Pod Security version pinning** — *fixed (ADR-029, ADR-046)*
     Version-gated rules added: baseline sysctl list (1.22/1.27/1.29/1.33 additions), AppArmor fields (1.30), `container_engine_t` SELinux type (1.31), Windows pods exempt from the restricted allowPrivilegeEscalation/capabilities/seccomp checks (1.25). `exemptions.usernames` reuses the request's authentication (no second token check). RuntimeClass exemptions match `spec.runtimeClassName` after RuntimeClass admission (Kubernetes has no default RuntimeClass, so there is nothing else to default).
+
+180-182, 184 (part of #183). **Audit parity: streams, in-process writers, PSA annotations, identity** — *fixed (ADR-046)*
+    `Audit-ID` header, single authentication per audited request (the audit hook hands the pre-impersonation identity to the handler), `ResponseComplete` when a watch/log stream ends, in-process controller/kubelet writes audited as their `system:kr:<component>` user, Pod Security `audit-violations`/`enforce-policy` annotations recorded by admission (after the decision, also denied requests and updates), `--audit-log-format legacy`, `--audit-log-maxage`.

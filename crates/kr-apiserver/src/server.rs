@@ -40,13 +40,18 @@ fn log_line(msg: &str) {
 pub async fn handle(api: &Rc<ApiServer>, req: Request) -> Response {
     let (t0, method, path) = (kr_rt::exec::now_ms(), req.method.clone(), alloc::string::String::from(req.path()));
     let pf = core::cell::RefCell::new(None);
+    let ann = core::cell::RefCell::new(alloc::vec::Vec::new());
     let audit = crate::audit::begin(api, &req, user_from_certs(req.peer.client_certs.as_deref()));
-    let mut resp = handle_inner(api, req, &pf).await;
+    let (aid, cached) = (audit.as_ref().map(|p| String::from(p.id())), audit.as_ref().and_then(|p| p.caller()));
+    let mut resp = handle_inner(api, req, &pf, cached, &ann).await;
     kr_rt::exec::phase("http: audit finish");
-    crate::audit::finish(api, audit, &resp);
+    crate::audit::finish(api, audit, &mut resp, ann.into_inner());
     kr_rt::exec::phase("http: response built");
     if let Some((flow, level)) = pf.into_inner() {
         resp = resp.with_header("X-Kubernetes-PF-FlowSchema-UID", &flow).with_header("X-Kubernetes-PF-PriorityLevel-UID", &level);
+    }
+    if let Some(id) = aid {
+        resp = resp.with_header("Audit-ID", &id);
     }
     if resp.status == 429 {
         resp = resp.with_header("Retry-After", "1");
@@ -58,12 +63,13 @@ pub async fn handle(api: &Rc<ApiServer>, req: Request) -> Response {
     resp
 }
 
-async fn handle_inner(api: &Rc<ApiServer>, req: Request, pf: &core::cell::RefCell<Option<(alloc::string::String, alloc::string::String)>>) -> Response {
+async fn handle_inner(api: &Rc<ApiServer>, req: Request, pf: &core::cell::RefCell<Option<(alloc::string::String, alloc::string::String)>>, cached: Option<User>, ann: &core::cell::RefCell<alloc::vec::Vec<(String, String)>>) -> Response {
     // Another server forwarding a write for one of its clients (ADR-026).
     let peer_cert = req.peer.client_certs.as_deref().and_then(|c| c.first()).map(|c| c.as_slice());
     let forwarded = forward::trusted_identity(peer_cert, req.header(forward::IDENTITY));
     let is_forwarded = forwarded.is_some();
-    let user = forwarded.or_else(|| user_from_certs(req.peer.client_certs.as_deref()));
+    let have_cached = cached.is_some();
+    let user = forwarded.or(cached).or_else(|| user_from_certs(req.peer.client_certs.as_deref()));
     let r = Req {
         method: &req.method,
         path: req.path(),
@@ -73,7 +79,7 @@ async fn handle_inner(api: &Rc<ApiServer>, req: Request, pf: &core::cell::RefCel
         body: &req.body,
         user,
         headers: &req.headers,
-        bearer: req.header("authorization").and_then(|a| a.strip_prefix("Bearer ").or_else(|| a.strip_prefix("bearer "))).map(str::trim),
+        bearer: req.header("authorization").filter(|_| !have_cached).and_then(|a| a.strip_prefix("Bearer ").or_else(|| a.strip_prefix("bearer "))).map(str::trim),
         authz_verb: None,
     };
     // API priority and fairness (a request forwarded by another server was admitted there).
@@ -184,6 +190,7 @@ async fn handle_inner(api: &Rc<ApiServer>, req: Request, pf: &core::cell::RefCel
                 }
             };
             warnings.extend(w);
+            *ann.borrow_mut() = api.audit.take_annotations();
             let reply = crate::convert::post(api, &r, reply).await;
             crate::convert::watch(api, &r, reply)
         }

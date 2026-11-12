@@ -26,13 +26,13 @@ Ordered by impact. Size: S days, M a week or two, L more.
     `NodeExpandVolume` runs only for volumes mounted by a running pod (no offline expansion, not for raw block); no retry with backoff, no `NodeResizeError` condition (failures are logged once). Volume stats come from `statfs` (as upstream for local volumes), the driver's `NodeGetVolumeStats` is not used.
 199. **Kubelet metrics endpoints** — *ADR-048*, M
     `/metrics/cadvisor` (container CPU throttling, network, filesystem series used by Prometheus and Grafana dashboards), `/metrics` (kubelet internals) and `/metrics/probes` are not served. (`kubelet_volume_stats_*` is: RESOLVED 268.)
-183. **Audit parity** (+180, +181, +182, +184) — *ADR-046, ADR-029*, M
-    k3s passes the kube-apiserver audit flags through; kr has the log backend only.
-    - #183: no `auditID` propagation, no `Audit-ID` response header, no webhook backend or batching, no `--audit-log-format`/`--audit-log-maxage`; backups are named `audit-<UTC time>.log`, no `.gz`.
-    - #180: watches, exec/attach/portforward and upgrades log only `ResponseStarted`; no `ResponseComplete`, no `requestObject`.
-    - #181: writes by in-process controllers and the in-process kubelet (`client::InProcess`) are not audited (upstream's controller-manager writes go over HTTP and are). Requests forwarded between HA servers are audited by the receiving server only.
-    - #182: pod-security `audit-violations` annotations are computed only on POST, before the decision; upstream annotates after it, also on updates.
-    - #184 (cost): with `users`/`userGroups` rules the bearer token is verified again by the audit hook (three times with impersonation); cache the transport's identity.
+183. **Audit parity** (remaining of #180-#184) — *ADR-046, ADR-029*, M
+    Done 2026-11-12: `Audit-ID` request header kept and returned on audited requests, one token verification per request (#184), `ResponseComplete` for chunked streams (#180), audit of in-process writes (#181), Pod Security annotations after the decision and on updates (#182), `--audit-log-format json|legacy`, `--audit-log-maxage`.
+    Left:
+    - No webhook backend (`--audit-webhook-config-file`, batching): it needs a batching HTTP client with retry/backoff and a kubeconfig-style config reader on the audit path; deferred, not skipped for a technical block. Use the log backend plus a shipper.
+    - `Audit-ID` is returned only when the request is audited (upstream returns it always); backups are named `audit-<UTC time>.log`, not compressed.
+    - `ResponseComplete` is not recorded for upgraded connections (exec/attach/portforward, `101`), only `ResponseStarted`; no `requestObject` for them.
+    - In-process audit covers writes only (reads of controllers would dominate the log) and has no source IP; requests forwarded between HA servers are audited by the receiving server only.
 130. **Images: manual removal** — *ADR-056, ADR-057*, S
     No `crictl rmi` equivalent (k3s: `k3s crictl rmi`, `rmi --prune`). Add `kr ctr rmi [--prune]` reusing the GC's in-use check. Also: the GC waits while any container directory lacks an image record (containers of the previous release, `kr run`); blobs of images installed before the layered store that no manifest names are never removed (one-off migration sweep).
 175. **`registries.yaml`: RSA client keys and regex flags** — *ADR-027, ADR-044*, S–M

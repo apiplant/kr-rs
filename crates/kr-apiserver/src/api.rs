@@ -1154,6 +1154,7 @@ impl ApiServer {
         let mode = if write { crate::fieldval::Mode::parse(Query::parse(req.query).ok().as_ref().and_then(|q| q.get("fieldValidation"))) } else { crate::fieldval::Mode::Ignore };
         self.fv_mode.set(mode);
         self.warnings.borrow_mut().clear();
+        self.audit.clear_annotations();
         if !self.writable() && Self::mutates(req) {
             let leader = self.cluster.borrow().as_ref().and_then(|c| c.leader());
             return (Reply::err(not_leader(leader)), Vec::new());
@@ -3444,6 +3445,7 @@ impl ApiServer {
         let nsobj = self.wh_object("", "v1", "namespaces", None, ns);
         let d = crate::psa::check(&self.audit.psa.borrow(), &self.audit.user.borrow(), ns, nsobj.as_ref(), spec, meta.unwrap_or(&Value::Null), !pod);
         self.warnings.borrow_mut().extend(d.warnings);
+        self.audit.add_annotations(d.audit);
         match d.deny {
             Some(msg) => Err(ApiError::new(403, "Forbidden", alloc::format!("pods {name:?} is forbidden: {msg}"))),
             None => Ok(()),

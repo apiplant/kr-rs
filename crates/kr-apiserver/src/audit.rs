@@ -11,6 +11,7 @@
 //! mode annotations are added in [`finish`] from the request body (no state is shared between
 //! interleaved requests).
 
+use alloc::boxed::Box;
 use crate::api::{ApiServer, Req, User};
 use crate::object::rfc3339;
 use alloc::format;
@@ -267,6 +268,10 @@ pub struct Auditor {
     buf: RefCell<Vec<u8>>,
     max_bytes: u64,
     max_backup: usize,
+    /// `--audit-log-format legacy`: one `AUDIT:` text line per event.
+    legacy: core::cell::Cell<bool>,
+    /// `--audit-log-maxage`: backups older than this many days are removed (0: keep).
+    max_age_days: core::cell::Cell<u64>,
 }
 
 /// The one-second flusher ([`spawn_flusher`]) writes the buffer; a request only flushes inline when
@@ -279,7 +284,12 @@ impl Auditor {
     pub fn open(policy: Policy, path: &str, max_mb: u64, max_backup: usize) -> Auditor {
         let stdout = path == "-";
         let sink = Sink { path: if stdout { String::new() } else { path.to_string() }, fd: None, size: 0, warned: false };
-        Auditor { policy, sink: RefCell::new(sink), buf: RefCell::new(Vec::new()), max_bytes: max_mb.saturating_mul(1024 * 1024), max_backup }
+        Auditor { policy, sink: RefCell::new(sink), buf: RefCell::new(Vec::new()), max_bytes: max_mb.saturating_mul(1024 * 1024), max_backup, legacy: core::cell::Cell::new(false), max_age_days: core::cell::Cell::new(0) }
+    }
+
+    pub fn set_format(&self, legacy: bool, max_age_days: u64) {
+        self.legacy.set(legacy);
+        self.max_age_days.set(max_age_days);
     }
 
     fn emit(&self, ev: &Value) {
@@ -288,6 +298,13 @@ impl Auditor {
 
     /// Queues an event that is already serialised.
     pub fn emit_text(&self, ev: &str) {
+        let legacy_line;
+        let ev = if self.legacy.get() {
+            legacy_line = json::parse(ev.as_bytes()).map(|v| legacy_text(&v)).unwrap_or_else(|_| ev.to_string());
+            legacy_line.as_str()
+        } else {
+            ev
+        };
         let mut b = self.buf.borrow_mut();
         b.extend_from_slice(ev.as_bytes());
         b.push(b'\n');
@@ -354,6 +371,18 @@ impl Auditor {
         from.push(0);
         to.push(0);
         let _ = kr_sys::fs::renameat2(kr_sys::fs::AT_FDCWD, &from, kr_sys::fs::AT_FDCWD, &to, 0);
+        let age = self.max_age_days.get();
+        if age > 0 {
+            let cutoff = wall().0 - (age as i64) * 86400;
+            for old in old_backups(dir, &stem, &ext) {
+                let when = old[stem.len() + 1..old.len() - ext.len()].split_once('T').and_then(|(d, tm)| crate::printers::parse_rfc3339(&format!("{d}T{}Z", tm.split('.').next().unwrap_or("").replace('-', ":"))));
+                if when.is_some_and(|w| w < cutoff) {
+                    let mut p = format!("{dir}/{old}").into_bytes();
+                    p.push(0);
+                    let _ = kr_sys::fs::unlinkat(kr_sys::fs::AT_FDCWD, &p, 0);
+                }
+            }
+        }
         if self.max_backup > 0 {
             for old in old_backups(dir, &stem, &ext).into_iter().skip(self.max_backup) {
                 let mut p = format!("{dir}/{old}").into_bytes();
@@ -363,6 +392,22 @@ impl Auditor {
         }
         self.open_file(s);
     }
+}
+
+/// The `--audit-log-format legacy` line of an event (apiserver's `audit/format.go`).
+fn legacy_text(ev: &Value) -> String {
+    let g = |p: &[&str]| ev.pointer(p).and_then(Value::as_str).unwrap_or("").to_string();
+    let groups = ev.pointer(&["user", "groups"]).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")).unwrap_or_default();
+    let ip = ev.pointer(&["sourceIPs"]).and_then(Value::as_array).and_then(|a| a.first()).and_then(Value::as_str).unwrap_or("<unknown>");
+    let as_user = ev.pointer(&["impersonatedUser", "username"]).and_then(Value::as_str).unwrap_or("<self>");
+    let as_groups = ev.pointer(&["impersonatedUser", "groups"]).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")).unwrap_or_else(|| String::from("<lookup>"));
+    let resp = ev.pointer(&["responseStatus", "code"]).and_then(Value::as_u64).map(|c| c.to_string()).unwrap_or_else(|| String::from("<deferred>"));
+    let mut s = format!("{} AUDIT: id={:?} stage={:?} ip={:?} method={:?} user={:?} groups={:?} as={:?} asgroups={:?}", g(&["requestReceivedTimestamp"]), g(&["auditID"]), g(&["stage"]), ip, g(&["verb"]), g(&["user", "username"]), groups, as_user, as_groups);
+    if let Some(ns) = ev.pointer(&["objectRef", "namespace"]).and_then(Value::as_str) {
+        s.push_str(&format!(" namespace={ns:?}"));
+    }
+    s.push_str(&format!(" uri={:?} response={:?}", g(&["requestURI"]), resp));
+    s
 }
 
 /// Backup file names of `stem-<time>ext` in `dir`, newest first.
@@ -426,11 +471,24 @@ pub struct Hub {
     pub psa: RefCell<crate::psa::Config>,
     /// The caller of the write being handled, for Pod Security user exemptions.
     pub user: RefCell<String>,
+    /// Pod Security annotations of the request being handled (set by admission, taken by the
+    /// transport right after the handler returns).
+    psa_ann: RefCell<Vec<(String, String)>>,
 }
 
 impl Hub {
     pub fn set_auditor(&self, a: Rc<Auditor>) {
         *self.auditor.borrow_mut() = Some(a);
+    }
+    pub(crate) fn add_annotations(&self, a: Vec<(String, String)>) {
+        self.psa_ann.borrow_mut().extend(a);
+    }
+    pub(crate) fn clear_annotations(&self) {
+        self.psa_ann.borrow_mut().clear();
+    }
+    /// The annotations recorded by admission for the request just handled.
+    pub fn take_annotations(&self) -> Vec<(String, String)> {
+        core::mem::take(&mut *self.psa_ann.borrow_mut())
     }
     fn auditor(&self) -> Option<Rc<Auditor>> {
         self.auditor.borrow().clone()
@@ -440,6 +498,7 @@ impl Hub {
 // ---- per-request hooks ----
 
 /// A request being audited.
+#[derive(Clone)]
 pub struct Pending {
     auditor: Rc<Auditor>,
     id: String,
@@ -456,6 +515,21 @@ pub struct Pending {
     body: Vec<u8>,
     /// The caller before impersonation.
     base: User,
+    /// `base` came from a successful authentication (certificate or token).
+    verified: bool,
+    /// Pod Security annotations from admission (after the decision, creates and updates).
+    psa: Vec<(String, String)>,
+}
+
+impl Pending {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    /// The authenticated caller before impersonation, to hand to the handler so the token is
+    /// not verified again.
+    pub fn caller(&self) -> Option<User> {
+        self.verified.then(|| self.base.clone())
+    }
 }
 
 /// Called by the transport when a request arrives. `None` when auditing is off or the policy
@@ -472,7 +546,11 @@ pub fn begin(api: &ApiServer, req: &kr_net::http1::server::Request, cert_user: O
     }
     let mut p = Pending {
         auditor,
-        id: crate::object::uuid4(|b| kr_sys::getrandom(b)),
+        // A client-supplied Audit-ID is kept (upstream propagates it across hops).
+        id: match req.header("audit-id").map(str::trim) {
+            Some(i) if !i.is_empty() && i.len() <= 64 && i.bytes().all(|b| b.is_ascii_graphic()) => i.to_string(),
+            _ => crate::object::uuid4(|b| kr_sys::getrandom(b)),
+        },
         received: micro_ts(),
         attrs: Attrs::default(),
         decision: early,
@@ -488,10 +566,17 @@ pub fn begin(api: &ApiServer, req: &kr_net::http1::server::Request, cert_user: O
         user_cert: cert_user,
         body: Vec::new(),
         base: User { name: String::new(), groups: Vec::new() },
+        verified: false,
+        psa: Vec::new(),
     };
     let anon = || User { name: String::from("system:anonymous"), groups: alloc::vec![String::from("system:unauthenticated")] };
-    let fin = identity(api, &p, true).unwrap_or_else(anon);
-    p.base = if p.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("impersonate-user")) { identity(api, &p, false).unwrap_or_else(anon) } else { fin.clone() };
+    // One token verification: the caller before impersonation is resolved once, the final
+    // identity is derived from it, and the handler reuses it (`Pending::caller`, #184).
+    let imp = p.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("impersonate-user"));
+    let base = identity(api, &p, false);
+    p.verified = base.is_some() && (p.bearer.is_some() || p.user_cert.is_some());
+    let fin = if imp { identity_with(api, &p, base.clone()) } else { base.clone() }.unwrap_or_else(anon);
+    p.base = base.unwrap_or_else(anon);
     attrs.user = fin.name;
     attrs.groups = fin.groups;
     let decision = match p.decision.take() {
@@ -514,6 +599,52 @@ pub fn begin(api: &ApiServer, req: &kr_net::http1::server::Request, cert_user: O
     Some(p)
 }
 
+/// Audits a write made by an in-process component (controllers, the server's kubelet) as
+/// `user` (#181): `(code, body)` is the reply. Reads are not recorded (volume), and the event
+/// has no source IP or user agent.
+pub fn record_internal(api: &Rc<ApiServer>, req: &Req, user: &User, code: u16, body: &str) {
+    if !matches!(req.method, "POST" | "PUT" | "PATCH" | "DELETE") {
+        return;
+    }
+    let Some(auditor) = api.audit.auditor() else { return };
+    let mut attrs = attrs_of(req.method, req.path, req.query);
+    attrs.user = user.name.clone();
+    attrs.groups = user.groups.clone();
+    let decision = auditor.policy.evaluate(&attrs);
+    if decision.level == Level::None {
+        return;
+    }
+    let p = Pending {
+        auditor,
+        id: crate::object::uuid4(|b| kr_sys::getrandom(b)),
+        received: micro_ts(),
+        uri: match req.query {
+            "" => req.path.to_string(),
+            q => format!("{}?{q}", req.path),
+        },
+        ua: String::new(),
+        ip: None,
+        ctype: req.content_type.unwrap_or("").to_string(),
+        headers: Vec::new(),
+        bearer: None,
+        user_cert: None,
+        body: if decision.level >= Level::Request { req.body.to_vec() } else { Vec::new() },
+        base: user.clone(),
+        verified: true,
+        psa: api.audit.take_annotations(),
+        attrs,
+        decision: Some(decision),
+    };
+    let mut resp = kr_net::http1::server::Response::new(code, body.as_bytes().to_vec()).with_header("Content-Type", "application/json");
+    let omit = p.decision.as_ref().unwrap().omit_stages.iter().any(|s| s == "RequestReceived");
+    if !omit {
+        let ev = event(api, &p, "RequestReceived", None, None, Bodies::Inline);
+        p.auditor.emit(&ev);
+    }
+    let ann = p.psa.clone();
+    finish(api, Some(p), &mut resp, ann);
+}
+
 /// The caller; `final_` = after impersonation.
 fn identity(api: &ApiServer, p: &Pending, final_: bool) -> Option<User> {
     let hs: Vec<(String, String)> = if final_ { p.headers.clone() } else { p.headers.iter().filter(|(k, _)| !k.to_ascii_lowercase().starts_with("impersonate-")).cloned().collect() };
@@ -521,10 +652,68 @@ fn identity(api: &ApiServer, p: &Pending, final_: bool) -> Option<User> {
     api.authenticate(&r).ok()
 }
 
+/// The final identity from an already authenticated `base` (impersonation applied).
+fn identity_with(api: &ApiServer, p: &Pending, base: Option<User>) -> Option<User> {
+    let r = Req { method: "GET", path: "/", query: "", content_type: None, accept: None, body: &[], user: base, bearer: None, headers: &p.headers, authz_verb: None };
+    api.authenticate(&r).ok()
+}
+
 /// Called when the response is ready. A streaming or upgraded response is recorded as
 /// `ResponseStarted` (the end of a stream is not observed).
-pub fn finish(api: &alloc::rc::Rc<ApiServer>, p: Option<Pending>, resp: &kr_net::http1::server::Response) {
-    let Some(p) = p else { return };
+pub fn finish(api: &alloc::rc::Rc<ApiServer>, p: Option<Pending>, resp: &mut kr_net::http1::server::Response, ann: Vec<(String, String)>) {
+    // A chunked stream (watch, log follow) gets its ResponseComplete when it ends (#180).
+    if let (Some(pp), kr_net::http1::server::Body::Stream(_)) = (&p, &resp.body) {
+        if !pp.decision.as_ref().is_some_and(|d| d.omit_stages.iter().any(|s| s == "ResponseComplete")) {
+            let mut pp = pp.clone();
+            pp.psa = ann.clone();
+            let status = resp.status;
+            let body = core::mem::replace(&mut resp.body, kr_net::http1::server::Body::Full(Vec::new()));
+            if let kr_net::http1::server::Body::Stream(inner) = body {
+                resp.body = kr_net::http1::server::Body::Stream(Box::new(Completing { inner, api: api.clone(), p: Some(pp), status }));
+            }
+        }
+    }
+    finish_started(api, p, resp, ann)
+}
+
+/// A response stream that records `ResponseComplete` when it ends or is dropped.
+struct Completing {
+    inner: Box<dyn kr_net::http1::server::ResponseStream>,
+    api: Rc<ApiServer>,
+    p: Option<Pending>,
+    status: u16,
+}
+
+impl Completing {
+    fn complete(&mut self) {
+        if let Some(p) = self.p.take() {
+            let r = kr_net::http1::server::Response::new(self.status, Vec::new());
+            let d = p.decision.clone();
+            let ev = event(&self.api, &p, "ResponseComplete", Some(&r), d.as_ref(), Bodies::Skip);
+            p.auditor.emit(&ev);
+        }
+    }
+}
+
+impl kr_net::http1::server::ResponseStream for Completing {
+    fn poll_next(&mut self, cx: &mut core::task::Context<'_>) -> core::task::Poll<Option<Vec<u8>>> {
+        let r = self.inner.poll_next(cx);
+        if matches!(r, core::task::Poll::Ready(None)) {
+            self.complete();
+        }
+        r
+    }
+}
+
+impl Drop for Completing {
+    fn drop(&mut self) {
+        self.complete();
+    }
+}
+
+fn finish_started(api: &alloc::rc::Rc<ApiServer>, p: Option<Pending>, resp: &kr_net::http1::server::Response, ann: Vec<(String, String)>) {
+    let Some(mut p) = p else { return };
+    p.psa = ann;
     let d = p.decision.clone().unwrap();
     let streaming = !matches!(resp.body, kr_net::http1::server::Body::Full(_));
     let stage = if streaming { "ResponseStarted" } else { "ResponseComplete" };
@@ -644,7 +833,7 @@ fn strip_managed(v: &mut Value) {
 }
 
 /// Builds one `audit.k8s.io/v1` Event.
-fn event(api: &ApiServer, p: &Pending, stage: &str, resp: Option<&kr_net::http1::server::Response>, d: Option<&Decision>, bodies: Bodies) -> Value {
+fn event(_api: &ApiServer, p: &Pending, stage: &str, resp: Option<&kr_net::http1::server::Response>, d: Option<&Decision>, bodies: Bodies) -> Value {
     let a = &p.attrs;
     let level = p.decision.as_ref().map(|d| d.level).unwrap_or(Level::Metadata);
     let user = &p.base;
@@ -754,9 +943,7 @@ fn event(api: &ApiServer, p: &Pending, stage: &str, resp: Option<&kr_net::http1:
             }
         }
         // Pod Security `audit` mode: violations of the namespace's audit level on creation.
-        if a.verb == "create" && !p.body.is_empty() {
-            psa_annotations(api, p, &mut annotations);
-        }
+        annotations.extend(p.psa.iter().cloned());
     }
     if !annotations.is_empty() {
         ev.set("annotations", Value::Object(annotations.into_iter().map(|(k, v)| (k, Value::String(v))).collect()));
@@ -766,34 +953,18 @@ fn event(api: &ApiServer, p: &Pending, stage: &str, resp: Option<&kr_net::http1:
     ev
 }
 
-fn psa_annotations(api: &ApiServer, p: &Pending, out: &mut Vec<(String, String)>) {
-    let a = &p.attrs;
-    let pod = a.group.is_empty() && a.resource == "pods";
-    let tpath = if pod { None } else { crate::psa::template_path(&a.group, &a.resource) };
-    if !pod && tpath.is_none() {
-        return;
-    }
-    let Some(o) = decode(&p.ctype, &p.body) else { return };
-    let (spec, meta) = match tpath {
-        None => (o.get("spec"), o.get("metadata")),
-        Some(path) => {
-            let t = o.pointer(path);
-            (t.and_then(|t| t.get("spec")), t.and_then(|t| t.get("metadata")))
-        }
-    };
-    let Some(spec) = spec else { return };
-    let nsobj = api.wh_object("", "v1", "namespaces", None, &a.namespace);
-    let cfg = api.audit.psa.borrow();
-    let d = crate::psa::check(&cfg, &a.user, &a.namespace, nsobj.as_ref(), spec, meta.unwrap_or(&Value::Null), !pod);
-    out.extend(d.audit);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn pol(s: &str) -> Policy {
         Policy::parse(s).unwrap()
+    }
+
+    #[test]
+    fn legacy_format() {
+        let ev = json::parse(br#"{"auditID":"a1","stage":"ResponseComplete","verb":"get","user":{"username":"u","groups":["g1","g2"]},"requestURI":"/api","sourceIPs":["1.2.3.4"],"requestReceivedTimestamp":"T","responseStatus":{"code":200},"objectRef":{"namespace":"ns"}}"#).unwrap();
+        assert_eq!(legacy_text(&ev), r#"T AUDIT: id="a1" stage="ResponseComplete" ip="1.2.3.4" method="get" user="u" groups="g1,g2" as="<self>" asgroups="<lookup>" namespace="ns" uri="/api" response="200""#);
     }
 
     #[test]
