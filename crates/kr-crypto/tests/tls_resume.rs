@@ -81,7 +81,7 @@ thread_local! {
     static CACHE: std::cell::RefCell<SessionCache> = const { std::cell::RefCell::new(SessionCache::new()) };
 }
 
-const TICKETS: TicketHooks = TicketHooks { seal: |p, now| KEYS.with(|k| k.borrow_mut().seal(p, now, rng)), open: |t| KEYS.with(|k| k.borrow().open(t)) };
+const TICKETS: TicketHooks = TicketHooks { seal: |p, now| KEYS.with(|k| k.borrow_mut().seal(p, now, rng)), open: |t, now| KEYS.with(|k| k.borrow_mut().open(t, now)) };
 const SESSIONS: SessionHooks = SessionHooks { put: |k, s| CACHE.with(|c| c.borrow_mut().put(k, s)), take: |k, now| CACHE.with(|c| c.borrow_mut().take(k, now)) };
 
 fn reset() {
@@ -302,4 +302,32 @@ fn certificates_verify_with_a_ca_key_table() {
     let mut s = Connection::server(scfg, rng, NOW).with_key_tables(ca_tables);
     let mut c = Connection::client(bad_client, b"api.kr.local", rng, NOW).with_key_tables(ca_tables);
     assert!(pump(&mut c, &mut s, usize::MAX).is_err());
+}
+
+/// With a shared secret (#209) a server restart, or another server of the cluster, still opens the ticket.
+#[test]
+fn tickets_survive_a_restart_and_work_across_servers_with_a_shared_secret() {
+    reset();
+    KEYS.with(|k| k.borrow_mut().set_secret([42; 32]));
+    let p = pki(false);
+    let scfg = server(&p, ClientAuth::Required(vec![p.ca.clone()]), false, vec![]);
+    let ccfg = client(&p, true, vec![]);
+    first_connection(&scfg, &ccfg, NOW);
+    // "Restart": all server state is gone, the secret is configured again.
+    KEYS.with(|k| {
+        *k.borrow_mut() = TicketKeys::new();
+        k.borrow_mut().set_secret([42; 32]);
+    });
+    let (mut s, mut c) = (srv(&scfg, NOW + 30), cli(&ccfg, NOW + 30));
+    pump(&mut c, &mut s, usize::MAX).unwrap();
+    assert!(c.resumed() && s.resumed(), "resumed after a restart");
+    assert_eq!(x509::Certificate::parse(&s.peer_certificates()[0]).unwrap().common_name(), Some(&b"alice"[..]));
+    // A server with another secret (not part of this cluster) falls back to a full handshake.
+    KEYS.with(|k| {
+        *k.borrow_mut() = TicketKeys::new();
+        k.borrow_mut().set_secret([43; 32]);
+    });
+    let (mut s, mut c) = (srv(&scfg, NOW + 40), cli(&ccfg, NOW + 40));
+    pump(&mut c, &mut s, usize::MAX).unwrap();
+    assert!(!c.resumed() && !s.resumed());
 }

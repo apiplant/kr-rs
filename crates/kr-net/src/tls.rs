@@ -58,7 +58,7 @@ static TICKET_KEYS: Spin<TicketKeys> = Spin::new(TicketKeys::new());
 static SESSIONS: Spin<SessionCache> = Spin::new(SessionCache::new());
 static RESUMPTION: AtomicBool = AtomicBool::new(true);
 
-const TICKET_HOOKS: TicketHooks = TicketHooks { seal: |p, now| TICKET_KEYS.with(|k| k.seal(p, now, rng)), open: |t| TICKET_KEYS.with(|k| k.open(t)) };
+const TICKET_HOOKS: TicketHooks = TicketHooks { seal: |p, now| TICKET_KEYS.with(|k| k.seal(p, now, rng)), open: |t, now| TICKET_KEYS.with(|k| k.open(t, now)) };
 const SESSION_HOOKS: SessionHooks = SessionHooks { put: |k, s| SESSIONS.with(|c| c.put(k, s)), take: |k, now| SESSIONS.with(|c| c.take(k, now)) };
 
 /// Comb tables of the trust anchors' P-256 keys (ADR-051 follow-up, #219): the cluster CA key
@@ -91,6 +91,13 @@ fn register_roots(roots: &[Vec<u8>]) {
             }
         });
     }
+}
+
+/// Derives the ticket keys from `secret` instead of generating them per process (ADR-051): every
+/// server of a cluster that is given the same secret opens the tickets of the others, and tickets
+/// survive a restart. Call before accepting connections.
+pub fn set_ticket_secret(secret: [u8; 32]) {
+    TICKET_KEYS.with(|k| k.set_secret(secret));
 }
 
 /// Turns TLS 1.3 session resumption (ADR-051) on or off for connections made afterwards; on by default.

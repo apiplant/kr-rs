@@ -411,7 +411,7 @@ thread_local! {
     static CACHE: std::cell::RefCell<SessionCache> = const { std::cell::RefCell::new(SessionCache::new()) };
 }
 
-const TICKETS: TicketHooks = TicketHooks { seal: |p, t| KEYS.with(|k| k.borrow_mut().seal(p, t, rng)), open: |t| KEYS.with(|k| k.borrow().open(t)) };
+const TICKETS: TicketHooks = TicketHooks { seal: |p, t| KEYS.with(|k| k.borrow_mut().seal(p, t, rng)), open: |t, now| KEYS.with(|k| k.borrow_mut().open(t, now)) };
 const SESSIONS: SessionHooks = SessionHooks { put: |k, s| CACHE.with(|c| c.borrow_mut().put(k, s)), take: |k, t| CACHE.with(|c| c.borrow_mut().take(k, t)) };
 
 /// kr's client offers its ticket to OpenSSL's s_server on a second connection, which accepts it

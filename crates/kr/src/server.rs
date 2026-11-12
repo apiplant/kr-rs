@@ -339,6 +339,14 @@ fn audit_setup(data: &str, policy: Option<&str>, path: Option<&str>, max_mb: u64
     Ok(Some(a))
 }
 
+/// The secret the TLS ticket keys are derived from: HKDF over the service-account key with a
+/// purpose label, so the key itself is never used as a ticket key.
+fn ticket_secret(sa_key: &[u8; 32]) -> [u8; 32] {
+    let mut prk = [0u8; 32];
+    kr_crypto::hmac::hkdf_extract::<kr_crypto::sha2::Sha256>(b"kr tls ticket secret v1", sa_key, &mut prk);
+    prk
+}
+
 pub fn main(mut args: Args) -> i32 {
     if kr_runtime::store::env_var("KR_TLS_RESUMPTION").as_deref() == Some("off") {
         kr_net::tls::set_resumption(false);
@@ -527,6 +535,9 @@ pub fn main(mut args: Args) -> i32 {
         let x509::SigningKey::P256(key) = x509::private_key_from_pkcs8(&der).map_err(|_| "sa.key unsupported")? else {
             return Err("sa.key must be a P-256 key".into());
         };
+        // TLS tickets: keys derived from the service-account key, which every server of a cluster
+        // holds (ADR-051): a restart or another server still opens the tickets.
+        kr_net::tls::set_ticket_secret(ticket_secret(&key.to_bytes()));
         let ca_pem = fs::read_file(&pki::path(&pki_dir, "ca.pem"), 1 << 20).ok().and_then(|b| String::from_utf8(b).ok()).ok_or("cannot read ca.pem")?;
         api.set_service_accounts(kr_apiserver::tokens::Signer::new(key), ca_pem).map_err(|e| e.message)
     };

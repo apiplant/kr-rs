@@ -32,6 +32,10 @@ impl Drop for Key {
 pub struct TicketKeys {
     cur: Option<Key>,
     prev: Option<Key>,
+    /// Shared mode: every key is derived from this secret and the hour (`created` = the epoch),
+    /// so servers holding the same secret open each other's tickets and a restart loses none.
+    secret: Option<[u8; 32]>,
+    derived: Vec<Key>,
 }
 
 impl Default for TicketKeys {
@@ -42,11 +46,50 @@ impl Default for TicketKeys {
 
 impl TicketKeys {
     pub const fn new() -> TicketKeys {
-        TicketKeys { cur: None, prev: None }
+        TicketKeys { cur: None, prev: None, secret: None, derived: Vec::new() }
+    }
+
+    /// Switches to keys derived from `secret` (the same on every server of a cluster): the key for
+    /// hour `h` is `HKDF(secret, "kr tls ticket key v1" || h)`. A ticket opens in the hour it was
+    /// sealed, the one before and the one after (clock skew between servers).
+    pub fn set_secret(&mut self, secret: [u8; 32]) {
+        self.secret = Some(secret);
+        self.derived.clear();
+        self.cur = None;
+        self.prev = None;
+    }
+
+    fn epoch(now: i64) -> i64 {
+        now.div_euclid(TICKET_LIFETIME as i64)
+    }
+
+    /// The derived key of `epoch`, cached.
+    fn derive(&mut self, epoch: i64) -> Option<&Key> {
+        let secret = self.secret?;
+        if !self.derived.iter().any(|k| k.created == epoch) {
+            let mut prk = [0u8; 32];
+            crate::hmac::hkdf_extract::<crate::sha2::Sha256>(b"kr tls ticket", &secret, &mut prk);
+            let mut out = [0u8; 40];
+            crate::hmac::hkdf_expand::<crate::sha2::Sha256>(&prk, &[b"kr tls ticket key v1", &epoch.to_be_bytes()], &mut out);
+            wipe(&mut prk);
+            let mut k = Key { id: [0; KEY_ID], key: [0; 32], created: epoch };
+            k.key.copy_from_slice(&out[..32]);
+            k.id.copy_from_slice(&out[32..]);
+            wipe(&mut out);
+            if self.derived.len() >= 4 {
+                self.derived.remove(0);
+            }
+            self.derived.push(k);
+        }
+        self.derived.iter().find(|k| k.created == epoch)
     }
 
     /// Seals `plaintext` into a ticket: `key_id | nonce | ciphertext | tag`.
     pub fn seal(&mut self, plaintext: &[u8], now: i64, rng: Rng) -> Vec<u8> {
+        if self.secret.is_some() {
+            let (id, key) = self.derive(Self::epoch(now)).map(|k| (k.id, k.key)).expect("secret set");
+            return Self::seal_with(&id, &key, plaintext, rng);
+        }
         if self.cur.as_ref().is_none_or(|k| now - k.created >= TICKET_LIFETIME as i64 || now < k.created) {
             let mut k = Key { id: [0; KEY_ID], key: [0; 32], created: now };
             rng(&mut k.id);
@@ -54,29 +97,49 @@ impl TicketKeys {
             self.prev = self.cur.replace(k);
         }
         let cur = self.cur.as_ref().expect("just set");
+        Self::seal_with(&cur.id, &cur.key, plaintext, rng)
+    }
+
+    fn seal_with(id: &[u8; KEY_ID], key: &[u8; 32], plaintext: &[u8], rng: Rng) -> Vec<u8> {
         let mut nonce = [0u8; 12];
         rng(&mut nonce);
         let mut out = Vec::with_capacity(KEY_ID + 12 + plaintext.len() + 16);
-        out.extend_from_slice(&cur.id);
+        out.extend_from_slice(id);
         out.extend_from_slice(&nonce);
         let start = out.len();
         out.extend_from_slice(plaintext);
-        let tag = chacha::seal(&cur.key, &nonce, &cur.id, &mut out[start..]);
+        let tag = chacha::seal(key, &nonce, id, &mut out[start..]);
         out.extend_from_slice(&tag);
         out
     }
 
-    /// The plaintext of a ticket sealed by this process under a current or previous key.
-    pub fn open(&self, ticket: &[u8]) -> Option<Vec<u8>> {
+    /// The plaintext of a ticket sealed under a key this process (or, in shared mode, any server
+    /// with the same secret) can derive or still holds. `now` selects the shared-mode hours.
+    pub fn open(&mut self, ticket: &[u8], now: i64) -> Option<Vec<u8>> {
         if ticket.len() < KEY_ID + 12 + 16 {
             return None;
         }
         let (id, rest) = ticket.split_at(KEY_ID);
-        let key = [self.cur.as_ref(), self.prev.as_ref()].into_iter().flatten().find(|k| k.id == id)?;
+        let key: (Vec<u8>, [u8; 32]) = if self.secret.is_some() {
+            let e = Self::epoch(now);
+            let mut found = None;
+            for epoch in [e, e - 1, e + 1] {
+                if let Some(k) = self.derive(epoch) {
+                    if k.id == id {
+                        found = Some((k.id.to_vec(), k.key));
+                        break;
+                    }
+                }
+            }
+            found?
+        } else {
+            let k = [self.cur.as_ref(), self.prev.as_ref()].into_iter().flatten().find(|k| k.id == id)?;
+            (k.id.to_vec(), k.key)
+        };
         let (nonce, rest) = rest.split_at(12);
         let (ct, tag) = rest.split_at(rest.len() - 16);
         let mut data = ct.to_vec();
-        chacha::open(&key.key, nonce.try_into().ok()?, &key.id, &mut data, tag).ok()?;
+        chacha::open(&key.1, nonce.try_into().ok()?, &key.0, &mut data, tag).ok()?;
         Some(data)
     }
 }
@@ -149,8 +212,8 @@ impl SessionCache {
 pub struct TicketHooks {
     /// `(plaintext, now)` -> ticket.
     pub seal: fn(&[u8], i64) -> Vec<u8>,
-    /// ticket -> plaintext, if it is ours and authentic.
-    pub open: fn(&[u8]) -> Option<Vec<u8>>,
+    /// `(ticket, now)` -> plaintext, if it is ours and authentic.
+    pub open: fn(&[u8], i64) -> Option<Vec<u8>>,
 }
 
 /// How a client connection stores and retrieves tickets.
@@ -248,22 +311,47 @@ mod tests {
     fn tickets_seal_open_and_rotate() {
         let mut k = TicketKeys::new();
         let t1 = k.seal(b"first", 1000, rng);
-        assert_eq!(k.open(&t1).as_deref(), Some(&b"first"[..]));
+        assert_eq!(k.open(&t1, 1000).as_deref(), Some(&b"first"[..]));
         // Same key within the period; a rotation keeps the previous key for one more period.
         let t2 = k.seal(b"second", 1000 + TICKET_LIFETIME as i64, rng);
         assert_ne!(t1[..8], t2[..8]);
-        assert!(k.open(&t1).is_some() && k.open(&t2).is_some());
+        assert!(k.open(&t1, 5000).is_some() && k.open(&t2, 5000).is_some());
         let _t3 = k.seal(b"third", 1000 + 2 * TICKET_LIFETIME as i64, rng);
-        assert!(k.open(&t1).is_none(), "two rotations later the first key is gone");
+        assert!(k.open(&t1, 9000).is_none(), "two rotations later the first key is gone");
         // Tampering anywhere fails.
         let mut bad = t2.clone();
         for i in 0..bad.len() {
             bad[i] ^= 1;
-            assert!(k.open(&bad).is_none(), "byte {i}");
+            assert!(k.open(&bad, 5000).is_none(), "byte {i}");
             bad[i] ^= 1;
         }
-        assert!(k.open(&t2[..t2.len() - 1]).is_none());
-        assert!(TicketKeys::new().open(&t2).is_none());
+        assert!(k.open(&t2[..t2.len() - 1], 5000).is_none());
+        assert!(TicketKeys::new().open(&t2, 5000).is_none());
+    }
+
+    #[test]
+    fn shared_secret_keys_open_across_instances_and_restarts() {
+        let h = TICKET_LIFETIME as i64;
+        let (mut a, mut b) = (TicketKeys::new(), TicketKeys::new());
+        a.set_secret([7; 32]);
+        b.set_secret([7; 32]);
+        let t = a.seal(b"shared", 10 * h + 5, rng);
+        // Another server with the same secret opens it (this hour, the next, the one after that
+        // is outside the skew window), a fresh instance too (a restart), a different secret never.
+        assert_eq!(b.open(&t, 10 * h + 100).as_deref(), Some(&b"shared"[..]));
+        assert!(b.open(&t, 11 * h + 1).is_some());
+        assert!(TicketKeys::new().open(&t, 10 * h).is_none(), "random-key mode cannot");
+        let mut restarted = TicketKeys::new();
+        restarted.set_secret([7; 32]);
+        assert!(restarted.open(&t, 10 * h + 50).is_some());
+        assert!(restarted.open(&t, 12 * h + 1).is_none(), "two hours later it is out of the window");
+        let mut other = TicketKeys::new();
+        other.set_secret([8; 32]);
+        assert!(other.open(&t, 10 * h).is_none());
+        // Hours use different keys.
+        let t2 = a.seal(b"later", 11 * h + 5, rng);
+        assert_ne!(t[..8], t2[..8]);
+        assert!(restarted.open(&t2, 11 * h + 5).is_some());
     }
 
     #[test]

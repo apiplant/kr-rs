@@ -1512,7 +1512,7 @@ impl Connection {
     }
 
     fn srv_open_ticket(&self, id: &[u8], binding: &[u8; 32], cfg: &ServerConfig, hooks: TicketHooks) -> Option<TicketData> {
-        let t = TicketData::decode(&(hooks.open)(id)?)?;
+        let t = TicketData::decode(&(hooks.open)(id, self.now)?)?;
         let required = matches!(cfg.client_auth, ClientAuth::Required(_));
         // The binding covers the client-auth mode; a ticket without client certificates is no use where they are required.
         let ok = t.valid_until >= self.now && t.suite == self.suite && ct_eq(&t.binding, binding) && t.alpn == self.alpn && !(required && t.chain.is_empty());
