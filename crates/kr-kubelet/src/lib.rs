@@ -2035,7 +2035,12 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         // back and the API disagrees with what it computed, write again despite the cache.
         let ready_of = |v: &Value| v.pointer(&["status", "conditions"]).or_else(|| v.get("conditions")).and_then(Value::as_array).and_then(|c| c.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("Ready"))).and_then(|c| c.get("status")).and_then(Value::as_str).map(String::from);
         let api_agrees = ready_of(pod) == ready_of(&status);
-        if api_agrees && self.pods.borrow().get(uid).is_some_and(|p| p.last_status == text) {
+        // Leftovers of an earlier status (see below) must be cleared even when nothing changed.
+        let has_key = |k: &str| status.get(k).is_some();
+        let leftovers = (matches!(pod.pointer(&["status", "reason"]).and_then(Value::as_str), Some("SandboxFailed" | "HostPortConflict" | "SysctlForbidden")) && !has_key("reason"))
+            || (!has_key("containerStatuses") && pod.pointer(&["status", "containerStatuses"]).is_some_and(|v| !v.is_null()))
+            || (!has_key("initContainerStatuses") && pod.pointer(&["status", "initContainerStatuses"]).is_some_and(|v| !v.is_null()));
+        if api_agrees && !leftovers && self.pods.borrow().get(uid).is_some_and(|p| p.last_status == text) {
             return;
         }
         let mut status = status;
