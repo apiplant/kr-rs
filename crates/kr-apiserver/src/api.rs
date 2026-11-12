@@ -319,6 +319,11 @@ impl ApiServer {
         self.custom.borrow().iter().map(|c| c.res).collect()
     }
 
+    /// Whether any aggregated API (an APIService backed by a Service) is currently available.
+    pub fn has_aggregated(&self) -> bool {
+        !self.agg.borrow().is_empty()
+    }
+
     /// Lets `list` hand big renderings to the offload workers (see [`crate::offload`]). The caller
     /// must take the job with [`ApiServer::take_list_job`] right after the call.
     pub fn set_defer_lists(&self, on: bool) {

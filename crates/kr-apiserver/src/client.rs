@@ -115,6 +115,14 @@ impl InProcess {
             &q2
         };
         let req = Req { method, path, query, content_type: ct, accept: Some("application/json"), body, user: Some(self.user.clone()), bearer: None, headers: &[], authz_verb: None };
+        // Aggregated APIs (Calico's projectcalico.org, extension servers) are served through the
+        // aggregator proxy, which the HTTP transport normally calls; controllers such as the
+        // namespace controller need them too (an unreachable group blocks namespace deletion).
+        if path.starts_with("/apis/") && self.api.has_aggregated() {
+            if let Some(r) = crate::aggregator::proxy(&self.api, &req).await {
+                return Self::reply_to_result(r);
+            }
+        }
         let reply = match self.api.cluster().filter(|_| ApiServer::mutates(&req)) {
             // HA follower: the leader makes the change (ADR-026).
             Some(c) => match c.route(5_000).await {
@@ -132,6 +140,18 @@ impl InProcess {
                 Err(l) => Reply::err(crate::api::not_leader(l)),
             },
             None => self.api.handle(&req),
+        };
+        Self::reply_to_result(reply)
+    }
+
+    fn reply_to_result(reply: Reply) -> Result<Value> {
+        // An aggregated API answers with a raw HTTP response.
+        let reply = match reply {
+            Reply::Http(r) => match r.body {
+                kr_net::http1::server::Body::Full(b) => Reply::Json(r.status, String::from_utf8(b).unwrap_or_default()),
+                _ => return Err(ApiError::new(500, "InternalError", "unexpected streaming reply")),
+            },
+            other => other,
         };
         match reply {
             Reply::Json(code, s) => {
