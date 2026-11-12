@@ -134,7 +134,7 @@ pub async fn run_all_with_ca<C: Client + Clone + 'static>(c: C, cfg: Config, ca:
         spawn(nodelifecycle::run(c.clone(), cfg)),
         spawn(servicelb::run(c.clone(), cfg)),
         spawn(hpa::run(c.clone(), cfg)),
-        spawn(attachdetach::run(c.clone())),
+        spawn(attachdetach::run(c.clone(), cfg.now)),
         spawn(gc::run(c.clone(), cfg)),
     ]);
     if let Some(ca) = ca {

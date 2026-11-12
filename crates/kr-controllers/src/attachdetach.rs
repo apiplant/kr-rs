@@ -16,6 +16,9 @@ use kr_apiserver::client::{Client, Result};
 use kr_fmt::json::Value;
 
 pub const LABEL: &str = "kr.io/attach-controller";
+/// Annotation: wall-clock seconds when the attachment was first found unwanted (the wait for the
+/// unmount survives a restart of the controller).
+const SINCE: &str = "kr.io/unwanted-since";
 const VAS: &str = "/apis/storage.k8s.io/v1/volumeattachments";
 /// How long a volume the node still reports in use blocks the detach.
 pub const MAX_WAIT_MS: u64 = 6 * 60 * 1000;
@@ -32,11 +35,11 @@ pub fn va_name(handle: &str, driver: &str, node: &str) -> String {
     s
 }
 
-pub async fn run<C: Client + Clone + 'static>(c: C) {
+pub async fn run<C: Client + Clone + 'static>(c: C, wall: fn() -> i64) {
     let waiting = RefCell::new(BTreeMap::new());
     loop {
         kr_rt::exec::sleep(3_000).await;
-        let _ = tick_at(&c, &waiting, kr_rt::exec::now_ms()).await;
+        let _ = tick_at(&c, &waiting, kr_rt::exec::now_ms(), wall().max(0) as u64).await;
     }
 }
 
@@ -52,13 +55,36 @@ fn find<'a>(l: &'a [Value], ns: &str, n: &str) -> Option<&'a Value> {
     l.iter().find(|o| name(o) == n && namespace(o) == ns)
 }
 
+/// `node.status.volumesAttached` (upstream's attach/detach controller writes it): the volumes
+/// whose attachment on the node is `status.attached`, until the attachment is gone. Only nodes
+/// whose list changed are patched.
+async fn publish_attached<C: Client>(c: &C, pvs: &[Value], vas: &[Value]) {
+    let mut by_node: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for va in vas.iter().filter(|v| str_at(v, &["status", "attached"]) == "true" || v.pointer(&["status", "attached"]).and_then(Value::as_bool) == Some(true)) {
+        let Some(pv) = pvs.iter().find(|p| name(p) == str_at(va, &["spec", "source", "persistentVolumeName"])) else { continue };
+        let vol = alloc::format!("kubernetes.io/csi/{}^{}", str_at(pv, &["spec", "csi", "driver"]), str_at(pv, &["spec", "csi", "volumeHandle"]));
+        by_node.entry(str_at(va, &["spec", "nodeName"]).to_string()).or_default().insert(vol);
+    }
+    let Ok(nodes) = c.list("/api/v1/nodes", "").await else { return };
+    for n in items(&nodes) {
+        let have: BTreeSet<String> = n.pointer(&["status", "volumesAttached"]).and_then(Value::as_array).unwrap_or(&[]).iter().map(|v| str_at(v, &["name"]).to_string()).collect();
+        let want = by_node.remove(name(&n)).unwrap_or_default();
+        if have == want {
+            continue;
+        }
+        let list: alloc::vec::Vec<Value> = want.iter().map(|v| obj(alloc::vec![("name", Value::from(v.as_str())), ("devicePath", Value::from(""))])).collect();
+        let patch = obj(alloc::vec![("status", obj(alloc::vec![("volumesAttached", Value::Array(list))]))]);
+        let _ = c.patch(&alloc::format!("/api/v1/nodes/{}/status", name(&n)), MERGE, &patch).await;
+    }
+}
+
 #[cfg(test)]
 async fn tick<C: Client>(c: &C) -> Result<()> {
-    tick_at(c, &RefCell::new(BTreeMap::new()), 0).await
+    tick_at(c, &RefCell::new(BTreeMap::new()), 0, 1_700_000_000).await
 }
 
 /// `waiting`: attachment name -> when it was first found unwanted (ms).
-async fn tick_at<C: Client>(c: &C, waiting: &RefCell<BTreeMap<String, u64>>, now: u64) -> Result<()> {
+async fn tick_at<C: Client>(c: &C, waiting: &RefCell<BTreeMap<String, u64>>, now: u64, wall: u64) -> Result<()> {
     let pvs = items(&c.list("/api/v1/persistentvolumes", "").await?);
     let mut want: BTreeSet<String> = BTreeSet::new();
     let mut create = alloc::vec::Vec::new();
@@ -101,6 +127,7 @@ async fn tick_at<C: Client>(c: &C, waiting: &RefCell<BTreeMap<String, u64>>, now
         }
     }
     let existing = items(&c.list(VAS, "").await?);
+    publish_attached(c, &pvs, &existing).await;
     for (n, driver, node, pv) in create {
         if existing.iter().any(|v| name(v) == n) {
             continue;
@@ -116,7 +143,24 @@ async fn tick_at<C: Client>(c: &C, waiting: &RefCell<BTreeMap<String, u64>>, now
         if want.contains(name(&va)) {
             waiting.borrow_mut().remove(name(&va));
         } else if ours && name(&va).starts_with("csi-") && !deleting(&va) {
-            let since = *waiting.borrow_mut().entry(name(&va).to_string()).or_insert(now);
+            let known = waiting.borrow().get(name(&va)).copied();
+            let since = match known {
+                Some(t) => t,
+                None => {
+                    // First time this run: the wall-clock stamp an earlier run (or leader) left on
+                    // the attachment says how long it has been unwanted; without one, stamp it now.
+                    let t = match str_at(&va, &["metadata", "annotations", SINCE]).parse::<u64>() {
+                        Ok(stamp) => now.saturating_sub(wall.saturating_sub(stamp) * 1000),
+                        Err(_) => {
+                            let p = obj(alloc::vec![("metadata", obj(alloc::vec![("annotations", obj(alloc::vec![(SINCE, Value::String(wall.to_string()))]))]))]);
+                            let _ = c.patch(&alloc::format!("{VAS}/{}", name(&va)), MERGE, &p).await;
+                            now
+                        }
+                    };
+                    waiting.borrow_mut().insert(name(&va).to_string(), t);
+                    t
+                }
+            };
             if now.saturating_sub(since) < MAX_WAIT_MS && in_use(c, &va).await {
                 continue; // still mounted on the node: wait for the kubelet to unmount
             }
@@ -132,6 +176,7 @@ mod tests {
     use crate::tests::*;
     use kr_apiserver::client::InProcess;
 
+    const WALL: u64 = 1_700_000_000;
     const PV: &str = "/api/v1/persistentvolumes";
     const CLAIMS: &str = "/api/v1/namespaces/default/persistentvolumeclaims";
 
@@ -229,12 +274,12 @@ mod tests {
             c.delete(&alloc::format!("{PODS}/app")).await.unwrap();
             wait_until("pod gone", || async { get_opt(&c, &alloc::format!("{PODS}/app")).await.unwrap().is_none() }).await;
             let waiting = RefCell::new(BTreeMap::new());
-            tick_at(&c, &waiting, 1_000).await.unwrap();
-            tick_at(&c, &waiting, 1_000 + MAX_WAIT_MS - 1).await.unwrap();
+            tick_at(&c, &waiting, 1_000, 1_700_000_000).await.unwrap();
+            tick_at(&c, &waiting, 1_000 + MAX_WAIT_MS - 1, 1_700_000_000).await.unwrap();
             assert_eq!(vas(&c).await, 1);
             // The node stops reporting it: detach right away.
             put_status(&c, "/api/v1/nodes/n1", |_| v(r#"{"volumesInUse":[]}"#)).await.unwrap();
-            tick_at(&c, &waiting, 2_000).await.unwrap();
+            tick_at(&c, &waiting, 2_000, 1_700_000_000).await.unwrap();
             assert_eq!(vas(&c).await, 0);
         });
     }
@@ -250,9 +295,9 @@ mod tests {
             c.delete(&alloc::format!("{PODS}/app")).await.unwrap();
             wait_until("pod gone", || async { get_opt(&c, &alloc::format!("{PODS}/app")).await.unwrap().is_none() }).await;
             let waiting = RefCell::new(BTreeMap::new());
-            tick_at(&c, &waiting, 1_000).await.unwrap();
+            tick_at(&c, &waiting, 1_000, 1_700_000_000).await.unwrap();
             assert_eq!(vas(&c).await, 1);
-            tick_at(&c, &waiting, 1_000 + MAX_WAIT_MS).await.unwrap();
+            tick_at(&c, &waiting, 1_000 + MAX_WAIT_MS, 1_700_000_000).await.unwrap();
             assert_eq!(vas(&c).await, 0);
         });
     }
@@ -264,6 +309,63 @@ mod tests {
             c.create(VAS, &va).await.unwrap();
             tick(&c).await.unwrap();
             assert_eq!(vas(&c).await, 1);
+        });
+    }
+
+    #[test]
+    fn attached_volumes_are_published_on_the_node() {
+        scenario(|c| async move {
+            c.create("/api/v1/nodes", &v(r#"{"metadata":{"name":"n1"}}"#)).await.unwrap();
+            setup(&c, CSI).await;
+            c.create(PODS, &pod("n1", "Running")).await.unwrap();
+            tick(&c).await.unwrap();
+            let node = |c: &InProcess| {
+                let c = c.clone();
+                async move { c.get("/api/v1/nodes/n1").await.unwrap() }
+            };
+            // Created but not attached yet: nothing listed.
+            assert!(node(&c).await.pointer(&["status", "volumesAttached"]).and_then(Value::as_array).is_none_or(|a| a.is_empty()));
+            let va = alloc::format!("{VAS}/{}", va_name("h1", "d.io", "n1"));
+            put_status(&c, &va, |_| v(r#"{"attached":true}"#)).await.unwrap();
+            tick(&c).await.unwrap();
+            let got = node(&c).await;
+            let list = got.pointer(&["status", "volumesAttached"]).and_then(Value::as_array).unwrap().clone();
+            assert_eq!(list.len(), 1);
+            assert_eq!(str_at(&list[0], &["name"]), "kubernetes.io/csi/d.io^h1");
+            // Detached (the attachment is gone): the list empties.
+            c.delete(&alloc::format!("{PODS}/app")).await.unwrap();
+            wait_until("pod gone", || async { get_opt(&c, &alloc::format!("{PODS}/app")).await.unwrap().is_none() }).await;
+            tick(&c).await.unwrap();
+            wait_until("attachment gone", || async { get_opt(&c, &va).await.unwrap().is_none() }).await;
+            tick(&c).await.unwrap();
+            assert!(node(&c).await.pointer(&["status", "volumesAttached"]).and_then(Value::as_array).is_none_or(|a| a.is_empty()));
+        });
+    }
+
+    #[test]
+    fn the_unmount_wait_survives_a_restart() {
+        scenario(|c| async move {
+            c.create("/api/v1/nodes", &v(r#"{"metadata":{"name":"n1"}}"#)).await.unwrap();
+            setup(&c, CSI).await;
+            c.create(PODS, &pod("n1", "Running")).await.unwrap();
+            tick(&c).await.unwrap();
+            put_status(&c, "/api/v1/nodes/n1", |_| v(r#"{"volumesInUse":["kubernetes.io/csi/d.io^h1"]}"#)).await.unwrap();
+            c.delete(&alloc::format!("{PODS}/app")).await.unwrap();
+            wait_until("pod gone", || async { get_opt(&c, &alloc::format!("{PODS}/app")).await.unwrap().is_none() }).await;
+            let va = alloc::format!("{VAS}/{}", va_name("h1", "d.io", "n1"));
+            // First controller: finds it unwanted, stamps it, keeps it (still in use).
+            tick_at(&c, &RefCell::new(BTreeMap::new()), 10_000_000, WALL).await.unwrap();
+            let stamped = c.get(&va).await.unwrap();
+            let stamp: u64 = str_at(&stamped, &["metadata", "annotations", SINCE]).parse().expect("a stamp");
+            assert_eq!(stamp, WALL);
+            assert_eq!(vas(&c).await, 1);
+            // A new controller (empty memory) a little later still knows: back-date the stamp past
+            // the maximum wait and it detaches at once.
+            let old = (stamp - MAX_WAIT_MS / 1000 - 5).to_string();
+            let p = obj(alloc::vec![("metadata", obj(alloc::vec![("annotations", obj(alloc::vec![(SINCE, Value::String(old))]))]))]);
+            c.patch(&va, MERGE, &p).await.unwrap();
+            tick_at(&c, &RefCell::new(BTreeMap::new()), 10_000_000, WALL).await.unwrap();
+            wait_until("attachment gone", || async { get_opt(&c, &va).await.unwrap().is_none() }).await;
         });
     }
 }
