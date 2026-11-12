@@ -149,3 +149,26 @@ fn managed_bootstrap_objects_are_adopted_then_follow_the_release_unless_frozen()
         assert_eq!(o.pointer(&["metadata", "annotations", "kr.io/autoupdate"]).and_then(Value::as_str), Some("true"), "{}", r.1);
     }
 }
+
+#[test]
+fn csr_status_certificate_needs_approval_pem_and_the_requested_key() {
+    use kr_apiserver::rbac::csr_update_check;
+    use kr_crypto::x509::{self, CertParams, Name, SigningKey};
+    let allow = |_: &kr_apiserver::rbac::Attrs| true;
+    let key = |n: u8| SigningKey::P256(kr_crypto::p256::SecretKey::from_seed(&[n; 48]));
+    let (ca, mine, other) = (key(1), key(2), key(3));
+    let ca_name = Name { common_name: "ca".into(), organizations: vec![] };
+    let cert = |k: &SigningKey| {
+        let p = CertParams { serial: [5; 16], subject: Name { common_name: "u".into(), organizations: vec![] }, not_before: 1_700_000_000, not_after: 1_800_000_000, is_ca: false, server: false, client: true, dns_names: vec![], ip_addrs: vec![], public_key: k.public() };
+        kr_fmt::base64::encode(x509::pem_encode("CERTIFICATE", &x509::issue(&p, &ca_name, &ca)).as_bytes())
+    };
+    let req = kr_fmt::base64::encode(x509::pem_encode("CERTIFICATE REQUEST", &x509::certification_request(&mine)).as_bytes());
+    let csr = |conds: &str, cert: &str| json::parse(format!(r#"{{"spec":{{"signerName":"x/y","request":"{req}"}},"status":{{"conditions":{conds},"certificate":"{cert}"}}}}"#).as_bytes()).unwrap();
+    let approved = r#"[{"type":"Approved","status":"True"}]"#;
+    let good = cert(&mine);
+    assert!(csr_update_check("status", &csr(approved, ""), &csr(approved, &good), false, &allow).is_ok());
+    assert!(csr_update_check("status", &csr(approved, ""), &csr(approved, &cert(&other)), false, &allow).is_err(), "other key");
+    assert!(csr_update_check("status", &csr("[]", ""), &csr("[]", &good), false, &allow).is_err(), "not approved");
+    assert!(csr_update_check("status", &csr(approved, ""), &csr(approved, "bm90IHBlbQ=="), false, &allow).is_err(), "not PEM");
+    assert!(csr_update_check("status", &csr(approved, &good), &csr(approved, ""), false, &allow).is_err(), "immutable");
+}

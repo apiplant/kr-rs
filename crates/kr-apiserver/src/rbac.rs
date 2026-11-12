@@ -240,6 +240,28 @@ pub fn csr_update_check(sub: &str, old: &Value, new: &Value, masters: bool, can:
     } else if added("Approved") || added("Denied") || changes("Approved") || changes("Denied") {
         return bad("status.conditions: Approved and Denied can only be set through the approval subresource");
     }
+    if sub == "status" {
+        let cert = |v: &Value| v.pointer(&["status", "certificate"]).and_then(Value::as_str).unwrap_or("").to_string();
+        let (oldc, newc) = (cert(old), cert(new));
+        if oldc != newc {
+            if !oldc.is_empty() {
+                return bad("status.certificate: field is immutable once set");
+            }
+            if !decided(&oc, "Approved") || decided(&oc, "Denied") || decided(&oc, "Failed") {
+                return bad("status.certificate: can only be set on an approved request that is not denied or failed");
+            }
+            let ders = kr_fmt::base64::decode(&newc).ok().and_then(|pem| kr_crypto::x509::pem_decode_all(&String::from_utf8_lossy(&pem), "CERTIFICATE").ok()).filter(|d| !d.is_empty());
+            let Some(ders) = ders else {
+                return bad("status.certificate: must be base64 of one or more PEM CERTIFICATE blocks");
+            };
+            let Some(leaf_key) = ders.iter().all(|d| kr_crypto::x509::Certificate::parse(d).is_ok()).then(|| kr_crypto::x509::Certificate::parse(&ders[0]).ok().and_then(|c| c.public_key)).flatten() else {
+                return bad("status.certificate: not a parsable certificate chain");
+            };
+            if csr_public_key(old).map(|k| k.spki()) != Some(leaf_key.spki()) {
+                return bad("status.certificate: the first certificate's public key does not match the request's");
+            }
+        }
+    }
     if issued && oc != nc {
         return bad("status.conditions: cannot update a CertificateSigningRequest whose certificate is issued");
     }
@@ -290,6 +312,18 @@ fn der(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
         (b.get(2..2 + n)?.iter().fold(0usize, |a, x| a << 8 | *x as usize), 2 + n)
     };
     Some((tag, b.get(off..off.checked_add(len)?)?, &b[off + len..]))
+}
+
+/// The public key of the PKCS#10 request in `spec.request`.
+fn csr_public_key(csr: &Value) -> Option<kr_crypto::x509::PublicKey> {
+    let pem = kr_fmt::base64::decode(csr.pointer(&["spec", "request"]).and_then(Value::as_str)?).ok()?;
+    let ders = kr_crypto::x509::pem_decode_all(&String::from_utf8_lossy(&pem), "CERTIFICATE REQUEST").ok()?;
+    let (_, req, _) = der(ders.first()?)?;
+    let (_, info, _) = der(req)?;
+    let (_, _, rest) = der(info)?; // version
+    let (_, _, rest) = der(rest)?; // subject
+    let (_, _, after) = der(rest)?;
+    kr_crypto::x509::PublicKey::from_spki(&rest[..rest.len() - after.len()]).ok().flatten()
 }
 
 /// The `O` (organization) values of the subject of a DER PKCS#10 request.
