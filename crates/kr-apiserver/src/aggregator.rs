@@ -138,32 +138,53 @@ pub struct Relayed {
     pub body: Vec<u8>,
 }
 
-type AggHttp = Http<TlsConnector<crate::webhook::WhResolver>>;
+pub(crate) type AggHttp = Http<TlsConnector<crate::webhook::WhResolver>>;
 
 /// An HTTP client for the extension behind `apisvc`, with the base URL and the identity headers.
-fn extension_client(api: &ApiServer, apisvc: &Value, user: &User, secs: u64) -> Result<(AggHttp, String, Vec<(String, String)>), String> {
+/// `pooled` clients are kept per APIService (keep-alive connections: one TCP and TLS handshake
+/// per connection instead of per request); a streaming request takes a client of its own.
+fn extension_client(api: &ApiServer, apisvc: &Value, user: &User, secs: u64, pooled: bool) -> Result<(Rc<AggHttp>, String, Vec<(String, String)>), String> {
     let (ns, name, port) = service_of(apisvc).ok_or("APIService has no service")?;
     let svc = api.wh_object("", "v1", "services", Some(&ns), &name).ok_or_else(|| format!("service \"{name}\" not found"))?;
     let ip = svc.pointer(&["spec", "clusterIP"]).and_then(Value::as_str).filter(|i| i.contains('.')).ok_or("service has no cluster IP")?;
     let host = format!("{name}.{ns}.svc");
     let base = format!("https://{host}:{port}");
+    let ca = apisvc.pointer(&["spec", "caBundle"]).and_then(Value::as_str).unwrap_or("");
+    let mut hdrs: Vec<(String, String)> = alloc::vec![(String::from("X-Remote-User"), user.name.clone())];
+    hdrs.extend(user.groups.iter().map(|g| (String::from("X-Remote-Group"), g.clone())));
+    // A changed address, port or CA bundle makes a different key, so the old client is replaced.
+    let key = format!("{host}|{secs}|{ip}|{port}|{ca}");
+    if pooled {
+        if let Some((_, c)) = api.agg_http.borrow().iter().find(|(k, _)| *k == key) {
+            return Ok((c.clone(), base, hdrs));
+        }
+    }
     let roots = match apisvc.pointer(&["spec", "caBundle"]).and_then(Value::as_str) {
         Some(b) => x509::pem_decode_all(core::str::from_utf8(&kr_fmt::base64::decode(b).map_err(|_| "invalid caBundle")?).map_err(|_| "invalid caBundle")?, "CERTIFICATE").map_err(|_| "invalid caBundle")?,
         None => Vec::new(),
     };
     let cfg = Rc::new(api.front_proxy().client_config(roots));
-    let http = Http::with_connector(
+    let max_idle = if pooled { 4 } else { 0 };
+    let http = Rc::new(Http::with_connector(
         TlsConnector::new(crate::webhook::WhResolver(HostsResolver::from_contents(&format!("{ip} {host}\n"))), cfg),
-        HttpConfig { max_redirects: 0, max_idle: 0, connect_timeout_ms: secs * 1000, head_timeout_ms: secs * 1000, read_timeout_ms: secs * 1000, user_agent: "kube-aggregator".to_string(), ..HttpConfig::default() },
-    );
-    let mut hdrs: Vec<(String, String)> = alloc::vec![(String::from("X-Remote-User"), user.name.clone())];
-    hdrs.extend(user.groups.iter().map(|g| (String::from("X-Remote-Group"), g.clone())));
+        HttpConfig { max_redirects: 0, max_idle, connect_timeout_ms: secs * 1000, head_timeout_ms: secs * 1000, read_timeout_ms: secs * 1000, user_agent: "kube-aggregator".to_string(), ..HttpConfig::default() },
+    ));
+    if pooled {
+        let mut pool = api.agg_http.borrow_mut();
+        // Same service and timeout with another address/CA: the stale client goes.
+        let prefix = format!("{host}|{secs}|");
+        pool.retain(|(k, _)| !k.starts_with(&prefix));
+        if pool.len() >= 16 {
+            pool.remove(0);
+        }
+        pool.push((key, http.clone()));
+    }
     Ok((http, base, hdrs))
 }
 
 /// Sends a request to the extension API server behind `apisvc`, as `user`.
 pub async fn forward(api: &ApiServer, apisvc: &Value, method: &str, path_query: &str, headers: &[(&str, &str)], body: &[u8], user: &User, secs: u64) -> Result<Relayed, String> {
-    let (http, base, mut owned) = extension_client(api, apisvc, user, secs)?;
+    let (http, base, mut owned) = extension_client(api, apisvc, user, secs, true)?;
     owned.extend(headers.iter().map(|(k, v)| (k.to_string(), v.to_string())));
     let hdrs: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let url = format!("{base}{path_query}");
@@ -226,7 +247,7 @@ fn push(p: &Rc<core::cell::RefCell<Pipe>>, chunk: Option<Vec<u8>>) -> bool {
 /// Opens a streaming request (a watch): the status and content type once the head arrives, then
 /// the body is relayed chunk by chunk until either side ends it.
 async fn forward_stream(api: &ApiServer, apisvc: &Value, path_query: &str, headers: &[(&str, &str)], user: &User) -> Result<Response, String> {
-    let (http, base, mut owned) = extension_client(api, apisvc, user, 30)?;
+    let (http, base, mut owned) = extension_client(api, apisvc, user, 30, false)?;
     owned.extend(headers.iter().map(|(k, v)| (k.to_string(), v.to_string())));
     let url = format!("{base}{path_query}");
     let resp = kr_rt::exec::timeout(30_000, async {

@@ -269,7 +269,10 @@ pub struct Auditor {
     max_backup: usize,
 }
 
-const FLUSH_AT: usize = 64 * 1024;
+/// The one-second flusher ([`spawn_flusher`]) writes the buffer; a request only flushes inline when
+/// events pile up faster than that (a write() to a file can block for seconds under write-back
+/// pressure, and this keeps it off the request path in the normal case, #223).
+const FLUSH_AT: usize = 4 * 1024 * 1024;
 
 impl Auditor {
     /// `path` `-` is stdout; the directory is created. `max_mb` 0 disables rotation.
