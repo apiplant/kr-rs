@@ -1156,7 +1156,19 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
     }
     if !wants.is_empty() {
         let (uid, cname) = (meta(pod, "uid"), ctr.get("name").and_then(Value::as_str).unwrap_or(""));
-        grant = Some(dp.allocate(uid, cname, &wants).await?);
+        // Init containers run one after the other and before the app containers: whatever an
+        // earlier one held is free again (restartable ones, the sidecars, keep theirs).
+        let reusable: Vec<String> = pod
+            .pointer(&["spec", "initContainers"])
+            .and_then(Value::as_array)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|i| i.get("restartPolicy").and_then(Value::as_str) != Some("Always"))
+            .filter_map(|i| i.get("name").and_then(Value::as_str))
+            .filter(|n| *n != cname)
+            .map(String::from)
+            .collect();
+        grant = Some(dp.allocate(uid, cname, &wants, &reusable).await?);
     }
     let mut hooks = kr_runtime::hooks::Hooks::default();
     if let Some(g) = grant {

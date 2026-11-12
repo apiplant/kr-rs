@@ -244,11 +244,14 @@ fn encode_batch(containers: &[Vec<String>]) -> Vec<u8> {
 }
 
 /// `PreferredAllocationRequest` for one container: pick `size` of `available`.
-fn encode_preferred(available: &[String], size: usize) -> Vec<u8> {
+fn encode_preferred(available: &[String], must_include: &[String], size: usize) -> Vec<u8> {
     let mut w = Writer::new();
     w.message(1, |w| {
         for i in available {
             w.string(1, i);
+        }
+        for i in must_include {
+            w.string(2, i);
         }
         w.varint(3, size as u64);
     });
@@ -713,10 +716,18 @@ impl Plugins {
     /// possible. Returns the ids, whether they are new, and the plugin socket and pre-start flag.
     #[cfg(test)]
     fn reserve(&self, uid: &str, ctr: &str, resource: &str, n: usize) -> Result<(Vec<String>, bool, String, bool), String> {
-        self.reserve_with(uid, ctr, resource, n, None)
+        self.reserve_with(uid, ctr, resource, n, None, &[])
     }
 
-    fn reserve_with(&self, uid: &str, ctr: &str, resource: &str, n: usize, pick: Option<&[String]>) -> Result<(Vec<String>, bool, String, bool), String> {
+    /// Devices held by the `reusable` containers of the pod (finished init containers): free for
+    /// the next container, and preferred for it, as upstream does.
+    fn reusable_ids(&self, uid: &str, resource: &str, reusable: &[String]) -> Vec<String> {
+        let st = self.st.borrow();
+        let healthy = |id: &String| st.res.get(resource).is_some_and(|r| r.devices.iter().any(|d| d.1 && d.0 == *id));
+        st.allocs.iter().filter(|a| a.uid == uid && a.res == resource && reusable.contains(&a.ctr)).flat_map(|a| a.ids.iter()).filter(|i| healthy(i)).cloned().collect()
+    }
+
+    fn reserve_with(&self, uid: &str, ctr: &str, resource: &str, n: usize, pick: Option<&[String]>, reusable: &[String]) -> Result<(Vec<String>, bool, String, bool), String> {
         let (ids, new, sock, pre) = {
             let mut st = self.st.borrow_mut();
             let Some(r) = st.res.get(resource) else { return Err(format!("device plugin resource {resource} is not registered (yet)")) };
@@ -725,15 +736,23 @@ impl Plugins {
                 return Ok((a.ids.clone(), false, sock, pre));
             }
             st.allocs.retain(|a| !(a.uid == uid && a.ctr == ctr && a.res == resource));
-            let used: BTreeSet<&String> = st.allocs.iter().filter(|a| a.res == resource).flat_map(|a| a.ids.iter()).collect();
+            let used: BTreeSet<&String> = st.allocs.iter().filter(|a| a.res == resource && !(a.uid == uid && reusable.contains(&a.ctr))).flat_map(|a| a.ids.iter()).collect();
             let r = &st.res[resource];
             let free: Vec<(String, i64)> = r.devices.iter().filter(|d| d.1 && !used.contains(&d.0)).map(|d| (d.0.clone(), r.numa.get(&d.0).copied().unwrap_or(-1))).collect();
             if free.len() < n {
                 return Err(format!("insufficient {resource}: requested {n}, {} healthy and unallocated", free.len()));
             }
+            let mut must: Vec<String> = st.allocs.iter().filter(|a| a.uid == uid && a.res == resource && reusable.contains(&a.ctr)).flat_map(|a| a.ids.iter()).filter(|i| free.iter().any(|f| f.0 == **i)).cloned().collect();
+            must.dedup();
+            must.truncate(n);
             let chosen = match pick {
-                Some(p) if p.len() == n && p.iter().all(|i| free.iter().any(|f| f.0 == *i)) && p.iter().collect::<BTreeSet<_>>().len() == n => p.to_vec(),
-                _ => choose(&free, n),
+                Some(p) if p.len() == n && p.iter().all(|i| free.iter().any(|f| f.0 == *i)) && p.iter().collect::<BTreeSet<_>>().len() == n && must.iter().all(|m| p.contains(m)) => p.to_vec(),
+                _ => {
+                    let rest: Vec<(String, i64)> = free.iter().filter(|f| !must.contains(&f.0)).cloned().collect();
+                    let mut c = must.clone();
+                    c.extend(choose(&rest, n - must.len()));
+                    c
+                }
             };
             st.allocs.push(Alloc { uid: uid.to_string(), ctr: ctr.to_string(), res: resource.to_string(), ids: chosen.clone() });
             (chosen, true, sock, pre)
@@ -750,14 +769,16 @@ impl Plugins {
     /// Asks a plugin that implements `GetPreferredAllocation` which `n` of the free devices to
     /// hand out (topology-aware choice). None if it does not, fails, or the container already
     /// holds its devices.
-    async fn preferred(&self, uid: &str, ctr: &str, resource: &str, n: usize) -> Option<Vec<String>> {
+    async fn preferred(&self, uid: &str, ctr: &str, resource: &str, n: usize, reusable: &[String]) -> Option<Vec<String>> {
+        let mut must = self.reusable_ids(uid, resource, reusable);
+        must.truncate(n);
         let (sock, free) = {
             let st = self.st.borrow();
             let r = st.res.get(resource).filter(|r| r.preferred && r.connected)?;
             if st.allocs.iter().any(|a| a.uid == uid && a.ctr == ctr && a.res == resource && a.ids.len() == n) {
                 return None;
             }
-            let used: BTreeSet<&String> = st.allocs.iter().filter(|a| a.res == resource).flat_map(|a| a.ids.iter()).collect();
+            let used: BTreeSet<&String> = st.allocs.iter().filter(|a| a.res == resource && !(a.uid == uid && reusable.contains(&a.ctr))).flat_map(|a| a.ids.iter()).collect();
             let free: Vec<String> = r.devices.iter().filter(|d| d.1 && !used.contains(&d.0)).map(|d| d.0.clone()).collect();
             (r.sock.clone(), free)
         };
@@ -765,16 +786,19 @@ impl Plugins {
             return None;
         }
         let c = self.conn(&sock).await.ok()?;
-        let b = c.unary(PREFERRED, &encode_preferred(&free, n), 5000).await.ok()?;
+        let b = c.unary(PREFERRED, &encode_preferred(&free, &must, n), 5000).await.ok()?;
         Some(decode_preferred(&b))
     }
 
     /// Allocates devices for one container and returns what to apply to it.
-    pub async fn allocate(&self, uid: &str, ctr: &str, wants: &[(String, usize)]) -> Result<Grant, String> {
+    /// `reusable`: the pod's init containers that ran before this container and are gone
+    /// (their devices are handed on, so a pod whose init and app containers each ask for the
+    /// one GPU of the node fits, as under upstream).
+    pub async fn allocate(&self, uid: &str, ctr: &str, wants: &[(String, usize)], reusable: &[String]) -> Result<Grant, String> {
         let mut total = Grant::default();
         for (resource, n) in wants {
-            let pick = self.preferred(uid, ctr, resource, *n).await;
-            let (ids, new, sock, pre) = self.reserve_with(uid, ctr, resource, *n, pick.as_deref())?;
+            let pick = self.preferred(uid, ctr, resource, *n, reusable).await;
+            let (ids, new, sock, pre) = self.reserve_with(uid, ctr, resource, *n, pick.as_deref(), reusable)?;
             match self.call_plugin(&sock, &[ids], pre).await.and_then(|mut v| v.pop().ok_or_else(|| String::from("empty AllocateResponse"))) {
                 Ok(g) => merge(&mut total, g),
                 Err(m) => {
@@ -794,8 +818,8 @@ impl Plugins {
         let mut reserved: Vec<(Vec<String>, bool)> = Vec::new();
         let (mut sock, mut pre) = (String::new(), false);
         for (ctr, n) in ctrs {
-            let pick = self.preferred(uid, ctr, resource, *n).await;
-            match self.reserve_with(uid, ctr, resource, *n, pick.as_deref()) {
+            let pick = self.preferred(uid, ctr, resource, *n, &[]).await;
+            match self.reserve_with(uid, ctr, resource, *n, pick.as_deref(), &[]) {
                 Ok((ids, new, s, p)) => {
                     (sock, pre) = (s, p);
                     reserved.push((ids, new));
@@ -1093,6 +1117,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn init_container_devices_are_handed_to_the_next_container() {
+        let dir = tmpdir("reuse");
+        let p = Plugins::new(&dir);
+        with_devices(&p, "x.com/gpu", &[("a", true), ("b", true)]);
+        // The node's one-GPU case: init and app container each ask for the same single device.
+        let one = Plugins::new(&tmpdir("reuse1"));
+        with_devices(&one, "x.com/gpu", &[("a", true)]);
+        assert_eq!(one.reserve_with("u", "init", "x.com/gpu", 1, None, &[]).unwrap().0, ["a"]);
+        assert!(one.reserve_with("u", "app", "x.com/gpu", 1, None, &[]).unwrap_err().contains("insufficient"));
+        assert_eq!(one.reserve_with("u", "app", "x.com/gpu", 1, None, &["init".to_string()]).unwrap().0, ["a"]);
+        // Another pod still cannot take it, and the reusable devices come first (must_include).
+        assert!(one.reserve_with("other", "app", "x.com/gpu", 1, None, &[]).is_err());
+        assert_eq!(p.reserve_with("u", "init", "x.com/gpu", 1, None, &[]).unwrap().0, ["a"]);
+        let (ids, _, _, _) = p.reserve_with("u", "app", "x.com/gpu", 2, None, &["init".to_string()]).unwrap();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
     fn allocator_rules() {
         let dir = tmpdir("alloc");
         let p = Plugins::new(&dir);
@@ -1269,7 +1311,7 @@ pub(crate) mod tests {
         });
         assert_eq!(decode_numa(w.as_bytes()), [("g0".to_string(), 1)]);
         assert_eq!(decode_devices(w.as_bytes()).unwrap().len(), 2);
-        assert_eq!(encode_preferred(&["a".into(), "b".into()], 1), [0x0a, 8, 0x0a, 1, b'a', 0x0a, 1, b'b', 0x18, 1]);
+        assert_eq!(encode_preferred(&["a".into(), "b".into()], &[], 1), [0x0a, 8, 0x0a, 1, b'a', 0x0a, 1, b'b', 0x18, 1]);
         let mut w = Writer::new();
         w.message(1, |w| {
             w.string(1, "b");
@@ -1278,9 +1320,9 @@ pub(crate) mod tests {
         assert!(decode_preferred(&[]).is_empty());
         // reserve honours a valid pick, ignores an invalid or duplicated one.
         let (p, _d) = plugins_with("x.com/gpu", &[("a", true, 0), ("b", true, 0), ("c", true, 1)], &[]);
-        assert_eq!(p.reserve_with("u", "c1", "x.com/gpu", 1, Some(&["c".to_string()])).unwrap().0, ["c"]);
-        assert_eq!(p.reserve_with("u", "c2", "x.com/gpu", 1, Some(&["c".to_string()])).unwrap().0, ["a"]);
-        assert_eq!(p.reserve_with("u", "c3", "x.com/gpu", 1, Some(&["zz".to_string()])).unwrap().0, ["b"]);
+        assert_eq!(p.reserve_with("u", "c1", "x.com/gpu", 1, Some(&["c".to_string()]), &[]).unwrap().0, ["c"]);
+        assert_eq!(p.reserve_with("u", "c2", "x.com/gpu", 1, Some(&["c".to_string()]), &[]).unwrap().0, ["a"]);
+        assert_eq!(p.reserve_with("u", "c3", "x.com/gpu", 1, Some(&["zz".to_string()]), &[]).unwrap().0, ["b"]);
     }
 
     #[test]
@@ -1317,7 +1359,7 @@ pub(crate) mod tests {
                 sleep(20).await;
             }
             // The plugin prefers the highest ids: that is what the container gets.
-            let g = p2.allocate("pod1", "a", &[("y.com/gpu".to_string(), 2)]).await.unwrap();
+            let g = p2.allocate("pod1", "a", &[("y.com/gpu".to_string(), 2)], &[]).await.unwrap();
             assert_eq!(g.envs, [("FAKE_VISIBLE".to_string(), "3,2".to_string())]);
             // One Allocate call for two containers; the connection is shared.
             let before = ALLOCATE_CALLS.load(core::sync::atomic::Ordering::SeqCst);
@@ -1359,20 +1401,20 @@ pub(crate) mod tests {
                 sleep(20).await;
             }
             assert_eq!(p2.node_resources(), vec![("x.com/gpu".to_string(), 4, 3)]);
-            let g = p2.allocate("pod1", "main", &[("x.com/gpu".to_string(), 2)]).await.unwrap();
+            let g = p2.allocate("pod1", "main", &[("x.com/gpu".to_string(), 2)], &[]).await.unwrap();
             assert_eq!(g.envs, [("FAKE_VISIBLE".to_string(), "0,1".to_string())]);
             assert_eq!(g.devices.len(), 2);
             assert_eq!(g.devices[0].0, "/dev/fake0");
             assert_eq!(g.mounts, [("/fake/lib".to_string(), "/tmp".to_string(), true)]);
             assert_eq!(g.annotations, [("k".to_string(), "v".to_string())]);
             // Only one healthy device is left.
-            let e = p2.allocate("pod2", "main", &[("x.com/gpu".to_string(), 2)]).await.unwrap_err();
+            let e = p2.allocate("pod2", "main", &[("x.com/gpu".to_string(), 2)], &[]).await.unwrap_err();
             assert!(e.contains("insufficient"), "{e}");
             // Same container again: same devices.
-            let g2 = p2.allocate("pod1", "main", &[("x.com/gpu".to_string(), 2)]).await.unwrap();
+            let g2 = p2.allocate("pod1", "main", &[("x.com/gpu".to_string(), 2)], &[]).await.unwrap();
             assert_eq!(g2.envs, g.envs);
             p2.release_pod("pod1");
-            let g3 = p2.allocate("pod2", "main", &[("x.com/gpu".to_string(), 3)]).await.unwrap();
+            let g3 = p2.allocate("pod2", "main", &[("x.com/gpu".to_string(), 3)], &[]).await.unwrap();
             assert_eq!(g3.envs[0].1, "0,1,2");
             // Plugin gone: devices turn unhealthy, capacity stays.
             let before = p2.generation();
