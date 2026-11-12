@@ -550,3 +550,6 @@
 
 278. **NetworkPolicy chains had one rule per peer pod IP and port** — *fixed* (part of #202)
     `netpol_batch` puts three or more single-address peers with the same ports into a named hash set (`<chain>-s<n>`, elements in messages of 512) and matches it with one `lookup` rule per port; checked in a real kernel (`tools/test/nft-proxy.sh`, scenario `pol-set`) and by `peers_with_the_same_ports_become_a_set`.
+
+279. **A pod whose sandbox could not be built failed for good** — *fixed*
+    Any `start_sandbox` error other than "no free IP" (a full disk writing `/etc/hosts`, a CNI error, a vanished file) set `failed_setup`, so the pod stayed `Failed` (`SandboxFailed`) and a ReplicaSet kept creating replacements. The kubelet now keeps the pod in `ContainerCreating`, emits one `FailedCreatePodSandBox` event per distinct message and retries every 10 s, as upstream. A container that cannot join a sandbox that has vanished (ESRCH) makes the kubelet drop the sandbox and build a new one.

@@ -236,6 +236,8 @@ struct PodRt {
     evicted: Option<String>,
     /// (hostIP, protocol, hostPort) of the containers' host ports.
     host_ports: Vec<(String, String, u64)>,
+    /// Earliest next attempt (ms) after a failed sandbox setup.
+    sandbox_retry_at: u64,
     /// Set once `activeDeadlineSeconds` passed: containers are killed and the pod is Failed.
     deadline_exceeded: bool,
     /// Last reported status and transition time (s) of each pod condition.
@@ -1103,6 +1105,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             return;
         }
         if self.pods.borrow()[uid].sandbox.is_none() {
+            if now_ms() < self.pods.borrow()[uid].sandbox_retry_at {
+                return;
+            }
             let mut lap = now_ms();
             let started = self.start_sandbox(uid, pod).await;
             slow_step("start_sandbox", pod, &mut lap);
@@ -1119,8 +1124,21 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     }
                     return;
                 }
-                self.emit_event(pod, "Warning", "FailedCreatePodSandBox", &e).await;
-                self.pods.borrow_mut().get_mut(uid).unwrap().failed_setup = Some(e);
+                // As upstream, a sandbox that cannot be built (a full disk, a CNI plugin error, a
+                // vanished file) is retried with a pause: the pod stays in ContainerCreating
+                // instead of failing for good.
+                let first = self.pods.borrow()[uid].ctrs.first().is_some_and(|c| !matches!(&c.state, CState::Waiting(_, m) if *m == e));
+                {
+                    let mut pods = self.pods.borrow_mut();
+                    let p = pods.get_mut(uid).unwrap();
+                    p.sandbox_retry_at = now_ms() + 10_000;
+                    for c in p.ctrs.iter_mut() {
+                        c.state = CState::Waiting("ContainerCreating", e.clone());
+                    }
+                }
+                if first {
+                    self.emit_event(pod, "Warning", "FailedCreatePodSandBox", &e).await;
+                }
                 return;
             }
         }
@@ -1436,7 +1454,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         let prio = pod.pointer(&["spec", "priorityClassName"]).and_then(Value::as_str).unwrap_or("");
         let critical = prio.starts_with("system-") && prio.ends_with("-critical") || pod.pointer(&["metadata", "annotations", "kubernetes.io/config.mirror"]).is_some();
-        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ip6: None, node_ip: self.cfg.node_ip, ctrs, start_time: now(), kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, cpu_request: spec::cpu_request(pod), resize_pending: None, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod), pvcs: None }
+        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ip6: None, node_ip: self.cfg.node_ip, ctrs, start_time: now(), kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, cpu_request: spec::cpu_request(pod), resize_pending: None, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod), sandbox_retry_at: 0, pvcs: None }
     }
 
     async fn start_sandbox(&self, uid: &str, pod: &Value) -> Result<(), String> {
@@ -2549,7 +2567,7 @@ mod status_tests {
         CState::Waiting("ContainerCreating", String::new())
     }
     fn pod(ctrs: Vec<Ctr>) -> PodRt {
-        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ip6: None, node_ip: kr_sys::map4([10, 0, 0, 1]), ctrs, start_time: 0, kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, cpu_request: 0, resize_pending: None, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new(), pvcs: None }
+        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ip6: None, node_ip: kr_sys::map4([10, 0, 0, 1]), ctrs, start_time: 0, kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, cpu_request: 0, resize_pending: None, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new(), sandbox_retry_at: 0, pvcs: None }
     }
     fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
         path.iter().try_fold(v, |v, k| match k.parse::<usize>() {
