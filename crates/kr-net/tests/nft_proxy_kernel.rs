@@ -93,6 +93,23 @@ fn apply() {
             // The Service goes with it: policy decides after the DNAT, on the real client.
             model(vec![Svc { v6: false, frontends: vec![Frontend::Addr { ip: ip4(CIP), proto: 6, port: 8080, policy: Policy::Plain }], backends: vec![be(B1, 9090, false)], affinity: false, ..Default::default() }])
         }
+        // The `bridge` policy table (#205): pods E (10.89.0.2), F (10.89.0.3), G (10.89.0.4) on one
+        // bridge, so their traffic never reaches the routing `forward` hook.
+        s if s.starts_with("brpol-") => {
+            let e = vec![10, 89, 0, 2];
+            let f = vec![10, 89, 0, 3];
+            let chains = match s {
+                // F accepts only E, on 9090 only.
+                "brpol-ingress" => vec![NpChain { name: "i4_0".into(), ip: f, ingress: true, allows: vec![NpAllow { peer: Some((e, 32)), ports: vec![NpPort { proto: 6, lo: 9090, hi: 9090 }] }] }],
+                // F accepts nobody.
+                "brpol-deny" => vec![NpChain { name: "i4_0".into(), ip: f, ingress: true, allows: vec![] }],
+                // E may only talk to F.
+                "brpol-egress" => vec![NpChain { name: "e4_0".into(), ip: e, ingress: false, allows: vec![NpAllow { peer: Some((f, 32)), ports: vec![] }] }],
+                other => panic!("unknown scenario {other:?}"),
+            };
+            kr_net::nft::ensure_netpol(PolFam::Bridge, &chains).unwrap_or_else(|e| panic!("bridge netpol batch refused: errno {}", e.0));
+            model(vec![])
+        }
         s => panic!("unknown scenario {s:?}"),
     };
     apply_model(&m);

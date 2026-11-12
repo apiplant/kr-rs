@@ -141,5 +141,39 @@ rules=$(nft list ruleset | grep -c "chain g")
 check "old generations are gone (only the last one remains)" "$([ "$rules" -le 12 ] && echo yes || echo "no: $rules chains")" "yes"
 ip link add d0 type dummy; ip link set d0 up; ip addr add fd00::1/64 dev d0 nodad
 if "$EXE" --ignored --exact ipv6_routes_by_proto >/tmp/r6.out 2>&1; then echo "ok   IPv6 routes of a protocol: add, dump, delete"; else echo "FAIL IPv6 routes: $(tail -3 /tmp/r6.out)"; fail=1; fi
+# The bridge policy table (ADR-049, #205): same-node pods on one bridge, as with kr0.
+unshare -n sleep 600 & E=$!
+unshare -n sleep 600 & F=$!
+unshare -n sleep 600 & G=$!
+sleep 0.3
+ip link add br0 type bridge; ip link set br0 up
+for p in "$E:2" "$F:3" "$G:4"; do
+  pid=${p%:*}; i=${p#*:}
+  ip link add b$i type veth peer name eth0 netns $pid
+  ip link set b$i master br0; ip link set b$i up
+  nsenter -t $pid -n sh -c "ip link set lo up; ip addr add 10.89.0.$i/24 dev eth0; ip link set eth0 up"
+done
+sleep 0.5
+nsenter -t $F -n python3 /tmp/srv.py F 9090 &
+SF=$!
+nsenter -t $F -n python3 /tmp/srv.py F 9091 &
+SF2=$!
+sleep 0.5
+clientE() { nsenter -t $E -n python3 /tmp/cli.py "$@"; }
+clientG() { nsenter -t $G -n python3 /tmp/cli.py "$@"; }
+check "bridge, no policy: pods reach each other" "$(clientG 10.89.0.3 9090 1 | cut -d" " -f1)" "F"
+scenario brpol-ingress
+check "bridge policy: the allowed pod reaches F" "$(clientE 10.89.0.3 9090 1)" "F 10.89.0.2"
+check "bridge policy: another pod is dropped" "$(clientG 10.89.0.3 9090 1)" "error TimeoutError"
+check "bridge policy: the allowed pod on another port is dropped" "$(clientE 10.89.0.3 9091 1)" "error TimeoutError"
+scenario brpol-deny
+check "bridge policy: default deny drops the pod that was allowed" "$(clientE 10.89.0.3 9090 1)" "error TimeoutError"
+scenario brpol-egress
+check "bridge policy: egress to the allowed pod works" "$(clientE 10.89.0.3 9090 1 | cut -d" " -f1)" "F"
+check "bridge policy: egress to another pod is dropped" "$(clientE 10.89.0.4 9090 1)" "error TimeoutError"
+check "bridge policy: an unselected pod is unaffected" "$(clientG 10.89.0.3 9090 1 | cut -d" " -f1)" "F"
+nft delete table bridge kr-netpol 2>/dev/null
+check "bridge policy: removed table opens traffic again" "$(clientG 10.89.0.3 9090 1 | cut -d" " -f1)" "F"
+kill $SF $SF2 $E $F $G 2>/dev/null
 exit $fail
 '

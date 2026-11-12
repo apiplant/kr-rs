@@ -308,6 +308,17 @@ struct Listener {
     _task: JoinHandle<()>,
 }
 
+/// The datapath choice for a node that could use the kernel: `KR_PROXY=nft` forces it,
+/// `userspace`/`off` forbids it, unset means the kernel unless an external CNI is in use (not
+/// verified with those).
+pub fn want_nft_mode(env: Option<&str>, external_cni: bool) -> bool {
+    match env {
+        Some("nft") => true,
+        Some(_) => false,
+        None => !external_cni,
+    }
+}
+
 pub struct Proxy<C: Client> {
     c: C,
     net: Rc<NodeNet>,
@@ -329,14 +340,15 @@ impl<C: Client + Clone + 'static> Proxy<C> {
         Rc::new(Proxy { c, net, node, listeners: RefCell::new(BTreeMap::new()) })
     }
 
-    /// `KR_PROXY=nft` (root, kr's own network namespace) programs the kernel (ADR-054); anything
-    /// else, and a kernel that refuses the rules, runs the userspace proxy.
+    /// Root with kr's own network namespace programs the kernel (ADR-054) unless `KR_PROXY=userspace`
+    /// or an external CNI is configured (then only `KR_PROXY=nft` asks for it); a kernel that
+    /// refuses the rules, and rootless, run the userspace proxy.
     pub async fn run(self: Rc<Self>) {
         if let Err(e) = self.net.setup() {
             kr_rt::eprint(alloc::format!("proxy: cannot route the service CIDR (errno {}); services disabled\n", e.0).as_bytes());
             return;
         }
-        let want_nft = matches!(self.net.as_ref(), NodeNet::Host) && matches!(kr_runtime::store::env_var("KR_PROXY").as_deref(), Some("nft"));
+        let want_nft = matches!(self.net.as_ref(), NodeNet::Host) && want_nft_mode(kr_runtime::store::env_var("KR_PROXY").as_deref(), crate::cni::conf_dir().is_some());
         if want_nft {
             let mut dp = kr_net::nft::proxy::Datapath::new();
             match dp.apply(&kr_net::nft::proxy::Model::default()) {
@@ -693,6 +705,14 @@ impl Drop for UdpSession {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn datapath_default_is_the_kernel_on_the_built_in_network() {
+        assert!(super::want_nft_mode(None, false));
+        assert!(!super::want_nft_mode(None, true));
+        assert!(super::want_nft_mode(Some("nft"), true));
+        assert!(!super::want_nft_mode(Some("userspace"), false));
+    }
+
     #[test]
     fn source_ranges_match_by_prefix_and_never_lock_out_the_node() {
         let svc: Value = kr_fmt::json::parse_str(r#"{"spec":{"type":"LoadBalancer","loadBalancerSourceRanges":["203.0.113.0/24","198.51.100.7/32","2001:db8::/32"]}}"#).unwrap();

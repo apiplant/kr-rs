@@ -631,3 +631,6 @@
 
 318. **A new pod was open for up to ~0.5 s (NetworkPolicy)** — *fixed* (#203, ADR-049)
     The pod's chain needed its IP, which reached the API only with the first status report. Now the kubelet, after it allocates the address and before any container starts (end of sandbox setup, built-in bridge only), registers it in the policy controller (`netpol::Ctl::announce`) and runs a pass (`Ctl::sync`), which overlays the announced IPs onto pods the API shows without any. The overlay entry is dropped once the API has the IPs. Test: `announced_ips_stand_in_until_the_api_has_them`; the kernel side is the existing nft tests. Not run on a live cluster here (no root).
+
+319. **The kernel Service datapath is the default for root (part of #133)** — *fixed, verified in namespaces*
+    `proxy::want_nft_mode`: unset `KR_PROXY` means nftables for root with kr's own network and no external CNI; `userspace` opts out. The bridge policy table (#205) got kernel tests in `tools/test/nft-proxy.sh`. What was not verified on a real cluster is listed under #133.

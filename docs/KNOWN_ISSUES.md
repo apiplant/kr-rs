@@ -7,11 +7,8 @@ Goal order: **(A) parity with k3s** (needed to call kr production ready) → **(
 # A. Parity with k3s (blocks "production ready")
 Ordered by impact. Size: S days, M a week or two, L more.
 
-133. **Make the kernel (nftables) Service datapath the default** (+165, +201) — *ADR-022, ADR-054, ADR-049* — **security**, M
-    k3s runs a kernel kube-proxy; kr's default is still the userspace proxy. `KR_PROXY=nft` (root) already does DNAT in the kernel (RESOLVED 262): client addresses kept, connections survive a kubelet restart, and NetworkPolicy then judges the real endpoint. To do: run it on a real multi-node cluster with the built-in bridge and with Calico, then make it the root default (userspace stays the rootless default and the fallback). This closes:
-    - #165: with the userspace proxy, NetworkPolicy is bypassed through ClusterIP/NodePort (the proxy re-opens the connection from the host, `output` hook, always allowed). Not fixable in the userspace proxy within a bounded change (`IP_TRANSPARENT` needs a policy route for the return path).
-    - #201: Service addresses the node serves itself (userspace proxy, built-in DNS on ClusterIPs) are exempt from egress rules.
-    - Userspace limits: lower throughput, connections end with the kubelet, `externalTrafficPolicy: Local`/source IP depend on the splice, an external IP that is not local is not served, and a host process on `0.0.0.0:port` blocks a Service on that port (`EADDRINUSE`).
+133. **Kernel (nftables) Service datapath: verified in network namespaces only** (+165, +201) — *ADR-022, ADR-054, ADR-049* — M
+    Root with kr's own network now defaults to the kernel datapath (`KR_PROXY=userspace` opts out; rootless and an external CNI such as Calico stay on the userspace proxy unless `KR_PROXY=nft`; a kernel that refuses the rules falls back). Verified with `tools/test/nft-proxy.sh` (unprivileged `unshare -Urn`: Services, NetworkPolicy through ClusterIPs, the bridge table). Not verified: a real multi-node cluster with the built-in bridge, Calico with the nft datapath, `kr server` restarts under it. Until then #165 and #201 remain for the userspace proxy (rootless, external CNI).
     Left in the kernel datapath: linear rules (hundreds of Services fine), no SCTP.
 189. **HA: distribute the CA, service-account key and encryption config through the cluster** (+156, +177, +188) — *ADR-043, ADR-047*, M
     k3s keeps this bootstrap data in the datastore (encrypted with the token), so every server gets it. kr copies it only at first join (`join_secrets`/`join_cluster`, `crates/kr/src/server.rs`); after that each rotation is manual per server:
@@ -62,7 +59,7 @@ Ordered by impact. Size: S days, M a week or two, L more.
 # B. Verification backlog (code exists, not run on real systems)
 Each is a test run, not new code, unless the run finds a bug.
 
-- **#133 / #205 NetworkPolicy and the nft datapath on a real cluster**: the `bridge` table for same-node bridged pod traffic is untested against the kernel, and that is kr's **default CNI**; also `ipBlock` with `except`, named ports, IPv6 peers, and the kubelet's controller end to end on the built-in bridge. (The `inet` forward table is verified: RESOLVED 264.)
+- **#133 / #205 NetworkPolicy and the nft datapath on a real cluster**: the `bridge` table is now tested against the kernel in namespaces (`tools/test/nft-proxy.sh`: ingress, egress, deny-all, removal), not on a real cluster; still untested: `ipBlock` with `except`, named ports, IPv6 peers, and the kubelet's controller end to end on the built-in bridge. (The `inet` forward table is verified: RESOLVED 264.)
 - **#156 agent CA follow**: `track_ca`/`Remote::set_roots` never ran against a real agent (`tools/test/two-node.sh`, privileged container); nothing checks the agents' kubelet serving certificates were re-issued before `finish`.
 - **#179 upgrade script**: `tools/upgrade/kr-upgrade.sh` only ran with `--dry-run`. It treats `Ready=True` as healthy, which is already true right after the restart; it picks `kr-server` over `kr-agent` by `systemctl is-enabled`.
 - **#175 registry base paths**: a pull through a registry served under a path was never run (parsing only).
