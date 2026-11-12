@@ -222,6 +222,14 @@ pub fn bootstrap_bindings() -> Vec<(&'static str, &'static str, &'static str)> {
 /// naming `system:masters` can be approved by a `system:masters` member only. Err is
 /// (status code, message). `can` answers an authorization question for the caller.
 pub fn csr_update_check(sub: &str, old: &Value, new: &Value, masters: bool, can: &dyn Fn(&Attrs) -> bool) -> core::result::Result<(), (u16, String)> {
+    csr_update_check_with(sub, old, new, masters, can, &|g| g == "system:masters")
+}
+
+/// [`csr_update_check`] with a `privileged` predicate on group names (`system:masters` and
+/// groups bound to `cluster-admin`): a `kube-apiserver-client` request naming one can only be
+/// approved by a `system:masters` member. Messages are field errors (`path: Type: detail`);
+/// the caller prefixes `Kind.group "name" is invalid: `.
+pub fn csr_update_check_with(sub: &str, old: &Value, new: &Value, masters: bool, can: &dyn Fn(&Attrs) -> bool, privileged: &dyn Fn(&str) -> bool) -> core::result::Result<(), (u16, String)> {
     let conds = |v: &Value| -> Vec<(String, String)> {
         let c = v.pointer(&["status", "conditions"]).and_then(Value::as_array).unwrap_or(&[]);
         c.iter().map(|c| (c.get("type").and_then(Value::as_str).unwrap_or("").to_string(), c.get("status").and_then(Value::as_str).unwrap_or("").to_string())).collect()
@@ -234,38 +242,47 @@ pub fn csr_update_check(sub: &str, old: &Value, new: &Value, masters: bool, can:
     let bad = |m: &str| Err((422, m.to_string()));
     if sub == "approval" {
         if nc.iter().any(|(t, _)| !matches!(t.as_str(), "Approved" | "Denied" | "Failed")) {
-            return bad("status.conditions: only Approved, Denied and Failed conditions are allowed through approval");
+            return bad("status.conditions: Unsupported value: only \"Approved\", \"Denied\" and \"Failed\" conditions are allowed through approval");
         }
         if (decided(&nc, "Approved") && decided(&nc, "Denied")) || (nc.iter().any(|(t, _)| t == "Approved") && nc.iter().any(|(t, _)| t == "Denied")) {
-            return bad("status.conditions: Approved and Denied conditions are mutually exclusive");
+            return bad("status.conditions: Invalid value: Approved and Denied conditions are mutually exclusive");
         }
     } else if added("Approved") || added("Denied") || changes("Approved") || changes("Denied") {
-        return bad("status.conditions: Approved and Denied can only be set through the approval subresource");
+        return bad("status.conditions: Forbidden: Approved and Denied can only be set through the approval subresource");
     }
     if sub == "status" {
         let cert = |v: &Value| v.pointer(&["status", "certificate"]).and_then(Value::as_str).unwrap_or("").to_string();
         let (oldc, newc) = (cert(old), cert(new));
         if oldc != newc {
             if !oldc.is_empty() {
-                return bad("status.certificate: field is immutable once set");
+                return bad("status.certificate: Invalid value: field is immutable once set");
             }
             if !decided(&oc, "Approved") || decided(&oc, "Denied") || decided(&oc, "Failed") {
-                return bad("status.certificate: can only be set on an approved request that is not denied or failed");
+                return bad("status.certificate: Forbidden: can only be set on an approved request that is not denied or failed");
             }
             let ders = kr_fmt::base64::decode(&newc).ok().and_then(|pem| kr_crypto::x509::pem_decode_all(&String::from_utf8_lossy(&pem), "CERTIFICATE").ok()).filter(|d| !d.is_empty());
             let Some(ders) = ders else {
-                return bad("status.certificate: must be base64 of one or more PEM CERTIFICATE blocks");
+                return bad("status.certificate: Invalid value: must be base64 of one or more PEM CERTIFICATE blocks");
             };
             let Some(leaf_key) = ders.iter().all(|d| kr_crypto::x509::Certificate::parse(d).is_ok()).then(|| kr_crypto::x509::Certificate::parse(&ders[0]).ok().and_then(|c| c.public_key)).flatten() else {
-                return bad("status.certificate: not a parsable certificate chain");
+                return bad("status.certificate: Invalid value: not a parsable certificate chain");
             };
+            // The chain must be what a signer issues: the leaf is an end-entity certificate and
+            // each certificate's issuer is the next one's subject.
+            let parsed: Vec<_> = ders.iter().filter_map(|d| kr_crypto::x509::Certificate::parse(d).ok()).collect();
+            if parsed[0].is_ca {
+                return bad("status.certificate: Invalid value: the first certificate must not be a CA certificate");
+            }
+            if parsed.windows(2).any(|w| w[0].issuer != w[1].subject) {
+                return bad("status.certificate: Invalid value: each certificate must be issued by the next one in the chain");
+            }
             if csr_public_key(old).map(|k| k.spki()) != Some(leaf_key.spki()) {
-                return bad("status.certificate: the first certificate's public key does not match the request's");
+                return bad("status.certificate: Invalid value: the first certificate's public key does not match the request's");
             }
         }
     }
     if issued && oc != nc {
-        return bad("status.conditions: cannot update a CertificateSigningRequest whose certificate is issued");
+        return bad("status.conditions: Forbidden: cannot update a CertificateSigningRequest whose certificate is issued");
     }
     if sub == "approval" && (added("Approved") || added("Denied")) {
         let signer = old.pointer(&["spec", "signerName"]).and_then(Value::as_str).unwrap_or("");
@@ -280,8 +297,8 @@ pub fn csr_update_check(sub: &str, old: &Value, new: &Value, masters: bool, can:
         if !ok {
             return Err((403, alloc::format!("user not permitted to approve requests with signerName \"{signer}\"")));
         }
-        if added("Approved") && signer == "kubernetes.io/kube-apiserver-client" && !masters && csr_names_masters(old) {
-            return Err((403, "only system:masters may approve a client certificate for the system:masters group".to_string()));
+        if added("Approved") && signer == "kubernetes.io/kube-apiserver-client" && !masters && csr_names_privileged(old, privileged) {
+            return Err((403, "only system:masters may approve a client certificate for a privileged group (system:masters or a cluster-admin group)".to_string()));
         }
     }
     Ok(())
@@ -290,12 +307,12 @@ pub fn csr_update_check(sub: &str, old: &Value, new: &Value, masters: bool, can:
 /// Does the PKCS#10 request in `spec.request` ask for `O=system:masters`? The subject is parsed
 /// (organization values in UTF-8, printable, IA5, T61, BMP and universal strings); a request
 /// whose subject cannot be parsed counts as naming it (fail closed).
-fn csr_names_masters(csr: &Value) -> bool {
+fn csr_names_privileged(csr: &Value, privileged: &dyn Fn(&str) -> bool) -> bool {
     let Some(b64) = csr.pointer(&["spec", "request"]).and_then(Value::as_str) else { return false };
     let Ok(pem) = kr_fmt::base64::decode(b64) else { return false };
     let Ok(ders) = kr_crypto::x509::pem_decode_all(&String::from_utf8_lossy(&pem), "CERTIFICATE REQUEST") else { return false };
     ders.iter().any(|d| match csr_organizations(d) {
-        Some(orgs) => orgs.iter().any(|o| o == "system:masters"),
+        Some(orgs) => orgs.iter().any(|o| privileged(o)),
         None => true,
     })
 }
@@ -535,10 +552,10 @@ mod tests {
             let b64 = kr_fmt::base64::encode(kr_crypto::x509::pem_encode("CERTIFICATE REQUEST", der).as_bytes());
             parse_str(&alloc::format!(r#"{{"spec":{{"request":"{b64}"}}}}"#)).unwrap()
         };
-        assert!(csr_names_masters(&mk(&req_with_org(0x1e, &bmp))));
-        assert!(!csr_names_masters(&mk(&req_with_org(0x0c, b"dev"))));
-        assert!(!csr_names_masters(&mk(&cn)));
-        assert!(csr_names_masters(&mk(b"\x30\x03abc"))); // unparsable: fail closed
+        assert!(csr_names_privileged(&mk(&req_with_org(0x1e, &bmp)), &|g| g == "system:masters"));
+        assert!(!csr_names_privileged(&mk(&req_with_org(0x0c, b"dev")), &|g| g == "system:masters"));
+        assert!(!csr_names_privileged(&mk(&cn), &|g| g == "system:masters"));
+        assert!(csr_names_privileged(&mk(b"\x30\x03abc"), &|g| g == "system:masters")); // unparsable: fail closed
     }
 
     #[test]
@@ -557,5 +574,12 @@ mod tests {
         let (old2, mut new2) = (mk("example.com/x"), mk("example.com/x"));
         new2.set("status", ap.get("status").unwrap().clone());
         assert!(csr_update_check("approval", &old2, &new2, false, &all).is_ok());
+        // a privileged (cluster-admin) group other than system:masters
+        let ca = |g: &str| g == "subject system:masters" || g == "system:masters";
+        assert_eq!(csr_update_check_with("approval", &old, &new, false, &all, &ca).unwrap_err().0, 403);
+        assert!(csr_update_check_with("approval", &old, &new, true, &all, &ca).is_ok());
+        // errors are field errors
+        let both = parse_str(r#"{"status":{"conditions":[{"type":"Approved"},{"type":"Denied"}]}}"#).unwrap();
+        assert!(csr_update_check("approval", &old2, &both, true, &all).unwrap_err().1.starts_with("status.conditions: Invalid value"));
     }
 }

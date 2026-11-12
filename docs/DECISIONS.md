@@ -684,3 +684,4 @@ Until `kr-crypto` ships TLS (phase 2), images are pulled from a local plain-HTTP
 * Rejected: storing the files in the clear in the store (keys next to the encrypted data), a separate transport (a second protocol), automatic restarts.
 
 **Consequences:** One command rotates keys cluster-wide. Not covered: restarts are manual (listeners), a server that is down during a rotation applies the latest generation when it returns (for encryption it must not have missed the reader step: the leader enforces that all voters acknowledged it), `finish` still cannot tell whether every node renewed (hence `--yes`), the cluster view lacks per-key object counts.
+**Addition (#206, 2026-11-12):** privileged client groups = `system:masters` plus groups of ClusterRoleBindings to `cluster-admin` (read from the store at approval time). The "issuer vs signer" check is a chain-linkage check (leaf not a CA, issuer(i) == subject(i+1)) since kr cannot know an external signer's CA.

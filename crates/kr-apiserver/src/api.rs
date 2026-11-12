@@ -1049,6 +1049,25 @@ impl ApiServer {
         crate::rbac::allowed(user, a, &crbs, &rbs, &lookup)
     }
 
+    /// Groups bound to the `cluster-admin` ClusterRole by a ClusterRoleBinding.
+    fn cluster_admin_groups(&self) -> Vec<String> {
+        let Some(r) = resources::find("rbac.authorization.k8s.io", "v1", "clusterrolebindings") else { return Vec::new() };
+        let store = self.store.borrow();
+        let mut out = Vec::new();
+        for kv in store.list(&r.prefix(), None, 0).0 {
+            let Ok(b) = json::parse(&kv.value) else { continue };
+            if b.pointer(&["roleRef", "name"]).and_then(Value::as_str) != Some("cluster-admin") || b.pointer(&["roleRef", "kind"]).and_then(Value::as_str) != Some("ClusterRole") {
+                continue;
+            }
+            for s in b.get("subjects").and_then(Value::as_array).unwrap_or(&[]) {
+                if s.get("kind").and_then(Value::as_str) == Some("Group") {
+                    out.extend(s.get("name").and_then(Value::as_str).map(String::from));
+                }
+            }
+        }
+        out
+    }
+
     /// `authorization.k8s.io/v1` SelfSubjectRulesReview: the caller's rules in `spec.namespace`
     /// from RBAC (a system:masters member gets everything).
     fn self_subject_rules_review(&self, req: &Req, user: &User) -> R<Reply> {
@@ -2363,7 +2382,9 @@ impl ApiServer {
             }
         };
         if let (true, Some(u), Some(sub @ ("approval" | "status"))) = (rt.res.plural == "certificatesigningrequests", &req.user, rt.sub.as_deref()) {
-            crate::rbac::csr_update_check(sub, &old, &new, is_masters(u), &|a| self.authorize(u, a, None)).map_err(|(c, m)| if c == 403 { ApiError::new(403, "Forbidden", m) } else { ApiError::invalid(m) })?;
+            let admin_groups = self.cluster_admin_groups();
+            crate::rbac::csr_update_check_with(sub, &old, &new, is_masters(u), &|a| self.authorize(u, a, None), &|g| g == "system:masters" || admin_groups.iter().any(|x| x == g))
+                .map_err(|(c, m)| if c == 403 { ApiError::new(403, "Forbidden", m) } else { ApiError::invalid(alloc::format!("CertificateSigningRequest.certificates.k8s.io \"{name}\" is invalid: {m}")) })?;
         }
         let (gv, mut t) = self.target(rt);
         t.api_version = &gv;
@@ -2487,7 +2508,7 @@ impl ApiServer {
             }
         }
         let (kv, old) = match existing {
-            Err(e) if is_apply && e.code == 404 => {
+            Err(e) if is_apply && e.code == 404 && rt.sub.is_none() => {
                 let mut o = p;
                 return self.create_value(&mut o, rt, q, req, manager).map(|v| Reply::Json(201, json::to_string(&v)));
             }
