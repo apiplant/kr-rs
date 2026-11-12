@@ -138,7 +138,7 @@ async fn kubelet(c: InProcess) {
                     "" | "Pending" => {
                         let ip = alloc::format!("10.244.0.{}", NEXT_IP.fetch_add(1, Ordering::SeqCst));
                         let ready_at = rfc3339(CLOCK.load(Ordering::SeqCst));
-                        let st = v(&alloc::format!(r#"{{"status":{{"phase":"Running","podIP":"{ip}","podIPs":[{{"ip":"{ip}"}}],"conditions":[{{"type":"Ready","status":"True","lastTransitionTime":"{ready_at}"}}]}}}}"#));
+                        let st = v(&alloc::format!(r#"{{"status":{{"phase":"Running","startTime":"{ready_at}","podIP":"{ip}","podIPs":[{{"ip":"{ip}"}}],"conditions":[{{"type":"Ready","status":"True","lastTransitionTime":"{ready_at}"}}]}}}}"#));
                         let _ = c.patch(&alloc::format!("{path}/status"), MERGE, &st).await;
                     }
                     "Running" if FINISH.load(Ordering::SeqCst) => {
@@ -804,10 +804,160 @@ fn hpa_v1_form_unsupported_metrics_and_missing_targets_report_conditions() {
         let custom = c.get(&alloc::format!("{HPAS}/custom")).await.unwrap();
         let active = cond(&custom, "ScalingActive").unwrap();
         assert_eq!(str_at(active, &["status"]), "False");
-        assert!(str_at(active, &["message"]).contains("no supported metric"), "{active:?}");
+        // A Pods metric is supported now; without a metrics adapter it fails to be read.
+        assert_eq!(str_at(active, &["reason"]), "FailedGetPodsMetric");
+        assert!(str_at(active, &["message"]).contains("unable to get metric qps"), "{active:?}");
         let nothing = c.get(&alloc::format!("{HPAS}/nothing")).await.unwrap();
         let able = cond(&nothing, "AbleToScale").unwrap();
         assert_eq!((str_at(able, &["status"]), str_at(able, &["reason"])), ("False", "FailedGetScale"));
+        feeder.abort();
+    });
+}
+
+// ---- custom and external metrics through an adapter ----
+
+std::thread_local! {
+    /// What the stand-in metrics adapter answers: (path prefix, MetricValueList items JSON).
+    static ADAPTER: core::cell::RefCell<Vec<(String, String)>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// The in-process client, except that `custom.metrics.k8s.io` and `external.metrics.k8s.io` are
+/// answered by [`ADAPTER`] (a real adapter would be an APIService behind the aggregator).
+#[derive(Clone)]
+struct WithAdapter(InProcess);
+
+impl WithAdapter {
+    fn answer(path: &str) -> Option<Value> {
+        if !(path.starts_with("/apis/custom.metrics.k8s.io") || path.starts_with("/apis/external.metrics.k8s.io")) {
+            return None;
+        }
+        ADAPTER.with(|a| a.borrow().iter().find(|(p, _)| path.starts_with(p.as_str())).map(|(_, items)| v(&alloc::format!(r#"{{"kind":"MetricValueList","items":{items}}}"#))))
+    }
+}
+
+impl Client for WithAdapter {
+    async fn get(&self, path: &str) -> kr_apiserver::client::Result<Value> {
+        match Self::answer(path) {
+            Some(l) => Ok(l),
+            None if path.starts_with("/apis/custom.metrics.k8s.io") || path.starts_with("/apis/external.metrics.k8s.io") => Err(kr_apiserver::object::ApiError::new(404, "NotFound", alloc::format!("path \"{path}\" not found"))),
+            None => self.0.get(path).await,
+        }
+    }
+    async fn list(&self, path: &str, query: &str) -> kr_apiserver::client::Result<Value> {
+        match Self::answer(path) {
+            Some(l) => Ok(l),
+            None if path.starts_with("/apis/custom.metrics.k8s.io") || path.starts_with("/apis/external.metrics.k8s.io") => Err(kr_apiserver::object::ApiError::new(404, "NotFound", alloc::format!("path \"{path}\" not found"))),
+            None => self.0.list(path, query).await,
+        }
+    }
+    async fn create(&self, path: &str, obj: &Value) -> kr_apiserver::client::Result<Value> {
+        self.0.create(path, obj).await
+    }
+    async fn update(&self, path: &str, obj: &Value) -> kr_apiserver::client::Result<Value> {
+        self.0.update(path, obj).await
+    }
+    async fn patch(&self, path: &str, content_type: &str, patch: &Value) -> kr_apiserver::client::Result<Value> {
+        self.0.patch(path, content_type, patch).await
+    }
+    async fn delete(&self, path: &str) -> kr_apiserver::client::Result<Value> {
+        self.0.delete(path).await
+    }
+    async fn watch(&self, path: &str, query: &str) -> kr_apiserver::client::Result<kr_apiserver::client::Watch> {
+        self.0.watch(path, query).await
+    }
+}
+
+/// [`scenario`] with the controllers talking to the API through [`WithAdapter`].
+fn scenario_adapter<F, Fut>(f: F)
+where
+    F: FnOnce(InProcess) -> Fut + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    let _l = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    CLOCK.store(T0, Ordering::SeqCst);
+    FINISH.store(false, Ordering::SeqCst);
+    HOLD_ALL.store(false, Ordering::SeqCst);
+    HOLD.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    HOLD_DELETE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    NEXT_IP.store(1, Ordering::SeqCst);
+    ADAPTER.with(|a| a.borrow_mut().clear());
+    let api = Rc::new(ApiServer::new(kr_store::Store::in_memory(), || CLOCK.load(Ordering::SeqCst), rng, "127.0.0.1:6443".to_string()).unwrap());
+    API.with(|a| *a.borrow_mut() = Some(api.clone()));
+    let c = InProcess::new(api, "test");
+    block_on(async move {
+        let ctl = spawn(run_all_with(WithAdapter(c.clone()), cfg()));
+        let kubelet = spawn(kubelet(c.clone()));
+        f(c).await;
+        ctl.abort();
+        kubelet.abort();
+    });
+}
+
+fn adapter(prefix: &str, items: &str) {
+    ADAPTER.with(|a| {
+        let mut a = a.borrow_mut();
+        a.retain(|(p, _)| p != prefix);
+        a.push((prefix.to_string(), items.to_string()));
+    });
+}
+
+#[test]
+fn hpa_scales_on_pods_and_external_metrics_and_reports_events_and_history() {
+    scenario_adapter(|c| async move {
+        c.create("/api/v1/nodes", &node("n1", "{}", "[]", "32")).await.unwrap();
+        c.create(DEPLOYMENTS, &deployment(2, "nginx:1", "")).await.unwrap();
+        wait_until("2 running pods", || async { live_pods(&c).await.iter().filter(|p| str_at(p, &["status", "phase"]) == "Running").count() == 2 }).await;
+        // Every pod reports 30 qps against a target of 10 per pod: x3.
+        let pods = live_pods(&c).await;
+        let items: Vec<String> = pods.iter().map(|p| alloc::format!(r#"{{"describedObject":{{"kind":"Pod","name":"{}"}},"metric":{{"name":"qps"}},"value":"30"}}"#, name(p))).collect();
+        adapter("/apis/custom.metrics.k8s.io/v1beta1/namespaces/default/pods/*/qps", &alloc::format!("[{}]", items.join(",")));
+        // An external queue holding 100 messages, 50 wanted per pod: also asks for more.
+        adapter("/apis/external.metrics.k8s.io/v1beta1/namespaces/default/queue_depth", r#"[{"metricName":"queue_depth","value":"100"}]"#);
+        let hpa = v(r#"{"metadata":{"name":"web"},"spec":{"scaleTargetRef":{"apiVersion":"apps/v1","kind":"Deployment","name":"web"},"minReplicas":2,"maxReplicas":5,"metrics":[{"type":"Pods","pods":{"metric":{"name":"qps"},"target":{"type":"AverageValue","averageValue":"10"}}},{"type":"External","external":{"metric":{"name":"queue_depth"},"target":{"type":"AverageValue","averageValue":"50"}}}]}}"#);
+        c.create(HPAS, &hpa).await.unwrap();
+        let cc = c.clone();
+        let feeder = spawn(async move { drive_metrics(&cc, 0.01, 20).await });
+        // qps asks for ceil(30/10 * 2) = 6, the queue for ceil(100/50) = 2: the maximum wins, bounded by maxReplicas.
+        wait_until("scaled to the maximum of 5", || async { deployment_replicas(&c).await == 5 }).await;
+        feeder.abort();
+        let h = c.get(&alloc::format!("{HPAS}/web")).await.unwrap();
+        let cm = h.pointer(&["status", "currentMetrics"]).and_then(Value::as_array).unwrap();
+        let pods_m = cm.iter().find(|m| str_at(m, &["type"]) == "Pods").unwrap();
+        assert_eq!(str_at(pods_m, &["pods", "metric", "name"]), "qps");
+        assert_eq!(str_at(pods_m, &["pods", "current", "averageValue"]), "30");
+        let ext = cm.iter().find(|m| str_at(m, &["type"]) == "External").unwrap();
+        assert!(str_at(ext, &["external", "current", "averageValue"]) == "50" || str_at(ext, &["external", "current", "averageValue"]) == "34", "{ext:?}");
+        assert_eq!(str_at(cond(&h, "ScalingActive").unwrap(), &["status"]), "True");
+        // An Event for the rescale, and the history persisted for the next run.
+        let evs = items_of(&c.list("/api/v1/namespaces/default/events", "").await.unwrap());
+        assert!(evs.iter().any(|e| str_at(e, &["reason"]) == "SuccessfulRescale" && str_at(e, &["involvedObject", "name"]) == "web" && str_at(e, &["message"]).starts_with("New size:")), "{evs:?}");
+        let hist = str_at(&h, &["status", "krHistory"]);
+        assert!(hist.contains("\"recs\":[[") && hist.contains("\"events\":[["), "{hist}");
+    });
+}
+
+fn items_of(l: &Value) -> Vec<Value> {
+    items(l)
+}
+
+#[test]
+fn hpa_never_scales_down_when_a_metric_cannot_be_read() {
+    scenario_adapter(|c| async move {
+        c.create("/api/v1/nodes", &node("n1", "{}", "[]", "32")).await.unwrap();
+        c.create(DEPLOYMENTS, &deployment(4, "nginx:1", "")).await.unwrap();
+        wait_until("4 running pods", || async { live_pods(&c).await.iter().filter(|p| str_at(p, &["status", "phase"]) == "Running").count() == 4 }).await;
+        // CPU is idle (would scale down to 1), but the external metric has no adapter: keep 4.
+        let hpa = v(r#"{"metadata":{"name":"web"},"spec":{"scaleTargetRef":{"apiVersion":"apps/v1","kind":"Deployment","name":"web"},"minReplicas":1,"maxReplicas":8,"metrics":[{"type":"Resource","resource":{"name":"cpu","target":{"type":"Utilization","averageUtilization":50}}},{"type":"External","external":{"metric":{"name":"missing"},"target":{"type":"Value","value":"10"}}}],"behavior":{"scaleDown":{"stabilizationWindowSeconds":0}}}}"#);
+        c.create(HPAS, &hpa).await.unwrap();
+        let cc = c.clone();
+        let feeder = spawn(async move { drive_metrics(&cc, 0.005, 14).await });
+        wait_until("the HPA has evaluated", || async {
+            let h = c.get(&alloc::format!("{HPAS}/web")).await.unwrap();
+            cond(&h, "ScalingActive").is_some_and(|c| str_at(c, &["message"]).contains("another metric failed"))
+        })
+        .await;
+        sleep(300).await;
+        assert_eq!(deployment_replicas(&c).await, 4, "an unreadable metric blocks scale-down");
         feeder.abort();
     });
 }
