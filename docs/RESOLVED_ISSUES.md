@@ -541,3 +541,6 @@
 
 275. **The kubelet's start-up sweep ran as one uninterrupted poll** — *fixed* (part of #215)
     `sweep_unclaimed` is async and yields between its steps and after every removed pod/container directory.
+
+276. **A kubelet restart ends exec and attach sessions** — *closed as upstream parity* (#134)
+    The client's TLS/WebSocket connection ends in the kubelet process, so no design lets a session survive that process short of handing the socket and TLS state to another process. Upstream's kubelet does not either: it proxies the runtime's streaming server (`proxyStream`), so restarting it drops `kubectl exec`/`attach`/`port-forward` there too. Containers, their terminals and `attach -i` stdin do survive in kr (the shim keeps them). The shim costs ~1 MB per container, far below containerd-shim-runc-v2.
