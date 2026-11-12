@@ -973,7 +973,10 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             return;
         }
         if self.pods.borrow()[uid].sandbox.is_none() {
-            if let Err(e) = self.start_sandbox(uid, pod).await {
+            let mut lap = now_ms();
+            let started = self.start_sandbox(uid, pod).await;
+            slow_step("start_sandbox", pod, &mut lap);
+            if let Err(e) = started {
                 if e.starts_with(NO_IP) {
                     // Addresses free up as other pods end: stay in ContainerCreating and retry on
                     // the next sync (one event per pod, not one per second).
