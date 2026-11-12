@@ -717,10 +717,12 @@ impl Running {
         if let Some(path) = self.exit_file.clone() {
             // Not our child: the shim reaps it and records the status.
             let fd = kr_rt::exec::Async::new(self.pidfd.clone()).map_err(err("register pidfd"))?;
-            while network::proc_start(self.pid as u32).is_some() {
+            // Judged through the pidfd, not the pid number: a fast container may be gone before
+            // we looked, and its pid may belong to another process by now.
+            while ns::pidfd_send_signal(&self.pidfd, 0).is_ok() {
                 fd.wait_readable().await;
                 // A zombie the shim has not reaped yet still reads as readable; do not spin.
-                if network::proc_start(self.pid as u32).is_some() {
+                if ns::pidfd_send_signal(&self.pidfd, 0).is_ok() {
                     kr_rt::exec::sleep(20).await;
                 }
             }
@@ -1833,11 +1835,32 @@ impl DetachedPending {
             return Err(RunError { step, errno: Errno(word(1) as i32) });
         }
         let (pid, shim) = (word(1) as i32, word(5) as i32);
-        // The shim has not reaped the container, so the pid cannot have been recycled.
-        let pidfd = ns::pidfd_open(pid).map_err(err("pidfd_open"))?;
+        // A container that is quick enough (`echo`) is already gone, reaped by its shim, when we
+        // get here: its exit status is in the exit file. Hold a pidfd of a process that is gone
+        // for sure (signals fail, waiting finds the exit file at once) instead of failing the
+        // start.
+        let pidfd = match ns::pidfd_open(pid) {
+            Ok(fd) => fd,
+            Err(Errno(3)) => dead_pidfd().map_err(err("pidfd_open"))?,
+            Err(e) => return Err(RunError { step: "pidfd_open", errno: e }),
+        };
         let cgroup = self.cgroup.as_ref().and_then(|(parent, id)| Cgroup::open_in(parent, id).ok());
         Ok(Running { pid, pidfd: Rc::new(pidfd), cgroup, host_net: self.host_net, userns: self.userns, exit_file: Some(cstr(&[&self.exit_path])), shim })
     }
+}
+
+/// A pidfd of a process that has exited and been reaped.
+fn dead_pidfd() -> Result<Fd, Errno> {
+    let mut pidfd: i32 = -1;
+    let mut a = CloneArgs { flags: ns::CLONE_PIDFD, exit_signal: ns::SIGCHLD as u64, pidfd: &mut pidfd as *mut i32 as u64, ..Default::default() };
+    // SAFETY: single-threaded runtime (ADR-005); the child only exits.
+    let pid = unsafe { ns::clone3(&mut a) }?;
+    if pid == 0 {
+        kr_sys::exit_group(0);
+    }
+    let fd = Fd(pidfd);
+    let _ = ns::wait4(pid);
+    Ok(fd)
 }
 
 async fn read_exact_async(fd: &kr_rt::exec::Async<Fd>, buf: &mut [u8]) -> usize {
@@ -2123,4 +2146,17 @@ pub async fn run_command(path: &[u8], env: &[(&str, &str)], stdin: &[u8]) -> Res
         return Err(alloc::format!("command exited {code}: {}", String::from_utf8_lossy(&stderr)));
     }
     Ok(stdout)
+}
+
+#[cfg(test)]
+mod dead_pidfd_tests {
+    use super::*;
+
+    #[test]
+    fn a_dead_pidfd_reports_no_process() {
+        let fd = dead_pidfd().unwrap();
+        // Signals fail (nothing to kill, nothing to be mistaken for), whatever pid was used.
+        assert_eq!(ns::pidfd_send_signal(&fd, 0), Err(Errno(3)));
+        assert_eq!(ns::pidfd_send_signal(&fd, ns::SIGKILL), Err(Errno(3)));
+    }
 }
