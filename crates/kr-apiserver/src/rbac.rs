@@ -262,14 +262,80 @@ pub fn csr_update_check(sub: &str, old: &Value, new: &Value, masters: bool, can:
     Ok(())
 }
 
-/// Does the PKCS#10 request in `spec.request` contain the string `system:masters` (a
-/// conservative stand-in for parsing the subject: any mention counts)? Unparsable counts as no.
+/// Does the PKCS#10 request in `spec.request` ask for `O=system:masters`? The subject is parsed
+/// (organization values in UTF-8, printable, IA5, T61, BMP and universal strings); a request
+/// whose subject cannot be parsed counts as naming it (fail closed).
 fn csr_names_masters(csr: &Value) -> bool {
     let Some(b64) = csr.pointer(&["spec", "request"]).and_then(Value::as_str) else { return false };
     let Ok(pem) = kr_fmt::base64::decode(b64) else { return false };
     let Ok(ders) = kr_crypto::x509::pem_decode_all(&String::from_utf8_lossy(&pem), "CERTIFICATE REQUEST") else { return false };
-    let needle = b"system:masters";
-    ders.iter().any(|d| d.windows(needle.len()).any(|w| w == needle))
+    ders.iter().any(|d| match csr_organizations(d) {
+        Some(orgs) => orgs.iter().any(|o| o == "system:masters"),
+        None => true,
+    })
+}
+
+/// One DER element: (tag, content, rest).
+fn der(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let tag = *b.first()?;
+    let l0 = *b.get(1)?;
+    let (len, off) = if l0 < 0x80 {
+        (l0 as usize, 2)
+    } else {
+        let n = (l0 & 0x7f) as usize;
+        if n == 0 || n > 3 {
+            return None;
+        }
+        (b.get(2..2 + n)?.iter().fold(0usize, |a, x| a << 8 | *x as usize), 2 + n)
+    };
+    Some((tag, b.get(off..off.checked_add(len)?)?, &b[off + len..]))
+}
+
+/// The `O` (organization) values of the subject of a DER PKCS#10 request.
+fn csr_organizations(req: &[u8]) -> Option<Vec<String>> {
+    let (t, req, _) = der(req)?;
+    let (t2, info, _) = der(req).filter(|_| t == 0x30)?;
+    if t2 != 0x30 {
+        return None;
+    }
+    let (tv, _, rest) = der(info)?; // version
+    if tv != 0x02 {
+        return None;
+    }
+    let (ts, mut name, _) = der(rest)?;
+    if ts != 0x30 {
+        return None;
+    }
+    let mut out = Vec::new();
+    while !name.is_empty() {
+        let (tset, mut set, rest) = der(name)?;
+        if tset != 0x31 {
+            return None;
+        }
+        name = rest;
+        while !set.is_empty() {
+            let (tseq, atv, rest) = der(set)?;
+            if tseq != 0x30 {
+                return None;
+            }
+            set = rest;
+            let (to, oid, v) = der(atv)?;
+            let (tval, val, _) = der(v)?;
+            if to != 0x06 {
+                return None;
+            }
+            if oid == [0x55, 0x04, 0x0a] {
+                let text = match tval {
+                    0x0c | 0x13 | 0x16 | 0x14 => String::from_utf8_lossy(val).into_owned(),
+                    0x1e if val.len() % 2 == 0 => val.chunks(2).map(|c| char::from_u32((c[0] as u32) << 8 | c[1] as u32).unwrap_or('\u{fffd}')).collect(),
+                    0x1c if val.len() % 4 == 0 => val.chunks(4).map(|c| char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]])).unwrap_or('\u{fffd}')).collect(),
+                    _ => return None,
+                };
+                out.push(text);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Maps an HTTP method to a Kubernetes verb.
@@ -401,6 +467,40 @@ mod tests {
         // status cannot approve; can set the certificate
         assert_eq!(csr_update_check("status", &old, &new, true, &all).unwrap_err().0, 422);
         assert!(csr_update_check("status", &new, &csr("example.com/x", approved, "AAAA"), false, &none).is_ok());
+    }
+
+    fn tlv(tag: u8, c: &[u8]) -> Vec<u8> {
+        let mut v = alloc::vec![tag, c.len() as u8];
+        v.extend_from_slice(c);
+        v
+    }
+
+    fn req_with_org(tag: u8, org: &[u8]) -> Vec<u8> {
+        let atv = |oid: &[u8], t: u8, val: &[u8]| tlv(0x31, &tlv(0x30, &[tlv(0x06, oid), tlv(t, val)].concat()));
+        let name = tlv(0x30, &[atv(&[0x55, 0x04, 0x03], 0x0c, b"alice"), atv(&[0x55, 0x04, 0x0a], tag, org)].concat());
+        tlv(0x30, &tlv(0x30, &[tlv(0x02, &[0]), name].concat()))
+    }
+
+    #[test]
+    fn csr_subject_parsing() {
+        let utf = req_with_org(0x0c, b"system:masters");
+        assert_eq!(csr_organizations(&utf).unwrap(), ["system:masters"]);
+        let bmp: Vec<u8> = "system:masters".encode_utf16().flat_map(|c| c.to_be_bytes()).collect();
+        assert_eq!(csr_organizations(&req_with_org(0x1e, &bmp)).unwrap(), ["system:masters"]);
+        assert_eq!(csr_organizations(&req_with_org(0x0c, b"dev")).unwrap(), ["dev"]);
+        // A CN that merely mentions the group is not an organization.
+        let atv = tlv(0x31, &tlv(0x30, &[tlv(0x06, &[0x55, 0x04, 0x03]), tlv(0x0c, b"system:masters")].concat()));
+        let cn = tlv(0x30, &tlv(0x30, &[tlv(0x02, &[0]), tlv(0x30, &atv)].concat()));
+        assert!(csr_organizations(&cn).unwrap().is_empty());
+        assert!(csr_organizations(b"\x30\x03abc").is_none());
+        let mk = |der: &[u8]| {
+            let b64 = kr_fmt::base64::encode(kr_crypto::x509::pem_encode("CERTIFICATE REQUEST", der).as_bytes());
+            parse_str(&alloc::format!(r#"{{"spec":{{"request":"{b64}"}}}}"#)).unwrap()
+        };
+        assert!(csr_names_masters(&mk(&req_with_org(0x1e, &bmp))));
+        assert!(!csr_names_masters(&mk(&req_with_org(0x0c, b"dev"))));
+        assert!(!csr_names_masters(&mk(&cn)));
+        assert!(csr_names_masters(&mk(b"\x30\x03abc"))); // unparsable: fail closed
     }
 
     #[test]

@@ -3602,6 +3602,10 @@ impl crate::node_authz::Pods for StorePods<'_> {
         let r = resources::find("", "v1", "persistentvolumes")?;
         json::parse(&self.0.store.borrow().get(&r.key(None, name))?.value).ok()
     }
+    fn volume_attachment(&self, name: &str) -> Option<Value> {
+        let r = resources::find("storage.k8s.io", "v1", "volumeattachments")?;
+        json::parse(&self.0.store.borrow().get(&r.key(None, name))?.value).ok()
+    }
     fn in_namespace(&self, ns: &str) -> Vec<Value> {
         let Some(r) = resources::find("", "v1", "pods") else { return Vec::new() };
         let prefix = alloc::format!("{}{ns}/", r.prefix());

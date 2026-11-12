@@ -371,3 +371,9 @@
 
 171. **CSI stats fallback described the parent filesystem** — *fixed*
     The `statfs` fallback in `csi.rs` (`volume_stats`) now runs only when the publish path is an exact mount point in `/proc/self/mountinfo` (`is_mount_point`); an unmounted path (failed publish) yields no stats. Tests: `stats_skip_unmounted_paths`, `mountinfo_matching`.
+
+207a. **Node `get` of other nodes' VolumeAttachments** — *fixed* (list/watch stays as #207)
+    `node_authz::decide` denies `get` of a VolumeAttachment whose `spec.nodeName` is another node (`Pods::volume_attachment`). Test: `volume_attachment_get_scoped_to_node`.
+
+206a. **CSR `O=system:masters` check searched raw bytes** — *fixed* (residual stays as #206)
+    `rbac::csr_organizations` parses the PKCS#10 subject (DER walker; UTF-8, printable, IA5, T61, BMP and universal strings), so a BMPString organization no longer bypasses the check and a CN that merely mentions the group no longer trips it. An unparsable request counts as naming the group (fail closed). Test: `csr_subject_parsing`.

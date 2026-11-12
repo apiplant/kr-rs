@@ -31,6 +31,8 @@ pub trait Pods {
     fn in_namespace(&self, ns: &str) -> Vec<Value>;
     /// A PersistentVolume by name.
     fn persistent_volume(&self, name: &str) -> Option<Value>;
+    /// A VolumeAttachment by name.
+    fn volume_attachment(&self, name: &str) -> Option<Value>;
 }
 
 fn bound_to(pod: &Value, node: &str) -> bool {
@@ -69,6 +71,13 @@ pub fn decide(node: &str, a: &Attrs, body_name: Option<&str>, pods: &dyn Pods) -
         }
         ("storage.k8s.io", "csinodes", "") if write => {
             if target == node { Decision::NoOpinion } else { Decision::Deny }
+        }
+        ("storage.k8s.io", "volumeattachments", "") if a.verb == "get" && !a.name.is_empty() => {
+            // Only the node's own attachments are readable (a missing one is left to answer 404).
+            match pods.volume_attachment(&a.name) {
+                Some(va) if va.pointer(&["spec", "nodeName"]).and_then(Value::as_str) != Some(node) => Decision::Deny,
+                _ => Decision::NoOpinion,
+            }
         }
         ("", "persistentvolumes", "") if !write => {
             // A PV is readable when its claim is used by a pod bound to this node. A missing PV
@@ -175,6 +184,13 @@ mod tests {
         fn persistent_volume(&self, name: &str) -> Option<Value> {
             (name == "pv1").then(|| json::parse_str(r#"{"spec":{"claimRef":{"namespace":"a","name":"data"}}}"#).unwrap())
         }
+        fn volume_attachment(&self, name: &str) -> Option<Value> {
+            match name {
+                "va-n1" => json::parse_str(r#"{"spec":{"nodeName":"n1"}}"#).ok(),
+                "va-n2" => json::parse_str(r#"{"spec":{"nodeName":"n2"}}"#).ok(),
+                _ => None,
+            }
+        }
         fn in_namespace(&self, ns: &str) -> Vec<Value> {
             self.0.iter().filter(|p| p.pointer(&["metadata", "namespace"]).and_then(Value::as_str) == Some(ns)).cloned().collect()
         }
@@ -221,6 +237,15 @@ mod tests {
         assert_eq!(d("n2", "pv1"), Decision::NoOpinion); // its pod does not use the claim
         assert_eq!(d("n1", "gone"), Decision::Allow); // 404 from the handler
         assert_eq!(decide("n1", &attrs("list", "", "persistentvolumes", "", "", ""), None, &p), Decision::NoOpinion);
+    }
+
+    #[test]
+    fn volume_attachment_get_scoped_to_node() {
+        let p = pods();
+        let d = |node: &str, name: &str| decide(node, &attrs("get", "storage.k8s.io", "volumeattachments", "", "", name), None, &p);
+        assert_eq!(d("n1", "va-n1"), Decision::NoOpinion);
+        assert_eq!(d("n1", "va-n2"), Decision::Deny);
+        assert_eq!(d("n1", "gone"), Decision::NoOpinion);
     }
 
     #[test]
