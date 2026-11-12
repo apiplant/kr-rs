@@ -144,7 +144,7 @@ ADR-047. Default `["secrets"]`; `plural` or `plural.group` (e.g. `configmaps`, `
 212. **Hashing and compression in the store and snapshots block the loop** — *ADR-050, #208*
     Store digest/`plain_image` for snapshots (#195), `kr snapshot` and Raft snapshot creation, the Raft log segment checksums, bcrypt-like token checks and the secret encryption codec (AEAD per Secret write, re-encrypt in #188) are inline. Candidates: take the Raft/store snapshot image in the helper (copy-on-write fork of the process, as Redis does, is the simplest correct approach for a consistent image), and batch AEAD for re-encryption.
 213. **Raft and API serving share one thread: causes of stalls remain** — *ADR-004, ADR-050, #126, #208*
-    The watchdog, heartbeat priority and configurable election timeout are in (RESOLVED 213a). What remains is removing the stalls themselves (#209–#212) and making the stall counters visible as a metric (`exec::stall_stats` is only logged, not served on a `/metrics` endpoint).
+    The watchdog, heartbeat priority and configurable election timeout are in (RESOLVED 213a). What remains is removing the stalls themselves (#209–#212)  The stall counters are now served (RESOLVED 248).
 
 245. **Bootstrap objects other than RBAC are created once and never updated** — *ADR-023*
     PriorityClasses, the default StorageClass, the ServiceCIDR and the APF objects are created when missing and not updated by a newer release (upstream reconciles only RBAC and APF's `autoupdate-spec` objects; the APF ones are not reconciled here). Low impact.

@@ -69,3 +69,23 @@ fn default_bindings_gain_missing_subjects_unless_frozen() {
     let frozen = subjects("system:discovery");
     assert!(!frozen.contains("system:authenticated"), "{frozen}");
 }
+
+#[test]
+fn metrics_endpoint_serves_the_loop_counters_to_admins_only() {
+    let api = ApiServer::new(kr_store::Store::in_memory(), || 1_700_000_000, rng, "127.0.0.1".into()).unwrap();
+    let key = kr_crypto::p256::SecretKey::from_bytes(&[7; 32]).unwrap();
+    api.set_service_accounts(kr_apiserver::tokens::Signer::new(key), "CA".into()).unwrap();
+    let get = |user: User| {
+        let req = Req { method: "GET", path: "/metrics", query: "", content_type: None, accept: None, body: b"", user: Some(user), bearer: None, headers: &[], authz_verb: None };
+        api.handle(&req)
+    };
+    match get(User { name: "admin".into(), groups: vec!["system:masters".into()] }) {
+        Reply::Http(r) => {
+            let body = String::from_utf8(match r.body { kr_net::http1::server::Body::Full(b) => b, _ => panic!("body") }).unwrap();
+            assert!(body.contains("kr_event_loop_stalls_total ") && body.contains("kr_offload_jobs_total{class=\"slow\"}"), "{body}");
+        }
+        _ => panic!("expected a raw reply"),
+    }
+    assert!(matches!(get(User { name: "nobody".into(), groups: vec!["system:authenticated".into()] }), Reply::Json(403, _)));
+    assert!(rules(&api, "system:monitoring").contains("/metrics"));
+}

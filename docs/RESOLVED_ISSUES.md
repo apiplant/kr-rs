@@ -457,3 +457,6 @@
 
 247. **Requests to aggregated APIs took 300-560 ms (Calico `projectcalico.org/v3`)** — *fixed* (was #225)
     Pooled per-APIService clients (230a): measured on the live cluster 50-86 ms per request, three runs each on three resources. Only the first requests after a restart are slower (320-380 ms), noted under #226.
+
+248. **The API server had no `/metrics`: stall counters were only logged** — *fixed* (part of #213)
+    `GET /metrics` (Prometheus text) serves `kr_event_loop_stalls_total`, `kr_event_loop_stall_seconds_total`, `kr_event_loop_stall_max_seconds` and `kr_offload_jobs_total{class}`; it is a non-resource URL, so it needs `get` on `/metrics` (the new default ClusterRole `system:monitoring` grants it, with the health endpoints; `system:masters` always). Only these counters so far: request counts and latencies are not exported. Test: `rbac_reconcile.rs::metrics_endpoint_serves_the_loop_counters_to_admins_only`.

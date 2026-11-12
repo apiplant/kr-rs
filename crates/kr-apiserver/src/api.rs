@@ -1310,6 +1310,18 @@ impl ApiServer {
         }
         match path {
             "/healthz" | "/livez" | "/readyz" => return Ok(Reply::Json(200, String::from("\"ok\""))),
+            "/metrics" if req.method == "GET" => {
+                let st = kr_rt::exec::stall_stats();
+                let (fast, slow) = (kr_rt::offload::jobs_done(kr_rt::offload::FAST), kr_rt::offload::jobs_done(kr_rt::offload::SLOW));
+                let body = alloc::format!(
+                    "# HELP kr_event_loop_stalls_total Polls of the event loop longer than the stall threshold.\n# TYPE kr_event_loop_stalls_total counter\nkr_event_loop_stalls_total {}\n\
+                     # HELP kr_event_loop_stall_seconds_total Time spent in those polls.\n# TYPE kr_event_loop_stall_seconds_total counter\nkr_event_loop_stall_seconds_total {:.6}\n\
+                     # HELP kr_event_loop_stall_max_seconds Longest stalled poll since start.\n# TYPE kr_event_loop_stall_max_seconds gauge\nkr_event_loop_stall_max_seconds {:.6}\n\
+                     # HELP kr_offload_jobs_total Jobs answered by the offload workers.\n# TYPE kr_offload_jobs_total counter\nkr_offload_jobs_total{{class=\"fast\"}} {fast}\nkr_offload_jobs_total{{class=\"slow\"}} {slow}\n",
+                    st.stalls, st.total_us as f64 / 1e6, st.max_us as f64 / 1e6
+                );
+                return Ok(Reply::Http(kr_net::http1::server::Response::new(200, body.into_bytes()).with_header("Content-Type", "text/plain; version=0.0.4")));
+            }
             "/version" => {
                 return Ok(Reply::ok(&obj(alloc::vec![
                     ("major", Value::from("1")),
