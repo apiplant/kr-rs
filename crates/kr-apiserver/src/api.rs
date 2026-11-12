@@ -1329,6 +1329,7 @@ impl ApiServer {
                 name: rt.name.clone().or_else(|| q.get("fieldSelector").and_then(|f| f.split(',').find_map(|t| t.trim().strip_prefix("metadata.name=").map(|n| n.trim_start_matches('=').to_string())))).unwrap_or_default(),
                 resource_request: true,
                 path: String::new(),
+                field_selector: q.get("fieldSelector").map(|f| f.to_string()).unwrap_or_default(),
             },
             // Review APIs are virtual resources (create-only, not in the storage table).
             None if path.starts_with("/apis/authorization.k8s.io/v1/") || path.starts_with("/apis/authentication.k8s.io/v1/") => crate::rbac::Attrs {
@@ -3302,6 +3303,7 @@ impl ApiServer {
                 name: s(&ra, "name"),
                 resource_request: true,
                 path: String::new(),
+                field_selector: String::new(),
             }
         } else {
             crate::rbac::Attrs { verb: s(&nra, "verb"), path: s(&nra, "path"), ..Default::default() }
@@ -3405,7 +3407,7 @@ impl ApiServer {
                 Some(ns) => ns.to_string(),
                 None => f(ra, "namespace"),
             };
-            crate::rbac::Attrs { verb: f(ra, "verb"), api_group: f(ra, "group"), resource: f(ra, "resource"), subresource: f(ra, "subresource"), namespace, name: f(ra, "name"), resource_request: true, path: String::new() }
+            crate::rbac::Attrs { verb: f(ra, "verb"), api_group: f(ra, "group"), resource: f(ra, "resource"), subresource: f(ra, "subresource"), namespace, name: f(ra, "name"), resource_request: true, path: String::new(), field_selector: String::new() }
         } else {
             crate::rbac::Attrs { verb: f(nra, "verb"), path: f(nra, "path"), ..Default::default() }
         };

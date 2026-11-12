@@ -22,6 +22,8 @@ pub struct Attrs {
     /// Non-resource requests (discovery, /healthz, ...):
     pub path: String,
     pub resource_request: bool,
+    /// The request's `fieldSelector` (lists and watches), for the node authorizer.
+    pub field_selector: String,
 }
 
 fn has(list: Option<&Value>, want: &str) -> bool {
@@ -501,7 +503,8 @@ mod tests {
         assert!(csr_update_check("approval", &issued, &issued, true, &all).is_ok());
         // status cannot approve; can set the certificate
         assert_eq!(csr_update_check("status", &old, &new, true, &all).unwrap_err().0, 422);
-        assert!(csr_update_check("status", &new, &csr("example.com/x", approved, "AAAA"), false, &none).is_ok());
+        // a certificate that is not PEM (or does not match the request) is refused; see tests/rbac_reconcile.rs for the accepted case
+        assert_eq!(csr_update_check("status", &new, &csr("example.com/x", approved, "AAAA"), false, &none).unwrap_err().0, 422);
     }
 
     fn tlv(tag: u8, c: &[u8]) -> Vec<u8> {

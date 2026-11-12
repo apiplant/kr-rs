@@ -72,7 +72,12 @@ pub fn decide(node: &str, a: &Attrs, body_name: Option<&str>, pods: &dyn Pods) -
         ("storage.k8s.io", "csinodes", "") if write => {
             if target == node { Decision::NoOpinion } else { Decision::Deny }
         }
-        ("storage.k8s.io", "volumeattachments", "") if a.verb == "get" && !a.name.is_empty() => {
+        ("storage.k8s.io", "volumeattachments", "") if a.name.is_empty() && matches!(a.verb.as_str(), "list" | "watch") => {
+            // Only a list limited to the node's own attachments.
+            if a.field_selector.split(',').any(|t| t.trim().trim_start_matches("spec.nodeName=").trim_start_matches('=') == node && t.trim().starts_with("spec.nodeName=")) { Decision::NoOpinion } else { Decision::Deny }
+        }
+        ("", "persistentvolumes", "") if a.name.is_empty() && matches!(a.verb.as_str(), "list" | "watch") => Decision::Deny, // a kubelet reads the PVs of its pods one by one
+        ("storage.k8s.io", "volumeattachments", "") if matches!(a.verb.as_str(), "get" | "list" | "watch") && !a.name.is_empty() => {
             // Only the node's own attachments are readable (a missing one is left to answer 404).
             match pods.volume_attachment(&a.name) {
                 Some(va) if va.pointer(&["spec", "nodeName"]).and_then(Value::as_str) != Some(node) => Decision::Deny,
@@ -82,14 +87,20 @@ pub fn decide(node: &str, a: &Attrs, body_name: Option<&str>, pods: &dyn Pods) -
         ("", "persistentvolumes", "") if !write => {
             // A PV is readable when its claim is used by a pod bound to this node. A missing PV
             // is allowed through (the handler answers 404; nothing leaks).
-            if a.verb != "get" || a.name.is_empty() {
+            if !matches!(a.verb.as_str(), "get" | "list" | "watch") || a.name.is_empty() {
                 return Decision::NoOpinion;
             }
             let Some(pv) = pods.persistent_volume(&a.name) else { return Decision::Allow };
             let s = |k: &str| pv.pointer(&["spec", "claimRef", k]).and_then(Value::as_str).unwrap_or("").to_string();
             let (ns, claim) = (s("namespace"), s("name"));
             let used = !claim.is_empty() && pods.in_namespace(&ns).iter().any(|p| bound_to(p, node) && references(p, "persistentvolumeclaims", &claim));
-            if used { Decision::Allow } else { Decision::NoOpinion }
+            if used {
+                Decision::Allow
+            } else if a.verb == "get" {
+                Decision::NoOpinion
+            } else {
+                Decision::Deny // a list/watch limited to one name is no way around the scope
+            }
         }
         ("", "serviceaccounts", "token") => {
             let used = pods.in_namespace(&a.namespace).iter().any(|p| bound_to(p, node) && p.pointer(&["spec", "serviceAccountName"]).and_then(Value::as_str) == Some(a.name.as_str()));
@@ -197,7 +208,7 @@ mod tests {
     }
 
     fn attrs(verb: &str, group: &str, res: &str, sub: &str, ns: &str, name: &str) -> Attrs {
-        Attrs { verb: verb.into(), api_group: group.into(), resource: res.into(), subresource: sub.into(), namespace: ns.into(), name: name.into(), resource_request: true, path: String::new() }
+        Attrs { verb: verb.into(), api_group: group.into(), resource: res.into(), subresource: sub.into(), namespace: ns.into(), name: name.into(), resource_request: true, path: String::new(), field_selector: String::new() }
     }
 
     fn pods() -> P {
@@ -236,7 +247,23 @@ mod tests {
         assert_eq!(d("n1", "pv1"), Decision::Allow);
         assert_eq!(d("n2", "pv1"), Decision::NoOpinion); // its pod does not use the claim
         assert_eq!(d("n1", "gone"), Decision::Allow); // 404 from the handler
-        assert_eq!(decide("n1", &attrs("list", "", "persistentvolumes", "", "", ""), None, &p), Decision::NoOpinion);
+        assert_eq!(decide("n1", &attrs("list", "", "persistentvolumes", "", "", ""), None, &p), Decision::Deny);
+        assert_eq!(decide("n1", &attrs("watch", "", "persistentvolumes", "", "", "pv1"), None, &p), Decision::Allow);
+        assert_eq!(decide("n2", &attrs("list", "", "persistentvolumes", "", "", "pv1"), None, &p), Decision::Deny);
+    }
+
+    #[test]
+    fn volume_attachment_lists_need_the_node_selector() {
+        let p = pods();
+        let list = |node: &str, sel: &str| {
+            let mut a = attrs("list", "storage.k8s.io", "volumeattachments", "", "", "");
+            a.field_selector = sel.into();
+            decide(node, &a, None, &p)
+        };
+        assert_eq!(list("n1", ""), Decision::Deny);
+        assert_eq!(list("n1", "spec.nodeName=n2"), Decision::Deny);
+        assert_eq!(list("n1", "spec.nodeName=n1"), Decision::NoOpinion);
+        assert_eq!(decide("n1", &attrs("list", "storage.k8s.io", "volumeattachments", "", "", "va-n2"), None, &p), Decision::Deny);
     }
 
     #[test]
