@@ -100,6 +100,7 @@ impl ApiServer {
 }
 
 /// One served group version of an extension API server.
+#[derive(PartialEq)]
 pub struct AggGroup {
     pub group: String,
     pub version: String,
@@ -362,6 +363,10 @@ pub async fn probe_all(api: &ApiServer) {
         let path = format!("/apis/{GROUP}/v1/apiservices/{name}/status");
         let r = Req { method: "PATCH", path: &path, query: "", content_type: Some("application/merge-patch+json"), accept: None, body: patch.as_bytes(), user: Some(system.clone()), bearer: None, headers: &[], authz_verb: None };
         let _ = api.handle(&r);
+    }
+    // Discovery documents are cached; they change only when the aggregated groups do.
+    if *api.agg.borrow() != found {
+        api.oa_cache.borrow_mut().clear();
     }
     *api.agg.borrow_mut() = found;
 }

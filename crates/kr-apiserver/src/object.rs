@@ -442,6 +442,18 @@ impl Selector {
         self.0.is_empty()
     }
 
+    /// True when the stored JSON `raw` certainly does not match, found by looking for the quoted
+    /// key and values in the bytes instead of parsing the object (a necessary condition only:
+    /// false means "parse it and check"). Used on lists that scan a whole collection.
+    pub fn quick_reject(&self, raw: &[u8]) -> bool {
+        self.0.iter().any(|r| match r {
+            Req::Eq(k, v) => absent(raw, k) || absent(raw, v),
+            Req::In(k, vs) => absent(raw, k) || (!vs.is_empty() && vs.iter().all(|v| absent(raw, v))),
+            Req::Exists(k) => absent(raw, k),
+            _ => false,
+        })
+    }
+
     /// Matches an object's metadata.labels.
     pub fn matches(&self, o: &Value) -> bool {
         let labels = o.pointer(&["metadata", "labels"]);
@@ -455,6 +467,32 @@ impl Selector {
             Req::NotExists(k) => get(k).is_none(),
         })
     }
+}
+
+/// Whether the quoted JSON string `"s"` certainly does not occur in `raw`: only decided for tokens
+/// that JSON never escapes (letters, digits, `.-_/`), otherwise `false`.
+fn absent(raw: &[u8], s: &str) -> bool {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/')) {
+        return false;
+    }
+    let mut needle = alloc::vec::Vec::with_capacity(s.len() + 2);
+    needle.push(b'"');
+    needle.extend_from_slice(s.as_bytes());
+    needle.push(b'"');
+    // Boyer-Moore-Horspool: skips by the needle length on most bytes.
+    let m = needle.len();
+    let mut skip = [m; 256];
+    for (i, &b) in needle[..m - 1].iter().enumerate() {
+        skip[b as usize] = m - 1 - i;
+    }
+    let mut at = 0;
+    while at + m <= raw.len() {
+        if raw[at..at + m] == needle[..] {
+            return false;
+        }
+        at += skip[raw[at + m - 1] as usize];
+    }
+    true
 }
 
 /// Field selectors: only `metadata.name` and `metadata.namespace` with `=`/`==`/`!=`
@@ -519,6 +557,12 @@ impl FieldSelector {
         self.0.is_empty()
     }
 
+    /// Like [`Selector::quick_reject`] for equality terms on string fields (numbers and booleans
+    /// are written without quotes, so they are never decided here).
+    pub fn quick_reject(&self, raw: &[u8]) -> bool {
+        self.0.iter().any(|(_, neg, v)| !*neg && v != "true" && v != "false" && v.parse::<i64>().is_err() && absent(raw, v))
+    }
+
     pub fn matches(&self, o: &Value) -> bool {
         self.0.iter().all(|(path, neg, v)| {
             let refs: Vec<&str> = path.iter().map(String::as_str).collect();
@@ -545,6 +589,31 @@ mod tests {
     fn rng(b: &mut [u8]) {
         for (i, x) in b.iter_mut().enumerate() {
             *x = (i * 37 + 11) as u8;
+        }
+    }
+
+    #[test]
+    fn quick_reject_never_rejects_a_match() {
+        let raw = br#"{"metadata":{"name":"p1","labels":{"app":"web","tier":"fe","app.kubernetes.io/name":"x"}},"spec":{"nodeName":"n1"}}"#;
+        let o = parse_str(core::str::from_utf8(raw).unwrap()).unwrap();
+        for sel in ["app=web", "app==web", "app in (db,web)", "tier", "app.kubernetes.io/name=x", "app=web,tier=fe", "app!=db", "!zone", "zone notin (a)", "app notin (db)"] {
+            let s = Selector::parse(sel).unwrap();
+            assert!(s.matches(&o), "{sel}");
+            assert!(!s.quick_reject(raw), "{sel} must not be rejected");
+        }
+        for sel in ["app=db", "app in (db,cache)", "zone", "app=web,tier=be", "zone=a"] {
+            let s = Selector::parse(sel).unwrap();
+            assert!(!s.matches(&o), "{sel}");
+            assert!(s.quick_reject(raw), "{sel} should be rejected without parsing");
+        }
+        // Values with characters JSON may escape are never decided by bytes.
+        assert!(!Selector::parse("app=we b").map(|s| s.quick_reject(raw)).unwrap_or(false));
+        let f = FieldSelector::parse("spec.nodeName=n1").unwrap();
+        assert!(f.matches(&o) && !f.quick_reject(raw));
+        let f = FieldSelector::parse("spec.nodeName=n2").unwrap();
+        assert!(!f.matches(&o) && f.quick_reject(raw));
+        for numeric in ["spec.replicas=3", "spec.unschedulable=false", "status.phase!=Running"] {
+            assert!(!FieldSelector::parse(numeric).map(|f| f.quick_reject(raw)).unwrap_or(false), "{numeric}");
         }
     }
 

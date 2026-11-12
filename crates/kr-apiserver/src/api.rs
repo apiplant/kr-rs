@@ -82,13 +82,20 @@ impl Reply {
             discovery::Negotiated::Aggregated(v) => v,
             _ => return Reply::Http(Response::new(406, Vec::new())),
         };
-        let mut body = discovery::aggregated(extra, core, ver);
-        if !core {
-            if let Ok(mut doc) = json::parse(body.as_bytes()) {
-                crate::aggregator::merge_aggregated(api, &mut doc);
-                body = json::to_string(&doc);
-            }
-        }
+        let key = alloc::format!("disc-agg:{core}:{}", discovery::agg_content_type(ver));
+        let body = api
+            .oa_cached(&key, || {
+                let mut body = discovery::aggregated(extra, core, ver);
+                if !core {
+                    if let Ok(mut doc) = json::parse(body.as_bytes()) {
+                        crate::aggregator::merge_aggregated(api, &mut doc);
+                        body = json::to_string(&doc);
+                    }
+                }
+                Some(body.into_bytes())
+            })
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default();
         let tag = discovery::etag(&body);
         let matched = req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("if-none-match") && v.split(',').any(|t| t.trim() == tag || t.trim() == "*"));
         let resp = if matched { Response::new(304, Vec::new()) } else { Response::new(200, body.into_bytes()) };
@@ -102,6 +109,17 @@ impl Reply {
         Reply::Json(200, json::to_string(v))
     }
 }
+
+/// Parsed objects of the store, kept while their revision is current. Bounded by the size of the
+/// JSON they were parsed from; when full, the older half (by key order) is dropped.
+#[derive(Default)]
+struct ParseCache {
+    map: alloc::collections::BTreeMap<alloc::rc::Rc<str>, (u64, alloc::rc::Rc<Value>, usize)>,
+    bytes: usize,
+}
+
+/// Raw JSON bytes whose parsed form is kept (the parsed trees take several times this memory).
+const PARSE_CACHE_BYTES: usize = 24 << 20;
 
 pub struct ApiServer {
     pub(crate) store: RefCell<Store>,
@@ -120,7 +138,9 @@ pub struct ApiServer {
     /// Served versions of established CustomResourceDefinitions.
     custom: RefCell<Vec<crate::crd::Custom>>,
     /// Serialised OpenAPI documents by request key; dropped whenever the CRD set changes (#210).
-    oa_cache: RefCell<alloc::collections::BTreeMap<String, Vec<u8>>>,
+    pub(crate) oa_cache: RefCell<alloc::collections::BTreeMap<String, Vec<u8>>>,
+    /// Parsed stored objects by key and revision, for the lists that read many of them (#210).
+    parsed: RefCell<ParseCache>,
     /// Group commit: writes reach the log synchronously, fsync happens off the event loop.
     committer: crate::durable::Committer,
     /// HA mode (ADR-026): the store is replicated by this Raft driver.
@@ -273,7 +293,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), oa_cache: RefCell::new(alloc::collections::BTreeMap::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), agg_http: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default() };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), oa_cache: RefCell::new(alloc::collections::BTreeMap::new()), parsed: RefCell::new(ParseCache::default()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), agg_http: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default() };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -295,9 +315,33 @@ impl ApiServer {
         self.custom.borrow().iter().map(|c| c.res).collect()
     }
 
+    /// The parsed form of a stored object, from the cache when its revision is unchanged.
+    pub(crate) fn parsed(&self, kv: &Kv) -> Option<alloc::rc::Rc<Value>> {
+        let mut c = self.parsed.borrow_mut();
+        if let Some((rev, v, _)) = c.map.get(&kv.key) {
+            if *rev == kv.mod_rev {
+                return Some(v.clone());
+            }
+        }
+        let v = alloc::rc::Rc::new(json::parse(&kv.value).ok()?);
+        if let Some((_, _, old)) = c.map.insert(kv.key.clone(), (kv.mod_rev, v.clone(), kv.value.len())) {
+            c.bytes -= old;
+        }
+        c.bytes += kv.value.len();
+        if c.bytes > PARSE_CACHE_BYTES {
+            let drop_keys: Vec<alloc::rc::Rc<str>> = c.map.keys().take(c.map.len() / 2).cloned().collect();
+            for k in drop_keys {
+                if let Some((_, _, n)) = c.map.remove(&k) {
+                    c.bytes -= n;
+                }
+            }
+        }
+        Some(v)
+    }
+
     /// An OpenAPI document, built once per CRD-set generation: the documents are large (the whole
     /// API schema) and kubectl and every controller-runtime client fetch them repeatedly.
-    fn oa_cached(&self, key: &str, build: impl FnOnce() -> Option<Vec<u8>>) -> Option<Vec<u8>> {
+    pub(crate) fn oa_cached(&self, key: &str, build: impl FnOnce() -> Option<Vec<u8>>) -> Option<Vec<u8>> {
         if let Some(b) = self.oa_cache.borrow().get(key) {
             return Some(b.clone());
         }
@@ -1238,11 +1282,19 @@ impl ApiServer {
             ["apis", "authentication.k8s.io", "v1", "selfsubjectreviews"] if req.method == "POST" => return self.self_subject_review(req, &user),
             ["api"] | ["apis"] if req.method == "GET" && discovery::negotiate(req.accept) != discovery::Negotiated::Legacy => return Ok(Reply::aggregated_discovery(self, req, &extra, segs.len() == 1 && segs[0] == "api")),
             ["api"] => return Ok(Reply::Json(200, discovery::core_versions(&self.server_address))),
-            ["api", "v1"] => return Ok(Reply::Json(200, discovery::resource_list(&extra, "", "v1").unwrap())),
+            ["api", "v1"] => {
+                let b = self.oa_cached("disc:api/v1", || Some(discovery::resource_list(&extra, "", "v1").unwrap().into_bytes())).unwrap_or_default();
+                return Ok(Reply::Json(200, String::from_utf8(b).unwrap_or_default()));
+            }
             ["apis"] => {
-                let mut doc = json::parse(discovery::group_list(&extra).as_bytes()).unwrap_or(Value::Null);
-                crate::aggregator::merge_groups(self, &mut doc);
-                return Ok(Reply::Json(200, json::to_string(&doc)));
+                let b = self
+                    .oa_cached("disc:apis", || {
+                        let mut doc = json::parse(discovery::group_list(&extra).as_bytes()).unwrap_or(Value::Null);
+                        crate::aggregator::merge_groups(self, &mut doc);
+                        Some(json::to_string(&doc).into_bytes())
+                    })
+                    .unwrap_or_default();
+                return Ok(Reply::Json(200, String::from_utf8(b).unwrap_or_default()));
             }
             ["openapi", "v3"] => {
                 let b = self.oa_cached("v3", || Some(crate::openapi::index(&extra).into_bytes())).unwrap_or_default();
@@ -1572,7 +1624,11 @@ impl ApiServer {
             for kv in &page {
                 cursor = Some(kv.key.to_string());
                 if !ls.is_empty() || !fs.is_empty() {
-                    let Ok(v) = json::parse(&kv.value) else { continue };
+                    // Most items of a selected list do not match: reject them from the bytes.
+                    if ls.quick_reject(&kv.value) || fs.quick_reject(&kv.value) {
+                        continue;
+                    }
+                    let Some(v) = self.parsed(kv) else { continue };
                     if !ls.matches(&v) || !fs.matches(&v) {
                         continue;
                     }
@@ -1614,7 +1670,7 @@ impl ApiServer {
             out.push_str("},\"items\":[");
             for (i, kv) in items.iter().enumerate() {
                 if i > 0 { out.push(','); }
-                let v = json::parse(&kv.value).unwrap_or(Value::Null);
+                let v = self.parsed(kv).unwrap_or_else(|| alloc::rc::Rc::new(Value::Null));
                 let meta = v.get("metadata").cloned().unwrap_or(Value::Object(Vec::new()));
                 let po = obj(alloc::vec![("kind", Value::from("PartialObjectMetadata")), ("apiVersion", Value::from("meta.k8s.io/v1")), ("metadata", meta)]);
                 out.push_str(&json::to_string(&po));
@@ -1684,44 +1740,56 @@ impl ApiServer {
         for (n, _, pr) in &cust_wide {
             cols.push(col(n, "string", "", "", *pr));
         }
-        let rows: Vec<Value> = items
-            .iter()
-            .filter_map(|kv| json::parse(&kv.value).ok())
-            .map(|o| {
-                let meta = o.get("metadata").cloned().unwrap_or(Value::Object(Vec::new()));
-                let name = meta.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                let mut cells = alloc::vec![Value::String(name)];
-                for (_, f) in extra {
-                    cells.push(Value::String(f(&o)));
-                }
-                for (_, p, _) in &cust_main {
-                    cells.push(Value::String(crate::crd::json_path(&o, p)));
-                }
+        // Rows are written as text straight from the parsed objects: no copy of each object's
+        // metadata (with its managedFields) into an intermediate tree.
+        let empty_meta = Value::Object(Vec::new());
+        let mut rows = String::with_capacity(items.len() * 700);
+        for kv in items {
+            let Some(o) = self.parsed(kv) else { continue };
+            let meta = o.get("metadata").unwrap_or(&empty_meta);
+            let name = meta.get("name").and_then(Value::as_str).unwrap_or("");
+            if !rows.is_empty() {
+                rows.push(',');
+            }
+            rows.push_str("{\"cells\":[");
+            json::write_str(name, &mut rows);
+            let cell = |c: &str, rows: &mut String| {
+                rows.push(',');
+                json::write_str(c, rows);
+            };
+            for (_, f) in extra {
+                cell(&f(&o), &mut rows);
+            }
+            for (_, p, _) in &cust_main {
+                cell(&crate::crd::json_path(&o, p), &mut rows);
+            }
+            if !own_age {
                 let created = meta.get("creationTimestamp").and_then(Value::as_str).and_then(crate::printers::parse_rfc3339);
-                if !own_age {
-                    cells.push(Value::String(created.map(|c| crate::printers::human_duration(now - c)).unwrap_or_else(|| "<unknown>".into())));
-                }
-                for (_, f) in wide {
-                    cells.push(Value::String(f(&o)));
-                }
-                for (_, p, _) in &cust_wide {
-                    cells.push(Value::String(crate::crd::json_path(&o, p)));
-                }
-                let partial = obj(alloc::vec![("kind", Value::from("PartialObjectMetadata")), ("apiVersion", Value::from("meta.k8s.io/v1")), ("metadata", meta)]);
-                obj(alloc::vec![("cells", Value::Array(cells)), ("object", partial)])
-            })
-            .collect();
+                cell(&created.map(|c| crate::printers::human_duration(now - c)).unwrap_or_else(|| "<unknown>".into()), &mut rows);
+            }
+            for (_, f) in wide {
+                cell(&f(&o), &mut rows);
+            }
+            for (_, p, _) in &cust_wide {
+                cell(&crate::crd::json_path(&o, p), &mut rows);
+            }
+            rows.push_str("],\"object\":{\"kind\":\"PartialObjectMetadata\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":");
+            rows.push_str(&json::to_string(meta));
+            rows.push_str("}}");
+        }
         let mut meta = alloc::vec![("resourceVersion", Value::String(rev.to_string()))];
         if let Some(c) = cont {
             meta.push(("continue", Value::from(c)));
         }
-        json::to_string(&obj(alloc::vec![
-            ("kind", Value::from("Table")),
-            ("apiVersion", Value::from("meta.k8s.io/v1")),
-            ("metadata", obj(meta)),
-            ("columnDefinitions", Value::Array(cols)),
-            ("rows", Value::Array(rows)),
-        ]))
+        let mut out = String::with_capacity(rows.len() + 1024);
+        out.push_str("{\"kind\":\"Table\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":");
+        out.push_str(&json::to_string(&obj(meta)));
+        out.push_str(",\"columnDefinitions\":");
+        out.push_str(&json::to_string(&Value::Array(cols)));
+        out.push_str(",\"rows\":[");
+        out.push_str(&rows);
+        out.push_str("]}");
+        out
     }
 
     // ---- writes ----
