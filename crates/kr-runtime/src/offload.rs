@@ -5,7 +5,7 @@
 
 use crate::store::{Error, Raw, Result, Store};
 use crate::unpack::Limits;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use kr_net::registry::{Descriptor, Digest};
 
@@ -14,6 +14,8 @@ pub const KIND_VERIFY_BLOB: u32 = 10;
 pub const KIND_INSTALL_IMAGE: u32 = 11;
 pub const KIND_FSYNC_FILE: u32 = 12;
 pub const KIND_REMOVE_IMAGE: u32 = 13;
+/// Disk usage of a directory tree (container writable layers, ADR-048).
+pub const KIND_DISK_USAGE: u32 = 14;
 
 #[derive(Default)]
 struct Enc(Vec<u8>);
@@ -51,6 +53,59 @@ impl<'a> Dec<'a> {
     }
 }
 
+/// Space allocated (`st_blocks`) and number of entries below `root` (not following symlinks, not
+/// crossing into other filesystems), looking at no more than `max_entries` entries; the third
+/// value tells whether the walk was cut short. This is what `du` reports for an overlay upper
+/// directory.
+pub fn disk_usage(root: &str, max_entries: u64) -> (u64, u64, bool) {
+    use kr_sys::fs;
+    let (mut bytes, mut inodes, mut seen) = (0u64, 0u64, 0u64);
+    let mut stack = alloc::vec![root.to_string()];
+    let mut dev = None;
+    while let Some(dir) = stack.pop() {
+        let mut c = dir.clone().into_bytes();
+        c.push(0);
+        let Ok(fd) = fs::openat(fs::AT_FDCWD, &c, fs::O_RDONLY | fs::O_DIRECTORY | fs::O_CLOEXEC | fs::O_NOFOLLOW, 0) else { continue };
+        for e in fs::read_dir(&fd).filter_map(|e| e.ok()) {
+            seen += 1;
+            if seen > max_entries {
+                return (bytes, inodes, true);
+            }
+            let mut n = e.name.clone();
+            n.push(0);
+            let Ok(st) = fs::newfstatat(fd.raw(), &n, fs::AT_SYMLINK_NOFOLLOW) else { continue };
+            if *dev.get_or_insert(st.dev) != st.dev {
+                continue;
+            }
+            inodes += 1;
+            bytes += st.blocks.max(0) as u64 * 512;
+            if st.is_dir() {
+                if let Ok(name) = String::from_utf8(e.name) {
+                    stack.push(alloc::format!("{dir}/{name}"));
+                }
+            }
+        }
+    }
+    (bytes, inodes, false)
+}
+
+/// `(bytes, inodes)` below `path`, walked in a worker when one is available, else inline with a
+/// bounded number of entries so that the event loop cannot stall for long (`None` when the
+/// bound was hit). Never fails: a missing directory is empty.
+pub async fn dir_usage(path: &str) -> Option<(u64, u64)> {
+    if kr_rt::offload::enabled_in(kr_rt::offload::SLOW) {
+        let mut e = Enc::default();
+        e.bytes(path.as_bytes());
+        if let Some(out) = kr_rt::offload::call_in(kr_rt::offload::SLOW, KIND_DISK_USAGE, &e.0).await {
+            if out.len() == 16 {
+                return Some((u64::from_le_bytes(out[..8].try_into().ok()?), u64::from_le_bytes(out[8..].try_into().ok()?)));
+            }
+        }
+    }
+    let (b, i, cut) = disk_usage(path, 20_000);
+    (!cut).then_some((b, i))
+}
+
 /// The handler the workers run for the kinds above.
 pub fn handler(kind: u32, req: &[u8]) -> Vec<u8> {
     run(kind, req).unwrap_or_else(|| alloc::vec![1, b'b', b'a', b'd', b' ', b'j', b'o', b'b'])
@@ -63,6 +118,12 @@ fn run(kind: u32, req: &[u8]) -> Option<Vec<u8>> {
         path.push(0);
         let fd = kr_sys::fs::openat(kr_sys::fs::AT_FDCWD, &path, kr_sys::fs::O_RDONLY | kr_sys::fs::O_CLOEXEC, 0).ok()?;
         return Some(alloc::vec![kr_sys::fs::fsync(fd.raw()).is_err() as u8]);
+    }
+    if kind == KIND_DISK_USAGE {
+        let (bytes, inodes, _) = disk_usage(d.str()?, u64::MAX);
+        let mut out = bytes.to_le_bytes().to_vec();
+        out.extend_from_slice(&inodes.to_le_bytes());
+        return Some(out);
     }
     let store = Store::open(Some(d.str()?)).ok()?;
     match kind {

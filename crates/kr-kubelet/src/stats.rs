@@ -33,6 +33,20 @@ pub struct Cad {
     pub usage: u64,
     pub rss: u64,
     pub cache: u64,
+    /// Writable layer (overlay upper directory) and the filesystem holding it; `None` until the
+    /// first `fs_usage_loop` pass measured it.
+    pub fs: Option<Fs>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Fs {
+    pub usage: u64,
+    pub inodes_used: u64,
+    /// Filesystem size and free space in bytes, inodes in total and free.
+    pub limit: u64,
+    pub available: u64,
+    pub inodes: u64,
+    pub inodes_free: u64,
 }
 
 /// Counters of one network interface of a pod's sandbox (`/proc/<pid>/net/dev`).
@@ -190,6 +204,22 @@ pub fn render_cadvisor(s: &Sample) -> String {
             let _ = writeln!(o, "{name}{{{}}} {} {ts}", lbl(c), f(c));
         }
     }
+    let fsm: [(&str, &str, fn(&Fs) -> u64); 5] = [
+        ("container_fs_usage_bytes", "Number of bytes that are consumed by the container on this filesystem.", |f| f.usage),
+        ("container_fs_limit_bytes", "Number of bytes that can be consumed by the container on this filesystem.", |f| f.limit),
+        ("container_fs_inodes_total", "Number of Inodes", |f| f.inodes),
+        ("container_fs_inodes_free", "Number of available Inodes", |f| f.inodes_free),
+        ("container_fs_inodes_used", "Number of inodes the container writable layer uses", |f| f.inodes_used),
+    ];
+    for (name, help, f) in fsm {
+        let ty = "gauge";
+        let _ = write!(o, "# HELP {name} {help}\n# TYPE {name} {ty}\n");
+        for c in &s.ctrs {
+            if let Some(fs) = &c.cad.fs {
+                let _ = writeln!(o, "{name}{{{}}} {} {ts}", lbl(c), f(fs));
+            }
+        }
+    }
     let _ = write!(o, "# HELP container_last_seen Last time a container was seen by the exporter\n# TYPE container_last_seen gauge\n");
     for c in &s.ctrs {
         let _ = writeln!(o, "container_last_seen{{{}}} {} {ts}", lbl(c), ts / 1000);
@@ -323,6 +353,9 @@ pub fn summary(node: &str, s: &Sample, vols: &[VolStat]) -> String {
         let mut f = alloc::vec![("name", Value::from(c.container.as_str()))];
         f.push(("cpu", obj(alloc::vec![("time", Value::from(ts.as_str())), ("usageCoreNanoSeconds", Value::from((c.cpu_secs * 1e9) as u64))])));
         f.push(("memory", obj(alloc::vec![("time", Value::from(ts.as_str())), ("workingSetBytes", Value::from(c.mem))])));
+        if let Some(fs) = &c.cad.fs {
+            f.push(("rootfs", obj(alloc::vec![("time", Value::from(ts.as_str())), ("availableBytes", Value::from(fs.available)), ("capacityBytes", Value::from(fs.limit)), ("usedBytes", Value::from(fs.usage)), ("inodesFree", Value::from(fs.inodes_free)), ("inodes", Value::from(fs.inodes)), ("inodesUsed", Value::from(fs.inodes_used))])));
+        }
         pods.entry((&c.ns, &c.pod)).or_default().push(obj(f));
     }
     // Pods that only have volumes (no cgroup, no container measured) are listed too.
@@ -428,6 +461,26 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
     }
 
+    /// Every 2 minutes: measures the writable layer of each running container (`du` of
+    /// `containers/<id>/upper`) for `container_fs_*` and the summary's `rootfs`. The walk runs in
+    /// an offload worker (ADR-052) when there is one, one container at a time; without workers it
+    /// is bounded and a bigger layer is skipped. The numbers are cached, so scraping is free.
+    pub async fn fs_usage_loop(self: &alloc::rc::Rc<Self>) {
+        loop {
+            kr_rt::exec::sleep(120_000).await;
+            let ids: Vec<String> = self.pods.borrow().values().flat_map(|p| p.ctrs.iter()).filter_map(|c| if let CState::Running { id, .. } = &c.state { Some(id.clone()) } else { None }).collect();
+            let root = self.store.root().to_string();
+            let Ok([bs, blocks, _, bavail, files, ffree]) = kr_sys::ns::statfs(root.as_bytes()) else { continue };
+            let mut cache = BTreeMap::new();
+            for id in ids {
+                if let Some((usage, inodes_used)) = kr_runtime::offload::dir_usage(&alloc::format!("{root}/containers/{id}/upper")).await {
+                    cache.insert(id, Fs { usage, inodes_used, limit: blocks * bs, available: bavail * bs, inodes: files, inodes_free: ffree });
+                }
+            }
+            *self.fs_cache.borrow_mut() = cache;
+        }
+    }
+
     pub fn internals(&self) -> Internals {
         let pods = self.pods.borrow();
         let containers = pods.values().flat_map(|p| p.ctrs.iter()).filter(|c| matches!(c.state, CState::Running { .. })).count() as u64;
@@ -470,6 +523,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     usage: cur,
                     rss: stat_field(&ms, "anon").unwrap_or(0),
                     cache: stat_field(&ms, "file").unwrap_or(0),
+                    fs: self.fs_cache.borrow().get(id).cloned(),
                 };
                 s.ctrs.push(CtrStat { ns: p.ns.clone(), pod: p.name.clone(), container: c.name.clone(), cpu_secs: usec as f64 / 1e6, mem, cad });
             }
@@ -615,10 +669,12 @@ mod tests {
         assert_eq!(stat_field("nr_periods 10\nnr_throttled 4\nthrottled_usec 2500000\n", "nr_throttled"), Some(4));
         assert_eq!(stat_field("anon 7\nanon_thp 9\n", "anon"), Some(7));
         let mut s = sample();
-        s.ctrs[0].cad = Cad { image: "nginx:1".into(), cid: "abc".into(), path: "/kubepods/x/abc".into(), throttled_periods: 4, periods: 10, throttled_secs: 2.5, rss: 99, usage: 5000, ..Default::default() };
+        s.ctrs[0].cad = Cad { fs: Some(Fs { usage: 7000, limit: 100_000, inodes: 50, inodes_free: 40, inodes_used: 3, available: 9 }), image: "nginx:1".into(), cid: "abc".into(), path: "/kubepods/x/abc".into(), throttled_periods: 4, periods: 10, throttled_secs: 2.5, rss: 99, usage: 5000, ..Default::default() };
         s.nets.push(PodNet { ns: "default".into(), pod: "web".into(), path: "/kubepods/x".into(), ifaces: i });
         let t = render_cadvisor(&s);
         assert!(t.contains("container_cpu_cfs_throttled_periods_total{container=\"app\",id=\"/kubepods/x/abc\",image=\"nginx:1\",name=\"abc\",namespace=\"default\",pod=\"web\"} 4 "), "{t}");
+        assert!(t.contains("container_fs_usage_bytes{container=\"app\",id=\"/kubepods/x/abc\",image=\"nginx:1\",name=\"abc\",namespace=\"default\",pod=\"web\"} 7000 ") && t.contains("container_fs_limit_bytes{") && t.contains("container_fs_inodes_free{"), "{t}");
+        assert_eq!(t.matches("container_fs_usage_bytes{").count(), 1, "only measured containers");
         for m in ["container_cpu_cfs_periods_total", "container_cpu_cfs_throttled_seconds_total", "container_memory_rss", "container_memory_usage_bytes", "container_network_transmit_bytes_total{id=\"/kubepods/x\",interface=\"eth0\",namespace=\"default\",pod=\"web\"} 7000", "container_network_receive_bytes_total"] {
             assert!(t.contains(m), "{m}");
         }
