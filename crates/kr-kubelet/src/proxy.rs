@@ -293,11 +293,53 @@ impl<C: Client + Clone + 'static> Proxy<C> {
         Rc::new(Proxy { c, net, node, listeners: RefCell::new(BTreeMap::new()) })
     }
 
+    /// `KR_PROXY=nft` (root, kr's own network namespace) programs the kernel (ADR-054); anything
+    /// else, and a kernel that refuses the rules, runs the userspace proxy.
     pub async fn run(self: Rc<Self>) {
         if let Err(e) = self.net.setup() {
             kr_rt::eprint(alloc::format!("proxy: cannot route the service CIDR (errno {}); services disabled\n", e.0).as_bytes());
             return;
         }
+        let want_nft = matches!(self.net.as_ref(), NodeNet::Host) && matches!(kr_runtime::store::env_var("KR_PROXY").as_deref(), Some("nft"));
+        if want_nft {
+            let mut dp = kr_net::nft::proxy::Datapath::new();
+            match dp.apply(&kr_net::nft::proxy::Model::default()) {
+                Ok(()) => return self.run_nft(dp).await,
+                Err(e) => kr_rt::eprint(alloc::format!("proxy: nftables datapath unavailable (errno {}); using the userspace proxy\n", e.0).as_bytes()),
+            }
+        } else if matches!(self.net.as_ref(), NodeNet::Host) {
+            // Switching back from the kernel datapath: its rules would DNAT ahead of the sockets.
+            let _ = kr_net::nft::proxy::delete();
+        }
+        self.run_userspace().await
+    }
+
+    /// The Services in the kernel: list, build the model, apply when it changed.
+    async fn run_nft(self: Rc<Self>, mut dp: kr_net::nft::proxy::Datapath) {
+        kr_rt::eprint(b"proxy: Services use the nftables datapath (KR_PROXY=nft)\n");
+        let mut last_err = 0;
+        loop {
+            let started = kr_rt::exec::now_ms();
+            let q = alloc::format!("fieldSelector=spec.nodeName%3D{}", self.node);
+            let lists = (self.c.list("/api/v1/services", "").await, self.c.list("/api/v1/endpoints", "").await, self.c.list("/apis/discovery.k8s.io/v1/endpointslices", "").await, self.c.list("/api/v1/pods", &q).await);
+            if let (Ok(svcs), Ok(eps), Ok(slices), Ok(pods)) = lists {
+                let items = |v: &Value| v.get("items").and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+                let model = crate::svcnft::build(&items(&svcs), &items(&eps), &items(&slices), &items(&pods), &self.node);
+                match dp.apply(&model) {
+                    Ok(()) => last_err = 0,
+                    Err(e) if e.0 != last_err => {
+                        last_err = e.0;
+                        kr_rt::eprint(alloc::format!("proxy: cannot program the nftables datapath (errno {}); retrying\n", e.0).as_bytes());
+                    }
+                    Err(_) => {}
+                }
+            }
+            let took = kr_rt::exec::now_ms().saturating_sub(started);
+            kr_rt::exec::sleep(1000.max(took * 3)).await;
+        }
+    }
+
+    async fn run_userspace(self: Rc<Self>) {
         loop {
             let started = kr_rt::exec::now_ms();
             self.reconcile().await;

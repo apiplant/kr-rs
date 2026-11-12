@@ -122,6 +122,19 @@ impl Netlink {
         Ok(Netlink { fd: kr_sys::socket(AF_NETLINK, SOCK_RAW | kr_sys::SOCK_CLOEXEC, protocol)? })
     }
 
+    /// Makes room for a message of `n` bytes (a netlink message larger than the send buffer is
+    /// refused, and an nft batch with thousands of rules is one message). Best effort: the
+    /// forced variants need CAP_NET_ADMIN, the plain ones are capped by `net.core.wmem_max`.
+    pub fn grow_buffers(&self, n: usize) {
+        let v = (n.max(1 << 20) as i32).to_ne_bytes();
+        for (force, plain) in [(32, 7), (33, 8)] {
+            // SO_SNDBUFFORCE / SO_SNDBUF, SO_RCVBUFFORCE / SO_RCVBUF at SOL_SOCKET.
+            if kr_sys::setsockopt(self.fd.raw(), 1, force, &v).is_err() {
+                let _ = kr_sys::setsockopt(self.fd.raw(), 1, plain, &v);
+            }
+        }
+    }
+
     /// Sends `msgs` and waits for every requested ack. Returns the first error the kernel reports
     /// (the rest of the replies are still drained, so the socket stays usable).
     pub fn transact(&self, msgs: &NlBuf) -> Result<(), Errno> {

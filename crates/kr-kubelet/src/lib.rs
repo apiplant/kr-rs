@@ -29,6 +29,7 @@ pub mod egress;
 pub mod netpol;
 mod probe;
 pub mod proxy;
+pub mod svcnft;
 pub mod remote;
 mod spec;
 pub mod stats;

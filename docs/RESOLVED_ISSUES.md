@@ -499,3 +499,9 @@
 
 261. **Pod and Service networks were fixed constants** — *fixed* (part of #132, ADR-053)
     `KR_POD_CIDR` (default `10.88.0.0/16`) and `KR_SERVICE_CIDR` (`10.96.0.0/16`), each `A.B.0.0/16`, are read at start by `kr server`, `agent` and `ctr`; node `podCIDR`s, the ServiceCIDR object, the `kubernetes` and `kube-dns` ClusterIPs, ClusterIP validation/allocation, the proxy route, masquerade, the pods' resolver address, the certificate SAN and the DNS server all follow. Invalid or equal values stop the start with a message. Tests: `kr_net::cidr::tests`, `tools/test/cidrs.sh` on a rootless server (Services `10.201.0.1/10`, a new Service `10.201.0.11`, an address outside refused, pod `10.200.*`, resolv.conf, a service name resolved, bad value refused).
+
+262. **Services only through a userspace proxy** — *fixed as an opt-in* (part of #133, #165; ADR-054)
+    `KR_PROXY=nft` on a root kubelet programs the Service datapath into the kernel (`inet kr-proxy`): ClusterIP, NodePort, external/load balancer addresses and hostPorts are DNAT'd to ready endpoints with the client address kept, so NetworkPolicy applies to Service traffic and backends see the client; `sessionAffinity: ClientIP` and `externalTrafficPolicy: Local` are honoured; IPv4 and IPv6; the rules are replaced generation by generation in bounded batches (3000 Services in ~240 ms) without a window where Services are missing. Verified against a real kernel without root: `tools/test/nft-proxy.sh` (16 checks). Default stays the userspace proxy until it has run on a cluster.
+
+263. **The event loop ran back-to-back requests of one connection in a single poll** — *mitigated*
+    After each response the connection loop now yields when the poll has lasted 5 ms (`yield_if_long`); a controller's burst of PUTs on one connection had all its bytes buffered and could hold the loop for the whole burst (stall reports with the last phase `http: next request`).

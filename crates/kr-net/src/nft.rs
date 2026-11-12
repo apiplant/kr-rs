@@ -6,6 +6,8 @@
 use crate::netlink::{NlBuf, Netlink, NETLINK_NETFILTER, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL};
 use kr_sys::Errno;
 
+pub mod proxy;
+
 /// NLM_F_APPEND: add the rule at the end of the chain (keeps rule order).
 const NLM_F_APPEND: u16 = 0x800;
 

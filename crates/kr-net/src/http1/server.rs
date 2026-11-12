@@ -546,6 +546,9 @@ async fn run(
         kr_rt::exec::phase("http: send response");
         let sent = send_response(conn, cfg, resp, is_head, minor, keep, &mut buf).await;
         kr_rt::exec::phase("http: next request");
+        // Requests that arrive back to back on one connection (a controller's burst of PUTs) all
+        // have their bytes buffered: without this they run in a single poll.
+        kr_rt::exec::yield_if_long(5).await;
         match sent {
             Ok(true) => {}
             Ok(false) => return Some(true),
