@@ -161,7 +161,7 @@ pub fn bootstrap_roles() -> Vec<(&'static str, String)> {
         // Upstream aggregates this into view/edit/admin by label; kr has no aggregation
         // controller, so the rule is inlined in those roles as well (KNOWN_ISSUES #200).
         ("system:aggregated-metrics-reader", alloc::format!("[{}]", metrics_rule())),
-        ("system:monitoring", alloc::format!("[{}]", nonres(&["/metrics", "/metrics/*", "/healthz", "/healthz/*", "/livez", "/livez/*", "/readyz", "/readyz/*"], &["get"]))),
+        ("system:monitoring", alloc::format!("[{},{}]", nonres(&["/metrics", "/metrics/*", "/healthz", "/healthz/*", "/livez", "/livez/*", "/readyz", "/readyz/*"], &["get"]), rule(&[""], &["nodes/proxy", "nodes/metrics", "nodes/stats"], &["get"]))),
         ("system:discovery", alloc::format!("[{}]", nonres(&["/api", "/api/*", "/apis", "/apis/*", "/healthz", "/livez", "/readyz", "/openapi", "/openapi/*", "/version", "/version/"], &["get"]))),
         ("system:auth-delegator", alloc::format!("[{},{}]", rule(&["authentication.k8s.io"], &["tokenreviews"], &["create"]), rule(&["authorization.k8s.io"], &["subjectaccessreviews"], &["create"]))),
         ("system:public-info-viewer", alloc::format!("[{}]", nonres(&["/healthz", "/livez", "/readyz", "/version", "/version/"], &["get"]))),

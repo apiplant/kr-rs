@@ -109,6 +109,9 @@ impl NodeProxy for Router {
             let l = self.local.as_ref().ok_or_else(|| ApiError::new(503, "ServiceUnavailable", "no local kubelet"))?;
             return l.pod_subresource(sub, ns, pod, node, node_ip, query, headers);
         }
+        if sub == "metrics" {
+            return Err(ApiError::new(501, "NotImplemented", alloc::format!("node {node} is another node's kubelet: scrape it on its port 10250")));
+        }
         let ip = node_ip.ok_or_else(|| ApiError::new(503, "ServiceUnavailable", alloc::format!("node {node} has no InternalIP")))?;
         let target = if query.is_empty() { alloc::format!("/pods/{ns}/{pod}/{sub}") } else { alloc::format!("/pods/{ns}/{pod}/{sub}?{query}") };
         let tls = self.tls.clone();
@@ -324,6 +327,10 @@ pub async fn serve(proxy: Rc<dyn NodeProxy>, node: String, tls: Rc<core::cell::R
                     Err(e) => Response::new(e.code, e.to_status_json().into_bytes()).with_header("Content-Type", "application/json"),
                 },
                 ["metrics", "resource"] | ["stats", "summary"] => match proxy.pod_subresource("metrics", parts[1], "", &node, None, "", &[]) {
+                    Ok(r) => r,
+                    Err(e) => Response::new(e.code, e.to_status_json().into_bytes()).with_header("Content-Type", "application/json"),
+                },
+                ["metrics"] => match proxy.pod_subresource("metrics", "kubelet", "", &node, None, "", &[]) {
                     Ok(r) => r,
                     Err(e) => Response::new(e.code, e.to_status_json().into_bytes()).with_header("Content-Type", "application/json"),
                 },

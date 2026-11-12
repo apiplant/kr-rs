@@ -57,7 +57,7 @@ macro_rules! r {
 pub static RESOURCES: &[Resource] = &[
     // core/v1
     r!("", "v1", "Namespace", "namespaces", "namespace", false, ["ns"], ["status", "finalize"], []),
-    r!("", "v1", "Node", "nodes", "node", false, ["no"], ["status"], []),
+    r!("", "v1", "Node", "nodes", "node", false, ["no"], ["status", "proxy"], []),
     r!("", "v1", "Pod", "pods", "pod", true, ["po"], ["status", "binding", "log", "exec", "attach", "portforward", "ephemeralcontainers", "eviction", "proxy", "resize"], ["all"]),
     r!("", "v1", "Service", "services", "service", true, ["svc"], ["status", "proxy"], ["all"]),
     r!("", "v1", "Endpoints", "endpoints", "endpoints", true, ["ep"], [], []),

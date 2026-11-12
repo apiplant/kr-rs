@@ -587,6 +587,12 @@ impl Csi {
         done.len()
     }
 
+    /// Where the PV `pv` of pod `uid` is published (the directory the container sees).
+    pub fn publish_path(&self, uid: &str, pv: &str) -> Option<String> {
+        let root = self.root.as_deref()?;
+        Some(format!("{root}/pods/{uid}/volumes/kubernetes.io~csi/{pv}/mount"))
+    }
+
     /// Usage of every volume mounted for a pod: `NodeGetVolumeStats` when the driver offers
     /// GET_VOLUME_STATS, otherwise `statfs` of the publish path. Volumes that cannot be read
     /// are left out.

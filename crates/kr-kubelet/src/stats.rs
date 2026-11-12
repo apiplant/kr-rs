@@ -27,6 +27,21 @@ pub struct CtrStat {
     pub mem: u64,
 }
 
+/// Usage of one PVC volume of a pod (`kubelet_volume_stats_*`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VolStat {
+    pub ns: String,
+    pub pod: String,
+    pub volume: String,
+    pub claim: String,
+    pub capacity: u64,
+    pub used: u64,
+    pub available: u64,
+    pub inodes: u64,
+    pub inodes_used: u64,
+    pub inodes_free: u64,
+}
+
 /// A measurement of the node and its containers at `ts_ms`.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Sample {
@@ -120,13 +135,37 @@ pub fn render(s: &Sample) -> String {
     o
 }
 
+/// The kubelet's own metrics (`GET /metrics`): the usage of every claim mounted by a pod here.
+pub fn render_kubelet(vols: &[VolStat]) -> String {
+    use core::fmt::Write;
+    let mut o = String::new();
+    let fields: [(&str, &str, fn(&VolStat) -> u64); 6] = [
+        ("kubelet_volume_stats_capacity_bytes", "Capacity in bytes of the volume", |v| v.capacity),
+        ("kubelet_volume_stats_used_bytes", "Number of used bytes in the volume", |v| v.used),
+        ("kubelet_volume_stats_available_bytes", "Number of available bytes in the volume", |v| v.available),
+        ("kubelet_volume_stats_inodes", "Maximum number of inodes in the volume", |v| v.inodes),
+        ("kubelet_volume_stats_inodes_used", "Number of used inodes in the volume", |v| v.inodes_used),
+        ("kubelet_volume_stats_inodes_free", "Number of free inodes in the volume", |v| v.inodes_free),
+    ];
+    // One series per claim (a claim shared by several pods on the node is reported once).
+    let mut seen: Vec<(&str, &str)> = Vec::new();
+    let uniq: Vec<&VolStat> = vols.iter().filter(|v| !seen.contains(&(v.ns.as_str(), v.claim.as_str())) && { seen.push((&v.ns, &v.claim)); true }).collect();
+    for (name, help, f) in fields {
+        let _ = write!(o, "# HELP {name} {help}\n# TYPE {name} gauge\n");
+        for v in &uniq {
+            let _ = writeln!(o, "{name}{{namespace=\"{}\",persistentvolumeclaim=\"{}\"}} {}", label(&v.ns), label(&v.claim), f(v));
+        }
+    }
+    o
+}
+
 fn usage(cpu_secs: f64, mem: u64, ts: &str) -> Vec<(&'static str, Value)> {
     alloc::vec![("time", Value::from(ts)), ("usageNanoCores", Value::from(0u64)), ("usageCoreNanoSeconds", Value::from((cpu_secs * 1e9) as u64)), ("workingSetBytes", Value::from(mem))]
 }
 
 /// A subset of `/stats/summary`: node and per-container cumulative CPU and working set
 /// (`usageNanoCores` is 0: it is a rate, which needs two samples; consumers use the counter).
-pub fn summary(node: &str, s: &Sample) -> String {
+pub fn summary(node: &str, s: &Sample, vols: &[VolStat]) -> String {
     let ts = kr_apiserver::object::rfc3339(s.ts_ms.div_euclid(1000));
     let mut pods: BTreeMap<(&str, &str), Vec<Value>> = BTreeMap::new();
     for c in &s.ctrs {
@@ -135,9 +174,36 @@ pub fn summary(node: &str, s: &Sample) -> String {
         f.push(("memory", obj(alloc::vec![("time", Value::from(ts.as_str())), ("workingSetBytes", Value::from(c.mem))])));
         pods.entry((&c.ns, &c.pod)).or_default().push(obj(f));
     }
+    // Pods that only have volumes (no cgroup, no container measured) are listed too.
+    for v in vols {
+        pods.entry((&v.ns, &v.pod)).or_default();
+    }
     let pods: Vec<Value> = pods
         .into_iter()
-        .map(|((ns, pod), ctrs)| obj(alloc::vec![("podRef", obj(alloc::vec![("name", Value::from(pod)), ("namespace", Value::from(ns))])), ("containers", Value::Array(ctrs))]))
+        .map(|((ns, pod), ctrs)| {
+            let volume: Vec<Value> = vols
+                .iter()
+                .filter(|v| v.ns == ns && v.pod == pod)
+                .map(|v| {
+                    obj(alloc::vec![
+                        ("time", Value::from(ts.as_str())),
+                        ("name", Value::from(v.volume.as_str())),
+                        ("pvcRef", obj(alloc::vec![("name", Value::from(v.claim.as_str())), ("namespace", Value::from(v.ns.as_str()))])),
+                        ("availableBytes", Value::from(v.available)),
+                        ("capacityBytes", Value::from(v.capacity)),
+                        ("usedBytes", Value::from(v.used)),
+                        ("inodes", Value::from(v.inodes)),
+                        ("inodesFree", Value::from(v.inodes_free)),
+                        ("inodesUsed", Value::from(v.inodes_used)),
+                    ])
+                })
+                .collect();
+            let mut f = alloc::vec![("podRef", obj(alloc::vec![("name", Value::from(pod)), ("namespace", Value::from(ns))])), ("containers", Value::Array(ctrs))];
+            if !volume.is_empty() {
+                f.push(("volume", Value::Array(volume)));
+            }
+            obj(f)
+        })
         .collect();
     let u = usage(s.node_cpu.unwrap_or(0.0), s.node_mem.unwrap_or(0), &ts);
     let pick = |keys: &[&str]| obj(u.iter().filter(|(k, _)| keys.contains(k)).map(|(k, v)| (*k, v.clone())).collect());
@@ -152,6 +218,30 @@ fn wall_ms() -> i64 {
 }
 
 impl<C: Client + Clone + 'static> Kubelet<C> {
+    /// Usage of the claims mounted by the pods here: `statfs` of the directory each is mounted
+    /// from (its filesystem; a path that is not there, or not a mount of a CSI volume, is left out).
+    pub fn volume_stats(&self) -> Vec<VolStat> {
+        let mut out = Vec::new();
+        for p in self.pods.borrow().values() {
+            for (volume, claim, path) in p.pvcs.iter().flatten() {
+                let Ok([bs, blocks, bfree, bavail, files, ffree]) = kr_sys::ns::statfs(path.as_bytes()) else { continue };
+                out.push(VolStat {
+                    ns: p.ns.clone(),
+                    pod: p.name.clone(),
+                    volume: volume.clone(),
+                    claim: claim.clone(),
+                    capacity: blocks * bs,
+                    used: blocks.saturating_sub(bfree) * bs,
+                    available: bavail * bs,
+                    inodes: files,
+                    inodes_used: files.saturating_sub(ffree),
+                    inodes_free: ffree,
+                });
+            }
+        }
+        out
+    }
+
     /// Measures the node and every running container that has a cgroup.
     pub fn sample(&self) -> Sample {
         let mut s = Sample { ts_ms: wall_ms(), node_cpu: read(b"/proc/stat\0").and_then(|t| parse_proc_stat(&t)), node_mem: read(b"/proc/meminfo\0").and_then(|t| parse_meminfo(&t)), ctrs: Vec::new() };
@@ -178,7 +268,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
 pub fn respond<C: Client + Clone + 'static>(k: &Kubelet<C>, what: &str) -> Result<Response, ApiError> {
     match what {
         "resource" => Ok(Response::new(200, render(&k.sample()).into_bytes()).with_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")),
-        "summary" => Ok(Response::new(200, summary(&k.cfg.node_name, &k.sample()).into_bytes()).with_header("Content-Type", "application/json")),
+        "summary" => Ok(Response::new(200, summary(&k.cfg.node_name, &k.sample(), &k.volume_stats()).into_bytes()).with_header("Content-Type", "application/json")),
+        "kubelet" => Ok(Response::new(200, render_kubelet(&k.volume_stats()).into_bytes()).with_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")),
         _ => Err(ApiError::not_found("metrics", what)),
     }
 }
@@ -251,6 +342,18 @@ mod tests {
     }
 
     #[test]
+    fn volume_stats_are_rendered_once_per_claim_and_listed_in_the_summary() {
+        let v = |pod: &str| VolStat { ns: "d".into(), pod: pod.into(), volume: "data".into(), claim: "db".into(), capacity: 1000, used: 400, available: 600, inodes: 50, inodes_used: 5, inodes_free: 45 };
+        let text = render_kubelet(&[v("a"), v("b")]);
+        assert_eq!(text.matches("kubelet_volume_stats_used_bytes{namespace=\"d\",persistentvolumeclaim=\"db\"} 400").count(), 1, "{text}");
+        assert!(text.contains("# TYPE kubelet_volume_stats_inodes_free gauge") && text.contains("kubelet_volume_stats_capacity_bytes{namespace=\"d\",persistentvolumeclaim=\"db\"} 1000"));
+        let s = json::parse(summary("n1", &sample(), &[v("a")]).as_bytes()).unwrap();
+        let vol = s.get("pods").and_then(Value::as_array).and_then(|a| a.iter().find_map(|p| p.get("volume")?.as_array()?.first())).expect("a volume entry");
+        assert_eq!(vol.get("usedBytes").and_then(Value::as_u64), Some(400));
+        assert_eq!(vol.pointer(&["pvcRef", "name"]).and_then(Value::as_str), Some("db"));
+    }
+
+    #[test]
     fn render_roundtrips_through_the_apiserver_parser() {
         let text = render(&sample());
         for m in ["node_cpu_usage_seconds_total", "node_memory_working_set_bytes", "container_cpu_usage_seconds_total", "container_memory_working_set_bytes", "pod_cpu_usage_seconds_total", "pod_memory_working_set_bytes", "resource_scrape_error 0"] {
@@ -271,7 +374,7 @@ mod tests {
 
     #[test]
     fn summary_subset() {
-        let v = json::parse(summary("n1", &sample()).as_bytes()).unwrap();
+        let v = json::parse(summary("n1", &sample(), &[]).as_bytes()).unwrap();
         assert_eq!(v.pointer(&["node", "nodeName"]).and_then(Value::as_str), Some("n1"));
         assert_eq!(v.pointer(&["node", "cpu", "usageCoreNanoSeconds"]).and_then(Value::as_u64), Some(12_500_000_000));
         let pods = v.get("pods").and_then(Value::as_array).unwrap();

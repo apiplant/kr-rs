@@ -239,6 +239,8 @@ struct PodRt {
     deadline_exceeded: bool,
     /// Last reported status and transition time (s) of each pod condition.
     conds: Vec<(String, bool, i64)>,
+    /// PVC volumes as (volume, claim, host directory), for volume statistics; None until looked up.
+    pvcs: Option<Vec<(String, String, String)>>,
 }
 
 struct Exit {
@@ -1364,7 +1366,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         let prio = pod.pointer(&["spec", "priorityClassName"]).and_then(Value::as_str).unwrap_or("");
         let critical = prio.starts_with("system-") && prio.ends_with("-critical") || pod.pointer(&["metadata", "annotations", "kubernetes.io/config.mirror"]).is_some();
-        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ip6: None, node_ip: self.cfg.node_ip, ctrs, start_time: now(), kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, cpu_request: spec::cpu_request(pod), resize_pending: None, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod) }
+        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ip6: None, node_ip: self.cfg.node_ip, ctrs, start_time: now(), kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, cpu_request: spec::cpu_request(pod), resize_pending: None, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod), pvcs: None }
     }
 
     async fn start_sandbox(&self, uid: &str, pod: &Value) -> Result<(), String> {
@@ -1869,6 +1871,13 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         };
         spec::refresh_volumes(&self.c, &self.csi, pod, &dir).await;
         spec::apply_fs_group(&self.maps, pod, &dir);
+        // Where the claims live, for volume statistics (looked up again when none was found).
+        if self.pods.borrow().get(uid).is_some_and(|p| p.pvcs.as_ref().is_none_or(Vec::is_empty)) {
+            let v = spec::pvc_paths(&self.c, &self.csi, pod).await;
+            if let Some(p) = self.pods.borrow_mut().get_mut(uid) {
+                p.pvcs = Some(v);
+            }
+        }
     }
 
     /// Starts any due probes as background tasks; results arrive via `probe_done`.
@@ -2450,7 +2459,7 @@ mod status_tests {
         CState::Waiting("ContainerCreating", String::new())
     }
     fn pod(ctrs: Vec<Ctr>) -> PodRt {
-        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ip6: None, node_ip: kr_sys::map4([10, 0, 0, 1]), ctrs, start_time: 0, kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, cpu_request: 0, resize_pending: None, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new() }
+        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ip6: None, node_ip: kr_sys::map4([10, 0, 0, 1]), ctrs, start_time: 0, kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, cpu_request: 0, resize_pending: None, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new(), pvcs: None }
     }
     fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
         path.iter().try_fold(v, |v, k| match k.parse::<usize>() {

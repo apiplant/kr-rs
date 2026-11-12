@@ -1508,6 +1508,22 @@ impl ApiServer {
 
     /// `pods/<name>[:port]/proxy[/path]`: relays the request to the pod's IP (default port: the
     /// first container port, else 80).
+    /// `nodes/<name>/proxy/<path>` for the kubelet endpoints kr serves: `metrics` (volume
+    /// statistics), `metrics/resource`, `stats/summary` and `healthz`. Only the node this server's
+    /// own kubelet runs on; an agent's kubelet is scraped on its port 10250.
+    fn node_kubelet(&self, req: &Req, node: &str) -> R<Reply> {
+        let rest = req.path.split_once("/proxy").map_or("", |(_, r)| r).trim_matches('/');
+        let what = match rest {
+            "healthz" => return Ok(Reply::Http(kr_net::http1::server::Response::new(200, b"ok".to_vec()).with_header("Content-Type", "text/plain"))),
+            "metrics" => "kubelet",
+            "metrics/resource" => "resource",
+            "stats/summary" => "summary",
+            _ => return Err(ApiError::not_found("path", &alloc::format!("/{rest}"))),
+        };
+        let proxy = self.node_proxy.borrow().clone().ok_or_else(|| ApiError::new(503, "ServiceUnavailable", "no kubelet on this server"))?;
+        proxy.pod_subresource("metrics", what, "", node, None, "", &[]).map(Reply::Http)
+    }
+
     fn pod_proxy(&self, req: &Req, rt: &Route, name: &str) -> R<Reply> {
         let (scheme, pod_name, port) = proxy_name(name)?;
         let port = (!port.is_empty()).then_some(port);
@@ -1598,6 +1614,8 @@ impl ApiServer {
                 Ok(Reply::Http(kr_net::http1::server::Response::new(301, Vec::new()).with_header("Location", &loc)))
             }
             (_, Some(n), Some("proxy")) if rt.res.plural == "services" => self.service_proxy(req, rt, n),
+            ("GET", Some(n), Some("proxy")) if rt.res.plural == "nodes" => self.node_kubelet(req, n),
+            (_, Some(_), Some("proxy")) if rt.res.plural == "nodes" => Err(ApiError::new(405, "MethodNotAllowed", "only GET is supported on nodes/proxy")),
             (_, Some(n), Some("proxy")) => self.pod_proxy(req, rt, n),
             ("GET" | "POST", Some(n), Some(sub @ ("log" | "exec" | "attach" | "portforward"))) => {
                 let (_, pod) = self.get_value(rt, n)?;
@@ -3779,7 +3797,7 @@ fn parse_route(extra: &[&'static Resource], group: &str, version: &str, rest: &[
         [p, n] => (*p, Some(n.to_string()), None),
         [p, n, s] => (*p, Some(n.to_string()), Some(s.to_string())),
         // pods|services/<name>[:port]/proxy/<path...>: the path is re-read from the request.
-        [p @ ("pods" | "services"), n, "proxy", ..] => (*p, Some(n.to_string()), Some(String::from("proxy"))),
+        [p @ ("pods" | "services" | "nodes"), n, "proxy", ..] => (*p, Some(n.to_string()), Some(String::from("proxy"))),
         _ => return None,
     };
     let res = resources::find_in(extra, group, version, plural)?;

@@ -926,6 +926,43 @@ async fn pvc_source<C: Client>(c: &C, csi: &crate::csi::Csi, pod: &Value, ns: &s
     Ok(path.to_string())
 }
 
+/// The PVC volumes of a pod as `(volume name, claim, host directory)`: where each is mounted or
+/// bind-mounted from, for volume statistics. Nothing is created or mounted; a claim that is not
+/// bound (or whose volume kind is unknown) is left out.
+pub async fn pvc_paths<C: Client>(c: &C, csi: &crate::csi::Csi, pod: &Value) -> Vec<(String, String, String)> {
+    let (ns, uid) = (meta(pod, "namespace"), meta(pod, "uid"));
+    let mut out = Vec::new();
+    for vol in pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]) {
+        let (Some(name), Some(claim)) = (vol.get("name").and_then(Value::as_str), vol.pointer(&["persistentVolumeClaim", "claimName"]).and_then(Value::as_str)) else { continue };
+        let Ok(pvc) = c.get(&alloc::format!("/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}")).await else { continue };
+        let pv_name = pvc.pointer(&["spec", "volumeName"]).and_then(Value::as_str).unwrap_or("");
+        if pv_name.is_empty() {
+            continue;
+        }
+        let Ok(pv) = c.get(&alloc::format!("/api/v1/persistentvolumes/{pv_name}")).await else { continue };
+        let path = if pv.pointer(&["spec", "csi"]).is_some() {
+            csi.publish_path(uid, pv_name)
+        } else {
+            let p = ["hostPath", "local"].iter().find_map(|k| pv.pointer(&["spec", k, "path"]).and_then(Value::as_str));
+            p.map(|p| map_storage_path(p))
+        };
+        if let Some(path) = path {
+            out.push((name.to_string(), claim.to_string(), path));
+        }
+    }
+    out
+}
+
+/// The storage root of this run replaces the canonical one in a PV path (see [`pvc_source`]).
+fn map_storage_path(path: &str) -> String {
+    let canon = kr_apiserver::client::STORAGE_ROOT;
+    let local = kr_runtime::store::local_storage_root(canon);
+    match path.strip_prefix(canon) {
+        Some(rest) if rest.starts_with('/') && local != canon => alloc::format!("{local}{rest}"),
+        _ => path.to_string(),
+    }
+}
+
 /// Removes `pvc-*` directories under the storage root whose PersistentVolume no longer exists
 /// (reclaim policy Delete: the controller deleted the PV). Only direct children of the root are
 /// considered, removed through a directory fd so symlinks are never followed.
