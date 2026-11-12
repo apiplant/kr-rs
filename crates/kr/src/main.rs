@@ -7,6 +7,7 @@ mod agent;
 mod ctr;
 mod ctr_import;
 mod manifests;
+mod offload;
 mod pki;
 mod rotate;
 mod secrets_encrypt;

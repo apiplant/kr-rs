@@ -9,6 +9,7 @@ pub mod container;
 pub mod devfilter;
 pub mod hooks;
 pub mod import;
+pub mod offload;
 pub mod network;
 pub mod pull;
 pub mod registries;

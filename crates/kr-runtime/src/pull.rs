@@ -146,7 +146,7 @@ async fn pull_full(store: &Store, image_ref: &str, creds: &[Cred], limits: &Limi
         ensure_blob(store, &mut reg, &r, l).await?;
     }
 
-    install_image(store, &id, &image.raw, &cfg_json, &image.manifest.layers, &gz, &icfg.diff_ids, limits)?;
+    crate::offload::install_image(store, &id, &image.raw, &cfg_json, &image.manifest.layers, &gz, &icfg.diff_ids, limits).await?;
     store.set_ref(image_ref, &id)?;
     Ok(id)
 }
@@ -246,13 +246,13 @@ async fn ensure_blob(store: &Store, reg: &mut Registry<RegConnector>, r: &Refere
     if !d.digest.is_sha256() {
         return Err(Error::Net(kr_net::Error::UnsupportedDigest));
     }
-    if store.has_blob(&d.digest) && store.verify_blob(&d.digest)? {
+    if store.has_blob(&d.digest) && crate::offload::verify_blob(store, &d.digest).await? {
         return Ok(());
     }
     let mut w = store.blob_writer(&d.digest)?;
     let mut werr: Option<Error> = None;
     let res = reg
-        .pull_blob(r, d, &mut |b: &[u8]| {
+        .pull_blob_trusted(r, d, &mut |b: &[u8]| {
             w.write(b).map_err(|e| {
                 werr = Some(e);
                 kr_net::Error::Sink
@@ -263,6 +263,9 @@ async fn ensure_blob(store: &Store, reg: &mut Registry<RegConnector>, r: &Refere
         return Err(e);
     }
     res?;
-    w.commit()
+    // The writer verifies the digest at commit; the (slow) fsync of the data goes to a worker first.
+    crate::offload::fsync_file(&w.tmp_path()).await?;
+    // A digest that does not match is reported like the download check always did.
+    w.commit_unsynced().map_err(|e| if e == Error::Digest { Error::Net(kr_net::Error::DigestMismatch) } else { e })
 }
 

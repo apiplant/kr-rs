@@ -30,7 +30,14 @@ const MAX_FRAME: usize = 1 << 30;
 /// Callers waiting for a free worker beyond this run their job inline instead.
 const MAX_WAITERS: usize = 16;
 
+/// Short jobs (a list rendering takes milliseconds).
+pub const FAST: usize = 0;
+/// Long jobs (unpacking an image takes seconds): a pool of their own, so they never queue short ones.
+pub const SLOW: usize = 1;
+const CLASSES: usize = 2;
+
 struct Worker {
+    class: usize,
     sock: Async<Fd>,
     pid: i32,
     busy: Cell<bool>,
@@ -38,6 +45,8 @@ struct Worker {
 }
 
 struct Pool {
+    /// Jobs answered by a worker since start (tests and diagnostics).
+    done: u64,
     handler: Handler,
     want: usize,
     workers: Vec<Rc<Worker>>,
@@ -48,37 +57,56 @@ struct Global<T>(UnsafeCell<T>);
 // SAFETY: the executor is single-threaded (see `exec`); the pool is only touched from it.
 unsafe impl<T> Sync for Global<T> {}
 
-static POOL: Global<RefCell<Option<Pool>>> = Global(UnsafeCell::new(RefCell::new(None)));
+static POOLS: Global<[RefCell<Option<Pool>>; CLASSES]> = Global(UnsafeCell::new([RefCell::new(None), RefCell::new(None)]));
 
-fn pool() -> &'static RefCell<Option<Pool>> {
-    // SAFETY: single-threaded; shared reference to a RefCell.
-    unsafe { &*POOL.0.get() }
+fn pool(class: usize) -> &'static RefCell<Option<Pool>> {
+    // SAFETY: single-threaded; shared reference to RefCells.
+    unsafe { &(*POOLS.0.get())[class] }
 }
 
 /// Starts `workers` worker processes that run `handler`. Call once, early (before the process has
 /// grown or opened its listeners: workers are forks and start with a copy of the caller's
 /// memory). `workers == 0` disables offloading.
 pub fn init(handler: Handler, workers: usize) {
+    init_class(FAST, handler, workers);
+}
+
+/// [`init`] for the workers of a job class ([`FAST`] or [`SLOW`]).
+pub fn init_class(class: usize, handler: Handler, workers: usize) {
     let mut ws = Vec::new();
     for _ in 0..workers {
-        if let Some(w) = spawn(handler) {
+        if let Some(w) = spawn(class, handler) {
             ws.push(Rc::new(w));
         }
     }
-    *pool().borrow_mut() = Some(Pool { handler, want: workers, workers: ws, waiters: Vec::new() });
+    *pool(class).borrow_mut() = Some(Pool { done: 0, handler, want: workers, workers: ws, waiters: Vec::new() });
 }
 
 /// Whether workers are configured (a call may still fall back to the caller).
 pub fn enabled() -> bool {
-    pool().borrow().as_ref().is_some_and(|p| p.want > 0)
+    enabled_in(FAST)
+}
+
+pub fn enabled_in(class: usize) -> bool {
+    pool(class).borrow().as_ref().is_some_and(|p| p.want > 0)
+}
+
+/// Jobs a worker of `class` has answered so far.
+pub fn jobs_done(class: usize) -> u64 {
+    pool(class).borrow().as_ref().map_or(0, |p| p.done)
 }
 
 /// Runs `handler(kind, req)` in a worker. `None`: do it yourself with the same handler.
 pub async fn call(kind: u32, req: &[u8]) -> Option<Vec<u8>> {
+    call_in(FAST, kind, req).await
+}
+
+/// [`call`] in the workers of `class`.
+pub async fn call_in(class: usize, kind: u32, req: &[u8]) -> Option<Vec<u8>> {
     if req.len() > MAX_FRAME {
         return None;
     }
-    let w = acquire().await?;
+    let w = acquire(class).await?;
     let mut guard = Busy { w: w.clone(), done: false };
     let mut hdr = [0u8; 8];
     hdr[..4].copy_from_slice(&kind.to_le_bytes());
@@ -103,6 +131,9 @@ pub async fn call(kind: u32, req: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     guard.done = true;
+    if let Some(p) = pool(w.class).borrow_mut().as_mut() {
+        p.done += 1;
+    }
     Some(out)
 }
 
@@ -122,7 +153,7 @@ impl Drop for Busy {
             let _ = ns::wait4(self.w.pid);
         }
         self.w.busy.set(false);
-        let waiters: Vec<Waker> = match pool().borrow_mut().as_mut() {
+        let waiters: Vec<Waker> = match pool(self.w.class).borrow_mut().as_mut() {
             Some(p) => core::mem::take(&mut p.waiters),
             None => Vec::new(),
         };
@@ -132,15 +163,15 @@ impl Drop for Busy {
     }
 }
 
-async fn acquire() -> Option<Rc<Worker>> {
+async fn acquire(class: usize) -> Option<Rc<Worker>> {
     let mut waiting = false;
     poll_fn(|cx| {
-        let mut guard = pool().borrow_mut();
+        let mut guard = pool(class).borrow_mut();
         let Some(p) = guard.as_mut() else { return Poll::Ready(None) };
         // Replace dead workers lazily.
         for i in 0..p.workers.len() {
             if p.workers[i].dead.get() && !p.workers[i].busy.get() {
-                match spawn(p.handler) {
+                match spawn(class, p.handler) {
                     Some(w) => p.workers[i] = Rc::new(w),
                     None => {
                         p.workers.remove(i);
@@ -174,7 +205,7 @@ async fn read_exact(sock: &Async<Fd>, buf: &mut [u8]) -> bool {
     true
 }
 
-fn spawn(handler: Handler) -> Option<Worker> {
+fn spawn(class: usize, handler: Handler) -> Option<Worker> {
     let (parent_end, child_end) = ns::socketpair().ok()?;
     let parent = kr_sys::fs::getpid();
     let mut args = ns::CloneArgs { exit_signal: ns::SIGCHLD as u64, ..Default::default() };
@@ -185,7 +216,7 @@ fn spawn(handler: Handler) -> Option<Worker> {
         Ok(pid) => {
             drop(child_end);
             ns::set_nonblocking(parent_end.raw()).ok()?;
-            Some(Worker { sock: Async::new(parent_end).ok()?, pid, busy: Cell::new(false), dead: Cell::new(false) })
+            Some(Worker { class, sock: Async::new(parent_end).ok()?, pid, busy: Cell::new(false), dead: Cell::new(false) })
         }
         Err(_) => None,
     }

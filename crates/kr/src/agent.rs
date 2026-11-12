@@ -195,6 +195,7 @@ pub(crate) fn read_token_file(path: &str) -> Result<String, String> {
 }
 
 pub fn main(mut args: Args) -> i32 {
+    crate::offload::start(false); // image unpacking in workers (ADR-052)
     if kr_runtime::store::env_var("KR_TLS_RESUMPTION").as_deref() == Some("off") {
         kr_net::tls::set_resumption(false);
     }

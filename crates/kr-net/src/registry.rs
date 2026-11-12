@@ -755,6 +755,16 @@ impl<C: Connector> Registry<C> {
 
     /// Streams a blob to `sink`, verifying size and sha256 on the way. Returns the byte count.
     pub async fn pull_blob<S: Sink>(&mut self, r: &Reference, desc: &Descriptor, sink: &mut S) -> Result<u64> {
+        self.pull_blob_opts(r, desc, sink, true).await
+    }
+
+    /// Like [`Registry::pull_blob`] for a sink that verifies the digest itself (the blob store's
+    /// writer does at commit): the stream is not hashed a second time. Size is still checked.
+    pub async fn pull_blob_trusted<S: Sink>(&mut self, r: &Reference, desc: &Descriptor, sink: &mut S) -> Result<u64> {
+        self.pull_blob_opts(r, desc, sink, false).await
+    }
+
+    async fn pull_blob_opts<S: Sink>(&mut self, r: &Reference, desc: &Descriptor, sink: &mut S, hash: bool) -> Result<u64> {
         if !desc.digest.is_sha256() {
             return Err(Error::UnsupportedDigest);
         }
@@ -775,11 +785,18 @@ impl<C: Connector> Registry<C> {
             if total > desc.size {
                 return Err(Error::DigestMismatch);
             }
-            h.update(&buf[..n]);
+            if hash {
+                h.update(&buf[..n]);
+            }
             sink.write(&buf[..n])?;
+            // On a fast link every read is ready at once: without this a whole layer would be
+            // received, hashed and written in one poll of the event loop.
+            kr_rt::exec::yield_if_long(5).await;
         }
-        let got = format!("sha256:{}", hex(&h.finalize()));
-        if total != desc.size || got != desc.digest.as_str() {
+        if total != desc.size {
+            return Err(Error::DigestMismatch);
+        }
+        if hash && format!("sha256:{}", hex(&h.finalize())) != desc.digest.as_str() {
             return Err(Error::DigestMismatch);
         }
         Ok(total)

@@ -31,8 +31,18 @@ fn fixture() -> Fixture {
 }
 
 fn fixture_with(bad_diff: bool) -> Fixture {
+    fixture_sized(bad_diff, 0)
+}
+
+/// `big_mb` > 0 adds a file of that many MB (incompressible-looking) to the first layer.
+fn fixture_sized(bad_diff: bool, big_mb: usize) -> Fixture {
     let mut l1 = Tar::new();
     l1.dir("bin", 0o755).file("bin/busybox", 0o755, b"ELF").hardlink("bin/sh", "bin/busybox");
+    if big_mb > 0 {
+        let mut x = 0x9e3779b97f4a7c15u64;
+        let data: Vec<u8> = (0..big_mb << 20).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 }).collect();
+        l1.file("big.bin", 0o644, &data);
+    }
     l1.dir("etc", 0o755).file("etc/old", 0o644, b"old").file("etc/keep", 0o644, b"keep");
     let mut l2 = Tar::new();
     l2.file("etc/.wh.old", 0o644, b"").file("etc/new", 0o644, b"new");
@@ -167,8 +177,16 @@ fn tmp_store(name: &str) -> (std::path::PathBuf, Store) {
     (p, s)
 }
 
+/// Every pull of this file runs with image workers: unpacking and blob verification happen in
+/// forked workers (ADR-052), so these tests cover that path; `pulls_use_the_workers` checks it.
+fn workers() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| kr_rt::offload::init_class(kr_rt::offload::SLOW, kr_runtime::offload::handler, 2));
+}
+
 fn run_pull(s: &Store, r: &str) -> Result<kr_runtime::store::ImageId, Error> {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    workers();
     let (s, r) = (s.clone(), r.to_string());
     block_on(async move { pull(&s, &r).await })
 }
@@ -253,7 +271,8 @@ fn pull_rejects_diff_id_mismatch_and_leaves_no_rootfs() {
     let (p, store) = tmp_store("diffid");
     let r = format!("127.0.0.1:{}/test/app:latest", srv.port);
     let e = run_pull(&store, &r).unwrap_err();
-    assert!(matches!(e, Error::Image(m) if m.contains("diff_id")), "{e:?}");
+    // Raised in a worker, the error arrives as text (Remote); inline it is Image.
+    assert!(matches!(&e, Error::Image(m) if m.contains("diff_id")) || format!("{e:?}").contains("diff_id"), "{e:?}");
     assert!(store.image(&r).is_none());
     let imgs: Vec<_> = std::fs::read_dir(p.join("images")).unwrap().flatten().collect();
     assert!(imgs.iter().all(|e| !e.path().join("rootfs").exists() && !e.path().join("rootfs.tmp").exists()), "{imgs:?}");
@@ -359,5 +378,68 @@ fn e2e_pull_busybox_from_local_registry() {
     // busybox applets are hardlinks/symlinks to it
     assert!(p.join(format!("images/{}/rootfs/bin/sh", id.hex())).exists());
     eprintln!("pulled busybox: {} config cmd {:?}", id, cfg.cmd);
+    let _ = std::fs::remove_dir_all(&p);
+}
+
+#[test]
+fn pulls_use_the_workers() {
+    let f = Arc::new(fixture());
+    let srv = serve(f.clone(), None);
+    let (p, store) = tmp_store("workers");
+    let r = format!("127.0.0.1:{}/test/app:latest", srv.port);
+    let before = {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        workers();
+        kr_rt::offload::jobs_done(kr_rt::offload::SLOW)
+    };
+    let id = run_pull(&store, &r).unwrap();
+    let after = kr_rt::offload::jobs_done(kr_rt::offload::SLOW);
+    assert!(after > before, "the unpack ran in a worker ({before} -> {after})");
+    assert_eq!(std::fs::read(p.join(format!("images/{}/rootfs/etc/new", id.hex()))).unwrap(), b"new");
+    // A blob that is present and good is verified by a worker, a corrupt one refetched.
+    let n = kr_rt::offload::jobs_done(kr_rt::offload::SLOW);
+    let (p2, store2) = tmp_store("workers-resume");
+    store2.put_blob(&Digest::parse(&dg(&f.layers[0])).unwrap(), &f.layers[0]).unwrap();
+    run_pull(&store2, &r).unwrap();
+    assert!(kr_rt::offload::jobs_done(kr_rt::offload::SLOW) >= n + 2, "verify and install both went to workers");
+    let _ = std::fs::remove_dir_all(&p);
+    let _ = std::fs::remove_dir_all(&p2);
+}
+
+/// `cargo test --release -p kr-runtime --test pull -- --ignored --nocapture loop_gap` and again with
+/// `KR_TEST_NOWORKERS=1`: the longest gap of the event loop while a 200 MB layer is pulled and unpacked.
+#[test]
+#[ignore]
+fn loop_gap_while_unpacking_a_big_layer() {
+    let f = Arc::new(fixture_sized(false, 200));
+    let srv = serve(f.clone(), None);
+    let (p, store) = tmp_store("biglayer");
+    let r = format!("127.0.0.1:{}/test/app:latest", srv.port);
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let off = std::env::var("KR_TEST_NOWORKERS").is_err();
+    if off {
+        workers();
+    }
+    let worst = std::rc::Rc::new(std::cell::Cell::new(0u128));
+    let w2 = worst.clone();
+    let s2 = store.clone();
+    let t = std::time::Instant::now();
+    block_on(async move {
+        let stop = std::rc::Rc::new(std::cell::Cell::new(false));
+        let st = stop.clone();
+        let ticker = kr_rt::exec::spawn(async move {
+            let mut last = std::time::Instant::now();
+            while !st.get() {
+                kr_rt::exec::sleep(2).await;
+                let now = std::time::Instant::now();
+                w2.set(w2.get().max((now - last).as_millis()));
+                last = now;
+            }
+        });
+        pull(&s2, &r).await.unwrap();
+        stop.set(true);
+        ticker.await.ok();
+    });
+    println!("pull + unpack of a 200 MB layer ({}): took {:?}, longest gap of the event loop {} ms", if off { "workers" } else { "inline" }, t.elapsed(), worst.get());
     let _ = std::fs::remove_dir_all(&p);
 }

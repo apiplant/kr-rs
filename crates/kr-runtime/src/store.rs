@@ -35,6 +35,18 @@ pub enum Error {
     Digest,
     /// The store root could not be determined.
     NoRoot,
+    /// A failure reported by an offload worker (the worker's own error, rendered).
+    Remote(Raw),
+}
+
+/// A message that prints as itself in `{:?}` (errors from workers arrive as text).
+#[derive(Clone, PartialEq, Eq)]
+pub struct Raw(pub String);
+
+impl core::fmt::Debug for Raw {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 pub type Result<T> = core::result::Result<T, Error>;
@@ -397,9 +409,24 @@ impl BlobWriter {
         self.len == 0
     }
 
+    /// The temporary file being written (for an fsync done elsewhere before [`BlobWriter::commit_unsynced`]).
+    pub fn tmp_path(&self) -> String {
+        String::from_utf8_lossy(&self.tmp[..self.tmp.len().saturating_sub(1)]).into_owned()
+    }
+
     /// Verifies the sha256 of everything written against `expected`, fsyncs and renames the
     /// blob into place. An already-present blob is left alone.
-    pub fn commit(mut self) -> Result<()> {
+    pub fn commit(self) -> Result<()> {
+        self.commit_with(true)
+    }
+
+    /// [`BlobWriter::commit`] without the fsync of the blob data: the caller has made the file
+    /// durable (a worker did, without blocking the event loop).
+    pub fn commit_unsynced(self) -> Result<()> {
+        self.commit_with(false)
+    }
+
+    fn commit_with(mut self, sync: bool) -> Result<()> {
         let h = core::mem::replace(&mut self.hash, Sha256::new()).finalize();
         let got = hex(&h);
         let want = self.dest_hex();
@@ -407,7 +434,9 @@ impl BlobWriter {
             return Err(Error::Digest);
         }
         let fd = self.fd.take().ok_or(Error::Image("blob writer closed"))?;
-        fs::fsync(fd.raw()).ctx("fsync blob")?;
+        if sync {
+            fs::fsync(fd.raw()).ctx("fsync blob")?;
+        }
         drop(fd);
         match fs::renameat2(AT_FDCWD, &self.tmp, AT_FDCWD, &self.dest, fs::RENAME_NOREPLACE) {
             Ok(()) => {}
