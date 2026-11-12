@@ -634,3 +634,6 @@
 
 319. **The kernel Service datapath is the default for root (part of #133)** — *fixed, verified in namespaces*
     `proxy::want_nft_mode`: unset `KR_PROXY` means nftables for root with kr's own network and no external CNI; `userspace` opts out. The bridge policy table (#205) got kernel tests in `tools/test/nft-proxy.sh`. What was not verified on a real cluster is listed under #133.
+
+320. **Keys were copied by hand between HA servers** — *fixed* (part of #189, #156, #177, #188)
+    A sealed key-sync record in the Raft log carries the CA files, `sa.key`/`sa-old.pem`, the tokens and the encryption config; every server applies it (atomic writes, live reload of encryption, SA signer and node-certificate CA) and acknowledges it (ADR-058). `kr pki rotate --ca` works in HA, `--service-account-key` and `secrets-encrypt rotate-key --online` replicate in two steps (read everywhere, then write), and the leader refuses a new write key until all voters can read it. `secrets-encrypt status` shows the cluster. Unit tests in `cluster/keysync.rs` (seal/open, tamper, ordering rule) and `encrypt.rs`.

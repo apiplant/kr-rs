@@ -627,6 +627,23 @@ impl ApiServer {
 
     /// Enables ServiceAccount tokens (TokenRequest, bearer auth, admission) and creates the
     /// bootstrap RBAC policy and kube-root-ca.crt ConfigMaps.
+    /// Re-reads the encryption config and swaps the store's codec.
+    pub fn reload_encryption(&self) -> Result<(), String> {
+        let Some(reload) = self.enc_reload.borrow().clone() else { return Err(String::from("this server cannot reload the encryption configuration")) };
+        match reload()? {
+            Some(codec) => {
+                self.store.borrow_mut().set_codec(codec);
+                Ok(())
+            }
+            None => Err(String::from("no encryption-config.json: encryption is off")),
+        }
+    }
+
+    /// Replaces the service-account signer (key rotation replicated by the key-sync record).
+    pub fn reload_service_accounts(&self, signer: crate::tokens::Signer, ca_pem: String) {
+        *self.sa.borrow_mut() = Some((signer, ca_pem));
+    }
+
     /// Installs the function behind `POST /kr/encryption/reload`.
     pub fn set_encryption_reloader(&self, f: alloc::rc::Rc<dyn Fn() -> core::result::Result<Option<alloc::rc::Rc<dyn kr_store::Codec>>, String>>) {
         *self.enc_reload.borrow_mut() = Some(f);
@@ -1413,15 +1430,10 @@ impl ApiServer {
                 if !req.user.as_ref().is_some_and(is_masters) {
                     return Err(ApiError::new(403, "Forbidden", "only system:masters may reload the encryption configuration"));
                 }
-                let Some(reload) = self.enc_reload.borrow().clone() else { return Err(ApiError::invalid("this server cannot reload the encryption configuration")) };
-                match reload() {
-                    Ok(Some(codec)) => {
-                        self.store.borrow_mut().set_codec(codec);
-                        return Ok(Reply::Json(200, String::from(r#"{"status":"reloaded"}"#)));
-                    }
-                    Ok(None) => return Err(ApiError::invalid("no encryption-config.json: encryption is off")),
-                    Err(e) => return Err(ApiError::invalid(e)),
-                }
+                return match self.reload_encryption() {
+                    Ok(()) => Ok(Reply::Json(200, String::from(r#"{"status":"reloaded"}"#))),
+                    Err(e) => Err(ApiError::invalid(e)),
+                };
             }
             "/version" => {
                 return Ok(Reply::ok(&obj(alloc::vec![

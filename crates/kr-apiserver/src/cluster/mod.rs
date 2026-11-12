@@ -14,6 +14,7 @@
 
 pub mod forward;
 pub mod join;
+pub mod keysync;
 pub mod transport;
 
 use crate::api::ApiServer;

@@ -229,7 +229,7 @@ fn import_single_server(data: &str, raft_dir: &str, id: u64) -> Result<(), Strin
 const JOIN_FILES: [(&str, u32); 5] = [("pki/ca.pem", 0o644), ("pki/ca.key", 0o600), ("pki/sa.key", 0o600), ("node-token", 0o600), ("server-token", 0o600)];
 
 /// What this server hands to joining servers (`/kr/join-server`).
-fn join_secrets(data: &str) -> Result<kr_apiserver::cluster::join::JoinSecrets, String> {
+pub fn join_secrets(data: &str) -> Result<kr_apiserver::cluster::join::JoinSecrets, String> {
     let mut files = Vec::new();
     for (f, _) in JOIN_FILES {
         let b = fs::read_file(&pki::path(data, f), 1 << 20).map_err(|e| format!("read {f}: errno {}", e.0))?;
@@ -348,7 +348,7 @@ fn audit_setup(data: &str, policy: Option<&str>, path: Option<&str>, max_mb: u64
 
 /// The secret the TLS ticket keys are derived from: HKDF over the service-account key with a
 /// purpose label, so the key itself is never used as a ticket key.
-fn ticket_secret(sa_key: &[u8; 32]) -> [u8; 32] {
+pub fn ticket_secret(sa_key: &[u8; 32]) -> [u8; 32] {
     let mut prk = [0u8; 32];
     kr_crypto::hmac::hkdf_extract::<kr_crypto::sha2::Sha256>(b"kr tls ticket secret v1", sa_key, &mut prk);
     prk
@@ -546,23 +546,10 @@ pub fn main(mut args: Args) -> i32 {
         }
     }
     let sa_setup = || -> Result<(), String> {
-        let der = load_pem(&pki_dir, "sa.key", "PRIVATE KEY")?.pop().ok_or("sa.key empty")?;
-        let x509::SigningKey::P256(key) = x509::private_key_from_pkcs8(&der).map_err(|_| "sa.key unsupported")? else {
-            return Err("sa.key must be a P-256 key".into());
-        };
+        let (signer, key, ca_pem) = crate::keysync::load_signer(&data)?;
         // TLS tickets: keys derived from the service-account key, which every server of a cluster
         // holds (ADR-051): a restart or another server still opens the tickets.
-        kr_net::tls::set_ticket_secret(ticket_secret(&key.to_bytes()));
-        let ca_pem = fs::read_file(&pki::path(&pki_dir, "ca.pem"), 1 << 20).ok().and_then(|b| String::from_utf8(b).ok()).ok_or("cannot read ca.pem")?;
-        let mut signer = kr_apiserver::tokens::Signer::new(key);
-        // Keys kept by `kr pki rotate --service-account-key`: their tokens verify until the file is removed.
-        if let Ok(text) = fs::read_file(&pki::path(&pki_dir, "sa-old.pem"), 1 << 20) {
-            for der in x509::pem_decode_all(&String::from_utf8_lossy(&text), "PRIVATE KEY").unwrap_or_default() {
-                if let Ok(x509::SigningKey::P256(k)) = x509::private_key_from_pkcs8(&der) {
-                    signer.add_verify_key(&k);
-                }
-            }
-        }
+        kr_net::tls::set_ticket_secret(ticket_secret(&key));
         api.set_service_accounts(signer, ca_pem).map_err(|e| e.message)
     };
     if let Err(e) = sa_setup() {
@@ -609,6 +596,7 @@ pub fn main(mut args: Args) -> i32 {
     };
     let api_for_proxy = api.clone();
     let snapshot_data = data.clone();
+    let data_for_sync = data.clone();
     let manifest_client = kr_apiserver::client::InProcess::new(api.clone(), "manifests");
     let manifest_dir = crate::manifests::dir(&data);
     match kr_rt::exec::block_on(async move {
@@ -626,6 +614,7 @@ pub fn main(mut args: Args) -> i32 {
                 kr_rt::exec::spawn(kr_apiserver::cluster::transport::serve(l, srv_tls, id, c.inbox.clone()));
                 kr_rt::exec::spawn_priority(c.clone().run(api.clone()));
                 kr_rt::exec::spawn(c.clone().keep_registered(api.clone()));
+                kr_rt::exec::spawn(crate::keysync::run(c.clone(), api.clone(), data_for_sync.clone(), port));
                 if let Some(url) = join_url {
                     let me = kr_apiserver::cluster::ServerAddr { ip: advertise, raft_port: kr_apiserver::cluster::transport::PORT, api_port: port };
                     kr_rt::exec::spawn(become_voter(c.clone(), url, pki_dir.clone(), me));

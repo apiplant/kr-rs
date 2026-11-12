@@ -8,6 +8,8 @@
 //!   own `system:kr-server:<id>` certificate, asks to become a voter. Its id comes from the
 //!   authenticated identity, never from the body.
 //! - `POST /kr/remove-server {"id"}`: cluster admins (`system:masters`) remove a voter.
+//! - `POST /kr/keysync {"files":{...}}` (admins), `/kr/keysync/ack` (servers) and
+//!   `/kr/keysync/status` (admins): the replicated key material (see [`super::keysync`]).
 
 use super::{transport, Cluster, ServerAddr, WriteError, SERVERS_PREFIX};
 use crate::api::{ApiServer, Reply, Req, User};
@@ -28,7 +30,7 @@ pub struct JoinSecrets {
 /// How long `/kr/add-server` waits for a learner to catch up before asking it to retry.
 const CATCH_UP_MS: u64 = 20_000;
 
-pub const PATHS: [&str; 3] = ["/kr/join-server", "/kr/add-server", "/kr/remove-server"];
+pub const PATHS: [&str; 6] = ["/kr/join-server", "/kr/add-server", "/kr/remove-server", "/kr/keysync", "/kr/keysync/ack", "/kr/keysync/status"];
 
 fn ok(v: Value) -> Reply {
     Reply::Json(200, json::to_string(&v))
@@ -143,8 +145,112 @@ impl Cluster {
                 self.refresh_endpoints(api).await?;
                 Ok(ok(self.voters_json()))
             }
+            "/kr/keysync" | "/kr/keysync/status" => {
+                let user = api.authenticate(req)?;
+                if !user.groups.iter().any(|g| g == "system:masters") {
+                    return Err(ApiError::new(403, "Forbidden", "key synchronisation requires system:masters"));
+                }
+                if req.path == "/kr/keysync/status" {
+                    return Ok(ok(self.keysync_status(api)));
+                }
+                self.keysync_set(api, &body).await
+            }
+            "/kr/keysync/ack" => {
+                let user = api.authenticate(req)?;
+                let id = server_id(&user).ok_or_else(|| ApiError::new(403, "Forbidden", "only servers acknowledge key synchronisation"))?;
+                let ack = super::keysync::Ack::from_json(req.body).ok_or_else(|| ApiError::bad_request("bad acknowledgement"))?;
+                let key = alloc::format!("{}{id}", super::keysync::ACK_PREFIX);
+                {
+                    let mut store = api.store.borrow_mut();
+                    let cur = store.get(&key).and_then(|kv| super::keysync::Ack::from_json(&kv.value));
+                    let r = match cur {
+                        Some(c) if c == ack => Ok(()),
+                        Some(_) => store.update(&key, ack.to_json().into_bytes(), None).map(|_| ()),
+                        None => store.create(&key, ack.to_json().into_bytes()).map(|_| ()),
+                    };
+                    r.map_err(|_| ApiError::new(500, "InternalError", "store write failed"))?;
+                }
+                api.commit(api.revision()).await.map_err(|_| ApiError::new(503, "ServiceUnavailable", "write did not commit; retry"))?;
+                Ok(ok(obj(alloc::vec![("gen", Value::from(ack.gen as i64))])))
+            }
             _ => Err(ApiError::new(404, "NotFound", "not found")),
         }
+    }
+
+    fn token_secret(&self) -> Result<String, ApiError> {
+        let s = self.join_secrets.borrow();
+        s.as_ref().map(|s| s.token_secret.clone()).filter(|t| !t.is_empty()).ok_or_else(|| ApiError::new(503, "ServiceUnavailable", "this server has no server token"))
+    }
+
+    fn acks(&self, api: &ApiServer) -> Vec<(NodeId, super::keysync::Ack)> {
+        let (kvs, _) = api.store.borrow().list(super::keysync::ACK_PREFIX, None, 1000);
+        kvs.iter().filter_map(|kv| Some((kv.key.strip_prefix(super::keysync::ACK_PREFIX)?.parse().ok()?, super::keysync::Ack::from_json(&kv.value)?))).collect()
+    }
+
+    fn keysync_status(&self, api: &ApiServer) -> Value {
+        let gen = self.keysync_gen(api);
+        let voters = self.voters();
+        let servers = self
+            .acks(api)
+            .into_iter()
+            .map(|(id, a)| {
+                obj(alloc::vec![
+                    ("id", Value::from(id as i64)),
+                    ("voter", Value::Bool(voters.contains(&id))),
+                    ("gen", Value::from(a.gen as i64)),
+                    ("keys", Value::Array(a.keys.iter().map(|k| Value::from(k.as_str())).collect())),
+                    ("writes", Value::from(a.writes.as_str())),
+                    ("ca", Value::from(a.ca.as_str())),
+                    ("sa", Value::from(a.sa.as_str())),
+                ])
+            })
+            .collect();
+        obj(alloc::vec![("gen", Value::from(gen as i64)), ("voters", Value::Array(voters.into_iter().map(|v| Value::from(v as i64)).collect())), ("servers", Value::Array(servers))])
+    }
+
+    /// Publishes the next generation of the key-sync record: the previous files with the
+    /// request's laid over them. Returns at once; servers acknowledge when they applied it.
+    async fn keysync_set(&self, api: &ApiServer, body: &Value) -> Result<Reply, ApiError> {
+        use super::keysync as ks;
+        let secret = self.token_secret()?;
+        let Some(Value::Object(fields)) = body.get("files") else { return Err(ApiError::bad_request("files is required")) };
+        let mut upd = Vec::new();
+        for (k, v) in fields {
+            upd.push((k.clone(), String::from(v.as_str().ok_or_else(|| ApiError::bad_request("a file must be a string"))?)));
+        }
+        ks::validate(&upd).map_err(ApiError::bad_request)?;
+        let cur = api.store.borrow().get(ks::KEY);
+        let prev = match &cur {
+            Some(kv) => Some(ks::open(&secret, &kv.value).map_err(|e| ApiError::new(500, "InternalError", e))?),
+            None => None,
+        };
+        let files = ks::merge(prev.as_ref(), upd);
+        let parse = |r: &ks::Record| r.file(crate::encrypt::FILE).and_then(|t| crate::encrypt::Config::parse(t.as_bytes()).ok());
+        let next = ks::Record { gen: prev.as_ref().map_or(1, |p| p.gen + 1), files };
+        if let Some(n) = parse(&next) {
+            ks::check_write_key(prev.as_ref().and_then(parse).as_ref(), &n, &self.voters(), &self.acks(api)).map_err(|e| ApiError::new(409, "Conflict", e))?;
+        }
+        let mut nonce = [0u8; 12];
+        (api.rng())(&mut nonce);
+        let env = ks::seal(&secret, &next, nonce).into_bytes();
+        {
+            let mut store = api.store.borrow_mut();
+            let r = if cur.is_some() { store.update(ks::KEY, env, None).map(|_| ()) } else { store.create(ks::KEY, env).map(|_| ()) };
+            r.map_err(|_| ApiError::new(500, "InternalError", "store write failed"))?;
+        }
+        api.commit(api.revision()).await.map_err(|_| ApiError::new(503, "ServiceUnavailable", "write did not commit; retry"))?;
+        Ok(ok(obj(alloc::vec![("gen", Value::from(next.gen as i64))])))
+    }
+
+    /// The decrypted record (for the applier on this server), if any.
+    pub fn keysync_record(&self, api: &ApiServer, secret: &str) -> Option<Result<super::keysync::Record, String>> {
+        let kv = api.store.borrow().get(super::keysync::KEY)?;
+        Some(super::keysync::open(secret, &kv.value))
+    }
+
+    /// Stored generation without decrypting.
+    pub fn keysync_gen(&self, api: &ApiServer) -> u64 {
+        api.store.borrow().get(super::keysync::KEY).and_then(|kv| super::keysync::gen_of(&kv.value)).unwrap_or(0)
     }
 
     /// Proposes a membership change and waits for it to commit.

@@ -55,6 +55,27 @@ impl Config {
         name
     }
 
+    /// Adds a new key as the last one: servers can read it, nothing is written with it yet.
+    pub fn add_reader(&mut self, rng: fn(&mut [u8]), now: i64) -> String {
+        let k = new_key(rng, now, &self.keys);
+        let name = k.name.clone();
+        self.keys.push(k);
+        name
+    }
+
+    /// Moves the key `name` to the front, to write with it.
+    pub fn promote(&mut self, name: &str) -> bool {
+        match self.keys.iter().position(|k| k.name == name) {
+            Some(i) => {
+                let k = self.keys.remove(i);
+                self.keys.insert(0, k);
+                self.identity_first = false;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn parse(text: &[u8]) -> Result<Config, String> {
         let v = json::parse(text).map_err(|_| String::from("not valid JSON"))?;
         let resources: Vec<String> = v.get("resources").and_then(Value::as_array).ok_or("missing resources")?.iter().filter_map(|r| r.as_str().map(String::from)).collect();
@@ -196,6 +217,21 @@ mod tests {
         let p = std::env::temp_dir().join(std::format!("kr-enc-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p.to_str().unwrap().into()
+    }
+
+    #[test]
+    fn add_reader_keeps_the_write_key_and_promote_switches_it() {
+        fn r(b: &mut [u8]) {
+            b.fill(9)
+        }
+        let mut c = Config::generate(r, 100);
+        let first = c.keys[0].name.clone();
+        let n = c.add_reader(r, 100);
+        assert_eq!(c.keys[0].name, first);
+        assert_eq!(c.keys.len(), 2);
+        assert!(c.promote(&n));
+        assert_eq!(c.keys[0].name, n);
+        assert!(!c.promote("nope"));
     }
 
     #[test]

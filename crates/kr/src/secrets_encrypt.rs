@@ -88,7 +88,7 @@ fn count_stored(data: &str, cfg: &Config) -> Result<Vec<(String, usize)>, String
     Ok(out)
 }
 
-fn status(data: &str) -> Result<(), String> {
+fn status(data: &str, server: &str) -> Result<(), String> {
     let Some(cfg) = read_config(data)? else {
         print(b"secrets encryption: not configured (no encryption-config.json); values are stored in plaintext\n");
         return Ok(());
@@ -108,6 +108,9 @@ fn status(data: &str) -> Result<(), String> {
         Err(_) => s.push_str("stored objects: not counted (no single-server datastore here)\n"),
     }
     print(s.as_bytes());
+    if ns_exists(&format!("{data}/raft")) {
+        print(cluster_status(data, server).as_bytes());
+    }
     Ok(())
 }
 
@@ -124,7 +127,7 @@ fn reencrypt(data: &str, cfg: &Config) -> Result<usize, String> {
 
 /// Rewrites every object of the configured resources through the API with the current key
 /// (`?krReencrypt=true` makes the server write even though nothing else changed).
-fn admin_remote(data: &str, server: &str) -> Result<kr_apiserver::client::Remote, String> {
+pub(crate) fn admin_remote(data: &str, server: &str) -> Result<kr_apiserver::client::Remote, String> {
     use kr_apiserver::client::{Remote, RemoteAuth};
     let read = |f: &str| fs::read_file(&pki::path(&format!("{data}/pki"), f), 1 << 20).ok().and_then(|b| String::from_utf8(b).ok());
     let (Some(ca_pem), Some(chain), Some(key)) = (read("ca.pem"), read("admin.pem"), read("admin.key")) else {
@@ -189,6 +192,35 @@ fn reencrypt_online(data: &str, cfg: &Config, server: &str) -> Result<usize, Str
     })
 }
 
+/// HA: publishes the config through the Raft log and waits until every voter applied it.
+fn replicate_config(data: &str, server: &str, cfg: &Config) -> Result<(), String> {
+    let gen = crate::keysync::push(data, server, &[(FILE, cfg.to_json())])?;
+    crate::keysync::wait_acked(data, server, gen, 90)
+}
+
+/// The cluster-wide part of `status`, from the running server (best effort).
+fn cluster_status(data: &str, server: &str) -> String {
+    use kr_fmt::json::Value;
+    let Ok(st) = crate::keysync::status(data, server) else { return String::from("cluster view: the running server is not reachable; the lines above are from this server's files\n") };
+    let mut s = format!("cluster view (key sync generation {}):\n", st.get("gen").and_then(Value::as_u64).unwrap_or(0));
+    for sv in st.get("servers").and_then(Value::as_array).unwrap_or(&[]) {
+        let names: Vec<&str> = sv.get("keys").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        let w = sv.get("writes").and_then(Value::as_str).unwrap_or("");
+        s.push_str(&format!(
+            "  server {}{}: generation {}, reads {}, writes {}, ca {}, sa {}\n",
+            sv.get("id").and_then(Value::as_u64).unwrap_or(0),
+            if sv.get("voter").and_then(Value::as_bool) == Some(true) { "" } else { " (not a voter)" },
+            sv.get("gen").and_then(Value::as_u64).unwrap_or(0),
+            if names.is_empty() { String::from("-") } else { names.join(",") },
+            if w.is_empty() { "plaintext" } else { w },
+            sv.get("ca").and_then(Value::as_str).unwrap_or("-"),
+            sv.get("sa").and_then(Value::as_str).unwrap_or("-")
+        ));
+    }
+    s.push_str("  (servers that never applied a generation do not appear; old ciphertext stays in the Raft log until the next snapshot)\n");
+    s
+}
+
 fn ns_exists(p: &str) -> bool {
     fs::newfstatat(fs::AT_FDCWD, &pki::path(p, ""), fs::AT_SYMLINK_NOFOLLOW).is_ok()
 }
@@ -211,7 +243,7 @@ pub fn main(mut args: Args) -> i32 {
     let run = || -> Result<(), String> {
         let need = || read_config(&data)?.ok_or_else(|| format!("no {data}/{FILE}: start `kr server` once to create it"));
         match cmd.as_slice() {
-            b"status" => status(&data),
+            b"status" => status(&data, &server_url),
             b"reload" => {
                 reload_online(&data, &server_url)?;
                 print(b"the running server re-read encryption-config.json\n");
@@ -219,6 +251,20 @@ pub fn main(mut args: Args) -> i32 {
             }
             b"rotate-key" => {
                 let mut cfg = need()?;
+                let ha = ns_exists(&format!("{data}/raft"));
+                if ha && !online {
+                    return Err("HA: use `rotate-key --online`; it adds the key on every server first and only then switches the write key".into());
+                }
+                if ha {
+                    // Two steps: every server can read the new key, then it becomes the write key.
+                    let name = cfg.add_reader(rng, pki::now());
+                    replicate_config(&data, &server_url, &cfg)?;
+                    cfg.promote(&name);
+                    replicate_config(&data, &server_url, &cfg)?;
+                    let n = reencrypt_online(&data, &cfg, &server_url)?;
+                    print(format!("added key {name} on every server, then switched the write key; {n} objects were rewritten with it (no restart; old ciphertext stays in the Raft log until the next snapshot)\n").as_bytes());
+                    return Ok(());
+                }
                 let name = cfg.rotate(rng, pki::now());
                 write_config(&data, &cfg)?;
                 if online {
@@ -245,8 +291,14 @@ pub fn main(mut args: Args) -> i32 {
             b"disable" if online => {
                 let mut cfg = need()?;
                 cfg.identity_first = true;
-                write_config(&data, &cfg)?;
-                reload_online(&data, &server_url)?;
+                if ns_exists(&format!("{data}/raft")) {
+                    replicate_config(&data, &server_url, &cfg)?;
+                } else {
+                    write_config(&data, &cfg)?;
+                }
+                if !ns_exists(&format!("{data}/raft")) {
+                    reload_online(&data, &server_url)?;
+                }
                 let n = reencrypt_online(&data, &cfg, &server_url)?;
                 print(format!("the running server now writes plaintext and {n} objects were rewritten as plaintext; keys stay in {data}/{FILE} for reading old data\n").as_bytes());
                 Ok(())

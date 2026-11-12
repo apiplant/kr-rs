@@ -189,7 +189,31 @@ ipchange_() {
   echo "PASS (ipchange)"
 }
 
+# Key sync (ADR-058): an online key rotation and an SA key rotation on krs1 reach krs2/krs3 through
+# the Raft log, a Secret written afterwards reads back on every server, and status shows all three.
+keysync_() {
+  local kr="docker exec -e KR_ROOT=/store krs1 /krbin/kr"
+  k krs1 create secret generic before-rotate --from-literal=a=b >/dev/null
+  $kr secrets-encrypt rotate-key --online --data /var/tmp/srv || fail "rotate-key --online in HA"
+  k krs1 create secret generic after-rotate --from-literal=a=c >/dev/null
+  for n in $SERVERS; do
+    for _ in $(seq 20); do k $n get secret after-rotate >/dev/null 2>&1 && break; sleep 1; done
+    k $n get secret after-rotate -o jsonpath='{.data.a}' | grep -q Yw== || fail "secret unreadable on $n"
+    k $n get secret before-rotate >/dev/null || fail "old secret unreadable on $n"
+  done
+  [ "$(for n in $SERVERS; do docker exec $n grep -o '"name":"[^"]*"' /var/tmp/srv/encryption-config.json | head -1; done | sort -u | wc -l)" = 1 ] || fail "write key differs between servers"
+  $kr secrets-encrypt status --data /var/tmp/srv | grep -c "server " | grep -q 3 || fail "status lacks the cluster view"
+  TOK=$(k krs1 create token default)
+  $kr pki rotate --service-account-key --data /var/tmp/srv || fail "SA rotation in HA"
+  for n in $SERVERS; do
+    [ "$(docker exec $n sha256sum /var/tmp/srv/pki/sa.key | cut -c1-16)" = "$(docker exec krs1 sha256sum /var/tmp/srv/pki/sa.key | cut -c1-16)" ] || fail "sa.key differs on $n"
+    docker exec $KC $n kubectl --token "$TOK" get --raw /api >/dev/null 2>&1 || fail "old token rejected on $n"
+  done
+  echo "PASS (keysync)"
+}
+
 case "${1:-all}" in
+  keysync) keysync_ ;;
   up) up ;;
   test) test_ ;;
   import) import_ ;;
