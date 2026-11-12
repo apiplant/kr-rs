@@ -63,7 +63,7 @@ fn kr_main(mut args: Args) -> i32 {
             0
         }
         Some(b"version") => {
-            print(b"kr 0.0.1\n");
+            print(concat!("kr ", env!("CARGO_PKG_VERSION"), "\n").as_bytes());
             0
         }
         Some(b"echo") => {

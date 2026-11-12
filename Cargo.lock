@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "kr"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "kr-apiserver",
  "kr-controllers",
@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "kr-apiserver"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "kr-crypto",
  "kr-fmt",
@@ -34,11 +34,11 @@ dependencies = [
 
 [[package]]
 name = "kr-archive"
-version = "0.1.3"
+version = "0.2.0"
 
 [[package]]
 name = "kr-controllers"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "kr-apiserver",
  "kr-crypto",
@@ -50,18 +50,18 @@ dependencies = [
 
 [[package]]
 name = "kr-crypto"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "kr-fmt",
 ]
 
 [[package]]
 name = "kr-fmt"
-version = "0.1.3"
+version = "0.2.0"
 
 [[package]]
 name = "kr-kubelet"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "kr-apiserver",
  "kr-crypto",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "kr-net"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "kr-archive",
  "kr-crypto",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "kr-raft"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "kr-archive",
  "kr-rt",
@@ -94,14 +94,14 @@ dependencies = [
 
 [[package]]
 name = "kr-rt"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "kr-sys",
 ]
 
 [[package]]
 name = "kr-runtime"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "kr-archive",
  "kr-fmt",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "kr-store"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "kr-archive",
  "kr-rt",
@@ -121,4 +121,4 @@ dependencies = [
 
 [[package]]
 name = "kr-sys"
-version = "0.1.3"
+version = "0.2.0"

@@ -1508,7 +1508,13 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
     // runtimes do; limits are visible there (`cpu.max`, `memory.max`). Best effort.
     if spec.limits.is_empty() == false {
         let _ = ns::mkdir(b"/sys/fs/cgroup\0", 0o555);
-        let _ = ns::mount(Some(b"cgroup\0"), b"/sys/fs/cgroup\0", Some(b"cgroup2\0"), ns::MS_RDONLY | ns::MS_NOSUID | ns::MS_NODEV | ns::MS_NOEXEC, None);
+        // /sys came from the host recursively: drop its view of the host's cgroup tree first.
+        let _ = ns::umount2(b"/sys/fs/cgroup\0", ns::MNT_DETACH);
+        // The shared cgroup2 superblock is read-write: a read-only mount of it is refused (EBUSY),
+        // so mount it as is and make this mount read-only.
+        if ns::mount(Some(b"cgroup\0"), b"/sys/fs/cgroup\0", Some(b"cgroup2\0"), ns::MS_NOSUID | ns::MS_NODEV | ns::MS_NOEXEC, None).is_ok() {
+            let _ = ns::mount(None, b"/sys/fs/cgroup\0", None, ns::MS_BIND | ns::MS_REMOUNT | ns::MS_RDONLY | ns::MS_NOSUID | ns::MS_NODEV | ns::MS_NOEXEC, None);
+        }
     }
 
     step!(25, mount_volumes(spec.mounts, &trees, rootless));
