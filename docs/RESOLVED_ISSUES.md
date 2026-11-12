@@ -529,3 +529,12 @@
 
 271. **Each image was unpacked in full: shared base layers were duplicated** — *fixed for root* (part of #130, ADR-056)
     A root kr stores each layer once under `layers/` (overlay whiteouts and opaque markers) and mounts an image's layers as a multi-`lowerdir` overlay; a layer another image already holds is not unpacked or stored again. Falls back to the flattened rootfs when a layer cannot be represented. Tests: `tools/test/layers.sh`, and an alpine image installed layered and run from its layer directory in a user namespace. Not run on your cluster yet (needs a rebuild; images pulled afterwards are layered).
+
+272. **The device-plugin checkpoint was fsynced on the event loop** — *fixed* (part of #215)
+    `persist` writes the file atomically without fsync and flushes it with `offload::fsync_file` in a worker, so an Allocate no longer waits for the disk.
+
+273. **A CSR's `status.certificate` was not validated** — *fixed* (part of #206)
+    The `status` update needs an approved, not denied/failed request, an unchanged-once-set value, a parsable PEM chain, and a first certificate whose public key equals the request's.
+
+274. **A kubelet could list every VolumeAttachment and PersistentVolume** — *fixed* (part of #207)
+    List/watch of `volumeattachments` requires `fieldSelector=spec.nodeName=<node>` (or one own name); `persistentvolumes` lists/watches are denied unless limited to one name the node uses.

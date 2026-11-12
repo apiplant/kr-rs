@@ -546,7 +546,14 @@ impl Plugins {
         }
         s.push_str("]}");
         drop(st);
-        let _ = kr_runtime::store::write_file_atomic(&self.file(), s.as_bytes());
+        // Readers see the old or the new file at once; the flush to disk (about 100 ms on a busy
+        // disk) happens in a worker so an Allocate does not stall the event loop (#215).
+        let path = self.file();
+        if kr_runtime::store::write_file_atomic_nosync(&path, s.as_bytes()).is_ok() {
+            spawn(async move {
+                let _ = kr_runtime::offload::fsync_file(&path).await;
+            });
+        }
     }
 
     fn bump(&self) {
