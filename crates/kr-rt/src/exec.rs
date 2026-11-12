@@ -60,6 +60,8 @@ struct Task {
     abort_pending: Cell<bool>,
     /// Woken to the front of the queue (Raft: a late heartbeat costs a leader election).
     priority: Cell<bool>,
+    /// Where the task was spawned, for stall reports.
+    origin: &'static core::panic::Location<'static>,
 }
 
 /// Event-loop stall accounting: one task poll that ran longer than the warning threshold blocked
@@ -97,7 +99,7 @@ pub fn stall_stats() -> StallStats {
     StallStats { stalls, max_us, total_us }
 }
 
-fn note_poll(started_ns: u64) {
+fn note_poll(started_ns: u64, origin: &core::panic::Location<'static>) {
     let warn = stall().warn_ms.get();
     if warn == 0 {
         return;
@@ -111,7 +113,7 @@ fn note_poll(started_ns: u64) {
     let now = now_ms();
     if now >= stall().last_log_ms.get() + 1000 {
         stall().last_log_ms.set(now);
-        crate::eprint(alloc::format!("kr: event loop stalled for {} ms in one task poll ({} stalls so far, longest {} ms)\n", us / 1000, n + 1, max.max(us) / 1000).as_bytes());
+        crate::eprint(alloc::format!("kr: event loop stalled for {} ms in one task poll of the task spawned at {}:{} ({} stalls so far, longest {} ms)\n", us / 1000, origin.file(), origin.line(), n + 1, max.max(us) / 1000).as_bytes());
     }
 }
 
@@ -234,6 +236,7 @@ impl<T> Future for JoinHandle<T> {
     }
 }
 
+#[track_caller]
 pub fn spawn<F>(fut: F) -> JoinHandle<F::Output>
 where
     F: Future + 'static,
@@ -244,6 +247,7 @@ where
 
 /// Like [`spawn`], but the task is polled before the other queued tasks of a round whenever it
 /// is woken. For latency-critical work only (Raft heartbeats and elections).
+#[track_caller]
 pub fn spawn_priority<F>(fut: F) -> JoinHandle<F::Output>
 where
     F: Future + 'static,
@@ -252,11 +256,13 @@ where
     spawn_with(fut, true)
 }
 
+#[track_caller]
 fn spawn_with<F>(fut: F, priority: bool) -> JoinHandle<F::Output>
 where
     F: Future + 'static,
     F::Output: 'static,
 {
+    let origin = core::panic::Location::caller();
     let st = Rc::new(JoinState { result: RefCell::new(None), aborted: Cell::new(false), waker: RefCell::new(None) });
     let st2 = st.clone();
     let wrapped = async move {
@@ -272,6 +278,7 @@ where
         queued: Cell::new(false),
         abort_pending: Cell::new(false),
         priority: Cell::new(priority),
+        origin,
     });
     // SAFETY: single-threaded (module docs).
     let c = unsafe { &*LIVE_TASKS.0.get() };
@@ -329,7 +336,7 @@ fn run_queue() {
         if let Some(f) = slot.as_mut() {
             let t0 = now_ns();
             let done = f.as_mut().poll(&mut cx).is_ready();
-            note_poll(t0);
+            note_poll(t0, task.origin);
             if done || task.abort_pending.get() {
                 dead = slot.take();
             }
