@@ -640,11 +640,14 @@ impl ApiServer {
         for (name, role, subjects) in crate::rbac::bootstrap_bindings() {
             let body = alloc::format!(r#"{{"metadata":{{"name":"{name}","labels":{{"kubernetes.io/bootstrapping":"rbac-defaults"}}}},"roleRef":{{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"{role}"}},"subjects":{subjects}}}"#);
             self.bootstrap_object(crbr, None, name, "ClusterRoleBinding", &body);
+            self.reconcile_binding(crbr, name, &subjects);
         }
         // Extension API servers authenticate the aggregator through this ConfigMap, which they
         // may read with this Role (bound by whoever deploys them).
         let rr = resources::find("rbac.authorization.k8s.io", "v1", "roles").unwrap();
-        self.bootstrap_object(rr, Some("kube-system"), "extension-apiserver-authentication-reader", "Role", r#"{"metadata":{"name":"extension-apiserver-authentication-reader","namespace":"kube-system","labels":{"kubernetes.io/bootstrapping":"rbac-defaults"}},"rules":[{"apiGroups":[""],"resources":["configmaps"],"resourceNames":["extension-apiserver-authentication"],"verbs":["get","list","watch"]}]}"#);
+        let reader_rules = r#"[{"apiGroups":[""],"resources":["configmaps"],"resourceNames":["extension-apiserver-authentication"],"verbs":["get","list","watch"]}]"#;
+        self.bootstrap_object(rr, Some("kube-system"), "extension-apiserver-authentication-reader", "Role", &alloc::format!(r#"{{"metadata":{{"name":"extension-apiserver-authentication-reader","namespace":"kube-system","labels":{{"kubernetes.io/bootstrapping":"rbac-defaults"}}}},"rules":{reader_rules}}}"#));
+        self.reconcile_rules(rr, Some("kube-system"), "extension-apiserver-authentication-reader", reader_rules);
         if let Some(ca) = self.sa.borrow().as_ref().map(|(_, p)| p.clone()) {
             let cmr = resources::find("", "v1", "configmaps").unwrap();
             let body = crate::aggregator::auth_configmap(&ca, &self.front_proxy());
@@ -675,10 +678,41 @@ impl ApiServer {
     /// rbac-defaults`, annotation `rbac.authorization.kubernetes.io/autoupdate` not `"false"`)
     /// gains the rules of the current release that it lacks; nothing is removed.
     fn reconcile_clusterrole(&self, res: &Resource, name: &str, rules: String) {
+        self.reconcile_rules(res, None, name, &rules);
+    }
+
+    /// Default ClusterRoleBinding: subjects of the current release that it lacks are added
+    /// (upstream's `autoupdate`); the roleRef is immutable and left alone.
+    fn reconcile_binding(&self, res: &Resource, name: &str, subjects: &str) {
         if !self.writable() {
             return;
         }
         let key = res.key(None, name);
+        let Some(kv) = self.store.borrow().get(&key) else { return };
+        let Ok(mut o) = json::parse(&kv.value) else { return };
+        let default_obj = o.pointer(&["metadata", "labels", "kubernetes.io/bootstrapping"]).and_then(Value::as_str) == Some("rbac-defaults");
+        let frozen = o.pointer(&["metadata", "annotations", "rbac.authorization.kubernetes.io/autoupdate"]).and_then(Value::as_str) == Some("false");
+        if !default_obj || frozen {
+            return;
+        }
+        let Ok(Value::Array(want)) = json::parse(subjects.as_bytes()) else { return };
+        let have: Vec<Value> = o.get("subjects").and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
+        let missing: Vec<Value> = want.into_iter().filter(|w| !have.contains(w)).collect();
+        if missing.is_empty() {
+            return;
+        }
+        let mut all = have;
+        all.extend(missing);
+        o.set("subjects", Value::Array(all));
+        o.entry_object("metadata").set("resourceVersion", Value::String((self.store.borrow().revision() + 1).to_string()));
+        let _ = self.store.borrow_mut().update(&key, json::to_string(&o).into_bytes(), Some(kv.mod_rev));
+    }
+
+    fn reconcile_rules(&self, res: &Resource, ns: Option<&str>, name: &str, rules: &str) {
+        if !self.writable() {
+            return;
+        }
+        let key = res.key(ns, name);
         let Some(kv) = self.store.borrow().get(&key) else { return };
         let Ok(mut o) = json::parse(&kv.value) else { return };
         let default_role = o.pointer(&["metadata", "labels", "kubernetes.io/bootstrapping"]).and_then(Value::as_str) == Some("rbac-defaults");

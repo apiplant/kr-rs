@@ -451,3 +451,6 @@
 
 244. **`client_vs_openssl_*` interop tests were flaky under load** — *fixed* (was #235)
     The test closed the connection and then read `s_server`'s stdout once it exited, but `s_server` may exit (stdin closed) before it has processed the data still in the socket. It now waits (10 s at most) until `s_server` has printed what the client sent, then kills it. Five consecutive runs pass.
+
+246. **Default ClusterRoleBindings and the extension-apiserver Role were not reconciled on upgrade** — *fixed* (was #214; remainder in #245)
+    At start-up a default ClusterRoleBinding (label `kubernetes.io/bootstrapping: rbac-defaults`, annotation `autoupdate` not `"false"`) gains the subjects of the current release that it lacks (extra subjects stay, `roleRef` is immutable); the `kube-system` `extension-apiserver-authentication-reader` Role gains missing rules like the ClusterRoles. Test: `rbac_reconcile.rs::default_bindings_gain_missing_subjects_unless_frozen`.

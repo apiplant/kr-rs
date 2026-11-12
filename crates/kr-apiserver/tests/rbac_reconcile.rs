@@ -43,3 +43,29 @@ fn stale_default_role_gets_new_rules_but_frozen_and_custom_ones_do_not() {
     assert!(!rules(&api, "edit").contains("metrics.k8s.io"));
     assert_eq!(rules(&api, "system:discovery"), old);
 }
+
+#[test]
+fn default_bindings_gain_missing_subjects_unless_frozen() {
+    let api = ApiServer::new(kr_store::Store::in_memory(), || 1_700_000_000, rng, "127.0.0.1".into()).unwrap();
+    let key = kr_crypto::p256::SecretKey::from_bytes(&[7; 32]).unwrap();
+    api.set_service_accounts(kr_apiserver::tokens::Signer::new(key), "CA".into()).unwrap();
+    let path = |n: &str| format!("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{n}");
+    let subjects = |n: &str| json::to_string(call(&api, "GET", &path(n), "").1.get("subjects").unwrap());
+    let put = |name: &str, extra: &str| {
+        let (_, cur) = call(&api, "GET", &path(name), "");
+        let rv = cur.pointer(&["metadata", "resourceVersion"]).and_then(Value::as_str).unwrap().to_string();
+        let role = json::to_string(cur.get("roleRef").unwrap());
+        let body = format!(r#"{{"apiVersion":"rbac.authorization.k8s.io/v1","kind":"ClusterRoleBinding","metadata":{{"name":"{name}","resourceVersion":"{rv}",{extra}}},"roleRef":{role},"subjects":[{{"kind":"User","name":"extra","apiGroup":"rbac.authorization.k8s.io"}}]}}"#);
+        assert_eq!(call(&api, "PUT", &path(name), &body).0, 200);
+    };
+    let label = r#""labels":{"kubernetes.io/bootstrapping":"rbac-defaults"}"#;
+    let full = subjects("system:basic-user");
+    put("system:basic-user", label);
+    put("system:discovery", &format!(r#"{label},"annotations":{{"rbac.authorization.kubernetes.io/autoupdate":"false"}}"#));
+    api.bootstrap_all();
+    let s = subjects("system:basic-user");
+    assert!(s.contains("\"extra\"") && s.contains("system:authenticated"), "kept the extra subject and regained the default: {s}");
+    assert!(full.contains("system:authenticated"));
+    let frozen = subjects("system:discovery");
+    assert!(!frozen.contains("system:authenticated"), "{frozen}");
+}

@@ -146,8 +146,8 @@ ADR-047. Default `["secrets"]`; `plural` or `plural.group` (e.g. `configmaps`, `
 213. **Raft and API serving share one thread: causes of stalls remain** — *ADR-004, ADR-050, #126, #208*
     The watchdog, heartbeat priority and configurable election timeout are in (RESOLVED 213a). What remains is removing the stalls themselves (#209–#212) and making the stall counters visible as a metric (`exec::stall_stats` is only logged, not served on a `/metrics` endpoint).
 
-214. **Default RBAC bindings, Roles and other bootstrap objects are not reconciled on upgrade** — *ADR-023*
-    Only default ClusterRoles gain missing rules at start (#215 in RESOLVED). Default ClusterRoleBindings (subjects), the `kube-system` Roles, PriorityClasses, the default StorageClass and APF objects are still created once and never updated, so changes in a newer release do not reach an existing cluster, and a deleted default role does come back but a modified binding does not. Upstream reconciles bindings' subjects and roles' rules the same way (`autoupdate`).
+245. **Bootstrap objects other than RBAC are created once and never updated** — *ADR-023*
+    PriorityClasses, the default StorageClass, the ServiceCIDR and the APF objects are created when missing and not updated by a newer release (upstream reconciles only RBAC and APF's `autoupdate-spec` objects; the APF ones are not reconciled here). Low impact.
 
 215. **Other synchronous disk work remains on the event loop** — *ADR-050, #208*
     The device-plugin checkpoint, the rootless infra file and the CNI/IPAM/state files are written with fsync inline; the kubelet's cgroup, `/proc` and directory scans (sweep, adoption, `remove_unclaimed_dirs`) are synchronous too. Use `KR_STALL_WARN_MS` and the "last phase" label of the stall log to find which one matters on a given machine; the fix is the helper facility of #208 or moving the fsync to the durable-commit helper process (ADR-024).
