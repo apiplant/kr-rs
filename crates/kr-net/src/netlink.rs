@@ -433,6 +433,80 @@ impl Netlink {
     }
 }
 
+/// The IPv6 twin of [`parse_route`].
+fn parse_route6(m: &[u8], proto: u8) -> Option<([u8; 16], u8, Option<[u8; 16]>)> {
+    if m.len() < 12 || m[0] != AF_INET6 || m[4] != 254 || m[5] != proto {
+        return None;
+    }
+    let (mut dst, mut gw) = ([0u8; 16], None);
+    let mut o = 12;
+    while o + 4 <= m.len() {
+        let l = u16::from_ne_bytes([m[o], m[o + 1]]) as usize;
+        let t = u16::from_ne_bytes([m[o + 2], m[o + 3]]) & 0x3fff;
+        if l < 4 || o + l > m.len() {
+            break;
+        }
+        if l == 20 && t == RTA_DST {
+            dst.copy_from_slice(&m[o + 4..o + 20]);
+        } else if l == 20 && t == RTA_GATEWAY {
+            let mut g = [0u8; 16];
+            g.copy_from_slice(&m[o + 4..o + 20]);
+            gw = Some(g);
+        }
+        o += align4(l);
+    }
+    Some((dst, m[1], gw))
+}
+
+impl Netlink {
+    /// Deletes the main-table IPv6 route `dst/prefix` installed with protocol `proto`.
+    pub fn route_del6(&self, dst: [u8; 16], prefix: u8, proto: u8) -> Result<(), Errno> {
+        self.one(|b| {
+            b.begin(RTM_DELROUTE, NLM_F_ACK);
+            b.raw(&[AF_INET6, prefix, 0, 0, 254, proto, 0, 1, 0, 0, 0, 0]);
+            b.attr(RTA_DST, &dst);
+        })
+    }
+
+    /// Dumps the main-table IPv6 routes whose protocol is `proto` as (dst, prefix, gateway).
+    pub fn routes6_by_proto(&self, proto: u8) -> Result<Vec<([u8; 16], u8, Option<[u8; 16]>)>, Errno> {
+        let mut b = NlBuf::new();
+        b.begin(RTM_GETROUTE, NLM_F_DUMP);
+        b.raw(&[AF_INET6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b.end();
+        if kr_sys::write(self.fd.raw(), b.bytes())? != b.bytes().len() {
+            return Err(Errno(5));
+        }
+        let mut out = Vec::new();
+        let mut buf = alloc::vec![0u8; 32 * 1024];
+        loop {
+            let n = match kr_sys::read(self.fd.raw(), &mut buf) {
+                Err(Errno(4)) => continue,
+                r => r?,
+            };
+            let mut off = 0;
+            while off + 16 <= n {
+                let len = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+                let ty = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
+                if len < 16 || off + len > n {
+                    return Err(Errno(74));
+                }
+                match ty {
+                    NLMSG_DONE => return Ok(out),
+                    NLMSG_ERROR => return Err(Errno(5)),
+                    RTM_NEWROUTE => {
+                        if let Some(r) = parse_route6(&buf[off + 16..off + len], proto) {
+                            out.push(r);
+                        }
+                    }
+                    _ => {}
+                }
+                off += align4(len);
+            }
+        }
+    }
+}
+
 /// Parses an rtmsg payload; None unless it is a main-table route of protocol `proto`.
 fn parse_route(m: &[u8], proto: u8) -> Option<([u8; 4], u8, Option<[u8; 4]>)> {
     if m.len() < 12 || m[0] != AF_INET || m[4] != 254 || m[5] != proto {

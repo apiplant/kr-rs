@@ -791,6 +791,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         loop {
             if let (Ok(list), Ok(nl)) = (self.c.list("/api/v1/nodes", "").await, kr_net::netlink::Netlink::route()) {
                 let mut want = Vec::new();
+                let mut want6: Vec<([u8; 16], u8, [u8; 16])> = Vec::new();
                 for n in list.get("items").and_then(Value::as_array).unwrap_or(&[]) {
                     if meta(n, "name") == self.cfg.node_name {
                         if let Some((_, nfam)) = node_podnet(n) {
@@ -814,13 +815,12 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     if let Some(gw) = ip.filter(|_| self.fam.get().v4 && nfam.v4) {
                         want.push((pn.subnet, pn.prefix, gw));
                     }
-                    // IPv6: the peer's pod /64 via its global IPv6 address (needs one on both ends;
-                    // existing routes answer EEXIST, stale ones are left for the next restart).
+                    // IPv6: the peer's pod /64 via its global IPv6 address (needs one on both ends).
                     let cidr6 = n.pointer(&["spec", "podCIDRs"]).and_then(Value::as_array).and_then(|a| a.iter().filter_map(Value::as_str).find(|c| c.contains(':')));
                     let gw6 = internal_ip(n, true).filter(|_| self.fam.get().v6 && nfam.v6);
                     if let (Some((net6, len)), Some(gw6)) = (cidr6.and_then(|c| c.split_once('/')), gw6) {
                         if let (Some(d), Ok(l)) = (kr_net::tcp::parse_ipv6(net6), len.parse::<u8>()) {
-                            let _ = nl.route_add6_proto(d, l, Some(gw6), 0, RTPROT_KR);
+                            want6.push((d, l, gw6));
                         }
                     }
                 }
@@ -831,6 +831,15 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 }
                 for (d, p, gw) in add {
                     let _ = nl.route_add_proto(d, p, Some(gw), 0, RTPROT_KR);
+                }
+                // The same for IPv6: routes of nodes that left or changed address are removed.
+                let have6 = nl.routes6_by_proto(RTPROT_KR).unwrap_or_default();
+                let (add6, del6) = route_diff(&want6, &have6);
+                for (d, p) in del6 {
+                    let _ = nl.route_del6(d, p, RTPROT_KR);
+                }
+                for (d, p, gw) in add6 {
+                    let _ = nl.route_add6_proto(d, p, Some(gw), 0, RTPROT_KR);
                 }
             }
             kr_rt::exec::sleep(5000).await;
@@ -2600,7 +2609,7 @@ fn set_diff<T: PartialEq + Copy>(want: &[T], have: &[T]) -> (Vec<T>, Vec<T>) {
 
 /// Diff between wanted host-gw routes and the kr-installed ones: (to add or fix, to delete).
 /// A route whose gateway changed is deleted and re-added.
-fn route_diff(want: &[([u8; 4], u8, [u8; 4])], have: &[([u8; 4], u8, Option<[u8; 4]>)]) -> (Vec<([u8; 4], u8, [u8; 4])>, Vec<([u8; 4], u8)>) {
+fn route_diff<A: PartialEq + Copy>(want: &[(A, u8, A)], have: &[(A, u8, Option<A>)]) -> (Vec<(A, u8, A)>, Vec<(A, u8)>) {
     let add = want.iter().filter(|w| !have.iter().any(|h| h.0 == w.0 && h.1 == w.1 && h.2 == Some(w.2))).copied().collect();
     let del = have.iter().filter(|h| !want.iter().any(|w| w.0 == h.0 && w.1 == h.1 && Some(w.2) == h.2)).map(|h| (h.0, h.1)).collect();
     (add, del)
@@ -2637,6 +2646,10 @@ mod route_tests {
         let a = ([10, 88, 1, 0], 24, [192, 168, 0, 2]);
         let b = ([10, 88, 2, 0], 24, [192, 168, 0, 3]);
         let (add, del) = route_diff(&[a, b], &[(a.0, 24, Some(a.2)), ([10, 88, 9, 0], 24, Some([1, 1, 1, 1]))]);
+        // The same diff for IPv6 routes (stale ones go, new ones come).
+        let (p1, p2, g1, g2) = ([0xfd; 16], [0xfc; 16], [1u8; 16], [2u8; 16]);
+        let (add6, del6) = route_diff(&[(p1, 64, g1), (p2, 64, g2)], &[(p1, 64, Some(g1)), ([0xfb; 16], 64, Some(g2))]);
+        assert_eq!((add6, del6), (alloc::vec![(p2, 64, g2)], alloc::vec![([0xfb; 16], 64)]));
         assert_eq!(add, [b]);
         assert_eq!(del, [([10, 88, 9, 0], 24)]);
         // gateway change: delete then re-add

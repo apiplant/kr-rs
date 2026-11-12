@@ -120,5 +120,7 @@ if KR_NFT_SCENARIO= "$EXE" --ignored --exact apply_sequence --nocapture >/tmp/se
 check "the table after the sequence still serves its service" "$(client 10.96.0.50 8080 1 | cut -d" " -f1)" "B"
 rules=$(nft list ruleset | grep -c "chain g")
 check "old generations are gone (only the last one remains)" "$([ "$rules" -le 12 ] && echo yes || echo "no: $rules chains")" "yes"
+ip link add d0 type dummy; ip link set d0 up; ip addr add fd00::1/64 dev d0 nodad
+if "$EXE" --ignored --exact ipv6_routes_by_proto >/tmp/r6.out 2>&1; then echo "ok   IPv6 routes of a protocol: add, dump, delete"; else echo "FAIL IPv6 routes: $(tail -3 /tmp/r6.out)"; fail=1; fi
 exit $fail
 '

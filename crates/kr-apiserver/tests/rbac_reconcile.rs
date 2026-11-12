@@ -82,7 +82,7 @@ fn metrics_endpoint_serves_the_loop_counters_to_admins_only() {
     match get(User { name: "admin".into(), groups: vec!["system:masters".into()] }) {
         Reply::Http(r) => {
             let body = String::from_utf8(match r.body { kr_net::http1::server::Body::Full(b) => b, _ => panic!("body") }).unwrap();
-            assert!(body.contains("kr_event_loop_stalls_total ") && body.contains("kr_offload_jobs_total{class=\"slow\"}"), "{body}");
+            assert!(body.contains("kr_event_loop_stalls_total ") && body.contains("kr_offload_jobs_total{class=\"slow\"}") && body.contains("# TYPE kr_apf_seats_in_use gauge") && body.contains("kr_apf_rejected_requests_total"), "{body}");
         }
         _ => panic!("expected a raw reply"),
     }

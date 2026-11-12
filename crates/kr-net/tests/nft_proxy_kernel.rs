@@ -108,3 +108,18 @@ fn apply_sequence() {
     d.apply(&model(vec![Svc { v6: false, frontends: vec![Frontend::Addr { ip: ip4(CIP), proto: 6, port: 8080, policy: Policy::Plain }], backends: vec![be(B1, 9090, false)], affinity: false }])).unwrap();
 }
 
+
+/// IPv6 routes of protocol `RTPROT_KR`: add, dump, delete (the host-gw route cleanup). Run inside
+/// a namespace that has `d0` with fd00::1/64 (see tools/test/nft-proxy.sh).
+#[test]
+#[ignore]
+fn ipv6_routes_by_proto() {
+    use kr_net::netlink::{Netlink, RTPROT_KR};
+    let nl = Netlink::route().unwrap();
+    let net = [0xfd, 0, 0, 0x55, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let gw = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    nl.route_add6_proto(net, 64, Some(gw), 0, RTPROT_KR).unwrap();
+    assert_eq!(nl.routes6_by_proto(RTPROT_KR).unwrap(), vec![(net, 64, Some(gw))]);
+    nl.route_del6(net, 64, RTPROT_KR).unwrap();
+    assert!(nl.routes6_by_proto(RTPROT_KR).unwrap().is_empty());
+}

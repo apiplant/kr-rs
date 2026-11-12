@@ -508,3 +508,12 @@
 
 264. **NetworkPolicy tables had never been loaded into a kernel** — *verified* (part of #205; #165 with `KR_PROXY=nft`)
     `tools/test/nft-proxy.sh` now also loads the `inet kr-netpol` batches into a real kernel (`unshare -Urn`, veth pods) and sends traffic: an allowed client reaches the pod, another client and an allowed client on another port are dropped, default deny drops everyone, an egress policy lets a pod reach only its peer; and through a ClusterIP of the nftables Service datapath the denied client is dropped while the allowed one gets through (the DNAT keeps the client address, which is #165). The netlink layout and the verdict/meta constants the batches were written with turned out right on the first run.
+
+265. **No APF metrics** — *fixed* (part of #143)
+    `/metrics` also serves, per priority level: `kr_apf_seats_limit`, `kr_apf_seats_in_use`, `kr_apf_seats_borrowed`, `kr_apf_queued_requests`, `kr_apf_admitted_requests_total`, `kr_apf_rejected_requests_total` (counters restart when the level's object changes). Test: `rbac_reconcile.rs::metrics_endpoint_...`.
+
+266. **Stale IPv6 host-gw routes stayed until a restart** — *fixed* (part of #144)
+    The route loop now diffs IPv6 pod-subnet routes like the IPv4 ones (`Netlink::routes6_by_proto`, `route_del6`): routes of nodes that left or changed address are removed. Tests: `route_diff` for IPv6, and the add/dump/delete round trip in a real kernel (`tools/test/nft-proxy.sh`).
+
+267. **OCI hooks for exec'd processes and the NVIDIA runtime class** — *closed, same as upstream* (was #142)
+    containerd and CRI-O run OCI hooks when the container is created and stopped, not for `exec`: an exec'd process joins the container as it is (kr does the same). Only the `nvidia*` RuntimeClass handler turns `NVIDIA_VISIBLE_DEVICES` into CDI devices, as the NVIDIA container runtime does in CDI mode; kr has one runtime, so other handlers add nothing. Verified live with the GPU pod tests of #164.

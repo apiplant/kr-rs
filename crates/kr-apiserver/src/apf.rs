@@ -72,6 +72,9 @@ pub struct Level {
     borrow_max: usize,
     /// Seats in use.
     inflight: Cell<usize>,
+    /// Requests this level refused and admitted (since the level was built).
+    rejected: Cell<u64>,
+    admitted: Cell<u64>,
     pool: Rc<Pool>,
     reject: bool,
     max_queued: usize,
@@ -200,6 +203,29 @@ struct Flow {
 struct Config {
     flows: Vec<Flow>,
     levels: BTreeMap<String, Rc<Level>>,
+}
+
+impl Apf {
+    /// Prometheus text for `/metrics`: per priority level its seat limit, seats in use, seats
+    /// borrowed from other levels, queued requests, and the requests admitted and refused.
+    pub fn metrics(&self) -> String {
+        use core::fmt::Write;
+        let mut o = String::new();
+        let cfg = self.cfg.borrow();
+        let gauge = |o: &mut String, name: &str, help: &str, f: &dyn Fn(&Level) -> u64, ty: &str| {
+            let _ = write!(o, "# HELP {name} {help}\n# TYPE {name} {ty}\n");
+            for l in cfg.levels.values().filter(|l| !l.exempt) {
+                let _ = writeln!(o, "{name}{{priority_level=\"{}\"}} {}", l.name, f(l));
+            }
+        };
+        gauge(&mut o, "kr_apf_seats_limit", "Seats a priority level may use before borrowing.", &|l| l.limit as u64, "gauge");
+        gauge(&mut o, "kr_apf_seats_in_use", "Seats in use by requests being served.", &|l| l.inflight.get() as u64, "gauge");
+        gauge(&mut o, "kr_apf_seats_borrowed", "Seats in use above the level's limit (borrowed from idle levels).", &|l| l.inflight.get().saturating_sub(l.limit) as u64, "gauge");
+        gauge(&mut o, "kr_apf_queued_requests", "Requests waiting for seats.", &|l| l.state.try_borrow().map_or(0, |s| s.queued as u64), "gauge");
+        gauge(&mut o, "kr_apf_admitted_requests_total", "Requests admitted since the level was built.", &|l| l.admitted.get(), "counter");
+        gauge(&mut o, "kr_apf_rejected_requests_total", "Requests refused with 429 since the level was built.", &|l| l.rejected.get(), "counter");
+        o
+    }
 }
 
 pub struct Apf {
@@ -409,7 +435,7 @@ impl Apf {
                 Some(old) if old.sig == sig => old.clone(),
                 _ => {
                     let inflight = Cell::new(cfg.levels.get(name).map_or(0, |o| o.inflight.get()));
-                    Rc::new(Level { name: name.to_string(), uid, exempt, limit, lendable, borrow_max, inflight, pool: self.pool.clone(), reject, max_queued, sig, state: RefCell::new(LState::default()) })
+                    Rc::new(Level { name: name.to_string(), uid, exempt, limit, lendable, borrow_max, inflight, rejected: Cell::new(0), admitted: Cell::new(0), pool: self.pool.clone(), reject, max_queued, sig, state: RefCell::new(LState::default()) })
                 },
             };
             levels.insert(name.to_string(), level);
@@ -465,6 +491,7 @@ pub async fn admit(api: &ApiServer, req: &Req<'_>) -> Result<(Permit, Option<(St
         return Ok((Permit(None), Some(ids)));
     }
     let too_many = |why: &str| {
+        level.rejected.set(level.rejected.get() + 1);
         ApiError::new(429, "TooManyRequests", alloc::format!("Too many requests ({why}), please try again later."))
     };
     let width = width_of(api, &i, req).min(level.limit.max(1));
@@ -472,6 +499,7 @@ pub async fn admit(api: &ApiServer, req: &Req<'_>) -> Result<(Permit, Option<(St
         let mut st = level.state.borrow_mut();
         if st.queued == 0 && level.can_take(width) {
             level.inflight.set(level.inflight.get() + width);
+            level.admitted.set(level.admitted.get() + 1);
             return Ok((Permit(Some((level.clone(), width))), Some(ids)));
         }
         if level.reject {
@@ -499,6 +527,7 @@ pub async fn admit(api: &ApiServer, req: &Req<'_>) -> Result<(Permit, Option<(St
         }
         return Err(too_many(&alloc::format!("timed out waiting in priority level {}", level.name)));
     }
+    level.admitted.set(level.admitted.get() + 1);
     Ok((Permit(Some((level, width))), Some(ids)))
 }
 
@@ -589,7 +618,7 @@ mod tests {
 
     #[test]
     fn freed_seats_go_to_flows_in_turn() {
-        let level = Rc::new(Level { name: "l".into(), uid: String::new(), exempt: false, limit: 1, lendable: 0, borrow_max: 0, inflight: Cell::new(0), pool: Rc::new(Pool::default()), reject: false, max_queued: 10, sig: String::new(), state: RefCell::new(LState::default()) });
+        let level = Rc::new(Level { name: "l".into(), uid: String::new(), exempt: false, limit: 1, lendable: 0, borrow_max: 0, inflight: Cell::new(0), rejected: Cell::new(0), admitted: Cell::new(0), pool: Rc::new(Pool::default()), reject: false, max_queued: 10, sig: String::new(), state: RefCell::new(LState::default()) });
         let slot = || Rc::new(Slot { width: 1, granted: Cell::new(false), waker: RefCell::new(None) });
         let (a1, a2, b1) = (slot(), slot(), slot());
         {
@@ -609,7 +638,7 @@ mod tests {
     }
 
     fn lvl(pool: &Rc<Pool>, limit: usize, lendable: usize, borrow_max: usize) -> Rc<Level> {
-        let l = Rc::new(Level { name: "l".into(), uid: String::new(), exempt: false, limit, lendable, borrow_max, inflight: Cell::new(0), pool: pool.clone(), reject: false, max_queued: 10, sig: String::new(), state: RefCell::new(LState::default()) });
+        let l = Rc::new(Level { name: "l".into(), uid: String::new(), exempt: false, limit, lendable, borrow_max, inflight: Cell::new(0), rejected: Cell::new(0), admitted: Cell::new(0), pool: pool.clone(), reject: false, max_queued: 10, sig: String::new(), state: RefCell::new(LState::default()) });
         pool.levels.borrow_mut().push(Rc::downgrade(&l));
         l
     }
