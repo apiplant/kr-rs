@@ -544,3 +544,6 @@
 
 276. **A kubelet restart ends exec and attach sessions** — *closed as upstream parity* (#134)
     The client's TLS/WebSocket connection ends in the kubelet process, so no design lets a session survive that process short of handing the socket and TLS state to another process. Upstream's kubelet does not either: it proxies the runtime's streaming server (`proxyStream`), so restarting it drops `kubectl exec`/`attach`/`port-forward` there too. Containers, their terminals and `attach -i` stdin do survive in kr (the shim keeps them). The shim costs ~1 MB per container, far below containerd-shim-runc-v2.
+
+277. **Images and layers were never removed** — *fixed* (part of #130, ADR-057)
+    The kubelet checks every 5 minutes; above `KR_IMAGE_GC_HIGH` (85 %) of the store's filesystem it removes images no pod on the node names and no container directory records, least recently used first, never younger than `KR_IMAGE_GC_MIN_AGE` (120 s), until usage is at or below `KR_IMAGE_GC_LOW` (80 %). Removing an image drops its refs, directory, the shared layers and the blobs no remaining image uses. `tests/gc.rs` covers sharing.

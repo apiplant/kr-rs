@@ -18,6 +18,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod evict;
+pub mod imagegc;
 pub mod node;
 mod adopt;
 pub mod cni;
@@ -446,6 +447,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         kr_rt::exec::spawn(async move { ev.eviction_loop().await });
         let lm = self.clone();
         kr_rt::exec::spawn(async move { lm.log_mark_loop().await });
+        let gc = self.clone();
+        kr_rt::exec::spawn(async move { gc.image_gc_loop().await });
         let mut swept = false;
         loop {
             let listed = self.sync_all().await;
@@ -575,6 +578,67 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 }
             }
         }
+    }
+
+    /// Every 5 minutes: free image space when the store's filesystem is fuller than the high
+    /// threshold (see [`imagegc`]).
+    async fn image_gc_loop(self: &Rc<Self>) {
+        let t = imagegc::Thresholds::from_env();
+        if t.high >= 100 {
+            return;
+        }
+        loop {
+            kr_rt::exec::sleep(300_000).await;
+            self.image_gc(&t).await;
+        }
+    }
+
+    async fn image_gc(self: &Rc<Self>, t: &imagegc::Thresholds) {
+        let usage = || kr_sys::ns::statfs(self.store.root().as_bytes()).map(|s| imagegc::usage_percent(&s)).unwrap_or(0);
+        let before = usage();
+        if before < t.high || self.pulls.borrow().values().any(|p| matches!(p, Pull::InProgress)) {
+            return;
+        }
+        // Images some pod on this node names, and images some container directory records.
+        let q = alloc::format!("fieldSelector=spec.nodeName%3D{}", self.cfg.node_name);
+        let Ok(list) = self.c.list("/api/v1/pods", &q).await else { return };
+        let mut in_use = alloc::collections::BTreeSet::new();
+        for pod in list.get("items").and_then(Value::as_array).unwrap_or(&[]) {
+            for r in imagegc::pod_images(pod) {
+                if let Some(id) = self.store.resolve_ref(&r) {
+                    in_use.insert(id.0);
+                }
+            }
+        }
+        let Some(running) = self.store.images_in_use() else {
+            kr_rt::eprint(alloc::format!("kubelet: image store is {before}% full but a container of an older release or `kr run` is present; image garbage collection waits\n").as_bytes());
+            return;
+        };
+        in_use.extend(running);
+        let now = now_ms() as i64 / 1000;
+        let (mut images, mut layers, mut blobs) = (0, 0, 0);
+        for id in imagegc::candidates(&self.store.images(), &in_use, now, t.min_age) {
+            let res = if kr_sys::fs::getuid() == 0 { kr_runtime::offload::remove_image(&self.store, &id).await } else {
+                let out = RefCell::new(None);
+                let _ = self.maps.run_as_root(|| {
+                    *out.borrow_mut() = Some(self.store.remove_image(&id));
+                    true
+                });
+                out.into_inner().unwrap_or(Err(kr_runtime::store::Error::Unsafe("cannot enter the id maps")))
+            };
+            match res {
+                Ok((l, b)) => {
+                    images += 1;
+                    layers += l;
+                    blobs += b;
+                }
+                Err(e) => kr_rt::eprint(alloc::format!("kubelet: removing image {}: {e:?}\n", id.0).as_bytes()),
+            }
+            if usage() <= t.low {
+                break;
+            }
+        }
+        kr_rt::eprint(alloc::format!("kubelet: image store was {before}% full; removed {images} unused images ({layers} layers, {blobs} blobs), now {}%\n", usage()).as_bytes());
     }
 
     /// Every 10 s: taint the node while MemAvailable is below the threshold and evict one pod.
@@ -1532,7 +1596,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             }
             return;
         }
-        let Some((_, img, mut rootfs)) = self.store.image(&image) else {
+        let Some((img_id, img, mut rootfs)) = self.store.image(&image) else {
             self.set_waiting(uid, i, "ErrImageNeverPull", alloc::format!("image {image} not present"));
             return;
         };
@@ -1618,6 +1682,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 return;
             }
         };
+        self.store.set_container_image(&cid, &img_id);
+        self.store.mark_used(&img_id);
         let log_path = alloc::format!("{}/{name}.log\0", self.pods.borrow()[uid].dir);
         if seq > 1 {
             // Keep the last run's output for `logs --previous` (and keep it out of this run's file).

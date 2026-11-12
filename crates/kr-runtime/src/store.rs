@@ -103,7 +103,7 @@ impl ImageId {
     pub fn digest(&self) -> String {
         format!("sha256:{}", self.0)
     }
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         self.0.len() == 64 && self.0.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     }
 }

@@ -13,6 +13,7 @@ use kr_net::registry::{Descriptor, Digest};
 pub const KIND_VERIFY_BLOB: u32 = 10;
 pub const KIND_INSTALL_IMAGE: u32 = 11;
 pub const KIND_FSYNC_FILE: u32 = 12;
+pub const KIND_REMOVE_IMAGE: u32 = 13;
 
 #[derive(Default)]
 struct Enc(Vec<u8>);
@@ -97,6 +98,22 @@ fn run(kind: u32, req: &[u8]) -> Option<Vec<u8>> {
                 }
             })
         }
+        KIND_REMOVE_IMAGE => {
+            let id = crate::store::ImageId(d.str()?.into());
+            Some(match store.remove_image(&id) {
+                Ok((l, b)) => {
+                    let mut out = alloc::vec![0];
+                    out.extend_from_slice(&(l as u64).to_le_bytes());
+                    out.extend_from_slice(&(b as u64).to_le_bytes());
+                    out
+                }
+                Err(e) => {
+                    let mut out = alloc::vec![1];
+                    out.extend_from_slice(alloc::format!("{e:?}").as_bytes());
+                    out
+                }
+            })
+        }
         _ => None,
     }
 }
@@ -171,4 +188,25 @@ pub async fn fsync_file(path: &str) -> Result<()> {
     p.push(0);
     let fd = kr_sys::fs::openat(kr_sys::fs::AT_FDCWD, &p, kr_sys::fs::O_RDONLY | kr_sys::fs::O_CLOEXEC, 0).map_err(|e| Error::Io("open blob for fsync", e))?;
     kr_sys::fs::fsync(fd.raw()).map_err(|e| Error::Io("fsync blob", e))
+}
+
+/// [`Store::remove_image`], in a worker when one is available (a rootfs holds tens of thousands
+/// of files). Only for a caller whose own uid may delete everything (real root): a rootless
+/// kubelet removes files through its id maps and calls the store directly.
+pub async fn remove_image(store: &Store, id: &crate::store::ImageId) -> Result<(usize, usize)> {
+    if kr_sys::fs::getuid() == 0 && kr_rt::offload::enabled_in(kr_rt::offload::SLOW) {
+        let mut e = Enc::default();
+        e.bytes(store.root().as_bytes());
+        e.bytes(id.0.as_bytes());
+        if let Some(out) = kr_rt::offload::call_in(kr_rt::offload::SLOW, KIND_REMOVE_IMAGE, &e.0).await {
+            match out.first() {
+                Some(0) if out.len() == 17 => {
+                    return Ok((u64::from_le_bytes(out[1..9].try_into().unwrap()) as usize, u64::from_le_bytes(out[9..17].try_into().unwrap()) as usize));
+                }
+                Some(1) => return Err(error_of(&out)),
+                _ => {}
+            }
+        }
+    }
+    store.remove_image(id)
 }

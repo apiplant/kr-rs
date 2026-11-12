@@ -7,6 +7,7 @@ pub mod auth;
 pub mod cgroup;
 pub mod container;
 pub mod devfilter;
+pub mod gc;
 pub mod hooks;
 pub mod import;
 pub mod offload;
