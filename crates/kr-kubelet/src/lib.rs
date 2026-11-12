@@ -118,20 +118,20 @@ fn now_ms() -> u64 {
 
 /// Wakes the sync loop.
 #[derive(Default)]
-struct Notify {
+pub(crate) struct Notify {
     flag: Cell<bool>,
     waker: RefCell<Option<Waker>>,
 }
 
 impl Notify {
-    fn notify(&self) {
+    pub(crate) fn notify(&self) {
         self.flag.set(true);
         if let Some(w) = self.waker.borrow_mut().take() {
             w.wake();
         }
     }
 
-    async fn wait(&self, max_ms: u64) {
+    pub(crate) async fn wait(&self, max_ms: u64) {
         let wait = poll_fn(|cx| {
             if self.flag.replace(false) {
                 Poll::Ready(())

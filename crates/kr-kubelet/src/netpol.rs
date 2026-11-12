@@ -14,6 +14,7 @@
 //! never filtered (issues #165 and the NEW ones in the docs).
 
 use alloc::string::{String, ToString};
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 use kr_apiserver::client::{meta, Client};
 use kr_fmt::json::Value;
@@ -320,6 +321,23 @@ pub async fn run<C: Client + Clone + 'static>(c: C, node: String) {
         }
         return;
     }
+    // Pods, namespaces and policies are watched: a change recomputes the rules within about half a
+    // second (bursts coalesce); the periodic pass repairs missed events and tables
+    // somebody flushed.
+    let wake = Rc::new(crate::Notify::default());
+    for path in ["/api/v1/pods", "/api/v1/namespaces", "/apis/networking.k8s.io/v1/networkpolicies"] {
+        let (c, wake) = (c.clone(), wake.clone());
+        kr_rt::exec::spawn(async move {
+            loop {
+                if let Ok(mut w) = c.watch(path, "").await {
+                    while w.next().await.is_some() {
+                        wake.notify();
+                    }
+                }
+                kr_rt::exec::sleep(1000).await;
+            }
+        });
+    }
     let mut last: Option<Vec<NpChain>> = None;
     loop {
         let got = (
@@ -334,7 +352,8 @@ pub async fn run<C: Client + Clone + 'static>(c: C, node: String) {
                 last = Some(chains);
             }
         }
-        kr_rt::exec::sleep(3000).await;
+        wake.wait(30_000).await;
+        kr_rt::exec::sleep(500).await; // let a burst of changes finish; bounds the work under churn
     }
 }
 
