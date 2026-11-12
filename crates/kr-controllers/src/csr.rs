@@ -70,8 +70,11 @@ pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config, ca: Rc<CaSigner
             let (c, q) = (c3.clone(), q3.clone());
             async move {
                 if let Ok(l) = c.list(BASE, "").await {
+                    let now = (cfg.now)();
                     for r in items(&l) {
-                        if str_at(&r, &["status", "certificate"]).is_empty() {
+                        if expired(&r, now) {
+                            let _ = c.delete(&alloc::format!("{BASE}/{}", str_at(&r, &["metadata", "name"]))).await;
+                        } else if str_at(&r, &["status", "certificate"]).is_empty() {
                             q.add(&key_of(&r));
                         }
                     }
@@ -80,6 +83,31 @@ pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config, ca: Rc<CaSigner
         },
     )
     .await
+}
+
+// ---- garbage collection ----
+
+const HOUR: i64 = 3600;
+
+/// Upstream's CSR cleaner: a request is deleted one hour after it was issued, denied or failed
+/// (or approved without ever being issued), and 24 hours after it was created if nobody decided
+/// it.
+pub fn expired(csr: &Value, now: i64) -> bool {
+    let created = parse_time(str_at(csr, &["metadata", "creationTimestamp"])).unwrap_or(now);
+    let cond_time = |ty: &str| {
+        csr.pointer(&["status", "conditions"]).and_then(Value::as_array).unwrap_or(&[]).iter().filter(|c| str_at(c, &["type"]) == ty && str_at(c, &["status"]) != "False").filter_map(|c| parse_time(str_at(c, &["lastUpdateTime"])).or_else(|| parse_time(str_at(c, &["lastTransitionTime"])))).max()
+    };
+    let past = |t: i64, secs: i64| now - t >= secs;
+    if !str_at(csr, &["status", "certificate"]).is_empty() {
+        return past(created, HOUR);
+    }
+    if let Some(t) = cond_time("Denied").or_else(|| cond_time("Failed")) {
+        return past(t, HOUR);
+    }
+    if let Some(t) = cond_time("Approved") {
+        return past(t, HOUR); // approved, never issued
+    }
+    past(created, 24 * HOUR)
 }
 
 // ---- PKCS#10 ----
@@ -381,6 +409,26 @@ pub async fn reconcile<C: Client>(c: &C, ca: &CaSigner, name: &str, now: i64) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_requests_are_collected_like_upstream() {
+        let csr = |created: &str, status: &str| kr_fmt::json::parse(alloc::format!(r#"{{"metadata":{{"name":"x","creationTimestamp":"{created}"}},"status":{status}}}"#).as_bytes()).unwrap();
+        let t0 = kr_apiserver::printers::parse_rfc3339("2026-11-12T00:00:00Z").unwrap();
+        let at = |h: i64| t0 + h * 3600;
+        let cond = |ty: &str, when: &str| alloc::format!(r#"{{"conditions":[{{"type":"{ty}","status":"True","lastUpdateTime":"{when}"}}]}}"#);
+        // Issued: gone an hour after creation, not before.
+        let issued = csr("2026-11-12T00:00:00Z", r#"{"certificate":"x"}"#);
+        assert!(!expired(&issued, at(0) + 3599) && expired(&issued, at(1)));
+        // Denied and failed count from the decision.
+        let denied = csr("2026-11-12T00:00:00Z", &cond("Denied", "2026-11-12T05:00:00Z"));
+        assert!(!expired(&denied, at(5)) && expired(&denied, at(6)));
+        assert!(expired(&csr("2026-11-12T00:00:00Z", &cond("Failed", "2026-11-12T00:00:00Z")), at(1)));
+        // Approved but never issued: one hour after the approval.
+        assert!(expired(&csr("2026-11-12T00:00:00Z", &cond("Approved", "2026-11-12T00:00:00Z")), at(1)));
+        // Undecided: 24 hours.
+        let pending = csr("2026-11-12T00:00:00Z", "{}");
+        assert!(!expired(&pending, at(23)) && expired(&pending, at(24)));
+    }
+
     use super::*;
     use crate::tests::*;
     use kr_apiserver::client::InProcess;

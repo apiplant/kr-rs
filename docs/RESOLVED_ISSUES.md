@@ -481,3 +481,9 @@
 
 255. **NetworkPolicy changes took up to 3 seconds to apply: the controller polled** — *fixed* (part of #203)
     `netpol::run` watches pods, namespaces and NetworkPolicies and recomputes after a change (a burst coalesces for 500 ms, which also bounds the work when pod status updates are frequent); a 30 s pass remains as a repair for missed events and flushed tables. Not exercised against the kernel (needs root, #205): the computation is unchanged and unit tested, only the trigger changed.
+
+256. **CSRs were never garbage collected** — *fixed* (part of #173)
+    The CSR controller deletes a request one hour after it was issued (from creation), denied or failed (from the decision), or approved without ever being issued (from the approval), and 24 hours after creation when nobody decided it: upstream's cleaner, run with the controller's resync. Test: `csr::tests::old_requests_are_collected_like_upstream`.
+
+257. **Eviction rate limits count nodes and live in memory** — *closed, same as upstream* (was #172)
+    kr's node lifecycle controller limits `NoExecute` taints per node with in-memory token buckets that start full after a restart or a leader change: exactly what upstream's taint manager and node lifecycle controller do (and so k3s). No difference to close.
