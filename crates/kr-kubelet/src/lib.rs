@@ -256,6 +256,8 @@ pub struct Kubelet<C: Client> {
     maps: IdMaps,
     pods: RefCell<BTreeMap<String, PodRt>>,
     exits: RefCell<Vec<Exit>>,
+    /// Pods whose first sync (sandbox + CNI, ~0.5 s each) runs as its own task.
+    starting: RefCell<alloc::collections::BTreeSet<String>>,
     notify: Notify,
     devices: Rc<deviceplugin::Plugins>,
     csi: Rc<csi::Csi>,
@@ -303,11 +305,14 @@ const NO_IP: &str = "failed to allocate a pod IP";
 const BACKOFF_START_MS: u64 = 10_000;
 const BACKOFF_MAX_MS: u64 = 300_000;
 
+/// Pods whose sandbox may be started at the same time.
+const MAX_STARTING: usize = 4;
+
 impl<C: Client + Clone + 'static> Kubelet<C> {
     pub fn new(c: C, cfg: Config, store: Store) -> Rc<Self> {
         let devices = deviceplugin::Plugins::new(&deviceplugin::default_dir(&cfg.root));
         let csi = csi::Csi::new(&cfg.node_name);
-        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), notify: Notify::default(), devices, csi, pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()), adopted: Cell::new((0, 0)), survive: Cell::new(false) })
+        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), starting: RefCell::new(alloc::collections::BTreeSet::new()), notify: Notify::default(), devices, csi, pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()), adopted: Cell::new((0, 0)), survive: Cell::new(false) })
     }
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
@@ -839,6 +844,18 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 kr_rt::exec::phase("sync_all: terminate");
                 self.terminate(&uid, pod).await;
                 slow_step("terminate", pod, &mut lap);
+            } else if self.starting.borrow().contains(&uid) {
+                // Its sandbox is being started by its own task: leave the pod alone until then.
+                continue;
+            } else if self.needs_sandbox(&uid) && self.starting.borrow().len() < MAX_STARTING {
+                self.starting.borrow_mut().insert(uid.clone());
+                let (k, u, p) = (self.clone(), uid.clone(), pod.clone());
+                kr_rt::exec::spawn(async move {
+                    k.sync_pod(&u, &p).await;
+                    k.starting.borrow_mut().remove(&u);
+                    k.notify.notify();
+                });
+                continue;
             } else {
                 kr_rt::exec::phase("sync_all: sync_pod");
                 self.sync_pod(&uid, pod).await;
@@ -911,6 +928,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         drop(pods);
         self.persist(&e.pod_uid);
+    }
+
+    /// True for a pod that has no sandbox yet (new, or waiting for one).
+    fn needs_sandbox(&self, uid: &str) -> bool {
+        self.pods.borrow().get(uid).is_none_or(|p| p.sandbox.is_none() && p.failed_setup.is_none())
     }
 
     async fn sync_pod(self: &Rc<Self>, uid: &str, pod: &Value) {

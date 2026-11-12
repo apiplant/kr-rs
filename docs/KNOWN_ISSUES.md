@@ -172,8 +172,6 @@ ADR-047. Default `["secrets"]`; `plural` or `plural.group` (e.g. `configmaps`, `
 
 235. **`client_vs_openssl_*` interop tests are flaky under a loaded machine** — *test*
     `kr_client_vs_s_server` (`kr-crypto/tests/tls_openssl.rs`) asserts on `s_server`'s stdout right after killing its stdin; under a fully loaded workspace test run it once saw an empty stdout ("s_server stdout: ..."). Not related to TLS behaviour (it passed 6 reruns and the next workspace run). Wait for `s_server` to print before asserting, or poll with a timeout.
-242. **New pods start one after the other: CNI setup (~575 ms with Calico) is serial** — *ADR-050*
-    The kubelet syncs pods in a single loop and awaits `start_sandbox` (the CNI ADD, 560-580 ms per pod with Calico) before the next pod, so 30 new pods take about 17 s to get their sandboxes (seen on the live cluster: `slow start_sandbox 583ms` for each of three replicas of one Deployment). The event loop is not blocked (the wait is asynchronous); it is latency. Fix: run the sandbox start of different pods as concurrent tasks (the pod state is behind `RefCell`s that are not held across the await), bounded to a few at a time because Calico's IPAM serialises on its datastore.
 # Accepted limitations (by design, or not planned for now)
 153. **No VolumeSnapshot support** — *missing compared with k3s*
     k3s can run the external snapshotter. kr ships no `VolumeSnapshot*` CRDs or controller and the CSI node side does not exercise snapshots; an external snapshot-controller with its CRDs may work but is untested.
