@@ -1102,7 +1102,10 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let Some(sb) = p.sandbox.as_ref() else { return };
             let Some(start) = kr_runtime::network::proc_start(sb.pid as u32) else { return };
             let host_net = sb.is_host_net();
-            let rec = adopt::Sb { pid: sb.pid, start, host_net, ip: p.lease.as_ref().map(|l| l.ip), userns: sb.userns };
+            // A CNI pod has no kr lease: its address is the one the plugin returned.
+            let ip = p.lease.as_ref().map(|l| l.ip).or(if host_net { None } else { p.ip });
+            let ip6 = if host_net || p.lease.is_some() { None } else { p.ip6 };
+            let rec = adopt::Sb { pid: sb.pid, start, host_net, ip, userns: sb.userns, ip6 };
             let ctrs: Vec<adopt::Ctr> = p
                 .ctrs
                 .iter()
@@ -1161,13 +1164,19 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let pn = self.podnet.get();
         let fam = self.fam.get();
         let net = sb.ip.filter(|_| !sb.host_net).map(|ip| NetConfig::with(ip, &pn, fam));
-        if !sb.host_net {
+        // With a CNI plugin the pod's address belongs to the plugin (no kr lease to take over);
+        // the record carries the addresses it returned.
+        let cni = cni::is_enabled() && !sb.host_net;
+        if !sb.host_net && !cni {
             // The pod keeps its IP; its lease must exist so nobody else gets it.
             let ip = sb.ip?;
             rt.lease = Some(Lease::adopt(alloc::format!("{}/ipam", self.cfg.root).as_bytes(), uid.as_bytes(), ip)?);
         }
-        rt.ip = if sb.host_net { kr_sys::unmap4(self.cfg.node_ip) } else { sb.ip.filter(|_| fam.v4) };
-        rt.ip6 = if sb.host_net { Some(self.cfg.node_ip).filter(|a| kr_sys::unmap4(*a).is_none()) } else { net.and_then(|n| n.ip6) };
+        if cni && sb.ip.is_none() && sb.ip6.is_none() {
+            return None; // a record from before CNI pods were adoptable: start the pod again
+        }
+        rt.ip = if sb.host_net { kr_sys::unmap4(self.cfg.node_ip) } else { sb.ip.filter(|_| fam.v4 || cni) };
+        rt.ip6 = if sb.host_net { Some(self.cfg.node_ip).filter(|a| kr_sys::unmap4(*a).is_none()) } else if cni { sb.ip6 } else { net.and_then(|n| n.ip6) };
         if self.cfg.cgroups {
             let (limits, _) = spec::pod_resources(pod);
             rt.cg = PodCgroup::create(spec::qos_class(pod), uid, &limits).ok();

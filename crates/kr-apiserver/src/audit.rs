@@ -307,10 +307,17 @@ impl Auditor {
         if self.max_bytes > 0 && s.size > 0 && s.size + data.len() as u64 > self.max_bytes {
             self.rotate(&mut s);
         }
+        let t0 = kr_rt::exec::now_ms();
+        kr_rt::exec::phase("audit: write");
         let ok = match &s.fd {
             Some(fd) => kr_sys::fs::write_all(fd.raw(), &data).is_ok(),
             None => false,
         };
+        // A write() to a file can block for seconds when the disk is under write-back pressure.
+        let took = kr_rt::exec::now_ms().saturating_sub(t0);
+        if took >= 100 {
+            kr_rt::eprint(alloc::format!("kr server: audit log write of {} bytes blocked the event loop for {took} ms\n", data.len()).as_bytes());
+        }
         if ok {
             s.size += data.len() as u64;
         } else if !s.warned {

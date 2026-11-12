@@ -42,7 +42,9 @@ pub async fn handle(api: &Rc<ApiServer>, req: Request) -> Response {
     let pf = core::cell::RefCell::new(None);
     let audit = crate::audit::begin(api, &req, user_from_certs(req.peer.client_certs.as_deref()));
     let mut resp = handle_inner(api, req, &pf).await;
+    kr_rt::exec::phase("http: audit finish");
     crate::audit::finish(api, audit, &resp);
+    kr_rt::exec::phase("http: response built");
     if let Some((flow, level)) = pf.into_inner() {
         resp = resp.with_header("X-Kubernetes-PF-FlowSchema-UID", &flow).with_header("X-Kubernetes-PF-PriorityLevel-UID", &level);
     }
@@ -181,9 +183,11 @@ async fn handle_inner(api: &Rc<ApiServer>, req: Request, pf: &core::cell::RefCel
     }
     // A write is acknowledged only once it is on disk (group commit, fsync off the event loop).
     let after = api.revision();
+    kr_rt::exec::phase("http: commit");
     if after > before && api.commit(after).await.is_err() {
         return respond(Reply::err(crate::object::ApiError::new(500, "InternalError", "storage sync failed")));
     }
+    kr_rt::exec::phase("http: respond");
     let mut resp = respond_to(reply, req.header("accept"));
     if is_forwarded {
         resp = resp.with_header(forward::REVISION, &format!("{}", api.revision()));
