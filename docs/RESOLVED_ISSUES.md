@@ -460,3 +460,6 @@
 
 248. **The API server had no `/metrics`: stall counters were only logged** — *fixed* (part of #213)
     `GET /metrics` (Prometheus text) serves `kr_event_loop_stalls_total`, `kr_event_loop_stall_seconds_total`, `kr_event_loop_stall_max_seconds` and `kr_offload_jobs_total{class}`; it is a non-resource URL, so it needs `get` on `/metrics` (the new default ClusterRole `system:monitoring` grants it, with the health endpoints; `system:masters` always). Only these counters so far: request counts and latencies are not exported. Test: `rbac_reconcile.rs::metrics_endpoint_serves_the_loop_counters_to_admins_only`.
+
+249. **`kr-rt` unit tests failed under parallel runs** — *fixed* (test only)
+    `freed_chunks_are_released` measures the process RSS, which the other tests of the crate (allocator stress, offload workers, executor) changed at the same time, so it failed on most workspace runs since the offload tests were added. The crate's tests now take a shared lock (`kr_rt::serial`) and run one at a time.

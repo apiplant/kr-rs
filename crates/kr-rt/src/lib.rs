@@ -401,6 +401,13 @@ unsafe impl GlobalAlloc for KrAlloc {
 #[global_allocator]
 static ALLOC: KrAlloc = KrAlloc::new();
 
+/// The tests measure process-wide state (RSS, stall counters, worker pools): one at a time.
+#[cfg(test)]
+pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod alloc_tests {
     use super::*;
@@ -413,6 +420,7 @@ mod alloc_tests {
 
     #[test]
     fn mixed_sizes_stress() {
+        let _serial = crate::serial();
         let a = KrAlloc::new();
         let mut live: Vec<(*mut u8, Layout, u8)> = Vec::new();
         let mut x: u64 = 0x1234_5678_9abc_def1;
@@ -455,6 +463,7 @@ mod alloc_tests {
 
     #[test]
     fn large_alignment_up_to_1mib() {
+        let _serial = crate::serial();
         let a = KrAlloc::new();
         let mut sh = 12;
         while sh <= 20 {
@@ -478,6 +487,7 @@ mod alloc_tests {
 
     #[test]
     fn freed_chunks_are_released() {
+        let _serial = crate::serial();
         let a = KrAlloc::new();
         let l = Layout::from_size_align(64, 8).unwrap();
         let n = 200_000; // ~12.8 MB
@@ -713,6 +723,7 @@ mod tests {
 
     #[test]
     fn copy_set_cmp_exhaustive() {
+        let _serial = crate::serial();
         for len in 0..=64usize {
             for so in 0..8 {
                 for dof in 0..8 {
@@ -752,6 +763,7 @@ mod tests {
 
     #[test]
     fn memmove_overlap_both_directions() {
+        let _serial = crate::serial();
         for len in 0..=64usize {
             for so in 0..8 {
                 for dof in (0..8).chain([9, 15, 16, 17]) {

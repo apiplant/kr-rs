@@ -853,6 +853,7 @@ mod tests {
     // One test: the executor is a process-wide singleton.
     #[test]
     fn priority_tasks_run_first_and_stalls_are_counted() {
+        let _serial = crate::serial();
         let order = Rc::new(RefCell::new(alloc::vec::Vec::new()));
         let (o1, o2) = (order.clone(), order.clone());
         set_stall_warn_ms(5);

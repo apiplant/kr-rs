@@ -307,6 +307,7 @@ mod tests {
     // One test: the pool is a process-wide singleton and workers are forks.
     #[test]
     fn workers_run_jobs_concurrently_and_recover() {
+        let _serial = crate::serial();
         init(handler, 2);
         assert!(enabled());
         exec::block_on(async {
