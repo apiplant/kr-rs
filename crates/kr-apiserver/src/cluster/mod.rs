@@ -33,6 +33,15 @@ use transport::{Inbox, Peer};
 
 /// One tick = 100 ms: heartbeat every 200 ms, election timeout 1–2 s.
 pub const TICK_MS: u64 = 100;
+static ELECTION_TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(10);
+
+/// Raft election timeout in milliseconds (default 1000; the actual timeout is randomised between
+/// one and two times this value). Raise it where the event loop is known to stall (#213). Takes
+/// effect for clusters opened afterwards; at least 3 ticks.
+pub fn set_election_timeout_ms(ms: u64) {
+    ELECTION_TICKS.store((ms / TICK_MS).clamp(3, 600) as u32, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Take a snapshot once this many entries were applied since the last one.
 const SNAPSHOT_EVERY: u64 = 10_000;
 /// Store key prefix of server addresses (replicated with everything else).
@@ -110,7 +119,9 @@ impl Cluster {
         if let Some(s) = &loaded.snapshot {
             api.store.borrow_mut().restore(&s.data).map_err(|e| alloc::format!("raft snapshot: {e:?}"))?;
         }
-        let raft = Raft::new(Config::new(id), seed, loaded.hard_state, loaded.snapshot.clone(), voters, loaded.entries);
+        let mut rcfg = Config::new(id);
+        rcfg.election_ticks = ELECTION_TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        let raft = Raft::new(rcfg, seed, loaded.hard_state, loaded.snapshot.clone(), voters, loaded.entries);
         let c = Cluster {
             id,
             committed_index: Cell::new(raft.snapshot_index()),

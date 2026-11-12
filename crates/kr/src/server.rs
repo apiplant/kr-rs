@@ -340,6 +340,13 @@ fn audit_setup(data: &str, policy: Option<&str>, path: Option<&str>, max_mb: u64
 }
 
 pub fn main(mut args: Args) -> i32 {
+    // Event-loop watchdog and Raft timing (#213).
+    if let Some(ms) = kr_runtime::store::env_var("KR_STALL_WARN_MS").and_then(|v| v.parse().ok()) {
+        kr_rt::exec::set_stall_warn_ms(ms);
+    }
+    if let Some(ms) = kr_runtime::store::env_var("KR_RAFT_ELECTION_MS").and_then(|v| v.parse().ok()) {
+        kr_apiserver::cluster::set_election_timeout_ms(ms);
+    }
     let (mut port, mut data, mut cluster_init) = (6443u16, None, false);
     let (mut snap_every, mut snap_keep) = (None::<u64>, 5usize);
     let mut enc_on = true;
@@ -579,7 +586,7 @@ pub fn main(mut args: Args) -> i32 {
                     kr_rt::exec::spawn(kr_apiserver::cluster::transport::serve(l6, srv_tls.clone(), id, c.inbox.clone()));
                 }
                 kr_rt::exec::spawn(kr_apiserver::cluster::transport::serve(l, srv_tls, id, c.inbox.clone()));
-                kr_rt::exec::spawn(c.clone().run(api.clone()));
+                kr_rt::exec::spawn_priority(c.clone().run(api.clone()));
                 kr_rt::exec::spawn(c.clone().keep_registered(api.clone()));
                 if let Some(url) = join_url {
                     let me = kr_apiserver::cluster::ServerAddr { ip: advertise, raft_port: kr_apiserver::cluster::transport::PORT, api_port: port };

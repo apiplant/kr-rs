@@ -58,6 +58,61 @@ struct Task {
     queued: Cell<bool>,
     /// Abort requested while the future was being polled; honoured right after the poll.
     abort_pending: Cell<bool>,
+    /// Woken to the front of the queue (Raft: a late heartbeat costs a leader election).
+    priority: Cell<bool>,
+}
+
+/// Event-loop stall accounting: one task poll that ran longer than the warning threshold blocked
+/// every other task, timer and socket for that long.
+pub struct StallStats {
+    /// Polls longer than the threshold since start.
+    pub stalls: u64,
+    /// Longest single poll, in microseconds.
+    pub max_us: u64,
+    /// Sum of the stalled polls, in microseconds.
+    pub total_us: u64,
+}
+
+struct StallState {
+    warn_ms: Cell<u64>,
+    stats: Cell<(u64, u64, u64)>,
+    last_log_ms: Cell<u64>,
+}
+
+static STALL: Global<StallState> = Global(UnsafeCell::new(StallState { warn_ms: Cell::new(100), stats: Cell::new((0, 0, 0)), last_log_ms: Cell::new(0) }));
+
+fn stall() -> &'static StallState {
+    // SAFETY: single-threaded (module docs).
+    unsafe { &*STALL.0.get() }
+}
+
+/// Polls longer than `ms` are counted and logged (at most once per second); 0 disables. Default 100.
+pub fn set_stall_warn_ms(ms: u64) {
+    stall().warn_ms.set(ms);
+}
+
+/// Stall counters since start (see [`StallStats`]).
+pub fn stall_stats() -> StallStats {
+    let (stalls, max_us, total_us) = stall().stats.get();
+    StallStats { stalls, max_us, total_us }
+}
+
+fn note_poll(started_ns: u64) {
+    let warn = stall().warn_ms.get();
+    if warn == 0 {
+        return;
+    }
+    let us = now_ns().saturating_sub(started_ns) / 1000;
+    if us < warn * 1000 {
+        return;
+    }
+    let (n, max, total) = stall().stats.get();
+    stall().stats.set((n + 1, max.max(us), total + us));
+    let now = now_ms();
+    if now >= stall().last_log_ms.get() + 1000 {
+        stall().last_log_ms.set(now);
+        crate::eprint(alloc::format!("kr: event loop stalled for {} ms in one task poll ({} stalls so far, longest {} ms)\n", us / 1000, n + 1, max.max(us) / 1000).as_bytes());
+    }
 }
 
 static LIVE_TASKS: Global<Cell<usize>> = Global(UnsafeCell::new(Cell::new(0)));
@@ -79,7 +134,11 @@ impl Drop for Task {
 
 fn schedule(t: Rc<Task>) {
     if !t.queued.replace(true) {
-        ex().queue.borrow_mut().push_back(t);
+        if t.priority.get() {
+            ex().queue.borrow_mut().push_front(t);
+        } else {
+            ex().queue.borrow_mut().push_back(t);
+        }
     }
 }
 
@@ -180,6 +239,24 @@ where
     F: Future + 'static,
     F::Output: 'static,
 {
+    spawn_with(fut, false)
+}
+
+/// Like [`spawn`], but the task is polled before the other queued tasks of a round whenever it
+/// is woken. For latency-critical work only (Raft heartbeats and elections).
+pub fn spawn_priority<F>(fut: F) -> JoinHandle<F::Output>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    spawn_with(fut, true)
+}
+
+fn spawn_with<F>(fut: F, priority: bool) -> JoinHandle<F::Output>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
     let st = Rc::new(JoinState { result: RefCell::new(None), aborted: Cell::new(false), waker: RefCell::new(None) });
     let st2 = st.clone();
     let wrapped = async move {
@@ -194,6 +271,7 @@ where
         fut: RefCell::new(Some(Box::pin(wrapped))),
         queued: Cell::new(false),
         abort_pending: Cell::new(false),
+        priority: Cell::new(priority),
     });
     // SAFETY: single-threaded (module docs).
     let c = unsafe { &*LIVE_TASKS.0.get() };
@@ -249,7 +327,10 @@ fn run_queue() {
         let mut slot = task.fut.borrow_mut();
         let mut dead = None;
         if let Some(f) = slot.as_mut() {
-            if f.as_mut().poll(&mut cx).is_ready() || task.abort_pending.get() {
+            let t0 = now_ns();
+            let done = f.as_mut().poll(&mut cx).is_ready();
+            note_poll(t0);
+            if done || task.abort_pending.get() {
                 dead = slot.take();
             }
         }
@@ -713,5 +794,33 @@ impl<T: AsRawFd> Drop for Async<T> {
             old
         };
         drop(old); // wakers dropped outside the borrow; the fd closes when `inner` drops
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::rc::Rc;
+    use core::cell::RefCell;
+
+    // One test: the executor is a process-wide singleton.
+    #[test]
+    fn priority_tasks_run_first_and_stalls_are_counted() {
+        let order = Rc::new(RefCell::new(alloc::vec::Vec::new()));
+        let (o1, o2) = (order.clone(), order.clone());
+        set_stall_warn_ms(5);
+        block_on(async move {
+            let a = spawn(async move { o1.borrow_mut().push(1) });
+            let b = spawn_priority(async move { o2.borrow_mut().push(2) });
+            let c = spawn(async {
+                let t = now_ms();
+                while now_ms() < t + 20 {}
+            });
+            let _ = (a.await, b.await, c.await);
+        });
+        // The priority task was queued last but polled before the normal one.
+        assert_eq!(*order.borrow(), [2, 1]);
+        let st = stall_stats();
+        assert!(st.stalls >= 1 && st.max_us >= 15_000, "{} {}", st.stalls, st.max_us);
     }
 }
