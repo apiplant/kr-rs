@@ -206,3 +206,25 @@ fn external_provisioner_gets_annotations_and_owns_deletion() {
         assert!(get_opt(&c, &alloc::format!("{PVS}/pv-ext")).await.unwrap().is_some());
     });
 }
+
+#[test]
+fn generic_ephemeral_volume_claim_is_created_owned_by_the_pod_and_binds_by_mode() {
+    scenario(|c| async move {
+        let pod = v(r#"{"metadata":{"name":"app"},"spec":{"containers":[{"name":"c","image":"x"}],"volumes":[{"name":"scratch","ephemeral":{"volumeClaimTemplate":{"metadata":{"labels":{"a":"b"}},"spec":{"storageClassName":"fast","volumeMode":"Block","accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"1Gi"}}}}}}]}}"#);
+        let p = c.create(PODS, &pod).await.unwrap();
+        wait_until("ephemeral claim created", || async { get_opt(&c, &alloc::format!("{CLAIMS}/app-scratch")).await.unwrap().is_some() }).await;
+        let pvc = c.get(&alloc::format!("{CLAIMS}/app-scratch")).await.unwrap();
+        let r = controller_ref(&pvc).expect("owner");
+        assert_eq!((str_at(r, &["kind"]), str_at(r, &["uid"])), ("Pod", uid(&p)));
+        assert_eq!(str_at(&pvc, &["metadata", "labels", "a"]), "b");
+        assert_eq!(volume_claim(&p, &p.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap()[0]), "app-scratch");
+        // A Filesystem PV does not satisfy a Block claim; a Block one does.
+        let pv = |n: &str, mode: &str| v(&alloc::format!(r#"{{"metadata":{{"name":"{n}"}},"spec":{{"capacity":{{"storage":"2Gi"}},"accessModes":["ReadWriteOnce"],"storageClassName":"fast","volumeMode":"{mode}","hostPath":{{"path":"/x"}}}}}}"#));
+        c.create(PVS, &pv("fs", "Filesystem")).await.unwrap();
+        sleep(500).await;
+        assert_eq!(phase(&c, &alloc::format!("{CLAIMS}/app-scratch")).await, "Pending");
+        c.create(PVS, &pv("blk", "Block")).await.unwrap();
+        wait_until("block pv bound", || async { phase(&c, &alloc::format!("{CLAIMS}/app-scratch")).await == "Bound" }).await;
+        assert_eq!(str_at(&c.get(&alloc::format!("{CLAIMS}/app-scratch")).await.unwrap(), &["spec", "volumeName"]), "blk");
+    });
+}

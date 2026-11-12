@@ -16,6 +16,8 @@
 //! * **External provisioners**: a claim whose class names another provisioner gets the
 //!   `volume.kubernetes.io/storage-provisioner` annotation (and `selected-node` for
 //!   `WaitForFirstConsumer`); the provisioner creates the PV with a `claimRef`, bound as above.
+//! * **Generic ephemeral volumes**: the claim `<pod>-<volume>` of an `ephemeral.volumeClaimTemplate`
+//!   is created owned by the pod.
 //! * **Reclaim**: when the claim of a PV is gone, `Delete` deletes the PV (the kubelet then
 //!   removes the directory), anything else marks it `Released`. PVs of another provisioner are
 //!   only marked `Released`: that provisioner deletes them.
@@ -62,7 +64,7 @@ pub async fn run<C: Client + Clone + 'static>(c: C, cfg: Config) {
 
 fn uses(pod: &Value, ns: &str, claim: &str) -> bool {
     namespace(pod) == ns
-        && pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).is_some_and(|vs| vs.iter().any(|v| str_at(v, &["persistentVolumeClaim", "claimName"]) == claim))
+        && pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).is_some_and(|vs| vs.iter().any(|v| volume_claim(pod, v) == claim))
 }
 
 /// `spec.<field>.storage` (PV capacity) or `spec.<field>.requests.storage` (PVC) in bytes.
@@ -79,6 +81,14 @@ fn modes(o: &Value) -> Vec<&str> {
     o.pointer(&["spec", "accessModes"]).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default()
 }
 
+/// `spec.volumeMode`, `Filesystem` when unset.
+fn volume_mode(o: &Value) -> &str {
+    match str_at(o, &["spec", "volumeMode"]) {
+        "" => "Filesystem",
+        m => m,
+    }
+}
+
 fn claim_matches(pv: &Value, pvc: &Value) -> bool {
     let r = |k: &str| str_at(pv, &["spec", "claimRef", k]);
     r("name") == name(pvc) && r("namespace") == namespace(pvc) && (r("uid").is_empty() || r("uid") == uid(pvc))
@@ -89,11 +99,41 @@ async fn sync<C: Client>(c: &C) -> Result<()> {
     let pod_list = items(&c.list(&pods(None), "").await?);
     let mut vols = items(&c.list(PVS, "").await?);
     let classes = items(&c.list(CLASSES, "").await?);
+    let mut claims = claims;
+    ephemeral_claims(c, &pod_list, &mut claims).await?;
     for pvc in &claims {
         sync_pvc(c, pvc, &pod_list, &mut vols, &classes).await?;
     }
     for pv in &vols {
         sync_pv(c, pv, &claims).await?;
+    }
+    Ok(())
+}
+
+/// Generic ephemeral volumes: creates `<pod>-<volume>` from `volumeClaimTemplate`, owned by the pod
+/// (garbage collection deletes it with the pod). A claim of that name not owned by the pod is
+/// left alone: the kubelet then refuses the volume.
+async fn ephemeral_claims<C: Client>(c: &C, pod_list: &[Value], claims: &mut Vec<Value>) -> Result<()> {
+    for pod in pod_list.iter().filter(|p| !pod_terminal(p) && !deleting(p)) {
+        for vol in pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]) {
+            let Some(t) = vol.pointer(&["ephemeral", "volumeClaimTemplate"]) else { continue };
+            let nm = volume_claim(pod, vol);
+            if claims.iter().any(|p| namespace(p) == namespace(pod) && name(p) == nm) {
+                continue;
+            }
+            let mut meta: Vec<(&str, Value)> = alloc::vec![("name", Value::from(nm.as_str())), ("ownerReferences", Value::Array(alloc::vec![owner_ref(pod, "v1", "Pod")]))];
+            for k in ["labels", "annotations"] {
+                if let Some(m) = t.pointer(&["metadata", k]) {
+                    meta.push((k, m.clone()));
+                }
+            }
+            let new = obj(alloc::vec![("apiVersion", Value::from("v1")), ("kind", Value::from("PersistentVolumeClaim")), ("metadata", obj(meta)), ("spec", t.get("spec").cloned().unwrap_or_else(|| obj(Vec::new())))]);
+            match c.create(&pvcs(Some(namespace(pod))), &new).await {
+                Ok(v) => claims.push(v),
+                Err(e) if e.code == 409 => {}
+                Err(e) => return Err(e),
+            }
+        }
     }
     Ok(())
 }
@@ -159,7 +199,7 @@ async fn sync_pvc<C: Client>(c: &C, pvc: &Value, pod_list: &[Value], vols: &mut 
         let claimed = !str_at(pv, &["spec", "claimRef", "name"]).is_empty();
         let ok = if claimed { claim_matches(pv, pvc) } else { !matches!(str_at(pv, &["status", "phase"]), "Released" | "Failed") };
         let pv_modes = modes(pv);
-        if ok && !deleting(pv) && str_at(pv, &["spec", "storageClassName"]) == class && storage(pv, "capacity") >= want && pvc_modes.iter().all(|m| pv_modes.contains(m)) {
+        if ok && !deleting(pv) && str_at(pv, &["spec", "storageClassName"]) == class && volume_mode(pv) == volume_mode(pvc) && storage(pv, "capacity") >= want && pvc_modes.iter().all(|m| pv_modes.contains(m)) {
             let mine = best.is_some_and(|b| !str_at(&vols[b], &["spec", "claimRef", "name"]).is_empty());
             if !mine && (claimed || best.is_none_or(|b| storage(&vols[b], "capacity") > storage(pv, "capacity"))) {
                 best = Some(i);
@@ -209,6 +249,9 @@ async fn sync_pvc<C: Client>(c: &C, pvc: &Value, pod_list: &[Value], vols: &mut 
     }
     // Dynamic provisioning.
     let Some(sc) = classes.iter().find(|k| name(k) == class && str_at(k, &["provisioner"]) == PROVISIONER) else { return Ok(()) };
+    if volume_mode(pvc) == "Block" {
+        return Ok(()); // a directory cannot back a block volume
+    }
     let node = match users.iter().map(|p| str_at(p, &["spec", "nodeName"])).find(|n| !n.is_empty()) {
         Some(n) => n.to_string(),
         None if str_at(sc, &["volumeBindingMode"]) == "Immediate" => {

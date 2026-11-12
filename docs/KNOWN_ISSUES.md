@@ -20,8 +20,8 @@ Ordered by impact. Size: S days, M a week or two, L more.
     k3s ships arm64 as a first-class target. Cross-built kr binaries run only under qemu-user (`tools/test/aarch64.sh`), where namespaces, cgroups, clone3 and mounts do not work, so the kubelet/runtime/apiserver paths have never run on aarch64. Needs a real arm64 host and a CI job.
 137. **CSI: block volumes and ephemeral volumes** — *ADR-041*, M
     `volumeMode: Block`, inline `csi:` ephemeral volumes and generic ephemeral volumes backed by CSI are not supported; only the first PV access mode is sent to the driver.
-136. **CSI: expansion and statistics details** — *ADR-041*, S
-    `NodeExpandVolume` runs only for volumes mounted by a running pod (no offline expansion, not for raw block); no retry with backoff, no `NodeResizeError` condition (failures are logged once). Volume stats come from `statfs` (as upstream for local volumes), the driver's `NodeGetVolumeStats` is not used.
+136. **CSI: driver volume statistics** — *ADR-041*, S
+    Expansion is done (RESOLVED 322). Volume stats still come from `statfs` (as upstream for local volumes); the driver's `NodeGetVolumeStats` is implemented in `Csi::volume_stats` but not called by the kubelet's `kubelet_volume_stats_*` (it is synchronous). Needs a test with a real driver.
 199. **Kubelet metrics endpoints** — *ADR-048*, M
     `/metrics/cadvisor` (container CPU throttling, network, filesystem series used by Prometheus and Grafana dashboards), `/metrics` (kubelet internals) and `/metrics/probes` are not served. (`kubelet_volume_stats_*` is: RESOLVED 268.)
 183. **Audit parity** (remaining of #180-#184) — *ADR-046, ADR-029*, M

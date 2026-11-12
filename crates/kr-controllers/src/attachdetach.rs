@@ -97,8 +97,8 @@ async fn tick_at<C: Client>(c: &C, waiting: &RefCell<BTreeMap<String, u64>>, now
                 continue;
             }
             for vol in pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]) {
-                let claim = str_at(vol, &["persistentVolumeClaim", "claimName"]);
-                let Some(pvc) = find(&claims, namespace(&pod), claim) else { continue };
+                let claim = volume_claim(&pod, vol);
+                let Some(pvc) = find(&claims, namespace(&pod), &claim) else { continue };
                 if claim.is_empty() || str_at(pvc, &["status", "phase"]) != "Bound" {
                     continue;
                 }

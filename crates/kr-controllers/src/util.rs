@@ -318,6 +318,19 @@ pub fn num(n: i64) -> Value {
     Value::Number(kr_fmt::json::Number::from_i64(n))
 }
 
+/// The PVC a pod volume uses: `persistentVolumeClaim.claimName`, or for a generic ephemeral
+/// volume `<pod name>-<volume name>` (empty for other volumes).
+pub fn volume_claim(pod: &Value, vol: &Value) -> String {
+    let c = str_at(vol, &["persistentVolumeClaim", "claimName"]);
+    if !c.is_empty() {
+        return c.to_string();
+    }
+    if vol.get("ephemeral").is_some() {
+        return alloc::format!("{}-{}", name(pod), str_at(vol, &["name"]));
+    }
+    String::new()
+}
+
 /// The `ownerReferences` entry with `controller: true`.
 pub fn controller_ref(o: &Value) -> Option<&Value> {
     o.pointer(&["metadata", "ownerReferences"])?.as_array()?.iter().find(|r| r.get("controller").and_then(Value::as_bool) == Some(true))

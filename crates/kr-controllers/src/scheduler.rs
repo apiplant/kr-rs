@@ -197,7 +197,7 @@ async fn preempt<C: Client>(c: &C, cfg: &Config, path: &str, pod: &Value, node: 
 /// `WaitForFirstConsumer` (those are bound by the PV controller regardless of any pod).
 async fn unbound_claim<C: Client>(c: &C, ns: &str, pod: &Value) -> Result<Option<String>> {
     for vol in pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]) {
-        let claim = str_at(vol, &["persistentVolumeClaim", "claimName"]);
+        let claim = volume_claim(pod, vol);
         if claim.is_empty() {
             continue;
         }
@@ -221,7 +221,7 @@ async fn unbound_claim<C: Client>(c: &C, ns: &str, pod: &Value) -> Result<Option
 async fn volume_affinity<C: Client>(c: &C, ns: &str, pod: &Value) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     for vol in pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]) {
-        let claim = str_at(vol, &["persistentVolumeClaim", "claimName"]);
+        let claim = volume_claim(pod, vol);
         if claim.is_empty() {
             continue;
         }
@@ -247,7 +247,7 @@ fn pod_csi_volumes(pod: &Value, claims: &BTreeMap<String, (String, String)>) -> 
         .and_then(Value::as_array)
         .unwrap_or(&[])
         .iter()
-        .filter_map(|v| claims.get(&alloc::format!("{ns}/{}", str_at(v, &["persistentVolumeClaim", "claimName"]))).cloned())
+        .filter_map(|v| claims.get(&alloc::format!("{ns}/{}", volume_claim(pod, v))).cloned())
         .collect()
 }
 
@@ -275,7 +275,7 @@ fn nodes_over_volume_limit(new: &BTreeSet<(String, String)>, limits: &BTreeMap<S
 async fn volume_limit_nodes<C: Client>(c: &C, ns: &str, pod: &Value, all_pods: &[Value]) -> Result<BTreeSet<String>> {
     let _ = ns;
     // Cheap exits: a pod with no PVC, or a cluster where no driver publishes a limit.
-    if !pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]).iter().any(|v| !str_at(v, &["persistentVolumeClaim", "claimName"]).is_empty()) {
+    if !pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]).iter().any(|v| !volume_claim(pod, v).is_empty()) {
         return Ok(BTreeSet::new());
     }
     let mut limits: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();

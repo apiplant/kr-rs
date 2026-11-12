@@ -1125,6 +1125,7 @@ pub(crate) mod tests {
 
     #[test]
     fn init_container_devices_are_handed_to_the_next_container() {
+        let _g = lock();
         let dir = tmpdir("reuse");
         let p = Plugins::new(&dir);
         with_devices(&p, "x.com/gpu", &[("a", true), ("b", true)]);
@@ -1143,6 +1144,7 @@ pub(crate) mod tests {
 
     #[test]
     fn allocator_rules() {
+        let _g = lock();
         let dir = tmpdir("alloc");
         let p = Plugins::new(&dir);
         with_devices(&p, "x.com/gpu", &[("a", true), ("b", false), ("c", true), ("d", true)]);
@@ -1166,6 +1168,7 @@ pub(crate) mod tests {
 
     #[test]
     fn persistence_round_trip_and_sync() {
+        let _g = lock();
         let dir = tmpdir("persist");
         {
             let p = Plugins::new(&dir);
@@ -1334,6 +1337,7 @@ pub(crate) mod tests {
 
     #[test]
     fn unhealthy_devices_name_their_holders() {
+        let _g = lock();
         let (p, _d) = plugins_with("x.com/gpu", &[("a", true, -1), ("b", false, -1), ("c", true, -1)], &[("u1", "m", &["a"]), ("u2", "m", &["b", "c"]), ("u2", "n", &[])]);
         assert_eq!(p.unhealthy_holders(), [("u2".to_string(), "m".to_string(), "x.com/gpu".to_string(), vec!["b".to_string()])]);
         let pods = p.unhealthy_pods();
@@ -1450,6 +1454,7 @@ mod nvidia_rc_tests {
 
     #[test]
     fn hooks_are_collected_by_stage() {
+        let _g = tests::lock();
         let spec = kr_fmt::json::parse_str(r#"{"kind":"nvidia.com/gpu","containerEdits":{"hooks":[{"hookName":"createContainer","path":"/usr/bin/h","args":["h","update-ldcache"],"env":["A=1"],"timeout":5}]},"devices":[{"name":"all","containerEdits":{"hooks":[{"hookName":"createRuntime","path":"/usr/bin/h","args":["h","x"]},{"hookName":"poststop","path":"/usr/bin/h"},{"hookName":"createContainer","path":"rel"}],"additionalGids":[985,989,985]}}]}"#).unwrap();
         let mut g = Grant::default();
         assert!(cdi_apply(&spec, "nvidia.com/gpu=all", &mut g));

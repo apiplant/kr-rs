@@ -194,6 +194,38 @@ pub struct Csi {
     reported: RefCell<Option<Vec<String>>>,
     /// CSINode and the node annotation need to be rewritten.
     dirty: Cell<bool>,
+    /// NodeExpandVolume failures per (driver, volume handle): (count, retry not before ms).
+    expand_backoff: RefCell<BTreeMap<(String, String), (u32, u64)>>,
+}
+
+/// The CSI access mode of a PV or claim. A node RPC carries one `VolumeCapability` (the spec has no
+/// list there), so, like upstream, the first listed mode is the one sent.
+fn access_mode(modes: Option<&[Value]>) -> u64 {
+    match modes.and_then(|a| a.first()).and_then(Value::as_str) {
+        Some("ReadOnlyMany") => 3,
+        Some("ReadWriteMany") => 5,
+        Some("ReadWriteOncePod") => 6,
+        _ => 1,
+    }
+}
+
+/// `VolumeCapability`: `block` access type (empty `BlockVolume`) or `mount` (fs type, flags).
+fn capability(w: &mut Writer, field: u32, block: bool, fs_type: &str, flags: &[String], mode: u64) {
+    w.message(field, |w| {
+        if block {
+            w.message(1, |_| {});
+        } else {
+            w.message(2, |w| {
+                w.string(1, fs_type);
+                for f in flags {
+                    w.string(2, f);
+                }
+            });
+        }
+        w.message(3, |w| {
+            w.varint(1, mode);
+        });
+    });
 }
 
 fn list(dir: &str) -> Vec<String> {
@@ -219,7 +251,7 @@ impl Csi {
     }
 
     fn with_root(root: Option<String>, node: &str) -> Rc<Csi> {
-        Rc::new(Csi { root, node: node.to_string(), drivers: RefCell::new(BTreeMap::new()), ignored: RefCell::new(BTreeSet::new()), staged: RefCell::new(BTreeSet::new()), published: RefCell::new(BTreeSet::new()), warned: RefCell::new(BTreeSet::new()), reported: RefCell::new(None), dirty: Cell::new(false) })
+        Rc::new(Csi { root, node: node.to_string(), drivers: RefCell::new(BTreeMap::new()), ignored: RefCell::new(BTreeSet::new()), staged: RefCell::new(BTreeSet::new()), published: RefCell::new(BTreeSet::new()), warned: RefCell::new(BTreeSet::new()), reported: RefCell::new(None), dirty: Cell::new(false), expand_backoff: RefCell::new(BTreeMap::new()) })
     }
 
     /// The kubelet directory when CSI is enabled.
@@ -383,7 +415,10 @@ impl Csi {
     /// Secret referenced by `pv.spec.csi.<key>` as name -> value (empty without a reference).
     async fn secrets<C: Api>(c: &C, pv: &Value, key: &str) -> Result<Vec<(String, String)>, String> {
         let Some(r) = pv.pointer(&["spec", "csi", key]) else { return Ok(Vec::new()) };
-        let (name, ns) = (r.get("name").and_then(Value::as_str).unwrap_or(""), r.get("namespace").and_then(Value::as_str).unwrap_or(""));
+        Self::secret_data(c, r.get("name").and_then(Value::as_str).unwrap_or(""), r.get("namespace").and_then(Value::as_str).unwrap_or("")).await
+    }
+
+    async fn secret_data<C: Api>(c: &C, name: &str, ns: &str) -> Result<Vec<(String, String)>, String> {
         if name.is_empty() || ns.is_empty() {
             return Ok(Vec::new());
         }
@@ -403,18 +438,12 @@ impl Csi {
             return Err("invalid persistent volume or pod".to_string());
         }
         let d = self.driver(&driver)?;
-        if s(&["spec", "volumeMode"]) == "Block" {
-            return Err("block volumes are not supported".to_string());
-        }
+        let block = s(&["spec", "volumeMode"]) == "Block";
         let fs_type = Some(s(&["spec", "csi", "fsType"])).filter(|f| !f.is_empty()).unwrap_or_else(|| "ext4".to_string());
         let ro = claim_readonly || pv.pointer(&["spec", "csi", "readOnly"]).and_then(Value::as_bool).unwrap_or(false);
         let vctx: Vec<(String, String)> = pv.pointer(&["spec", "csi", "volumeAttributes"]).and_then(Value::as_object).unwrap_or(&[]).iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect();
         let flags: Vec<String> = pv.pointer(&["spec", "mountOptions"]).and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(|v| v.as_str().map(String::from)).collect();
-        let mode = match pv.pointer(&["spec", "accessModes"]).and_then(Value::as_array).and_then(|a| a.first()).and_then(Value::as_str) {
-            Some("ReadOnlyMany") => 3u64,
-            Some("ReadWriteMany") => 5,
-            _ => 1,
-        };
+        let mode = access_mode(pv.pointer(&["spec", "accessModes"]).and_then(Value::as_array));
 
         let cd = match c.get(&format!("/apis/storage.k8s.io/v1/csidrivers/{driver}")).await {
             Ok(v) => v,
@@ -436,19 +465,7 @@ impl Csi {
             let sa = pod.pointer(&["spec", "serviceAccountName"]).and_then(Value::as_str).unwrap_or("").to_string();
             pctx.extend([("csi.storage.k8s.io/pod.name".to_string(), m("name")), ("csi.storage.k8s.io/pod.namespace".to_string(), m("namespace")), ("csi.storage.k8s.io/pod.uid".to_string(), uid.to_string()), ("csi.storage.k8s.io/serviceAccount.name".to_string(), sa), ("csi.storage.k8s.io/ephemeral".to_string(), "false".to_string())]);
         }
-        let cap = |w: &mut Writer, field: u32| {
-            w.message(field, |w| {
-                w.message(2, |w| {
-                    w.string(1, &fs_type);
-                    for f in &flags {
-                        w.string(2, f);
-                    }
-                });
-                w.message(3, |w| {
-                    w.varint(1, mode);
-                });
-            });
-        };
+        let cap = |w: &mut Writer, field: u32| capability(w, field, block, &fs_type, &flags, mode);
 
         let mut staging = String::new();
         if d.stage {
@@ -489,6 +506,63 @@ impl Csi {
             self.call(&d, &driver, PUBLISH, w.as_bytes(), SLOW_MS).await?;
             self.published.borrow_mut().insert(key);
         }
+        if block && kr_runtime::devfilter::rule_for(target.as_bytes(), true).is_none() {
+            self.published.borrow_mut().remove(&(uid.to_string(), pv_name.clone())); // publish again next time
+            return Err(format!("CSI {driver} NodePublishVolume did not create a block device at {target}"));
+        }
+        // Offline expansion: a claim that grew while no pod used it is expanded now, before the
+        // container starts (a failure keeps the pod waiting, retried with backoff).
+        let vol_path = if d.stage { staging.as_str() } else { target.as_str() };
+        self.expand_if_needed(c, &d, &driver, &handle, pv, vol_path, &staging, false).await?;
+        Ok(target)
+    }
+
+    /// Ephemeral inline `csi:` volume of `pod`: published (no attach, no stage) at the pod's
+    /// volume directory; the driver must list `Ephemeral` in `volumeLifecycleModes`.
+    pub async fn mount_ephemeral<C: Api>(&self, c: &C, pod: &Value, vol: &Value) -> Result<String, String> {
+        let root = self.root.as_deref().ok_or(DISABLED)?;
+        let name = vol.get("name").and_then(Value::as_str).unwrap_or("");
+        let uid = pod.pointer(&["metadata", "uid"]).and_then(Value::as_str).unwrap_or("");
+        let s = |k: &str| vol.pointer(&["csi", k]).and_then(Value::as_str).unwrap_or("").to_string();
+        let driver = s("driver");
+        if !safe_name(name) || !safe_name(uid) || driver.is_empty() {
+            return Err("invalid inline csi volume".to_string());
+        }
+        let d = self.driver(&driver)?;
+        let cd = c.get(&format!("/apis/storage.k8s.io/v1/csidrivers/{driver}")).await.map_err(|_| format!("CSIDriver {driver} not found: inline volumes need one with volumeLifecycleModes Ephemeral"))?;
+        if !cd.pointer(&["spec", "volumeLifecycleModes"]).and_then(Value::as_array).is_some_and(|m| m.iter().any(|x| x.as_str() == Some("Ephemeral"))) {
+            return Err(format!("CSIDriver {driver} does not support ephemeral inline volumes (volumeLifecycleModes)"));
+        }
+        let handle = format!("csi-{}", sha(&format!("{uid}{name}")));
+        let dir = format!("{root}/pods/{uid}/volumes/kubernetes.io~csi/{name}");
+        let target = format!("{dir}/mount");
+        let key = (uid.to_string(), name.to_string());
+        if !self.published.borrow().contains(&key) {
+            kr_runtime::store::mkdir_p(&dir, 0o750).map_err(|_| format!("cannot create {dir}"))?;
+            let data = format!(r#"{{"driverName":{},"volumeHandle":{},"specVolID":{},"nodeName":{},"ephemeral":true}}"#, q(&driver), q(&handle), q(name), q(&self.node));
+            write_private(&format!("{dir}/vol_data.json"), data.as_bytes()).map_err(|_| format!("cannot write {dir}/vol_data.json"))?;
+            let ns = pod.pointer(&["metadata", "namespace"]).and_then(Value::as_str).unwrap_or("");
+            let sref = vol.pointer(&["csi", "nodePublishSecretRef", "name"]).and_then(Value::as_str).unwrap_or("");
+            let secrets = Self::secret_data(c, sref, ns).await?;
+            let mut ctx: Vec<(String, String)> = vol.pointer(&["csi", "volumeAttributes"]).and_then(Value::as_object).unwrap_or(&[]).iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect();
+            if cd.pointer(&["spec", "podInfoOnMount"]).and_then(Value::as_bool) == Some(true) {
+                let m = |k: &str| pod.pointer(&["metadata", k]).and_then(Value::as_str).unwrap_or("").to_string();
+                let sa = pod.pointer(&["spec", "serviceAccountName"]).and_then(Value::as_str).unwrap_or("").to_string();
+                ctx.extend([("csi.storage.k8s.io/pod.name".to_string(), m("name")), ("csi.storage.k8s.io/pod.namespace".to_string(), m("namespace")), ("csi.storage.k8s.io/pod.uid".to_string(), uid.to_string()), ("csi.storage.k8s.io/serviceAccount.name".to_string(), sa), ("csi.storage.k8s.io/ephemeral".to_string(), "true".to_string())]);
+            }
+            let fs_type = s("fsType");
+            let mut w = Writer::new();
+            w.string(1, &handle);
+            map_field(&mut w, 2, &[]);
+            w.string(3, "").string(4, &target);
+            capability(&mut w, 5, false, &fs_type, &[], 1);
+            w.bool(6, vol.pointer(&["csi", "readOnly"]).and_then(Value::as_bool).unwrap_or(false));
+            map_field(&mut w, 7, &secrets);
+            map_field(&mut w, 8, &ctx);
+            let _ = &d;
+            self.call(&d, &driver, PUBLISH, w.as_bytes(), SLOW_MS).await?;
+            self.published.borrow_mut().insert(key);
+        }
         Ok(target)
     }
 
@@ -499,7 +573,7 @@ impl Csi {
     /// until the unpublish succeeds). Read from disk so it survives a kubelet restart.
     pub fn volumes_in_use(&self) -> Vec<String> {
         let Some(root) = self.root.as_deref() else { return Vec::new() };
-        let mut v: Vec<String> = self.pod_uids().iter().flat_map(|u| Self::entries(root, u)).map(|(_, d, h)| volume_name(&d, &h)).collect();
+        let mut v: Vec<String> = self.pod_uids().iter().flat_map(|u| Self::entries(root, u)).filter(|e| !e.3).map(|(_, d, h, _)| volume_name(&d, &h)).collect();
         v.sort();
         v.dedup();
         v
@@ -519,67 +593,134 @@ impl Csi {
         }
     }
 
-    /// Grows the filesystem of volumes whose claim waits for it: the external-resizer has
-    /// expanded the PV (claim condition `FileSystemResizePending`, PV capacity >= the request)
-    /// and the driver offers EXPAND_VOLUME. After `NodeExpandVolume` the claim's
-    /// `status.capacity` is set and the condition removed. Returns the number expanded.
+    /// Retry delay after `fails` consecutive NodeExpandVolume failures: 2 s doubling up to ~2 min.
+    fn backoff_ms(fails: u32) -> u64 {
+        (2_000u64 << fails.saturating_sub(1).min(6)).min(122_000)
+    }
+
+    /// Runs `NodeExpandVolume` when the claim of `pv` asks for more than `status.capacity` and the
+    /// volume is big enough (the external-resizer is done). `Ok(true)`: expanded and the claim
+    /// status updated; `Ok(false)`: nothing to do (or the claim is not readable); `Err`: failed or
+    /// waiting for the retry backoff. A failure sets the claim condition `NodeResizeError` and an
+    /// event; success removes it. `need_condition`: a filesystem volume of a running pod is only
+    /// grown once the resizer set `FileSystemResizePending` (raw block has no such condition).
+    #[allow(clippy::too_many_arguments)]
+    async fn expand_if_needed<C: Api>(&self, c: &C, d: &Driver, driver: &str, handle: &str, pv: &Value, vol_path: &str, staging: &str, need_condition: bool) -> Result<bool, String> {
+        if !d.expand {
+            return Ok(false);
+        }
+        let g = |k: &str| pv.pointer(&["spec", "claimRef", k]).and_then(Value::as_str).unwrap_or("").to_string();
+        let (ns, claim, pv_name) = (g("namespace"), g("name"), pv.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("").to_string());
+        if !safe_name(&ns) || !safe_name(&claim) {
+            return Ok(false);
+        }
+        let path = format!("/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}");
+        let Ok(pvc) = c.get(&path).await else { return Ok(false) };
+        let conds = pvc.pointer(&["status", "conditions"]).and_then(Value::as_array).unwrap_or(&[]);
+        let has = |t: &str| conds.iter().any(|x| x.get("type").and_then(Value::as_str) == Some(t) && x.get("status").and_then(Value::as_str) == Some("True"));
+        let block = pv.pointer(&["spec", "volumeMode"]).and_then(Value::as_str) == Some("Block");
+        let (Some(want), Some(have)) = (bytes_of(pvc.pointer(&["spec", "resources", "requests", "storage"])), bytes_of(pvc.pointer(&["status", "capacity", "storage"]))) else { return Ok(false) };
+        if want <= have || bytes_of(pv.pointer(&["spec", "capacity", "storage"])).is_none_or(|p| p < want) || (need_condition && !block && !has("FileSystemResizePending")) {
+            return Ok(false);
+        }
+        let key = (driver.to_string(), handle.to_string());
+        let now = kr_rt::exec::now_ms();
+        if let Some((_, next)) = self.expand_backoff.borrow().get(&key) {
+            if now < *next {
+                return Err(format!("expanding volume {pv_name} failed, retrying in {} s", (next - now) / 1000 + 1));
+            }
+        }
+        let fs_type = Some(pv.pointer(&["spec", "csi", "fsType"]).and_then(Value::as_str).unwrap_or("").to_string()).filter(|f| !f.is_empty()).unwrap_or_else(|| "ext4".to_string());
+        let flags: Vec<String> = pv.pointer(&["spec", "mountOptions"]).and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(|v| v.as_str().map(String::from)).collect();
+        let mode = access_mode(pv.pointer(&["spec", "accessModes"]).and_then(Value::as_array));
+        let secrets = Self::secrets(c, pv, "nodeExpandSecretRef").await?;
+        let mut w = Writer::new();
+        w.string(1, handle).string(2, vol_path);
+        w.message(3, |w| {
+            w.varint(1, want);
+        });
+        w.string(4, if d.stage { staging } else { "" });
+        capability(&mut w, 5, block, &fs_type, &flags, mode);
+        map_field(&mut w, 6, &secrets);
+        let others = |drop: &[&str]| -> Vec<String> { conds.iter().filter(|x| !drop.contains(&x.get("type").and_then(Value::as_str).unwrap_or(""))).map(json::to_string).collect() };
+        match self.call(d, driver, EXPAND, w.as_bytes(), SLOW_MS).await {
+            Ok(_) => {
+                self.expand_backoff.borrow_mut().remove(&key);
+                let req = pvc.pointer(&["spec", "resources", "requests", "storage"]).and_then(Value::as_str).unwrap_or("");
+                let p = json::parse(format!(r#"{{"status":{{"capacity":{{"storage":{}}},"conditions":[{}]}}}}"#, q(req), others(&["FileSystemResizePending", "NodeResizeError"]).join(",")).as_bytes()).map_err(|_| "bad patch".to_string())?;
+                c.patch(&format!("{path}/status"), "application/merge-patch+json", &p).await.map_err(|e| format!("cannot update status of persistentvolumeclaim {ns}/{claim} after expanding {pv_name}: {} ({})", e.message, e.code))?;
+                self.event(c, &ns, &claim, pvc.pointer(&["metadata", "uid"]).and_then(Value::as_str).unwrap_or(""), "Normal", "VolumeResizeSuccessful", &format!("NodeExpandVolume succeeded for volume {pv_name}")).await;
+                Ok(true)
+            }
+            Err(e) => {
+                let fails = {
+                    let mut b = self.expand_backoff.borrow_mut();
+                    let n = b.get(&key).map_or(0, |x| x.0) + 1;
+                    b.insert(key, (n, now + Self::backoff_ms(n)));
+                    n
+                };
+                let cond = format!(r#"{{"type":"NodeResizeError","status":"True","lastTransitionTime":{},"reason":"NodeExpandFailed","message":{}}}"#, q(&kr_apiserver::object::rfc3339(now as i64 / 1000)), q(&e));
+                let mut all = others(&["NodeResizeError"]);
+                all.push(cond);
+                if let Ok(p) = json::parse(format!(r#"{{"status":{{"conditions":[{}]}}}}"#, all.join(",")).as_bytes()) {
+                    let _ = c.patch(&format!("{path}/status"), "application/merge-patch+json", &p).await;
+                }
+                if fails == 1 || fails.is_power_of_two() {
+                    self.event(c, &ns, &claim, pvc.pointer(&["metadata", "uid"]).and_then(Value::as_str).unwrap_or(""), "Warning", "VolumeResizeFailed", &e).await;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Best-effort event on a claim.
+    async fn event<C: Api>(&self, c: &C, ns: &str, name: &str, uid: &str, ty: &str, reason: &str, msg: &str) {
+        let at = q(&kr_apiserver::object::rfc3339(kr_rt::exec::now_ms() as i64 / 1000));
+        let body = format!(
+            r#"{{"apiVersion":"v1","kind":"Event","metadata":{{"generateName":{},"namespace":{}}},"involvedObject":{{"apiVersion":"v1","kind":"PersistentVolumeClaim","namespace":{},"name":{},"uid":{}}},"type":{},"reason":{},"message":{},"source":{{"component":"kubelet","host":{}}},"reportingComponent":"kubelet","reportingInstance":{},"firstTimestamp":{at},"lastTimestamp":{at},"count":1}}"#,
+            q(&format!("{name}.")),
+            q(ns),
+            q(ns),
+            q(name),
+            q(uid),
+            q(ty),
+            q(reason),
+            q(msg),
+            q(&self.node),
+            q(&self.node)
+        );
+        if let Ok(ev) = json::parse(body.as_bytes()) {
+            let _ = c.create(&format!("/api/v1/namespaces/{ns}/events"), &ev).await;
+        }
+    }
+
+    /// Grows the volumes of running pods whose claim waits for it (`FileSystemResizePending` set
+    /// by the external-resizer, or a raw block claim whose request exceeds `status.capacity`):
+    /// `NodeExpandVolume`, then the claim's `status.capacity` is set and the condition removed.
+    /// Failures are retried with backoff and shown as the claim condition `NodeResizeError`.
+    /// Volumes nobody has mounted are expanded when a pod mounts them ([`Csi::mount_pv`]).
+    /// Returns the number expanded.
     pub async fn expand_pending<C: Api>(&self, c: &C) -> usize {
         let Some(root) = self.root.as_deref() else { return 0 };
         let mut done: BTreeSet<(String, String)> = BTreeSet::new();
         for uid in self.pod_uids() {
-            for (pv_name, driver, handle) in Self::entries(root, &uid) {
+            for (pv_name, driver, handle, eph) in Self::entries(root, &uid) {
                 let key = (driver.clone(), handle.clone());
                 let Ok(d) = self.driver(&driver) else { continue };
-                if !d.expand || done.contains(&key) {
+                if eph || !d.expand || done.contains(&key) {
                     continue;
                 }
                 let Ok(pv) = c.get(&format!("/api/v1/persistentvolumes/{pv_name}")).await else { continue };
-                let g = |k: &str| pv.pointer(&["spec", "claimRef", k]).and_then(Value::as_str).unwrap_or("").to_string();
-                let (ns, claim) = (g("namespace"), g("name"));
-                if !safe_name(&ns) || !safe_name(&claim) {
-                    continue;
-                }
-                let path = format!("/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}");
-                let Ok(pvc) = c.get(&path).await else { continue };
-                let conds = pvc.pointer(&["status", "conditions"]).and_then(Value::as_array).unwrap_or(&[]);
-                let pending = conds.iter().any(|x| x.get("type").and_then(Value::as_str) == Some("FileSystemResizePending") && x.get("status").and_then(Value::as_str) == Some("True"));
-                let (Some(want), Some(have)) = (bytes_of(pvc.pointer(&["spec", "resources", "requests", "storage"])), bytes_of(pvc.pointer(&["status", "capacity", "storage"]))) else { continue };
-                if !pending || want <= have || bytes_of(pv.pointer(&["spec", "capacity", "storage"])).is_none_or(|p| p < want) {
-                    continue;
-                }
                 let base = format!("{root}/pods/{uid}/volumes/kubernetes.io~csi/{pv_name}");
                 let staging = format!("{root}/plugins/kubernetes.io/csi/{driver}/{}/globalmount", sha(&handle));
                 let vol_path = if d.stage { staging.clone() } else { format!("{base}/mount") };
-                let fs_type = Some(pv.pointer(&["spec", "csi", "fsType"]).and_then(Value::as_str).unwrap_or("").to_string()).filter(|f| !f.is_empty()).unwrap_or_else(|| "ext4".to_string());
-                let mut w = Writer::new();
-                w.string(1, &handle).string(2, &vol_path);
-                w.message(3, |w| {
-                    w.varint(1, want);
-                });
-                w.string(4, if d.stage { &staging } else { "" });
-                w.message(5, |w| {
-                    w.message(2, |w| {
-                        w.string(1, &fs_type);
-                    });
-                    w.message(3, |w| {
-                        w.varint(1, 1);
-                    });
-                });
-                let Ok(secrets) = Self::secrets(c, &pv, "nodeExpandSecretRef").await else { continue };
-                map_field(&mut w, 6, &secrets);
-                if let Err(e) = self.call(&d, &driver, EXPAND, w.as_bytes(), SLOW_MS).await {
-                    self.warn(&e);
-                    continue;
-                }
-                let rest: Vec<String> = conds.iter().filter(|x| x.get("type").and_then(Value::as_str) != Some("FileSystemResizePending")).map(json::to_string).collect();
-                let req = pvc.pointer(&["spec", "resources", "requests", "storage"]).and_then(Value::as_str).unwrap_or("");
-                let Ok(p) = json::parse(format!(r#"{{"status":{{"capacity":{{"storage":{}}},"conditions":[{}]}}}}"#, q(req), rest.join(",")).as_bytes()) else { continue };
-                match c.patch(&format!("{path}/status"), "application/merge-patch+json", &p).await {
-                    Ok(_) => {
+                match self.expand_if_needed(c, &d, &driver, &handle, &pv, &vol_path, &staging, true).await {
+                    Ok(true) => {
                         done.insert(key);
                     }
+                    Ok(false) => {}
                     Err(e) => {
-                        self.warn(&format!("cannot update status of persistentvolumeclaim {ns}/{claim} after expanding {pv_name}: {} ({})", e.message, e.code));
+                        self.warn(&e);
                     }
                 }
             }
@@ -601,7 +742,10 @@ impl Csi {
         let Some(root) = self.root.as_deref() else { return Vec::new() };
         let mut out = Vec::new();
         for uid in self.pod_uids() {
-            for (pv, driver, handle) in Self::entries(root, &uid) {
+            for (pv, driver, handle, eph) in Self::entries(root, &uid) {
+                if eph {
+                    continue;
+                }
                 let target = format!("{root}/pods/{uid}/volumes/kubernetes.io~csi/{pv}/mount");
                 let mut s = VolumeStats { pod_uid: uid.clone(), pv, ..Default::default() };
                 let via_driver = match self.driver(&driver) {
@@ -634,7 +778,7 @@ impl Csi {
     // -------------------------------------------------------------- unmounting
 
     /// Every (pv dir name, driver, handle) recorded under a pod.
-    fn entries(root: &str, uid: &str) -> Vec<(String, String, String)> {
+    fn entries(root: &str, uid: &str) -> Vec<(String, String, String, bool)> {
         let base = format!("{root}/pods/{uid}/volumes/kubernetes.io~csi");
         list(&base)
             .into_iter()
@@ -643,7 +787,7 @@ impl Csi {
                 let b = kr_sys::fs::read_file(format!("{base}/{n}/vol_data.json\0").as_bytes(), 1 << 16).ok()?;
                 let v = json::parse(&b).ok()?;
                 let g = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-                Some((n, g("driverName"), g("volumeHandle")))
+                Some((n, g("driverName"), g("volumeHandle"), v.get("ephemeral").and_then(Value::as_bool) == Some(true)))
             })
             .collect()
     }
@@ -657,7 +801,7 @@ impl Csi {
         }
         let base = format!("{root}/pods/{uid}/volumes/kubernetes.io~csi");
         let mut unstaged: BTreeSet<(String, String)> = BTreeSet::new();
-        for (pv, driver, handle) in Self::entries(root, uid) {
+        for (pv, driver, handle, eph) in Self::entries(root, uid) {
             let Some(d) = self.wait_driver(&driver).await else {
                 self.warn(&format!("CSI driver {driver} is not registered; cannot unmount volume {pv} of pod {uid}"));
                 continue;
@@ -670,12 +814,14 @@ impl Csi {
                 continue;
             }
             self.published.borrow_mut().remove(&(uid.to_string(), pv.clone()));
+            // A block volume's publish target is a file (a mount point or device node).
+            let _ = kr_sys::fs::unlinkat(kr_sys::fs::AT_FDCWD, format!("{target}\0").as_bytes(), 0);
             if !rmdir(&target) && kr_sys::fs::newfstatat(kr_sys::fs::AT_FDCWD, format!("{target}\0").as_bytes(), kr_sys::fs::AT_SYMLINK_NOFOLLOW).is_ok() {
                 self.warn(&format!("cannot remove {target}"));
                 continue;
             }
             let key = (driver.clone(), handle.clone());
-            if d.stage && !unstaged.contains(&key) && !self.in_use(root, uid, &driver, &handle) {
+            if d.stage && !eph && !unstaged.contains(&key) && !self.in_use(root, uid, &driver, &handle) {
                 let parent = format!("{root}/plugins/kubernetes.io/csi/{driver}/{}", sha(&handle));
                 let staging = format!("{parent}/globalmount");
                 let mut w = Writer::new();
@@ -709,7 +855,7 @@ impl Csi {
 
     /// Whether a pod other than `uid` still has the volume published.
     fn in_use(&self, root: &str, uid: &str, driver: &str, handle: &str) -> bool {
-        list(&format!("{root}/pods")).iter().filter(|p| safe_name(p) && *p != uid).any(|p| Self::entries(root, p).iter().any(|(_, d, h)| d == driver && h == handle))
+        list(&format!("{root}/pods")).iter().filter(|p| safe_name(p) && *p != uid).any(|p| Self::entries(root, p).iter().any(|(_, d, h, _)| d == driver && h == handle))
     }
 }
 
@@ -739,6 +885,9 @@ mod tests {
         p.to_str().unwrap().into()
     }
 
+    static LINK_TARGET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    static FAIL_EXPAND: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
     type Calls = Rc<RefCell<Vec<(String, Vec<u8>)>>>;
 
     fn fake_driver(path: &str, stage: bool) -> Calls {
@@ -757,7 +906,7 @@ mod tests {
             Rc::new(move |m: String, req: Vec<u8>, r: Responder| {
                 let rec = rec.clone();
                 async move {
-                    rec.borrow_mut().push((m.clone(), req));
+                    rec.borrow_mut().push((m.clone(), req.clone()));
                     let mut w = Writer::new();
                     match m.as_str() {
                         GET_INFO => {
@@ -782,6 +931,15 @@ mod tests {
                                     });
                                 });
                             }
+                        }
+                        PUBLISH if LINK_TARGET.load(core::sync::atomic::Ordering::SeqCst) => {
+                            // A "block device" for the test: a link to /dev/null at the target path.
+                            let t = field(&req, 4);
+                            let _ = kr_sys::fs::unlinkat(kr_sys::fs::AT_FDCWD, format!("{t}\0").as_bytes(), 0);
+                            let _ = kr_sys::fs::symlinkat(b"/dev/null\0", kr_sys::fs::AT_FDCWD, format!("{t}\0").as_bytes());
+                        }
+                        EXPAND if FAIL_EXPAND.load(core::sync::atomic::Ordering::SeqCst) => {
+                            return r.finish(Status::new(13, "disk is busy")).await;
                         }
                         STATS => {
                             for (unit, v) in [(1, [400, 1000, 600]), (2, [90, 100, 10])] {
@@ -1084,6 +1242,117 @@ mod tests {
             let l = fake.log.borrow().iter().find(|l| l.0 == "patch" && l.1.ends_with("/status") && l.1.contains("persistentvolumeclaims")).unwrap().clone();
             assert_eq!(l.2, r#"{"status":{"capacity":{"storage":"2Gi"},"conditions":[{"type":"Other","status":"True"}]}}"#);
             csi.unmount_pod("u1").await;
+        });
+    }
+
+    fn expand_fixture(name: &str, vmode: &str) -> (String, Calls, Rc<Csi>, Fake, String) {
+        let root = tmpdir(name);
+        let calls = fake_driver_with(&format!("{root}/plugins_registry/fake.sock"), &[1, 3], 0);
+        let csi = Csi::with_root(Some(root.clone()), "node1");
+        let mut fake = Fake::default();
+        fake.objs.insert("/apis/storage.k8s.io/v1/csidrivers/fake.csi".into(), obj(r#"{"spec":{"attachRequired":false}}"#));
+        let pvj = format!(r#"{{"metadata":{{"name":"pvc-1"}},"spec":{{"volumeMode":"{vmode}","capacity":{{"storage":"2Gi"}},"accessModes":["ReadWriteOncePod"],"claimRef":{{"namespace":"ns","name":"data"}},"csi":{{"driver":"fake.csi","volumeHandle":"vol-1","fsType":"xfs"}}}}}}"#);
+        fake.objs.insert("/api/v1/persistentvolumes/pvc-1".into(), obj(&pvj));
+        fake.objs.insert("/api/v1/namespaces/ns/persistentvolumeclaims/data".into(), obj(r#"{"metadata":{"uid":"cu"},"spec":{"resources":{"requests":{"storage":"2Gi"}}},"status":{"capacity":{"storage":"1Gi"},"conditions":[{"type":"FileSystemResizePending","status":"True"}]}}"#));
+        (root, calls, csi, fake, pvj)
+    }
+
+    #[test]
+    fn offline_expansion_on_mount_then_failures_back_off_with_a_resize_error_condition() {
+        let _g = lock();
+        let (_root, calls, csi, fake, pvj) = expand_fixture("offline", "Filesystem");
+        block_on(async move {
+            csi.tick().await;
+            // Nothing mounted before: the grown claim is expanded while the volume is staged.
+            FAIL_EXPAND.store(true, core::sync::atomic::Ordering::SeqCst);
+            let e = csi.mount_pv(&fake, &pod("u1"), &obj(&pvj), false).await.unwrap_err();
+            assert!(e.contains("NodeExpandVolume failed") && e.contains("disk is busy"), "{e}");
+            let log = fake.log.borrow().clone();
+            let cond = log.iter().find(|l| l.0 == "patch" && l.2.contains("NodeResizeError")).expect("condition patched");
+            assert!(cond.2.contains(r#""reason":"NodeExpandFailed""#) && cond.2.contains("FileSystemResizePending"), "{}", cond.2);
+            assert!(log.iter().any(|l| l.0 == "create" && l.1.ends_with("/events") && l.2.contains("VolumeResizeFailed") && l.2.contains(r#""kind":"PersistentVolumeClaim""#)));
+            // Within the backoff window the driver is not called again.
+            let n = calls.borrow().iter().filter(|c| c.0 == EXPAND).count();
+            assert!(csi.mount_pv(&fake, &pod("u1"), &obj(&pvj), false).await.unwrap_err().contains("retrying in"));
+            assert_eq!(calls.borrow().iter().filter(|c| c.0 == EXPAND).count(), n);
+            // After the delay, a working driver succeeds: capacity set, error condition gone, ReadWriteOncePod sent as SINGLE_NODE_SINGLE_WRITER.
+            FAIL_EXPAND.store(false, core::sync::atomic::Ordering::SeqCst);
+            csi.expand_backoff.borrow_mut().clear();
+            csi.mount_pv(&fake, &pod("u1"), &obj(&pvj), false).await.unwrap();
+            let req = calls.borrow().iter().rev().find(|c| c.0 == EXPAND).unwrap().1.clone();
+            let cap = fields(&req).into_iter().find(|f| f.0 == 5).unwrap().1;
+            assert_eq!(field(&fields(&cap).into_iter().find(|f| f.0 == 3).unwrap().1, 1), "6");
+            let ok = fake.log.borrow().iter().rev().find(|l| l.0 == "patch" && l.2.contains(r#""capacity""#)).unwrap().clone();
+            assert_eq!(ok.2, r#"{"status":{"capacity":{"storage":"2Gi"},"conditions":[]}}"#);
+            assert!(csi.expand_backoff.borrow().is_empty());
+            csi.unmount_pod("u1").await;
+        });
+        assert!(backoff_series());
+    }
+
+    fn backoff_series() -> bool {
+        [1, 2, 3, 7, 20].map(Csi::backoff_ms) == [2_000, 4_000, 8_000, 122_000, 122_000]
+    }
+
+    #[test]
+    fn raw_block_volume_is_staged_published_as_a_device_expanded_and_unlinked() {
+        let _g = lock();
+        let (root, calls, csi, mut fake, pvj) = expand_fixture("block", "Block");
+        // A block claim has no FileSystemResizePending condition: the larger request is enough.
+        fake.objs.insert("/api/v1/namespaces/ns/persistentvolumeclaims/data".into(), obj(r#"{"metadata":{"uid":"cu"},"spec":{"resources":{"requests":{"storage":"2Gi"}}},"status":{"capacity":{"storage":"1Gi"}}}"#));
+        block_on(async move {
+            csi.tick().await;
+            // The driver creates no device node: the pod must not start with a missing device.
+            LINK_TARGET.store(false, core::sync::atomic::Ordering::SeqCst);
+            let e = csi.mount_pv(&fake, &pod("u1"), &obj(&pvj), false).await.unwrap_err();
+            assert!(e.contains("did not create a block device"), "{e}");
+            LINK_TARGET.store(true, core::sync::atomic::Ordering::SeqCst);
+            let t = csi.mount_pv(&fake, &pod("u1"), &obj(&pvj), false).await.unwrap();
+            assert_eq!(t, format!("{root}/pods/u1/volumes/kubernetes.io~csi/pvc-1/mount"));
+            // The publish capability has the block access type (field 1) and no mount type (field 2).
+            let publish = calls.borrow().iter().find(|c| c.0 == PUBLISH).unwrap().1.clone();
+            let cap = fields(&fields(&publish).into_iter().find(|f| f.0 == 5).unwrap().1);
+            assert!(cap.iter().any(|f| f.0 == 1) && !cap.iter().any(|f| f.0 == 2));
+            // Expanded as a block capability.
+            let ex = calls.borrow().iter().find(|c| c.0 == EXPAND).unwrap().1.clone();
+            let cap = fields(&fields(&ex).into_iter().find(|f| f.0 == 5).unwrap().1);
+            assert!(cap.iter().any(|f| f.0 == 1) && !cap.iter().any(|f| f.0 == 2));
+            // Unmount removes the file (not only directories).
+            csi.unmount_pod("u1").await;
+            assert!(kr_sys::fs::newfstatat(kr_sys::fs::AT_FDCWD, format!("{t}\0").as_bytes(), kr_sys::fs::AT_SYMLINK_NOFOLLOW).is_err());
+            LINK_TARGET.store(false, core::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
+    #[test]
+    fn inline_ephemeral_volume_is_published_without_attach_or_stage_and_not_reported_in_use() {
+        let _g = lock();
+        let root = tmpdir("inline");
+        let calls = fake_driver(&format!("{root}/plugins_registry/fake.sock"), true);
+        let csi = Csi::with_root(Some(root.clone()), "node1");
+        let mut fake = Fake::default();
+        let vol = obj(r#"{"name":"scratch","csi":{"driver":"fake.csi","fsType":"ext4","readOnly":true,"volumeAttributes":{"size":"1Gi"},"nodePublishSecretRef":{"name":"s"}}}"#);
+        block_on(async move {
+            csi.tick().await;
+            // The driver is not ephemeral-capable, or has no CSIDriver at all.
+            assert!(csi.mount_ephemeral(&fake, &pod("u1"), &vol).await.unwrap_err().contains("CSIDriver"));
+            fake.objs.insert("/apis/storage.k8s.io/v1/csidrivers/fake.csi".into(), obj(r#"{"spec":{"volumeLifecycleModes":["Persistent"]}}"#));
+            assert!(csi.mount_ephemeral(&fake, &pod("u1"), &vol).await.unwrap_err().contains("does not support ephemeral"));
+            fake.objs.insert("/apis/storage.k8s.io/v1/csidrivers/fake.csi".into(), obj(r#"{"spec":{"attachRequired":true,"podInfoOnMount":true,"volumeLifecycleModes":["Persistent","Ephemeral"]}}"#));
+            fake.objs.insert("/api/v1/namespaces/ns/secrets/s".into(), obj(r#"{"data":{"k":"dg=="}}"#));
+            let t = csi.mount_ephemeral(&fake, &pod("u1"), &vol).await.unwrap();
+            assert!(t.ends_with("/pods/u1/volumes/kubernetes.io~csi/scratch/mount"));
+            assert_eq!(names(&calls).iter().filter(|n| *n == "NodePublishVolume").count(), 1);
+            assert!(!names(&calls).contains(&"NodeStageVolume".to_string()));
+            let req = calls.borrow().iter().find(|c| c.0 == PUBLISH).unwrap().1.clone();
+            assert!(field(&req, 1).starts_with("csi-") && field(&req, 3).is_empty() && field(&req, 4) == t);
+            let ctx = kv_of(&req, 8);
+            assert!(ctx.contains(&("size".into(), "1Gi".into())) && ctx.contains(&("csi.storage.k8s.io/ephemeral".into(), "true".into())) && ctx.contains(&("csi.storage.k8s.io/pod.name".into(), "p-u1".into())));
+            assert_eq!(kv_of(&req, 7), [("k".to_string(), "v".to_string())]);
+            assert!(csi.volumes_in_use().is_empty(), "inline volumes are not attached");
+            csi.unmount_pod("u1").await;
+            let n = names(&calls);
+            assert!(n.contains(&"NodeUnpublishVolume".to_string()) && !n.contains(&"NodeUnstageVolume".to_string()), "{n:?}");
         });
     }
 }
