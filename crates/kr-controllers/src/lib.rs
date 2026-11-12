@@ -46,8 +46,10 @@ pub mod deployment;
 pub mod disruption;
 pub mod endpoints;
 pub mod gc;
+pub mod helm;
 pub mod hpa;
 pub mod job;
+pub mod manifests;
 pub mod mirror;
 pub mod attachdetach;
 pub mod crd;
@@ -90,6 +92,8 @@ pub struct Config {
     pub hpa_ms: u64,
     /// Components turned off with `--disable` (ADR-060).
     pub disabled: kr_apiserver::components::Disabled,
+    /// Image of the Jobs the Helm controller runs (`None`: [`helm::DEFAULT_IMAGE`]).
+    pub helm_image: Option<&'static str>,
 }
 
 fn zero_clock() -> i64 {
@@ -98,7 +102,7 @@ fn zero_clock() -> i64 {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { resync_ms: 30_000, gc_ms: 5_000, backoff_ms: 1_000, retry_ms: 5_000, job_backoff_ms: 10_000, now: zero_clock, evict: nodelifecycle::Limits::default(), hpa_ms: 15_000, disabled: Default::default() }
+        Config { resync_ms: 30_000, gc_ms: 5_000, backoff_ms: 1_000, retry_ms: 5_000, job_backoff_ms: 10_000, now: zero_clock, evict: nodelifecycle::Limits::default(), hpa_ms: 15_000, disabled: Default::default(), helm_image: None }
     }
 }
 
@@ -141,6 +145,9 @@ pub async fn run_all_with_ca<C: Client + Clone + 'static>(c: C, cfg: Config, ca:
     if !cfg.disabled.servicelb {
         guard.0.push(spawn(servicelb::run(c.clone(), cfg)));
     }
+    if !cfg.disabled.helm_controller {
+        guard.0.push(spawn(helm::run(c.clone(), cfg)));
+    }
     if let Some(ca) = ca {
         guard.0.push(spawn(csr::run(c, cfg, ca)));
     }
@@ -157,3 +164,5 @@ mod tests;
 mod tests_workloads;
 #[cfg(test)]
 mod tests_pvc;
+#[cfg(test)]
+mod tests_helm;

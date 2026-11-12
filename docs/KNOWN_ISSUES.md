@@ -12,8 +12,6 @@ Ordered by impact. Size: S days, M a week or two, L more.
     Left in the kernel datapath: linear rules (hundreds of Services fine), no SCTP.
 189. **HA key sync: remaining gaps** (+156, +177, +188) — *ADR-058*, S
     The CA, service-account key and encryption config now replicate through the Raft log (RESOLVED 320). Left: the Docker script `tools/test/ha.sh keysync` has not been run; HTTPS/Raft listeners need a rolling restart after a CA step (no hot reload of listener trust); `finish` of a CA rotation cannot tell whether every node renewed its certificates (hence `--yes`); `secrets-encrypt status` has no per-key object counts for the cluster; `kr pki rotate` without `admin.kubeconfig` assumes port 6443 unless `--port`.
-154. **Helm controller** — *ADR-043*, M
-    k3s ships a `HelmChart`/`HelmChartConfig` controller; kr's `<data dir>/manifests` applies plain YAML/JSON only, so charts must be rendered with `helm template`. Applied objects are never deleted when their file goes away (the `kr.io/manifest-file` annotation records the origin). Once this exists, shipping an optional ingress (k3s packages Traefik as a HelmChart) becomes cheap: see #151 and ADR-045.
 11. **aarch64 on real hardware, and CI** — L
     k3s ships arm64 as a first-class target. Cross-built kr binaries run only under qemu-user (`tools/test/aarch64.sh`), where namespaces, cgroups, clone3 and mounts do not work, so the kubelet/runtime/apiserver paths have never run on aarch64. Needs a real arm64 host and a CI job.
 136. **CSI: driver volume statistics** — *ADR-041*, S
@@ -40,6 +38,8 @@ Ordered by impact. Size: S days, M a week or two, L more.
 
 # B. Verification backlog (code exists, not run on real systems)
 Each is a test run, not new code, unless the run finds a bug.
+
+- **#154 Helm controller (ADR-061) with a real cluster**: the controller's Jobs, supporting objects, upgrade on change and uninstall run in the in-process scenario tests with a fake kubelet; never run: an actual `rancher/klipper-helm` Job (the entrypoint contract of env, args and `/config`, `/chart`, `/auth`, `/ca-file` mounts is reproduced from k3s's helm-controller from memory), install from a repository, from `chartContent`, with `authSecret` / `repoCA`, `bootstrap: true` before a CNI is up, a failing uninstall, a HelmChart dropped into `manifests/` on a live server, and pruning after file removal across a server restart.
 
 - **#318 install-time configuration (ADR-060)**: config file merge, taint/label parsing, and the registration patch are unit-tested; not run on a live cluster: the API server certificate re-issue after a `--tls-san` change (clients connecting by the new name), `--node-label`/`--node-taint` on a real join and after a config change, `--node-ip` on a multi-homed host, and `--disable` of each component (coredns, network-policy, metrics-server, servicelb, local-storage) observed in a running cluster.
 
@@ -127,7 +127,7 @@ Nothing to do unless the stated trigger happens.
 144. **Pod network families: changes and IPv6-only hosts** — *ADR-032, ADR-034*
     Changing `KR_POD_FAMILIES` needs every agent restarted and loses existing pods (as in k3s); IPv6-only pods need host IPv6 for NAT66; host-gw routes IPv6 pod subnets only on an IPv6 underlay.
 151. **No bundled Ingress controller** — *ADR-045*
-    k3s ships Traefik; kr does not by design: install one as a workload. Revisit once the Helm controller (#154) exists, which makes an optional packaged chart cheap.
+    k3s ships Traefik; kr does not by design: install one as a workload. The Helm controller now exists (RESOLVED 331), so an optional packaged chart is cheap: revisit if asked for.
 167. **Unhealthy-device eviction deletes bare pods** — *ADR-038*
     Goes beyond upstream (which only lowers allocatable); chosen by the user. After `KR_DEVICE_UNHEALTHY_GRACE` (30 s) the eviction API removes the pod, a PDB can hold it for `KR_DEVICE_UNHEALTHY_PDB_WAIT` (600 s, RESOLVED 252). Bare pods are gone. Live run in section B.
 174b. **ServiceLB corners shared with k3s** — *ADR-042*

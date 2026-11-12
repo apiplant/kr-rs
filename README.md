@@ -140,6 +140,7 @@ Numbers will vary with hardware; the commands to reproduce them are in `tools/te
 ## Features
 
 **Control plane**
+- Helm controller: `HelmChart` / `HelmChartConfig` (`helm.cattle.io/v1`) like k3s, run as a `rancher/klipper-helm` Job (`--helm-job-image` to change the image, `--disable helm-controller` to turn off); drop HelmChart YAML into `<data dir>/manifests`, which also deletes what a removed file created
 - Kubernetes API v1.37: core, apps, batch, autoscaling, policy, networking, storage, RBAC, certificates, coordination, discovery, flowcontrol, scheduling, resource (DRA), events and more, served as JSON and protobuf, with watches, chunked lists, Tables and aggregated discovery
 - Embedded datastore (append-only log with MVCC revisions, compaction, optional Raft replication for 3 or more servers) instead of etcd
 - Server-side apply with managed fields, strategic merge and JSON patch, field validation, defaulting

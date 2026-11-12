@@ -404,6 +404,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
     let (mut audit_legacy, mut audit_age) = (false, 0u64);
     let (mut join_url, mut token, mut token_file): (Option<String>, Option<String>, Option<String>) = (None, None, None);
     let mut inst = crate::install::Install::default();
+    let mut helm_image: Option<String> = None;
     while let Some(a) = args.next() {
         // `--flag=value` and `--flag value` are both accepted.
         let (a, inline) = match a.iter().position(|&c| c == b'=') {
@@ -454,7 +455,8 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
             (b"--audit-log-maxage", Some(v)) => audit_age = v.parse().unwrap_or(u64::MAX),
             (b"--audit-log-format", Some(v)) if v == "json" || v == "legacy" => audit_legacy = v == "legacy",
             (b"--pod-security-config", Some(v)) => psa_config = Some(String::from(v)),
-            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h [--snapshot-keep 5]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--pod-security-config FILE] [--config FILE] [--tls-san NAME]... [--node-name NAME] [--node-label K=V]... [--node-taint K=V:EFFECT]... [--node-ip IP] [--node-external-ip IP] [--disable COMPONENT]..."),
+            (b"--helm-job-image", Some(v)) => helm_image = Some(String::from(v)),
+            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h [--snapshot-keep 5]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--pod-security-config FILE] [--config FILE] [--tls-san NAME]... [--node-name NAME] [--node-label K=V]... [--node-taint K=V:EFFECT]... [--node-ip IP] [--node-external-ip IP] [--disable COMPONENT]... [--helm-job-image IMAGE]"),
         }
     }
     if let Err(e) = crate::install::publish(&inst) {
@@ -641,12 +643,12 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
     let snapshot_data = data.clone();
     let data_for_sync = data.clone();
     let manifest_client = kr_apiserver::client::InProcess::new(api.clone(), "manifests");
-    let manifest_dir = crate::manifests::dir(&data);
+    let manifest_dir = kr_controllers::manifests::dir(&data);
     match kr_rt::exec::block_on(async move {
         if let Some(a) = auditor {
             kr_apiserver::audit::spawn_flusher(a);
         }
-        let cfg = kr_controllers::Config { now: pki::now, evict: kr_controllers::nodelifecycle::Limits::from_lookup(kr_runtime::store::env_var), disabled, ..kr_controllers::Config::default() };
+        let cfg = kr_controllers::Config { now: pki::now, evict: kr_controllers::nodelifecycle::Limits::from_lookup(kr_runtime::store::env_var), disabled, helm_image: helm_image.clone().or_else(|| kr_runtime::store::env_var("KR_HELM_JOB_IMAGE").filter(|v| !v.is_empty())).map(|i| &*alloc::boxed::Box::leak(i.into_boxed_str())), ..kr_controllers::Config::default() };
         // The CSR approver/signer issues with the cluster CA (absent: it does not run).
         let csr_ca = pki::load_ca(&pki_dir).ok().map(|(name, key, _)| Rc::new(kr_controllers::csr::CaSigner { name, key, rng }));
         match ha_tasks {
@@ -664,11 +666,11 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
                 }
                 // Exactly one copy of the controllers and the scheduler: on the leader.
                 kr_rt::exec::spawn(c.clone().while_leader(move || kr_controllers::run_all_with_ca(controllers.clone(), cfg, csr_ca.clone())));
-                kr_rt::exec::spawn(c.while_leader(move || crate::manifests::run(manifest_client.clone(), manifest_dir.clone())));
+                kr_rt::exec::spawn(c.while_leader(move || kr_controllers::manifests::run(manifest_client.clone(), manifest_dir.clone())));
             }
             None => {
                 kr_rt::exec::spawn(kr_controllers::run_all_with_ca(controllers, cfg, csr_ca));
-                kr_rt::exec::spawn(crate::manifests::run(manifest_client, manifest_dir));
+                kr_rt::exec::spawn(kr_controllers::manifests::run(manifest_client, manifest_dir));
             }
         }
         if let Some(every) = snap_every {

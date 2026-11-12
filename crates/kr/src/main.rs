@@ -9,7 +9,6 @@ mod ctr_import;
 mod ctr_rmi;
 mod install;
 mod keysync;
-mod manifests;
 mod offload;
 mod pki;
 mod rotate;

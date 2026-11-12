@@ -45,6 +45,7 @@ dependencies = [
  "kr-fmt",
  "kr-rt",
  "kr-store",
+ "kr-sys",
 ]
 
 [[package]]
