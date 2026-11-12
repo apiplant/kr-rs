@@ -999,6 +999,7 @@ impl ApiServer {
 
     /// Like [`Self::handle`], with the `fieldValidation` warnings returned apart from the reply.
     pub fn handle_w(&self, req: &Req) -> (Reply, Vec<String>) {
+        kr_rt::exec::detail(req.method, req.path); // named in stall reports
         let write = matches!(req.method, "POST" | "PUT" | "PATCH");
         let mode = if write { crate::fieldval::Mode::parse(Query::parse(req.query).ok().as_ref().and_then(|q| q.get("fieldValidation"))) } else { crate::fieldval::Mode::Ignore };
         self.fv_mode.set(mode);
