@@ -20,6 +20,7 @@ pub mod field25519;
 pub mod hmac;
 pub mod p256;
 mod p256_table;
+pub mod resume;
 pub mod rsa;
 pub mod sha2;
 pub mod tls;

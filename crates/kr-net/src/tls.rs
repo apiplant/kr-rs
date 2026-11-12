@@ -9,6 +9,9 @@ use crate::tcp::{self, Resolver};
 use crate::{Error, Result};
 use alloc::rc::Rc;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, Ordering};
+use kr_crypto::resume::{SessionCache, SessionHooks, TicketHooks, TicketKeys};
 use kr_crypto::tls::{ClientConfig, Connection, ServerConfig};
 use kr_rt::exec::Async;
 use kr_sys::Fd;
@@ -19,6 +22,48 @@ fn rng(buf: &mut [u8]) {
 
 fn unix_now() -> i64 {
     kr_sys::clock_gettime(0).map(|t| t.tv_sec as i64).unwrap_or(0) // CLOCK_REALTIME
+}
+
+/// A value behind a spin lock: the process-wide resumption state (ADR-051) must be a `static`,
+/// and `kr-crypto` keeps no global state. The critical sections are a few microseconds and never
+/// call back into this module, so contention (tests with threads) is harmless.
+struct Spin<T> {
+    lock: AtomicBool,
+    v: UnsafeCell<T>,
+}
+
+// SAFETY: access to `v` is serialised by `lock`.
+unsafe impl<T: Send> Sync for Spin<T> {}
+
+impl<T> Spin<T> {
+    const fn new(v: T) -> Spin<T> {
+        Spin { lock: AtomicBool::new(false), v: UnsafeCell::new(v) }
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        while self.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        // SAFETY: the lock is held, so this is the only reference.
+        let r = f(unsafe { &mut *self.v.get() });
+        self.lock.store(false, Ordering::Release);
+        r
+    }
+}
+
+/// Ticket keys of this process (servers): a restart invalidates every ticket, which only costs a
+/// full handshake.
+static TICKET_KEYS: Spin<TicketKeys> = Spin::new(TicketKeys::new());
+/// Tickets received from servers (clients).
+static SESSIONS: Spin<SessionCache> = Spin::new(SessionCache::new());
+static RESUMPTION: AtomicBool = AtomicBool::new(true);
+
+const TICKET_HOOKS: TicketHooks = TicketHooks { seal: |p, now| TICKET_KEYS.with(|k| k.seal(p, now, rng)), open: |t| TICKET_KEYS.with(|k| k.open(t)) };
+const SESSION_HOOKS: SessionHooks = SessionHooks { put: |k, s| SESSIONS.with(|c| c.put(k, s)), take: |k, now| SESSIONS.with(|c| c.take(k, now)) };
+
+/// Turns TLS 1.3 session resumption (ADR-051) on or off for connections made afterwards; on by default.
+pub fn set_resumption(enabled: bool) {
+    RESUMPTION.store(enabled, Ordering::Relaxed);
 }
 
 /// A TLS connection over an inner transport.
@@ -33,7 +78,11 @@ pub struct TlsStream<T: Transport> {
 impl<T: Transport> TlsStream<T> {
     /// Client handshake to `server_name` (also checked against the certificate).
     pub async fn connect(inner: T, cfg: Rc<ClientConfig>, server_name: &str) -> Result<Self> {
-        let conn = Connection::client(cfg, server_name.as_bytes(), rng, unix_now());
+        let conn = if RESUMPTION.load(Ordering::Relaxed) {
+            Connection::client_with_sessions(cfg, server_name.as_bytes(), SESSION_HOOKS, rng, unix_now())
+        } else {
+            Connection::client(cfg, server_name.as_bytes(), rng, unix_now())
+        };
         Self::handshake(inner, conn).await
     }
 
@@ -45,7 +94,12 @@ impl<T: Transport> TlsStream<T> {
 
     /// Server handshake on an accepted connection.
     pub async fn accept(inner: T, cfg: Rc<ServerConfig>) -> Result<Self> {
-        Self::handshake(inner, Connection::server(cfg, rng, unix_now())).await
+        let conn = if RESUMPTION.load(Ordering::Relaxed) {
+            Connection::server_with_tickets(cfg, TICKET_HOOKS, rng, unix_now())
+        } else {
+            Connection::server(cfg, rng, unix_now())
+        };
+        Self::handshake(inner, conn).await
     }
 
     async fn handshake(inner: T, conn: Connection) -> Result<Self> {

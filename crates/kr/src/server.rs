@@ -340,6 +340,9 @@ fn audit_setup(data: &str, policy: Option<&str>, path: Option<&str>, max_mb: u64
 }
 
 pub fn main(mut args: Args) -> i32 {
+    if kr_runtime::store::env_var("KR_TLS_RESUMPTION").as_deref() == Some("off") {
+        kr_net::tls::set_resumption(false);
+    }
     // Event-loop watchdog and Raft timing (#213).
     if let Some(ms) = kr_runtime::store::env_var("KR_STALL_WARN_MS").and_then(|v| v.parse().ok()) {
         kr_rt::exec::set_stall_warn_ms(ms);

@@ -195,6 +195,9 @@ pub(crate) fn read_token_file(path: &str) -> Result<String, String> {
 }
 
 pub fn main(mut args: Args) -> i32 {
+    if kr_runtime::store::env_var("KR_TLS_RESUMPTION").as_deref() == Some("off") {
+        kr_net::tls::set_resumption(false);
+    }
     let (mut server, mut token, mut token_file, mut data) = (None, None, None, None);
     while let Some(a) = args.next() {
         let v = args.next().and_then(|v| core::str::from_utf8(v).ok()).map(String::from);

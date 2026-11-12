@@ -6,7 +6,9 @@
 //!
 //! Supported: TLS_CHACHA20_POLY1305_SHA256 (preferred) and TLS_AES_128_GCM_SHA256; X25519 and
 //! secp256r1 key exchange; ecdsa_secp256r1_sha256 and ed25519 signatures; mutual TLS; ALPN;
-//! KeyUpdate; middlebox-compatibility ChangeCipherSpec. Not supported: PSK/resumption, 0-RTT,
+//! KeyUpdate; middlebox-compatibility ChangeCipherSpec; session resumption with stateless tickets
+//! and `psk_dhe_ke` (ADR-051, [`Connection::server_with_tickets`] / [`Connection::client_with_sessions`]).
+//! Not supported: 0-RTT, external PSKs,
 //! cookies in HelloRetryRequest (the server sends at most one HelloRetryRequest, to ask for X25519
 //! or P-256 when the client only sent a key share for another group).
 //!
@@ -18,6 +20,7 @@
 
 use crate::aes::AesGcm;
 use crate::hmac::{hkdf_expand, hkdf_extract, Hmac};
+use crate::resume::{Session, SessionHooks, TicketData, TicketHooks, HARD_LIMIT_SECS, TICKET_LIFETIME};
 use crate::sha2::Sha256;
 use crate::x509::{self, PublicKey, SigAlg, SigningKey, Usage, VerifyError};
 use crate::{chacha, ct_eq, p256, x25519};
@@ -47,6 +50,8 @@ const EXT_SIGNATURE_ALGORITHMS: u16 = 13;
 const EXT_ALPN: u16 = 16;
 const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const EXT_KEY_SHARE: u16 = 51;
+const EXT_PRE_SHARED_KEY: u16 = 41;
+const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 45;
 
 const TLS13: u16 = 0x0304;
 const TLS12: u16 = 0x0303;
@@ -179,6 +184,10 @@ impl<'a> Rd<'a> {
     fn u16(&mut self) -> Result<u16> {
         let b = self.take(2)?;
         Ok(u16::from_be_bytes([b[0], b[1]]))
+    }
+    fn u32(&mut self) -> Result<u32> {
+        let b = self.take(4)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
     fn u24(&mut self) -> Result<usize> {
         let b = self.take(3)?;
@@ -639,6 +648,20 @@ pub struct Connection {
     /// TLS 1.2 server ECDHE (group, public point) from ServerKeyExchange.
     kx12: Option<(u16, Vec<u8>)>,
     master12: [u8; 48],
+    // ---- resumption (ADR-051) ----
+    tickets: Option<TicketHooks>,
+    sessions: Option<SessionHooks>,
+    session_key: Vec<u8>,
+    /// Client: the ticket offered in the ClientHello (until the ServerHello answers it).
+    offered: Option<Session>,
+    /// The PSK of a resumed handshake (client: once the server accepted it).
+    psk: Option<Secret>,
+    resumed: bool,
+    res_master: Secret,
+    /// Server, resumed: the end of the chain of resumed sessions this one belongs to.
+    chain_limit: i64,
+    /// Server: the client advertised psk_dhe_ke, so it accepts tickets.
+    client_takes_tickets: bool,
 }
 
 impl Connection {
@@ -677,12 +700,50 @@ impl Connection {
             server_random: [0; 32],
             kx12: None,
             master12: [0; 48],
+            tickets: None,
+            sessions: None,
+            session_key: Vec::new(),
+            offered: None,
+            psk: None,
+            resumed: false,
+            res_master: [0; 32],
+            chain_limit: 0,
+            client_takes_tickets: false,
         }
     }
 
     /// A server connection; `now` (Unix seconds) is used to validate client certificates.
     pub fn server(cfg: Rc<ServerConfig>, rng: Rng, now: i64) -> Connection {
         Connection::base(Role::Server(cfg), State::SrvWaitClientHello, rng, now)
+    }
+
+    /// A server that issues and accepts resumption tickets through `hooks` (ADR-051).
+    pub fn server_with_tickets(cfg: Rc<ServerConfig>, hooks: TicketHooks, rng: Rng, now: i64) -> Connection {
+        let mut c = Connection::server(cfg, rng, now);
+        c.tickets = Some(hooks);
+        c
+    }
+
+    /// A client that offers a stored ticket for `server_name` and stores the tickets the server
+    /// sends (ADR-051). Not for `client_insecure` connections.
+    pub fn client_with_sessions(cfg: Rc<ClientConfig>, server_name: &[u8], hooks: SessionHooks, rng: Rng, now: i64) -> Connection {
+        let key = session_key(&cfg, server_name);
+        let mut c = Connection::base(
+            Role::Client { cfg, server_name: server_name.to_vec(), share: None, offered_p256: false },
+            State::CliWaitServerHello,
+            rng,
+            now,
+        );
+        c.sessions = Some(hooks);
+        c.offered = (hooks.take)(&key, now).filter(|s| s.suite == TLS_CHACHA20_POLY1305_SHA256 || s.suite == TLS_AES_128_GCM_SHA256);
+        c.session_key = key;
+        c.send_client_hello(false);
+        c
+    }
+
+    /// Whether this handshake resumed a session (no certificate exchange took place).
+    pub fn resumed(&self) -> bool {
+        self.resumed
     }
 
     /// A client connection to `server_name` (DNS name or IP literal, used for SNI and checks).
@@ -988,7 +1049,7 @@ impl Connection {
             (State::Cli12WaitFinished, HT_FINISHED) => self.cli12_finished(msg, body),
             (State::Established, HT_HELLO_REQUEST) if self.tls12 => Ok(()), // no renegotiation: ignored
             (State::Established, HT_KEY_UPDATE) => self.peer_key_update(body),
-            (State::Established, HT_NEW_SESSION_TICKET) if matches!(self.role, Role::Client { .. }) => Ok(()), // no resumption
+            (State::Established, HT_NEW_SESSION_TICKET) if matches!(self.role, Role::Client { .. }) => self.cli_new_session_ticket(body),
             _ => fail(Alert::UnexpectedMessage),
         }
     }
@@ -1050,7 +1111,10 @@ impl Connection {
     }
 
     fn derive_handshake(&mut self, shared: &[u8]) {
-        let early = extract(&[], &[0u8; 32]);
+        let early = match &self.psk {
+            Some(p) => extract(&[], p),
+            None => extract(&[], &[0u8; 32]),
+        };
         let derived = derive_secret(&early, b"derived", &empty_hash());
         self.hs_secret = extract(&derived, shared);
         let th = self.transcript_hash();
@@ -1176,6 +1240,9 @@ impl Connection {
             self.alpn = Some(pick.clone());
         }
 
+        self.client_takes_tickets = find_ext(&exts, EXT_PSK_KEY_EXCHANGE_MODES).is_some_and(|m| m.len() >= 2 && m[0] as usize == m.len() - 1 && m[1..].contains(&1));
+        // Resumption: a ticket that opens, matches this configuration and has a valid binder.
+        let psk_index = self.srv_try_psk(msg, &exts, &cfg)?;
         self.session_id = session_id.to_vec();
         self.transcript.update(msg);
         let share = if group == GROUP_X25519 { KeyShare::X25519(self.random32()) } else { KeyShare::P256(p256_key(self.rng)) };
@@ -1193,6 +1260,9 @@ impl Connection {
                     put_u16(v, group);
                     put_vec(v, 2, |k| k.extend_from_slice(&share.public()));
                 });
+                if let Some(i) = psk_index {
+                    put_ext(e, EXT_PRE_SHARED_KEY, |v| put_u16(v, i));
+                }
             });
         });
         self.send_hs(sh);
@@ -1211,7 +1281,7 @@ impl Connection {
             })
         });
         self.send_hs(ee);
-        if !matches!(cfg.client_auth, ClientAuth::None) {
+        if !self.resumed && !matches!(cfg.client_auth, ClientAuth::None) {
             let cr = handshake_msg(HT_CERTIFICATE_REQUEST, |m| {
                 m.push(0); // empty context
                 put_vec(m, 2, |e| put_ext(e, EXT_SIGNATURE_ALGORITHMS, |v| put_vec(v, 2, |l| {
@@ -1222,8 +1292,10 @@ impl Connection {
             self.send_hs(cr);
             self.cert_requested = true;
         }
-        self.send_certificate(&cfg.cert_chain);
-        self.send_cert_verify(&cfg.key, b"TLS 1.3, server CertificateVerify");
+        if !self.resumed {
+            self.send_certificate(&cfg.cert_chain);
+            self.send_cert_verify(&cfg.key, b"TLS 1.3, server CertificateVerify");
+        }
         let fin = finished_mac(&self.s_hs, &self.transcript_hash());
         self.send_hs(handshake_msg(HT_FINISHED, |m| m.extend_from_slice(&fin)));
         // Server application keys are derived over CH..server Finished.
@@ -1363,7 +1435,112 @@ impl Connection {
         self.set_read(k);
         self.ccs_allowed = false;
         self.state = State::Established;
+        self.res_master = derive_secret(&self.master, b"res master", &self.transcript_hash());
+        self.send_new_session_ticket();
         Ok(())
+    }
+
+    /// Server: looks for a usable ticket among the PSK identities of the ClientHello. Returns the
+    /// index the ServerHello must select, and sets up the resumed handshake (PSK, the client
+    /// certificates stored in the ticket). `None`: no usable ticket, a normal handshake follows.
+    fn srv_try_psk(&mut self, msg: &[u8], exts: &[(u16, &[u8])], cfg: &ServerConfig) -> Result<Option<u16>> {
+        let Some(hooks) = self.tickets else { return Ok(None) };
+        let Some(ext) = find_ext(exts, EXT_PRE_SHARED_KEY) else { return Ok(None) };
+        if exts.last().map(|e| e.0) != Some(EXT_PRE_SHARED_KEY) {
+            return fail(Alert::IllegalParameter); // RFC 8446 4.2.11: the last extension
+        }
+        let modes = find_ext(exts, EXT_PSK_KEY_EXCHANGE_MODES).ok_or(Error::Local(Alert::MissingExtension))?;
+        let mut mr = Rd::new(modes);
+        let list = mr.vec8()?;
+        mr.done()?;
+        if !list.contains(&1) {
+            return Ok(None); // psk_dhe_ke is the only mode supported
+        }
+        let mut r = Rd::new(ext);
+        let mut ids = Rd::new(r.vec16()?);
+        let binders_raw = r.vec16()?;
+        r.done()?;
+        let mut binders = Vec::new();
+        let mut br = Rd::new(binders_raw);
+        while !br.b.is_empty() {
+            binders.push(br.vec8()?);
+        }
+        // The binder covers the ClientHello up to (excluding) the binders list.
+        let trunc = msg.len().checked_sub(2 + binders_raw.len()).ok_or(Error::Local(Alert::DecodeError))?;
+        let th = {
+            let mut t = self.transcript.clone();
+            t.update(&msg[..trunc]);
+            t.finalize()
+        };
+        let want = server_binding(cfg);
+        let mut idx = 0usize;
+        let mut accepted = None;
+        while !ids.b.is_empty() {
+            let id = ids.vec16()?;
+            ids.u32()?; // obfuscated age: unused without 0-RTT
+            let binder = *binders.get(idx).ok_or(Error::Local(Alert::IllegalParameter))?;
+            if accepted.is_none() {
+                if let Some(t) = self.srv_open_ticket(id, &want, cfg, hooks) {
+                    let early = extract(&[], &t.psk);
+                    let bk = derive_secret(&early, b"res binder", &empty_hash());
+                    if !ct_eq(&finished_mac(&bk, &th), binder) {
+                        return fail(Alert::DecryptError);
+                    }
+                    accepted = Some((idx as u16, t));
+                }
+            }
+            idx += 1;
+        }
+        if idx != binders.len() {
+            return fail(Alert::IllegalParameter);
+        }
+        let Some((i, t)) = accepted else { return Ok(None) };
+        self.psk = Some(t.psk);
+        self.resumed = true;
+        self.peer_certs = t.chain;
+        self.chain_limit = t.limit;
+        Ok(Some(i))
+    }
+
+    fn srv_open_ticket(&self, id: &[u8], binding: &[u8; 32], cfg: &ServerConfig, hooks: TicketHooks) -> Option<TicketData> {
+        let t = TicketData::decode(&(hooks.open)(id)?)?;
+        let required = matches!(cfg.client_auth, ClientAuth::Required(_));
+        // The binding covers the client-auth mode; a ticket without client certificates is no use where they are required.
+        let ok = t.valid_until >= self.now && t.suite == self.suite && ct_eq(&t.binding, binding) && t.alpn == self.alpn && !(required && t.chain.is_empty());
+        ok.then_some(t)
+    }
+
+    /// Server: one `NewSessionTicket` after the client Finished, bound to this session's
+    /// identity and to the end of its chain of resumptions (ADR-051).
+    fn send_new_session_ticket(&mut self) {
+        let Some(hooks) = self.tickets else { return };
+        if !self.client_takes_tickets {
+            return;
+        }
+        let cert_cap = self.peer_certs.iter().filter_map(|c| x509::Certificate::parse(c).ok()).map(|c| c.not_after).min().unwrap_or(i64::MAX);
+        let hard = if self.resumed { self.chain_limit } else { self.now.saturating_add(HARD_LIMIT_SECS) };
+        let limit = hard.min(cert_cap);
+        let valid_until = self.now.saturating_add(TICKET_LIFETIME as i64).min(limit);
+        if valid_until <= self.now {
+            return;
+        }
+        let Role::Server(cfg) = &self.role else { return };
+        let mut psk = [0u8; 32];
+        expand_label(&self.res_master, b"resumption", &[0], &mut psk);
+        let data = TicketData { valid_until, limit, suite: self.suite, psk, binding: server_binding(cfg), alpn: self.alpn.clone(), chain: self.peer_certs.clone() };
+        crate::wipe(&mut psk);
+        let ticket = (hooks.seal)(&data.encode(), self.now);
+        let mut age_add = [0u8; 4];
+        (self.rng)(&mut age_add);
+        let life = (valid_until - self.now) as u32;
+        let msg = handshake_msg(HT_NEW_SESSION_TICKET, |m| {
+            m.extend_from_slice(&life.to_be_bytes());
+            m.extend_from_slice(&age_add);
+            put_vec(m, 1, |n| n.push(0)); // ticket_nonce
+            put_vec(m, 2, |t| t.extend_from_slice(&ticket));
+            put_vec(m, 2, |_| {}); // extensions
+        });
+        self.send_handshake_record(&msg);
     }
 
     // ---- client ----
@@ -1387,7 +1564,14 @@ impl Connection {
         let random = self.random32();
         self.client_random = random;
         let tls12 = cfg.tls12;
-        let ch = handshake_msg(HT_CLIENT_HELLO, |m| {
+        // A stored ticket: (identity, obfuscated age). The binder is filled in after encoding.
+        let offer: Option<(Vec<u8>, u32)> = self.offered.as_ref().map(|o| {
+            let age_ms = (self.now - o.received_at).max(0) as u64 * 1000;
+            (o.ticket.clone(), (age_ms as u32).wrapping_add(o.age_add))
+        });
+        // A client that keeps tickets must say so (RFC 8446 4.2.9): servers send none otherwise.
+        let want_modes = self.sessions.is_some() && !self.insecure;
+        let mut ch = handshake_msg(HT_CLIENT_HELLO, |m| {
             put_u16(m, 0x0303);
             m.extend_from_slice(&random);
             put_vec(m, 1, |v| v.extend_from_slice(&self.session_id));
@@ -1439,8 +1623,32 @@ impl Connection {
                         }
                     }));
                 }
+                if want_modes || offer.is_some() {
+                    put_ext(e, EXT_PSK_KEY_EXCHANGE_MODES, |v| put_vec(v, 1, |l| l.push(1))); // psk_dhe_ke
+                }
+                if let Some((ticket, age)) = &offer {
+                    // pre_shared_key must be the last extension; the binder is a placeholder for now.
+                    put_ext(e, EXT_PRE_SHARED_KEY, |v| {
+                        put_vec(v, 2, |ids| {
+                            put_vec(ids, 2, |t| t.extend_from_slice(ticket));
+                            ids.extend_from_slice(&age.to_be_bytes());
+                        });
+                        put_vec(v, 2, |b| put_vec(b, 1, |x| x.extend_from_slice(&[0u8; 32])));
+                    });
+                }
             });
         });
+        if let Some(o) = &self.offered {
+            // binder = Finished-style MAC over the transcript and the ClientHello up to the binders.
+            let early = extract(&[], &o.psk);
+            let bk = derive_secret(&early, b"res binder", &empty_hash());
+            let trunc = ch.len() - (2 + 1 + 32);
+            let mut t = self.transcript.clone();
+            t.update(&ch[..trunc]);
+            let binder = finished_mac(&bk, &t.finalize());
+            let n = ch.len();
+            ch[n - 32..].copy_from_slice(&binder);
+        }
         self.send_hs(ch);
     }
 
@@ -1472,6 +1680,9 @@ impl Connection {
             return fail(Alert::ProtocolVersion);
         }
         let ks = find_ext(&exts, EXT_KEY_SHARE).ok_or(Error::Local(Alert::MissingExtension))?;
+        if random == HRR_RANDOM && find_ext(&exts, EXT_PRE_SHARED_KEY).is_some() {
+            return fail(Alert::IllegalParameter);
+        }
         if random == HRR_RANDOM {
             // HelloRetryRequest: only "use P-256 instead" is supported, once.
             let Role::Client { offered_p256, .. } = &self.role else { unreachable!() };
@@ -1499,6 +1710,19 @@ impl Connection {
         }
         let shared = share.shared(key)?;
         self.suite = suite;
+        // The server accepted the ticket (selected_identity 0), or ignored it: full handshake.
+        match find_ext(&exts, EXT_PRE_SHARED_KEY) {
+            Some(sel) => {
+                let offered = self.offered.take().ok_or(Error::Local(Alert::IllegalParameter))?;
+                if sel != [0, 0] || offered.suite != suite {
+                    return fail(Alert::IllegalParameter);
+                }
+                self.psk = Some(offered.psk);
+                self.resumed = true;
+                self.peer_certs = offered.server_chain.clone();
+            }
+            None => self.offered = None,
+        }
         self.transcript.update(msg);
         self.derive_handshake(&shared);
         self.set_read(Some(RecordKeys::new(self.suite, self.s_hs)));
@@ -1527,7 +1751,7 @@ impl Connection {
             self.alpn = Some(p.to_vec());
         }
         self.transcript.update(msg);
-        self.state = State::CliWaitCertOrRequest;
+        self.state = if self.resumed { State::CliWaitFinished } else { State::CliWaitCertOrRequest };
         Ok(())
     }
 
@@ -1569,6 +1793,31 @@ impl Connection {
         self.set_read(Some(RecordKeys::new(self.suite, s_ap)));
         self.ccs_allowed = false;
         self.state = State::Established;
+        self.res_master = derive_secret(&self.master, b"res master", &self.transcript_hash());
+        Ok(())
+    }
+
+    /// Client: keeps a `NewSessionTicket` for the next connection to this server.
+    fn cli_new_session_ticket(&mut self, body: &[u8]) -> Result<()> {
+        let mut r = Rd::new(body);
+        let lifetime = r.u32()?;
+        let age_add = r.u32()?;
+        let nonce = r.vec8()?;
+        let ticket = r.vec16()?;
+        extensions(r.vec16()?)?;
+        r.done()?;
+        if ticket.is_empty() {
+            return fail(Alert::DecodeError);
+        }
+        let Some(hooks) = self.sessions else { return Ok(()) };
+        if self.insecure || self.tls12 || lifetime == 0 {
+            return Ok(());
+        }
+        let mut psk = [0u8; 32];
+        expand_label(&self.res_master, b"resumption", nonce, &mut psk);
+        let s = Session { ticket: ticket.to_vec(), psk, suite: self.suite, age_add, received_at: self.now, lifetime: lifetime.min(7 * 24 * 3600), server_chain: self.peer_certs.clone(), alpn: self.alpn.clone() };
+        crate::wipe(&mut psk);
+        (hooks.put)(&self.session_key, s);
         Ok(())
     }
 }
@@ -1761,6 +2010,55 @@ impl Connection {
         self.state = State::Established;
         Ok(())
     }
+}
+
+/// What a ticket is bound to on the server: the server certificate, the client-auth mode and
+/// the client trust roots. A ticket from another configuration is not used (ADR-051).
+fn server_binding(cfg: &ServerConfig) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"kr tls ticket binding v1");
+    h.update(&(cfg.cert_chain.first().map_or(0, |c| c.len()) as u32).to_be_bytes());
+    if let Some(leaf) = cfg.cert_chain.first() {
+        h.update(leaf);
+    }
+    let (mode, roots): (u8, &[Vec<u8>]) = match &cfg.client_auth {
+        ClientAuth::None => (0, &[]),
+        ClientAuth::Optional(r) => (1, r),
+        ClientAuth::Required(r) => (2, r),
+    };
+    h.update(&[mode]);
+    for r in roots {
+        h.update(&crate::sha2::sha256(r));
+    }
+    h.finalize()
+}
+
+/// The cache key of a client session: the server name and a fingerprint of the configuration
+/// (trust roots, pin, client certificate, ALPN), so a ticket is only offered where the same
+/// verification applied.
+pub fn session_key(cfg: &ClientConfig, server_name: &[u8]) -> Vec<u8> {
+    let mut h = Sha256::new();
+    h.update(b"kr tls session key v1");
+    for r in &cfg.roots {
+        h.update(&crate::sha2::sha256(r));
+    }
+    h.update(&[cfg.pinned_ca.is_some() as u8]);
+    if let Some(p) = &cfg.pinned_ca {
+        h.update(p);
+    }
+    if let Some((chain, _)) = &cfg.client_cert {
+        h.update(&[1]);
+        if let Some(leaf) = chain.first() {
+            h.update(&crate::sha2::sha256(leaf));
+        }
+    }
+    for a in &cfg.alpn {
+        h.update(&[a.len() as u8]);
+        h.update(a);
+    }
+    let mut key = h.finalize().to_vec();
+    key.extend_from_slice(server_name);
+    key
 }
 
 fn sig_scheme(k: &SigningKey) -> u16 {

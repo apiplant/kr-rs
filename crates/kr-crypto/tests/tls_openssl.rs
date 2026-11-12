@@ -401,3 +401,109 @@ fn tls12_refused_unless_enabled_and_without_ems() {
         }
     }
 }
+
+// ---- session resumption (ADR-051) against OpenSSL ----
+
+use kr_crypto::resume::{SessionCache, SessionHooks, TicketHooks, TicketKeys};
+
+thread_local! {
+    static KEYS: std::cell::RefCell<TicketKeys> = const { std::cell::RefCell::new(TicketKeys::new()) };
+    static CACHE: std::cell::RefCell<SessionCache> = const { std::cell::RefCell::new(SessionCache::new()) };
+}
+
+const TICKETS: TicketHooks = TicketHooks { seal: |p, t| KEYS.with(|k| k.borrow_mut().seal(p, t, rng)), open: |t| KEYS.with(|k| k.borrow().open(t)) };
+const SESSIONS: SessionHooks = SessionHooks { put: |k, s| CACHE.with(|c| c.borrow_mut().put(k, s)), take: |k, t| CACHE.with(|c| c.borrow_mut().take(k, t)) };
+
+/// kr's client offers its ticket to OpenSSL's s_server on a second connection, which accepts it
+/// (so OpenSSL verified our binder and agreed on the key schedule).
+#[test]
+fn client_resumes_with_openssl_server() {
+    if !have_openssl() {
+        return;
+    }
+    let f = setup("res-c", false);
+    let port = free_port();
+    let mut srv = Command::new("openssl")
+        .args(["s_server", "-quiet", "-tls1_3", "-accept", &port.to_string(), "-naccept", "2"])
+        .arg("-cert").arg(f.dir.join("srv.pem")).arg("-key").arg(f.dir.join("srv.key"))
+        .arg("-Verify").arg("1").arg("-CAfile").arg(f.dir.join("ca.pem"))
+        .args(["-alpn", "http/1.1"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: vec![f.ca.clone()], client_cert: Some((vec![f.cli_cert.clone()], f.cli_key)), alpn: vec![b"http/1.1".to_vec()], tls12: false });
+    let mut resumed = Vec::new();
+    for round in 0..2 {
+        let mut sock = (0..400).find_map(|_| { std::thread::sleep(Duration::from_millis(30)); TcpStream::connect(("127.0.0.1", port)).ok() }).expect("connect");
+        let mut c = Connection::client_with_sessions(cfg.clone(), b"localhost", SESSIONS, rng, now());
+        // Until the handshake is done and (first round) OpenSSL's ticket has arrived.
+        drive(&mut c, &mut sock, |c| !c.is_handshaking() && (round == 1 || CACHE.with(|k| k.borrow().len()) == 1));
+        resumed.push(c.resumed());
+        assert_eq!(c.alpn(), Some(&b"http/1.1"[..]));
+        c.write(b"ping\n").unwrap();
+        drive(&mut c, &mut sock, |c| !c.has_output());
+        c.close();
+        let _ = sock.write_all(&c.take_output());
+    }
+    assert_eq!(resumed, [false, true], "second connection resumed against OpenSSL");
+    drop(srv.stdin.take());
+    let _ = srv.wait();
+}
+
+/// OpenSSL's s_client resumes against kr's server: `Reused` in its report, and kr still sees the
+/// client certificate of the first handshake.
+#[test]
+fn openssl_client_resumes_with_kr_server() {
+    if !have_openssl() {
+        return;
+    }
+    let f = setup("res-s", false);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let cfg = Rc::new(ServerConfig { cert_chain: vec![f.srv_cert.clone()], key: f.srv_key, client_auth: ClientAuth::Required(vec![f.ca.clone()]), alpn: vec![b"http/1.1".to_vec()] });
+    let dir = f.dir.clone();
+    let sess = dir.join("sess.pem");
+    let clients = std::thread::spawn(move || {
+        let mut outs = Vec::new();
+        for round in 0..2 {
+            let mut cmd = Command::new("openssl");
+            cmd.args(["s_client", "-tls1_3", "-connect", &format!("127.0.0.1:{port}"), "-servername", "localhost", "-alpn", "http/1.1"])
+                .arg("-CAfile").arg(dir.join("ca.pem")).arg("-cert").arg(dir.join("cli.pem")).arg("-key").arg(dir.join("cli.key"))
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            if round == 0 {
+                cmd.arg("-sess_out").arg(&sess);
+            } else {
+                cmd.arg("-sess_in").arg(&sess);
+            }
+            let mut ch = cmd.spawn().unwrap();
+            ch.stdin.as_mut().unwrap().write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+            // Keep stdin open so s_client reads the ticket and the response before it quits.
+            std::thread::sleep(Duration::from_millis(1500));
+            let out = ch.wait_with_output().unwrap();
+            outs.push(String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr));
+        }
+        outs
+    });
+    let mut resumed = Vec::new();
+    for _ in 0..2 {
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut s = Connection::server_with_tickets(cfg.clone(), TICKETS, rng, now());
+        let mut req = Vec::new();
+        drive(&mut s, &mut sock, |s| {
+            let mut b = [0u8; 1024];
+            let n = s.read(&mut b);
+            req.extend_from_slice(&b[..n]);
+            req.windows(4).any(|w| w == b"\r\n\r\n")
+        });
+        resumed.push(s.resumed());
+        let cn = x509::Certificate::parse(&s.peer_certificates()[0]).unwrap().common_name().unwrap().to_vec();
+        assert_eq!(cn, b"alice");
+        let body = "ok";
+        s.write(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+        s.close();
+        sock.write_all(&s.take_output()).unwrap();
+    }
+    let outs = clients.join().unwrap();
+    assert_eq!(resumed, [false, true]);
+    assert!(!outs[0].contains("Reused,"), "{}", outs[0]);
+    assert!(outs[1].contains("Reused, TLSv1.3"), "second s_client did not report reuse:\n{}", outs[1]);
+}
