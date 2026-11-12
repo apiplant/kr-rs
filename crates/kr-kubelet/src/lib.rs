@@ -1847,6 +1847,14 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 let _ = self.maps.run_as_root(|| self.store.delete_container(&cid).is_ok());
                 self.set_waiting(uid, i, "RunContainerError", alloc::format!("{}: errno {}", e.step, e.errno.0));
                 self.pods.borrow_mut().get_mut(uid).unwrap().ctrs[i].seq = seq;
+                if e.step == "join sandbox" && e.errno.0 == 3 {
+                    // The pod's sandbox process is gone (killed with a previous kubelet run, or
+                    // by hand): drop it so the next sync builds a new sandbox (same IP) instead
+                    // of failing every restart of the container.
+                    kr_rt::eprint(alloc::format!("kubelet: sandbox of pod {uid} is gone; recreating it\n").as_bytes());
+                    self.pods.borrow_mut().get_mut(uid).unwrap().sandbox = None;
+                    self.notify.notify();
+                }
                 self.backoff(uid, i);
             }
         }
