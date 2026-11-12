@@ -127,9 +127,55 @@ fn cap(v: &Value, path: &[&str]) -> String {
     s(v, path)
 }
 
+/// `kind/name` of an HPA's scale target.
+fn hpa_reference(v: &Value) -> String {
+    alloc::format!("{}/{}", s(v, &["spec", "scaleTargetRef", "kind"]), s(v, &["spec", "scaleTargetRef", "name"]))
+}
+
+/// `current/target` of each metric of an HPA (`kubectl get hpa` TARGETS), e.g. `45%/80%`.
+fn hpa_targets(v: &Value) -> String {
+    let specs = v.pointer(&["spec", "metrics"]).and_then(Value::as_array).filter(|m| !m.is_empty());
+    let Some(specs) = specs else {
+        // autoscaling/v1: a CPU percentage.
+        let cur = v.pointer(&["status", "currentCPUUtilizationPercentage"]).and_then(Value::as_i64).map(|c| alloc::format!("{c}%")).unwrap_or_else(|| "<unknown>".into());
+        let target = v.pointer(&["spec", "targetCPUUtilizationPercentage"]).and_then(Value::as_i64).map(|t| alloc::format!("{t}%")).unwrap_or_else(|| "<unset>".into());
+        return alloc::format!("{cur}/{target}");
+    };
+    let current: &[Value] = v.pointer(&["status", "currentMetrics"]).and_then(Value::as_array).unwrap_or(&[]);
+    specs
+        .iter()
+        .map(|m| {
+            let ty = s(m, &["type"]);
+            let key = match ty.as_str() {
+                "Resource" => "resource",
+                "ContainerResource" => "containerResource",
+                "Pods" => "pods",
+                "Object" => "object",
+                _ => "external",
+            };
+            let name = if matches!(ty.as_str(), "Resource" | "ContainerResource") { s(m, &[key, "name"]) } else { s(m, &[key, "metric", "name"]) };
+            let target = match s(m, &[key, "target", "type"]).as_str() {
+                "Utilization" => alloc::format!("{}%", s(m, &[key, "target", "averageUtilization"])),
+                "AverageValue" => s(m, &[key, "target", "averageValue"]),
+                _ => s(m, &[key, "target", "value"]),
+            };
+            let cur = current.iter().find(|c| s(c, &["type"]) == ty && (if matches!(ty.as_str(), "Resource" | "ContainerResource") { s(c, &[key, "name"]) == name } else { s(c, &[key, "metric", "name"]) == name }));
+            let cur = match cur {
+                Some(c) if c.pointer(&[key, "current", "averageUtilization"]).is_some() => alloc::format!("{}%", s(c, &[key, "current", "averageUtilization"])),
+                Some(c) if c.pointer(&[key, "current", "averageValue"]).is_some() => s(c, &[key, "current", "averageValue"]),
+                Some(c) => s(c, &[key, "current", "value"]),
+                None => "<unknown>".into(),
+            };
+            alloc::format!("{cur}/{target}")
+        })
+        .collect::<alloc::vec::Vec<_>>()
+        .join(", ")
+}
+
 /// Extra columns between NAME and AGE.
 pub fn columns(kind: &str) -> &'static [Col] {
     match kind {
+        "HorizontalPodAutoscaler" => &[("Reference", hpa_reference), ("Targets", hpa_targets), ("MinPods", |v| v.pointer(&["spec", "minReplicas"]).and_then(Value::as_i64).unwrap_or(1).to_string()), ("MaxPods", |v| n(v, &["spec", "maxReplicas"]).to_string()), ("Replicas", |v| n(v, &["status", "currentReplicas"]).to_string())],
         "Pod" => &[("Ready", pod_ready), ("Status", pod_status), ("Restarts", pod_restarts)],
         "Deployment" => &[("Ready", ready_of), ("Up-to-date", |v| n(v, &["status", "updatedReplicas"]).to_string()), ("Available", |v| n(v, &["status", "availableReplicas"]).to_string())],
         "ReplicaSet" => &[("Desired", |v| n(v, &["spec", "replicas"]).to_string()), ("Current", |v| n(v, &["status", "replicas"]).to_string()), ("Ready", |v| n(v, &["status", "readyReplicas"]).to_string())],

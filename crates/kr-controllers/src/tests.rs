@@ -20,6 +20,11 @@ use std::sync::Mutex;
 
 pub(crate) static LOCK: Mutex<()> = Mutex::new(());
 
+std::thread_local! {
+    /// The API server of the running scenario (for tests that feed it metrics).
+    pub(crate) static API: core::cell::RefCell<Option<Rc<ApiServer>>> = const { core::cell::RefCell::new(None) };
+}
+
 /// The fake clock behind `Config::now` and the API server's clock; tests move it.
 pub(crate) static CLOCK: AtomicI64 = AtomicI64::new(T0);
 /// 2027-01-15 08:00:00 UTC.
@@ -69,7 +74,7 @@ pub(crate) fn rng(b: &mut [u8]) {
 }
 
 pub(crate) fn cfg() -> Config {
-    Config { resync_ms: 150, gc_ms: 60, backoff_ms: 30, retry_ms: 60, job_backoff_ms: 0, now: || CLOCK.load(Ordering::SeqCst), evict: crate::nodelifecycle::Limits::default() }
+    Config { resync_ms: 150, gc_ms: 60, backoff_ms: 30, retry_ms: 60, job_backoff_ms: 0, now: || CLOCK.load(Ordering::SeqCst), evict: crate::nodelifecycle::Limits::default(), hpa_ms: 100 }
 }
 
 pub(crate) fn v(s: &str) -> Value {
@@ -99,6 +104,7 @@ where
     HOLD_DELETE.lock().unwrap_or_else(|e| e.into_inner()).clear();
     NEXT_IP.store(1, Ordering::SeqCst);
     let api = Rc::new(ApiServer::new(kr_store::Store::in_memory(), || CLOCK.load(Ordering::SeqCst), rng, "127.0.0.1:6443".to_string()).unwrap());
+    API.with(|a| *a.borrow_mut() = Some(api.clone()));
     let c = InProcess::new(api, "test");
     block_on(async move {
         let ctl = spawn(run_all_with(c.clone(), tweak(cfg())));
@@ -708,5 +714,100 @@ fn expired_bootstrap_tokens_are_deleted() {
         assert_eq!(crate::gc::expire_tokens(&c, 1_700_000_000).await, 1);
         let names: Vec<String> = items(&c.list(p, "").await.unwrap()).iter().map(|s| name(s).to_string()).collect();
         assert!(!names.iter().any(|n| n == "bootstrap-token-aaaaaa") && names.iter().any(|n| n == "bootstrap-token-bbbbbb") && names.iter().any(|n| n == "other"));
+    });
+}
+
+// ---- HorizontalPodAutoscaler ----
+
+const HPAS: &str = "/apis/autoscaling/v2/namespaces/default/horizontalpodautoscalers";
+
+/// One scrape of every live pod: each has used `rate` cores more over the last 15 virtual seconds.
+fn feed(api: &ApiServer, pods: &[Value], cum: &mut alloc::collections::BTreeMap<String, f64>, rate: f64) {
+    use kr_apiserver::metrics::{CtrSample, Scrape};
+    let ts = CLOCK.load(Ordering::SeqCst) * 1000;
+    let ctrs: Vec<CtrSample> = pods
+        .iter()
+        .map(|p| {
+            let c = cum.entry(name(p).to_string()).or_insert(0.0);
+            *c += rate * 15.0;
+            CtrSample { ns: "default".into(), pod: name(p).to_string(), container: "c".into(), cpu_secs: *c, mem: 32 << 20, ts_ms: ts }
+        })
+        .collect();
+    api.metrics.apply("n1", &Scrape { node_cpu: Some((ctrs.iter().map(|c| c.cpu_secs).sum(), ts)), node_mem: Some(1 << 30), ctrs, error: false });
+}
+
+/// Steps the virtual clock 15 s per round (the controller period in virtual time), feeding metrics.
+async fn drive_metrics(c: &InProcess, rate: f64, rounds: usize) {
+    let api = API.with(|a| a.borrow().clone().unwrap());
+    let mut cum = alloc::collections::BTreeMap::new();
+    for _ in 0..rounds {
+        let pods = live_pods(c).await;
+        feed(&api, &pods, &mut cum, rate);
+        advance_clock(15);
+        sleep(130).await;
+    }
+}
+
+async fn deployment_replicas(c: &InProcess) -> i64 {
+    int_at(&deployment_status(c).await, &["spec", "replicas"], -1)
+}
+
+#[test]
+fn hpa_scales_a_deployment_up_to_max_and_back_down() {
+    scenario(|c| async move {
+        c.create("/api/v1/nodes", &node("n1", "{}", "[]", "16")).await.unwrap();
+        c.create(DEPLOYMENTS, &deployment(2, "nginx:1", "")).await.unwrap();
+        wait_until("2 running pods", || async { live_pods(&c).await.iter().filter(|p| str_at(p, &["status", "phase"]) == "Running").count() == 2 }).await;
+        let hpa = v(r#"{"metadata":{"name":"web"},"spec":{"scaleTargetRef":{"apiVersion":"apps/v1","kind":"Deployment","name":"web"},"minReplicas":2,"maxReplicas":6,"metrics":[{"type":"Resource","resource":{"name":"cpu","target":{"type":"Utilization","averageUtilization":50}}}],"behavior":{"scaleDown":{"stabilizationWindowSeconds":0}}}}"#);
+        c.create(HPAS, &hpa).await.unwrap();
+
+        // 90% of the requests against a 50% target: up to the maximum.
+        let cc = c.clone();
+        let feeder = spawn(async move { drive_metrics(&cc, 0.09, 60).await });
+        wait_until("scaled up to 6", || async { deployment_replicas(&c).await == 6 }).await;
+        wait_until("6 pods running", || async { live_pods(&c).await.iter().filter(|p| str_at(p, &["status", "phase"]) == "Running").count() == 6 }).await;
+        let h = c.get(&alloc::format!("{HPAS}/web")).await.unwrap();
+        assert!(int_at(&h, &["status", "desiredReplicas"], -1) >= 4, "{h:?}");
+        assert_eq!(str_at(cond(&h, "ScalingActive").unwrap(), &["status"]), "True");
+        assert_eq!(str_at(cond(&h, "AbleToScale").unwrap(), &["status"]), "True");
+        assert!(h.pointer(&["status", "currentMetrics"]).and_then(Value::as_array).is_some_and(|m| !m.is_empty()), "{h:?}");
+        feeder.abort();
+
+        // Load drops to 10%: back to the minimum (no stabilization window in this HPA).
+        let cc = c.clone();
+        let feeder = spawn(async move { drive_metrics(&cc, 0.01, 80).await });
+        wait_until("scaled down to 2", || async { deployment_replicas(&c).await == 2 }).await;
+        feeder.abort();
+        let h = c.get(&alloc::format!("{HPAS}/web")).await.unwrap();
+        assert!(h.pointer(&["status", "conditions"]).and_then(Value::as_array).is_some_and(|c| !c.is_empty()));
+        assert!(h.pointer(&["status", "lastScaleTime"]).is_some());
+    });
+}
+
+#[test]
+fn hpa_v1_form_unsupported_metrics_and_missing_targets_report_conditions() {
+    scenario(|c| async move {
+        c.create("/api/v1/nodes", &node("n1", "{}", "[]", "16")).await.unwrap();
+        c.create(DEPLOYMENTS, &deployment(2, "nginx:1", "")).await.unwrap();
+        wait_until("2 running pods", || async { live_pods(&c).await.iter().filter(|p| str_at(p, &["status", "phase"]) == "Running").count() == 2 }).await;
+        // An autoscaling/v1 object: a CPU percentage instead of metrics.
+        let v1 = v(r#"{"apiVersion":"autoscaling/v1","kind":"HorizontalPodAutoscaler","metadata":{"name":"old"},"spec":{"scaleTargetRef":{"apiVersion":"apps/v1","kind":"Deployment","name":"web"},"minReplicas":2,"maxReplicas":3,"targetCPUUtilizationPercentage":50}}"#);
+        c.create("/apis/autoscaling/v1/namespaces/default/horizontalpodautoscalers", &v1).await.unwrap();
+        // Only unsupported metric types, and a target that does not exist.
+        c.create(HPAS, &v(r#"{"metadata":{"name":"custom"},"spec":{"scaleTargetRef":{"apiVersion":"apps/v1","kind":"Deployment","name":"web"},"minReplicas":1,"maxReplicas":3,"metrics":[{"type":"Pods","pods":{"metric":{"name":"qps"},"target":{"type":"AverageValue","averageValue":"10"}}}]}}"#)).await.unwrap();
+        c.create(HPAS, &v(r#"{"metadata":{"name":"nothing"},"spec":{"scaleTargetRef":{"apiVersion":"apps/v1","kind":"Deployment","name":"nope"},"minReplicas":1,"maxReplicas":3}}"#)).await.unwrap();
+        let cc = c.clone();
+        let feeder = spawn(async move { drive_metrics(&cc, 0.09, 40).await });
+        wait_until("v1 HPA scaled to its maximum", || async { deployment_replicas(&c).await == 3 }).await;
+        let h = c.get("/apis/autoscaling/v1/namespaces/default/horizontalpodautoscalers/old").await.unwrap();
+        assert!(h.pointer(&["status", "currentCPUUtilizationPercentage"]).is_some() || int_at(&h, &["status", "desiredReplicas"], 0) >= 2, "{h:?}");
+        let custom = c.get(&alloc::format!("{HPAS}/custom")).await.unwrap();
+        let active = cond(&custom, "ScalingActive").unwrap();
+        assert_eq!(str_at(active, &["status"]), "False");
+        assert!(str_at(active, &["message"]).contains("no supported metric"), "{active:?}");
+        let nothing = c.get(&alloc::format!("{HPAS}/nothing")).await.unwrap();
+        let able = cond(&nothing, "AbleToScale").unwrap();
+        assert_eq!((str_at(able, &["status"]), str_at(able, &["reason"])), ("False", "FailedGetScale"));
+        feeder.abort();
     });
 }

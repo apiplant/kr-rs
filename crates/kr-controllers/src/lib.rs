@@ -19,6 +19,7 @@
 //! * [`pvc`]: PVC/PV binding, a local-path provisioner and pvc-protection.
 //! * [`nodelifecycle`]: marks nodes without heartbeats Unknown, taints them and evicts their pods.
 //! * [`attachdetach`]: creates and garbage-collects `VolumeAttachment`s for pods using CSI volumes.
+//! * [`hpa`]: scales workloads from resource metrics (HorizontalPodAutoscaler).
 //! * [`gc`]: deletes dependents whose owner no longer exists (background propagation).
 //!
 //! All of them are *level-triggered*. A watch (list, remember the list's `resourceVersion`,
@@ -45,6 +46,7 @@ pub mod deployment;
 pub mod disruption;
 pub mod endpoints;
 pub mod gc;
+pub mod hpa;
 pub mod job;
 pub mod mirror;
 pub mod attachdetach;
@@ -84,6 +86,8 @@ pub struct Config {
     pub now: fn() -> i64,
     /// Node eviction knobs (`KR_NODE_EVICTION_RATE` and friends, read by the binary).
     pub evict: nodelifecycle::Limits,
+    /// HorizontalPodAutoscaler evaluation period (upstream: 15 s).
+    pub hpa_ms: u64,
 }
 
 fn zero_clock() -> i64 {
@@ -92,7 +96,7 @@ fn zero_clock() -> i64 {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { resync_ms: 30_000, gc_ms: 5_000, backoff_ms: 1_000, retry_ms: 5_000, job_backoff_ms: 10_000, now: zero_clock, evict: nodelifecycle::Limits::default() }
+        Config { resync_ms: 30_000, gc_ms: 5_000, backoff_ms: 1_000, retry_ms: 5_000, job_backoff_ms: 10_000, now: zero_clock, evict: nodelifecycle::Limits::default(), hpa_ms: 15_000 }
     }
 }
 
@@ -129,6 +133,7 @@ pub async fn run_all_with_ca<C: Client + Clone + 'static>(c: C, cfg: Config, ca:
         spawn(pvc::run(c.clone(), cfg)),
         spawn(nodelifecycle::run(c.clone(), cfg)),
         spawn(servicelb::run(c.clone(), cfg)),
+        spawn(hpa::run(c.clone(), cfg)),
         spawn(attachdetach::run(c.clone())),
         spawn(gc::run(c.clone(), cfg)),
     ]);
