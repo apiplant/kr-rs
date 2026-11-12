@@ -171,7 +171,17 @@ async fn handle_inner(api: &Rc<ApiServer>, req: Request, pf: &core::cell::RefCel
             // Admission saw the request's version; the write is stored as the storage version.
             let (reply, w) = match crate::convert::write(api, &r).await {
                 Some(done) => done,
-                None => api.handle_w(&r),
+                None => {
+                    // A big list may leave its rendering for a worker; it is awaited here.
+                    let defer = r.method == "GET";
+                    api.set_defer_lists(defer);
+                    let done = api.handle_w(&r);
+                    api.set_defer_lists(false);
+                    match api.take_list_job() {
+                        Some(job) if defer => (job.run().await, done.1),
+                        _ => done,
+                    }
+                }
             };
             warnings.extend(w);
             let reply = crate::convert::post(api, &r, reply).await;

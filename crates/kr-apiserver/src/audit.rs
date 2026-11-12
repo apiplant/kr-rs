@@ -283,8 +283,13 @@ impl Auditor {
     }
 
     fn emit(&self, ev: &Value) {
+        self.emit_text(&json::to_string(ev));
+    }
+
+    /// Queues an event that is already serialised.
+    pub fn emit_text(&self, ev: &str) {
         let mut b = self.buf.borrow_mut();
-        b.extend_from_slice(json::to_string(ev).as_bytes());
+        b.extend_from_slice(ev.as_bytes());
         b.push(b'\n');
         let big = b.len() >= FLUSH_AT;
         drop(b);
@@ -509,7 +514,7 @@ pub fn begin(api: &ApiServer, req: &kr_net::http1::server::Request, cert_user: O
     p.attrs = attrs;
     p.decision = Some(decision);
     if !p.decision.as_ref().unwrap().omit_stages.iter().any(|s| s == "RequestReceived") {
-        let ev = event(api, &p, "RequestReceived", None, None);
+        let ev = event(api, &p, "RequestReceived", None, None, Bodies::Inline);
         p.auditor.emit(&ev);
     }
     Some(p)
@@ -524,7 +529,7 @@ fn identity(api: &ApiServer, p: &Pending, final_: bool) -> Option<User> {
 
 /// Called when the response is ready. A streaming or upgraded response is recorded as
 /// `ResponseStarted` (the end of a stream is not observed).
-pub fn finish(api: &ApiServer, p: Option<Pending>, resp: &kr_net::http1::server::Response) {
+pub fn finish(api: &alloc::rc::Rc<ApiServer>, p: Option<Pending>, resp: &kr_net::http1::server::Response) {
     let Some(p) = p else { return };
     let d = p.decision.clone().unwrap();
     let streaming = !matches!(resp.body, kr_net::http1::server::Body::Full(_));
@@ -532,8 +537,82 @@ pub fn finish(api: &ApiServer, p: Option<Pending>, resp: &kr_net::http1::server:
     if d.omit_stages.iter().any(|s| s == stage) {
         return;
     }
-    let ev = event(api, &p, stage, Some(resp), Some(&d));
+    // Bodies of a big request or response are decoded and re-encoded in a worker, after the
+    // response has gone out (#187); the event is written when they are ready, so it may follow
+    // later events in the file (its timestamps are those of the request).
+    let big = |n: usize| n >= crate::offload::MIN_BYTES;
+    let resp_len = match &resp.body {
+        kr_net::http1::server::Body::Full(b) => b.len(),
+        _ => 0,
+    };
+    if kr_rt::offload::enabled() && d.level >= Level::Request && (big(p.body.len()) || (d.level == Level::RequestResponse && big(resp_len))) {
+        let ev = event(api, &p, stage, Some(resp), Some(&d), Bodies::Skip);
+        let sens = sensitive(&p.attrs);
+        let ctype = resp.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map(|(_, v)| v.clone()).unwrap_or_else(|| String::from("application/json"));
+        let rbody = match &resp.body {
+            kr_net::http1::server::Body::Full(b) if d.level == Level::RequestResponse && !sens && resp.status < 400 => b.clone(),
+            _ => Vec::new(),
+        };
+        let reqbody = if sens { Vec::new() } else { p.body.clone() };
+        let omit = d.omit_managed_fields;
+        kr_rt::exec::spawn(async move {
+            let req_json = body_json(&p.ctype, reqbody, omit, false).await;
+            let resp_json = body_json(&ctype, rbody, omit, true).await;
+            let mut text = json::to_string(&ev);
+            text.pop(); // the closing brace: the bodies are appended as members
+            for (name, j) in [("requestObject", req_json), ("responseObject", resp_json)] {
+                if let Some(j) = j {
+                    text.push_str(",\"");
+                    text.push_str(name);
+                    text.push_str("\":");
+                    text.push_str(&j);
+                }
+            }
+            text.push('}');
+            p.auditor.emit_text(&text);
+        });
+        return;
+    }
+    let ev = event(api, &p, stage, Some(resp), Some(&d), Bodies::Inline);
     p.auditor.emit(&ev);
+}
+
+/// The JSON of a recordable body, from a worker when it is big. `None`: nothing to record.
+async fn body_json(ctype: &str, body: Vec<u8>, omit_managed: bool, response: bool) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+    if body.len() < crate::offload::MIN_BYTES {
+        return render_body(ctype, &body, omit_managed, response);
+    }
+    let mut e = crate::offload::Enc::default();
+    e.bytes(ctype.as_bytes()).u8(omit_managed as u8).u8(response as u8).bytes(&body);
+    let out = match kr_rt::offload::call(crate::offload::KIND_AUDIT_BODY, &e.0).await {
+        Some(o) => o,
+        None => crate::offload::handler(crate::offload::KIND_AUDIT_BODY, &e.0),
+    };
+    String::from_utf8(out).ok().filter(|s| !s.is_empty())
+}
+
+/// The recorded form of a request or response body: decoded, without managedFields when asked,
+/// `None` for sensitive kinds, Tables (responses) and bodies that do not decode.
+pub(crate) fn render_body(ctype: &str, body: &[u8], omit_managed: bool, response: bool) -> Option<String> {
+    let mut b = decode(ctype, body)?;
+    if sensitive_kind(&b) || (response && b.get("kind").and_then(Value::as_str) == Some("Table")) {
+        return None;
+    }
+    if omit_managed {
+        strip_managed(&mut b);
+    }
+    Some(json::to_string(&b))
+}
+
+/// Whether [`event`] decodes the request and response bodies itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bodies {
+    Inline,
+    /// The caller appends them (decoded elsewhere).
+    Skip,
 }
 
 /// A JSON, YAML or Kubernetes protobuf body as a value.
@@ -571,7 +650,7 @@ fn strip_managed(v: &mut Value) {
 }
 
 /// Builds one `audit.k8s.io/v1` Event.
-fn event(api: &ApiServer, p: &Pending, stage: &str, resp: Option<&kr_net::http1::server::Response>, d: Option<&Decision>) -> Value {
+fn event(api: &ApiServer, p: &Pending, stage: &str, resp: Option<&kr_net::http1::server::Response>, d: Option<&Decision>, bodies: Bodies) -> Value {
     let a = &p.attrs;
     let level = p.decision.as_ref().map(|d| d.level).unwrap_or(Level::Metadata);
     let user = &p.base;
@@ -632,8 +711,10 @@ fn event(api: &ApiServer, p: &Pending, stage: &str, resp: Option<&kr_net::http1:
     if let Some(r) = resp {
         let code = r.status;
         let mut st = obj(alloc::vec![("metadata", obj(Vec::new())), ("code", Value::from(code as u64))]);
+        // Only an error response (its reason and message) and a RequestResponse event need the body.
+        let want_body = code >= 400 || (bodies == Bodies::Inline && level == Level::RequestResponse);
         let rbody: Option<Value> = match &r.body {
-            kr_net::http1::server::Body::Full(b) => decode(r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map(|(_, v)| v.as_str()).unwrap_or("application/json"), b),
+            kr_net::http1::server::Body::Full(b) if want_body => decode(r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map(|(_, v)| v.as_str()).unwrap_or("application/json"), b),
             _ => None,
         };
         if code >= 400 {
@@ -654,7 +735,7 @@ fn event(api: &ApiServer, p: &Pending, stage: &str, resp: Option<&kr_net::http1:
         } else if code == 403 {
             annotations.push((String::from("authorization.k8s.io/decision"), String::from("forbid")));
         }
-        if let (Some(d), true) = (d, level >= Level::Request) {
+        if let (Some(d), true, Bodies::Inline) = (d, level >= Level::Request, bodies) {
             // Request body (JSON; other encodings are not recorded).
             let sens = sensitive(a);
             if !sens && !p.body.is_empty() {

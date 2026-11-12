@@ -56,5 +56,10 @@ ck "event format" "grep -q '\"kind\":\"Event\",\"apiVersion\":\"audit.k8s.io/v1\
 # rotation: fill the 1 MB log with big configmaps
 head -c 300000 /dev/urandom | base64 -w0 > "$W/big"
 for i in 1 2 3 4 5 6; do k -n t create cm big$i --from-file=d="$W/big" >/dev/null; done; sleep 3
+# Bodies over 256 KB are encoded by an offload worker after the response (ADR-052): the event
+# is complete and still carries the request object (and, for the list below, the response).
+ck "big request body logged (offload worker)" "[ \$(cat $A/server/audit/audit*.log | grep -c '\"requestObject\".*\"name\":\"big[0-9]\"') -ge 1 ]"
+for i in 1 2 3; do k -n t get cm -o json >/dev/null; done; sleep 2
+ck "big response body logged (offload worker)" "[ \$(cat $A/server/audit/audit*.log | grep '\"verb\":\"list\"' | grep -c '\"responseObject\".*big[0-9]') -ge 1 ]"
 ck "rotated" "[ \$(ls $A/server/audit | grep -c '^audit-') -ge 1 ]"
 [ $fail = 0 ] && echo "audit: all checks passed" || { echo "audit: FAILED"; exit 1; }

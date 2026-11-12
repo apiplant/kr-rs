@@ -10,6 +10,7 @@ extern crate std;
 extern crate alloc;
 
 pub mod exec;
+pub mod offload;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;

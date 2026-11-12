@@ -355,6 +355,12 @@ pub fn main(mut args: Args) -> i32 {
     if let Some(ms) = kr_runtime::store::env_var("KR_STALL_WARN_MS").and_then(|v| v.parse().ok()) {
         kr_rt::exec::set_stall_warn_ms(ms);
     }
+    // Workers for CPU-bound jobs (big lists, audit bodies; ADR-052). They are forks, so start them
+    // before the process grows. KR_OFFLOAD_WORKERS=0 turns the facility off.
+    let workers = kr_runtime::store::env_var("KR_OFFLOAD_WORKERS").and_then(|v| v.parse().ok()).unwrap_or(2usize);
+    if workers > 0 {
+        kr_rt::offload::init(kr_apiserver::offload::handler, workers);
+    }
     if let Some(ms) = kr_runtime::store::env_var("KR_RAFT_ELECTION_MS").and_then(|v| v.parse().ok()) {
         kr_apiserver::cluster::set_election_timeout_ms(ms);
     }

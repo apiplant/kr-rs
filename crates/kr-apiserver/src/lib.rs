@@ -26,6 +26,7 @@ pub mod encrypt;
 pub mod fieldval;
 pub mod metrics;
 pub mod node_authz;
+pub mod offload;
 pub mod object;
 pub mod openapi;
 pub mod patch;

@@ -139,6 +139,10 @@ pub struct ApiServer {
     custom: RefCell<Vec<crate::crd::Custom>>,
     /// Serialised OpenAPI documents by request key; dropped whenever the CRD set changes (#210).
     pub(crate) oa_cache: RefCell<alloc::collections::BTreeMap<String, Vec<u8>>>,
+    /// The transport awaits big list renderings in a worker: while this is set (around one
+    /// synchronous `handle_w`), `list` may leave a [`crate::offload::ListJob`] in `list_job`.
+    defer_lists: core::cell::Cell<bool>,
+    list_job: RefCell<Option<crate::offload::ListJob>>,
     /// Parsed stored objects by key and revision, for the lists that read many of them (#210).
     parsed: RefCell<ParseCache>,
     /// Group commit: writes reach the log synchronously, fsync happens off the event loop.
@@ -293,7 +297,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), oa_cache: RefCell::new(alloc::collections::BTreeMap::new()), parsed: RefCell::new(ParseCache::default()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), agg_http: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default() };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), oa_cache: RefCell::new(alloc::collections::BTreeMap::new()), parsed: RefCell::new(ParseCache::default()), defer_lists: core::cell::Cell::new(false), list_job: RefCell::new(None), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), agg_http: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default() };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -313,6 +317,22 @@ impl ApiServer {
 
     fn extra(&self) -> Vec<&'static Resource> {
         self.custom.borrow().iter().map(|c| c.res).collect()
+    }
+
+    /// Lets `list` hand big renderings to the offload workers (see [`crate::offload`]). The caller
+    /// must take the job with [`ApiServer::take_list_job`] right after the call.
+    pub fn set_defer_lists(&self, on: bool) {
+        self.defer_lists.set(on);
+    }
+
+    pub fn take_list_job(&self) -> Option<crate::offload::ListJob> {
+        self.list_job.borrow_mut().take()
+    }
+
+    /// Leaves `job` for the transport and returns the placeholder reply.
+    fn defer(&self, kind: u32, payload: Vec<u8>, finish: impl FnOnce(Vec<u8>) -> Reply + 'static) -> Reply {
+        *self.list_job.borrow_mut() = Some(crate::offload::ListJob { kind, payload, finish: Box::new(finish) });
+        Reply::Json(200, String::new())
     }
 
     /// The parsed form of a stored object, from the cache when its revision is unchanged.
@@ -1654,7 +1674,23 @@ impl ApiServer {
             (Some(_), Some(c)) if ls.is_empty() && fs.is_empty() => Some(self.store.borrow().list(&prefix, Some(c), 0).0.len()),
             _ => None,
         };
+        let bytes: usize = items.iter().map(|k| k.value.len()).sum();
+        // A big rendering goes to a worker (the transport awaits it); never for converted kinds.
+        let offload = self.defer_lists.get() && bytes >= crate::offload::MIN_BYTES && kr_rt::offload::enabled() && self.conversion_webhook(rt.res).is_none();
         if wants_table(req.accept) {
+            if offload {
+                let (cols, ctx) = self.table_head(rt.res);
+                let mut e = crate::offload::Enc::default();
+                ctx.encode(&mut e);
+                crate::offload::pack_items(&mut e, &items);
+                let head = self.table_open(cols, rev, cont.as_deref());
+                return Ok(self.defer(crate::offload::KIND_TABLE_ROWS, e.0, move |rows| {
+                    let mut out = head;
+                    out.push_str(core::str::from_utf8(&rows).unwrap_or(""));
+                    out.push_str("]}");
+                    Reply::Json(200, out)
+                }));
+            }
             return Ok(Reply::Json(200, self.table(rt.res, &items, rev, cont.as_deref())));
         }
         if wants_partial(req.accept) {
@@ -1668,6 +1704,16 @@ impl ApiServer {
                 json::write_str(c, &mut out);
             }
             out.push_str("},\"items\":[");
+            if offload {
+                let mut e = crate::offload::Enc::default();
+                e.u8(1);
+                crate::offload::pack_items(&mut e, &items);
+                return Ok(self.defer(crate::offload::KIND_ITEMS, e.0, move |body| {
+                    out.push_str(core::str::from_utf8(&body).unwrap_or(""));
+                    out.push_str("]}");
+                    Reply::Json(200, out)
+                }));
+            }
             for (i, kv) in items.iter().enumerate() {
                 if i > 0 { out.push(','); }
                 let v = self.parsed(kv).unwrap_or_else(|| alloc::rc::Rc::new(Value::Null));
@@ -1696,6 +1742,16 @@ impl ApiServer {
         }
         out.push_str("},\"items\":[");
         let defaulted = self.read_defaults(rt);
+        if let (Some(sch), true) = (&defaulted, offload) {
+            let mut e = crate::offload::Enc::default();
+            e.u8(0).bytes(json::to_string(sch).as_bytes());
+            crate::offload::pack_items(&mut e, &items);
+            return Ok(self.defer(crate::offload::KIND_ITEMS, e.0, move |body| {
+                out.push_str(core::str::from_utf8(&body).unwrap_or(""));
+                out.push_str("]}");
+                Reply::Json(200, out)
+            }));
+        }
         for (i, kv) in items.iter().enumerate() {
             if i > 0 {
                 out.push(',');
@@ -1713,14 +1769,16 @@ impl ApiServer {
         Ok(Reply::Json(200, out))
     }
 
-    fn table(&self, res: &Resource, items: &[Kv], rev: u64, cont: Option<&str>) -> String {
+    /// Column definitions of a Table and what its rows need.
+    fn table_head(&self, res: &Resource) -> (Vec<Value>, crate::offload::TableCtx) {
         let now = (self.now)();
         let col = |name: &str, ty: &str, fmt: &str, desc: &str, prio: u64| {
             obj(alloc::vec![("name", Value::from(name)), ("type", Value::from(ty)), ("format", Value::from(fmt)), ("description", Value::from(desc)), ("priority", Value::Number(Number::from_u64(prio)))])
         };
         let mut cols = alloc::vec![col("Name", "string", "name", "Name must be unique within a namespace.", 0)];
         let custom_cols: Option<Vec<(String, String, u64)>> = self.custom.borrow().iter().find(|c| core::ptr::eq(c.res, res)).map(|c| c.printer.clone());
-        let extra = if custom_cols.is_some() { &[][..] } else { crate::printers::columns(res.kind) };
+        let builtin = custom_cols.is_none();
+        let extra = if builtin { crate::printers::columns(res.kind) } else { &[][..] };
         for (n, _) in extra {
             cols.push(col(n, "string", "", "", 0));
         }
@@ -1733,60 +1791,50 @@ impl ApiServer {
         if !own_age {
             cols.push(col("Age", "string", "", "CreationTimestamp", 0));
         }
-        let wide = if self.custom.borrow().iter().any(|c| core::ptr::eq(c.res, res)) { &[][..] } else { crate::printers::wide_columns(res.kind) };
+        let wide = if builtin { crate::printers::wide_columns(res.kind) } else { &[][..] };
         for (n, _) in wide {
             cols.push(col(n, "string", "", "", 1));
         }
         for (n, _, pr) in &cust_wide {
             cols.push(col(n, "string", "", "", *pr));
         }
-        // Rows are written as text straight from the parsed objects: no copy of each object's
-        // metadata (with its managedFields) into an intermediate tree.
-        let empty_meta = Value::Object(Vec::new());
-        let mut rows = String::with_capacity(items.len() * 700);
-        for kv in items {
-            let Some(o) = self.parsed(kv) else { continue };
-            let meta = o.get("metadata").unwrap_or(&empty_meta);
-            let name = meta.get("name").and_then(Value::as_str).unwrap_or("");
-            if !rows.is_empty() {
-                rows.push(',');
-            }
-            rows.push_str("{\"cells\":[");
-            json::write_str(name, &mut rows);
-            let cell = |c: &str, rows: &mut String| {
-                rows.push(',');
-                json::write_str(c, rows);
-            };
-            for (_, f) in extra {
-                cell(&f(&o), &mut rows);
-            }
-            for (_, p, _) in &cust_main {
-                cell(&crate::crd::json_path(&o, p), &mut rows);
-            }
-            if !own_age {
-                let created = meta.get("creationTimestamp").and_then(Value::as_str).and_then(crate::printers::parse_rfc3339);
-                cell(&created.map(|c| crate::printers::human_duration(now - c)).unwrap_or_else(|| "<unknown>".into()), &mut rows);
-            }
-            for (_, f) in wide {
-                cell(&f(&o), &mut rows);
-            }
-            for (_, p, _) in &cust_wide {
-                cell(&crate::crd::json_path(&o, p), &mut rows);
-            }
-            rows.push_str("],\"object\":{\"kind\":\"PartialObjectMetadata\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":");
-            rows.push_str(&json::to_string(meta));
-            rows.push_str("}}");
-        }
+        let ctx = crate::offload::TableCtx {
+            kind: res.kind.to_string(),
+            builtin,
+            cust_main: cust_main.into_iter().map(|c| c.1).collect(),
+            cust_wide: cust_wide.into_iter().map(|c| c.1).collect(),
+            own_age,
+            now,
+        };
+        (cols, ctx)
+    }
+
+    /// The text of a Table up to and including `"rows":[`.
+    fn table_open(&self, cols: Vec<Value>, rev: u64, cont: Option<&str>) -> String {
         let mut meta = alloc::vec![("resourceVersion", Value::String(rev.to_string()))];
         if let Some(c) = cont {
             meta.push(("continue", Value::from(c)));
         }
-        let mut out = String::with_capacity(rows.len() + 1024);
+        let mut out = String::with_capacity(2048);
         out.push_str("{\"kind\":\"Table\",\"apiVersion\":\"meta.k8s.io/v1\",\"metadata\":");
         out.push_str(&json::to_string(&obj(meta)));
         out.push_str(",\"columnDefinitions\":");
         out.push_str(&json::to_string(&Value::Array(cols)));
         out.push_str(",\"rows\":[");
+        out
+    }
+
+    fn table(&self, res: &Resource, items: &[Kv], rev: u64, cont: Option<&str>) -> String {
+        let (cols, ctx) = self.table_head(res);
+        let mut out = self.table_open(cols, rev, cont);
+        // Rows are written as text straight from the cached trees: no copy of each object's
+        // metadata (with its managedFields) into an intermediate tree.
+        let mut rows = String::with_capacity(items.len() * 700);
+        for kv in items {
+            if let Some(o) = self.parsed(kv) {
+                crate::offload::write_row(&mut rows, &o, &ctx);
+            }
+        }
         out.push_str(&rows);
         out.push_str("]}");
         out
