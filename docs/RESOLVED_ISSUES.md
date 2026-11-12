@@ -389,3 +389,6 @@
 
 210a. **OpenAPI documents were rebuilt on every request** — *fixed* (rest stays as #210)
     `/openapi/v2` (JSON and protobuf), `/openapi/v3` and `/openapi/v3/<group-version>` are cached in `ApiServer::oa_cache` and dropped whenever the CRD set changes (`register_crd`, `unregister_crd`, `reload_crds`). Test: `cached_documents_follow_the_crd_set`.
+
+216. **Kubelet fsynced on the event loop (100+ ms stalls at start-up and at every pod start)** — *fixed*
+    Found with the stall watchdog (#213a): the kubelet main loop stalled 100–160 ms per pod while adopting pods because `persist` rewrote each pod's adoption record with `write_file_atomic`, which fsyncs. `persist` now skips the write when the file already holds the same content, and the regenerable per-pod files (`resolv.conf`, `/etc/hosts`, projected Secret/ConfigMap/ServiceAccount volume files) use the new `write_file_atomic_nosync` (atomic rename, no fsync). Takes effect after a restart.

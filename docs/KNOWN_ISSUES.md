@@ -149,6 +149,9 @@ ADR-047. Default `["secrets"]`; `plural` or `plural.group` (e.g. `configmaps`, `
 214. **Default RBAC bindings, Roles and other bootstrap objects are not reconciled on upgrade** — *ADR-023*
     Only default ClusterRoles gain missing rules at start (#215 in RESOLVED). Default ClusterRoleBindings (subjects), the `kube-system` Roles, PriorityClasses, the default StorageClass and APF objects are still created once and never updated, so changes in a newer release do not reach an existing cluster, and a deleted default role does come back but a modified binding does not. Upstream reconciles bindings' subjects and roles' rules the same way (`autoupdate`).
 
+215. **Other synchronous disk work remains on the event loop** — *ADR-050, #208*
+    The adoption record (`persist`) still fsyncs when it really changes, the device-plugin checkpoint, the rootless infra file and the CNI/IPAM/state files are written with fsync inline; the kubelet's cgroup, `/proc` and directory scans (sweep, adoption, `remove_unclaimed_dirs`) are synchronous too. Use `KR_STALL_WARN_MS` and the "last phase" label of the stall log to find which one matters on a given machine; the fix is the helper facility of #208 or moving the fsync to the durable-commit helper process (ADR-024).
+
 # Accepted limitations (by design, or not planned for now)
 153. **No VolumeSnapshot support** — *missing compared with k3s*
     k3s can run the external snapshotter. kr ships no `VolumeSnapshot*` CRDs or controller and the CSI node side does not exercise snapshots; an external snapshot-controller with its CRDs may work but is untested.

@@ -163,7 +163,7 @@ pub fn write_resolv_conf(pod_dir: &str, pod: &Value, rootless_pod: bool, fam: kr
             }
         }
     }
-    kr_runtime::store::write_file_atomic(&alloc::format!("{pod_dir}/resolv.conf"), s.as_bytes()).map_err(|_| ())
+    kr_runtime::store::write_file_atomic_nosync(&alloc::format!("{pod_dir}/resolv.conf"), s.as_bytes()).map_err(|_| ())
 }
 
 /// Docker-link style service environment variables for the pod's namespace.
@@ -245,7 +245,7 @@ pub fn write_etc_hosts(pod_dir: &str, pod: &Value, hostname: &str, ip: Option<[u
             }
         }
     }
-    kr_runtime::store::write_file_atomic(&alloc::format!("{pod_dir}/etc-hosts"), s.as_bytes()).map_err(|_| ())
+    kr_runtime::store::write_file_atomic_nosync(&alloc::format!("{pod_dir}/etc-hosts"), s.as_bytes()).map_err(|_| ())
 }
 
 fn strs(v: Option<&Value>) -> Option<Vec<String>> {
@@ -450,7 +450,7 @@ fn write_item(dir: &str, path: &str, data: &[u8], mode: u32) -> Result<(), Strin
     if let Some((parent, _)) = full.rsplit_once('/') {
         let _ = kr_runtime::store::mkdir_p(parent, 0o755);
     }
-    kr_runtime::store::write_file_atomic(&full, data).map_err(|_| alloc::format!("cannot write {path}"))?;
+    kr_runtime::store::write_file_atomic_nosync(&full, data).map_err(|_| alloc::format!("cannot write {path}"))?;
     let fd = kr_sys::ns::open(alloc::format!("{full}\0").as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::fs::O_NOFOLLOW | kr_sys::O_CLOEXEC, 0).map_err(|_| alloc::format!("cannot open {path}"))?;
     kr_sys::fs::fchmod(fd.raw(), mode).map_err(|_| alloc::format!("cannot chmod {path}"))
 }

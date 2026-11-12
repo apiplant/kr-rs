@@ -342,12 +342,26 @@ pub fn mkdir_p(path: &str, mode: u32) -> Result<()> {
 
 /// Writes `data` to `path` atomically (tmp file + fsync + rename over).
 pub fn write_file_atomic(path: &str, data: &[u8]) -> Result<()> {
+    write_atomic(path, data, true)
+}
+
+/// Like [`write_file_atomic`] (readers see the old or the new content, never a partial file) but
+/// without the fsync: for files that are regenerated whenever they are lost (pod `resolv.conf`,
+/// `/etc/hosts`, projected volume files). An fsync costs about 100 ms on a busy disk and these
+/// are written on the event loop at every pod start.
+pub fn write_file_atomic_nosync(path: &str, data: &[u8]) -> Result<()> {
+    write_atomic(path, data, false)
+}
+
+fn write_atomic(path: &str, data: &[u8], sync: bool) -> Result<()> {
     let tmp = format!("{}{}", path, tmp_suffix());
     let ct = cpath(&tmp)?;
     let fd = fs::openat(AT_FDCWD, &ct, fs::O_WRONLY | fs::O_CREAT | fs::O_EXCL | fs::O_CLOEXEC, 0o644).ctx("create tmp")?;
     let r = (|| -> Result<()> {
         fs::write_all(fd.raw(), data).ctx("write")?;
-        fs::fsync(fd.raw()).ctx("fsync")?;
+        if sync {
+            fs::fsync(fd.raw()).ctx("fsync")?;
+        }
         fs::renameat2(AT_FDCWD, &ct, AT_FDCWD, &cpath(path)?, 0).ctx("rename")
     })();
     if r.is_err() {

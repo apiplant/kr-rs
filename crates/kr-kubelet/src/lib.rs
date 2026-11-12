@@ -1086,7 +1086,13 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 .collect();
             (alloc::format!("{}/{}", p.dir, adopt::FILE), adopt::encode(&rec, &ctrs))
         };
-        let _ = kr_runtime::store::write_file_atomic(&text.0, text.1.as_bytes());
+        // The write is atomic and fsyncs (about 100 ms on a busy disk, on the event loop): skip
+        // it when the record is already what is on disk (every adopted pod after a restart,
+        // every sync that changed nothing).
+        let same = kr_sys::fs::read_file(alloc::format!("{}\0", text.0).as_bytes(), 1 << 20).is_ok_and(|old| old == text.1.as_bytes());
+        if !same {
+            let _ = kr_runtime::store::write_file_atomic(&text.0, text.1.as_bytes());
+        }
     }
 
     /// Takes over the sandbox and containers a previous kubelet left running for this pod.
