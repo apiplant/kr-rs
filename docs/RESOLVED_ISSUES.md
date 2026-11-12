@@ -526,3 +526,6 @@
 
 270. **`seccompProfile` was ignored** — *fixed* (part of #131, ADR-055)
     Containers honour `securityContext.seccompProfile`: `RuntimeDefault` and no profile run the default filter, `Unconfined` runs without one, `Localhost` compiles an OCI/Docker profile file from the kubelet's seccomp directory (actions, caps/arch conditions, argument conditions; see ADR-055); a bad or missing profile is a `CreateContainerConfigError`. Exec'd processes get the same filter. The default filter refuses syscalls newer than the build's table with ENOSYS. Tests: `seccomp::tests` (5), `tools/test/seccomp.sh` (7 checks against real containers).
+
+271. **Each image was unpacked in full: shared base layers were duplicated** — *fixed for root* (part of #130, ADR-056)
+    A root kr stores each layer once under `layers/` (overlay whiteouts and opaque markers) and mounts an image's layers as a multi-`lowerdir` overlay; a layer another image already holds is not unpacked or stored again. Falls back to the flattened rootfs when a layer cannot be represented. Tests: `tools/test/layers.sh`, and an alpine image installed layered and run from its layer directory in a user namespace. Not run on your cluster yet (needs a rebuild; images pulled afterwards are layered).

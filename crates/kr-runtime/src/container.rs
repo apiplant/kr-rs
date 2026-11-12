@@ -806,7 +806,8 @@ pub fn start(spec: &RunSpec) -> Result<Running, RunError> {
     prepare_hooks(spec)?;
     // Overlay options are comma/colon separated, so those bytes (and NUL) must not occur in paths.
     let bad = |p: &[u8]| p.is_empty() || p.iter().any(|&b| b == b',' || b == b':' || b == 0);
-    if bad(spec.rootfs) || bad(spec.upper) || bad(spec.work) || bad(spec.merged) || spec.argv.is_empty() {
+    // The lower directories are separated by ':' (image layers, top first).
+    if spec.rootfs.split(|&b| b == b':').any(|l| bad(l)) || bad(spec.upper) || bad(spec.work) || bad(spec.merged) || spec.argv.is_empty() {
         return Err(RunError { step: "invalid spec", errno: Errno(22) });
     }
 

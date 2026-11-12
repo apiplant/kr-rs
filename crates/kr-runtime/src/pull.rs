@@ -159,6 +159,14 @@ pub(crate) fn install_image(store: &Store, id: &ImageId, manifest: &[u8], cfg_js
     crate::store::mkdir_p(&dir, 0o755)?;
     crate::store::write_file_atomic(&format!("{dir}/manifest.json"), manifest)?;
     crate::store::write_file_atomic(&format!("{dir}/config.json"), cfg_json)?;
+    // Real root keeps one directory per layer and lets images share them (ADR-056); anything the
+    // layered form cannot represent falls back to the flattened rootfs below.
+    if layered_wanted() {
+        match install_layers(store, &dir, layers, gz, diff_ids, limits) {
+            Ok(()) => return Ok(()),
+            Err(e) => kr_sys::write(2, format!("kr: image layers cannot be shared ({e:?}); unpacking a flattened rootfs\n").as_bytes()).map(|_| ()).unwrap_or(()),
+        }
+    }
 
     // Concurrent pulls of one image (other namespaces, other `kr ctr` processes) each unpack
     // into their own directory; the first rename wins.
@@ -187,6 +195,86 @@ pub(crate) fn install_image(store: &Store, id: &ImageId, manifest: &[u8], cfg_js
         }
     }
     Ok(())
+}
+
+/// Layered images are for root (the whiteout devices and `trusted.` xattrs of lower layers); a
+/// rootless store keeps flattening (ADR-017). `KR_LAYERED_STORE=off` turns it off.
+fn layered_wanted() -> bool {
+    fs::getuid() == 0 && !matches!(crate::store::env_var("KR_LAYERED_STORE").as_deref(), Some("off" | "0" | "false"))
+}
+
+/// An overlay option string is limited to a page: refuse image stacks that would not fit.
+const MAX_LOWERDIR_BYTES: usize = 3600;
+
+/// Unpacks every layer that is not in `layers/` yet, each into a directory of its own, and lists
+/// them in `<image>/layers`.
+fn install_layers(store: &Store, dir: &str, layers: &[Descriptor], gz: &[bool], diff_ids: &[String], limits: &Limits) -> Result<()> {
+    if diff_ids.len() != layers.len() {
+        return Err(Error::Image("config rootfs.diff_ids does not match the layer count"));
+    }
+    let keys: Vec<String> = diff_ids.iter().map(|d| Store::layer_key(d).ok_or(Error::Image("bad diff_id"))).collect::<Result<_>>()?;
+    if keys.len() * (store.layers_dir().len() + 25) > MAX_LOWERDIR_BYTES {
+        return Err(Error::Image("too many layers for one overlay mount"));
+    }
+    crate::store::mkdir_p(&store.layers_dir(), 0o755)?;
+    clear_stale_layer_tmp(&store.layers_dir());
+    let ldir = fs::openat(AT_FDCWD, &cpath(&store.layers_dir())?, fs::O_PATH | fs::O_DIRECTORY | fs::O_CLOEXEC, 0).ctx("open layers dir")?;
+    for (((l, &g), want), key) in layers.iter().zip(gz).zip(diff_ids).zip(&keys) {
+        if store.has_layer(key) {
+            continue;
+        }
+        let pid = kr_sys::fs::getpid();
+        let mut nonce = [0u8; 4];
+        kr_sys::getrandom(&mut nonce);
+        let tmp = format!("tmp-{key}-{pid}-{}-{:08x}", crate::network::proc_start(pid).unwrap_or(0), u32::from_le_bytes(nonce));
+        let ctmp = cpath(&tmp)?;
+        fs::mkdirat(ldir.raw(), &ctmp, 0o755).ctx("mkdir layer.tmp")?;
+        let res = (|| -> Result<()> {
+            let root = fs::openat(ldir.raw(), &ctmp, fs::O_RDONLY | fs::O_DIRECTORY | fs::O_CLOEXEC, 0).ctx("open layer.tmp")?;
+            let blob = store.open_blob(&l.digest)?;
+            let st = crate::unpack::unpack_layer_overlay_fd(root.raw(), blob.raw(), g, limits)?;
+            if st.diff_id != *want && alloc::format!("sha256:{}", st.diff_id) != *want {
+                return Err(Error::Image("layer diff_id does not match the config"));
+            }
+            Ok(())
+        })();
+        if let Err(e) = res {
+            let _ = fs::remove_all(ldir.raw(), &ctmp);
+            return Err(e);
+        }
+        match fs::renameat2(ldir.raw(), &ctmp, ldir.raw(), &cpath(key)?, fs::RENAME_NOREPLACE) {
+            Ok(()) => {}
+            Err(Errno(fs::EEXIST)) | Err(Errno(fs::ENOTEMPTY)) => {
+                let _ = fs::remove_all(ldir.raw(), &ctmp); // a concurrent pull finished first
+            }
+            Err(e) => {
+                let _ = fs::remove_all(ldir.raw(), &ctmp);
+                return Err(Error::Io("rename layer", e));
+            }
+        }
+    }
+    let list: String = keys.iter().map(|k| format!("{k}\n")).collect();
+    crate::store::write_file_atomic(&format!("{dir}/layers"), list.as_bytes())
+}
+
+/// Removes layer unpack directories (`tmp-<key>-<pid>-<start>-<n>`) of pulls whose process is gone.
+fn clear_stale_layer_tmp(dir: &str) {
+    let Ok(c) = cpath(dir) else { return };
+    let Ok(fd) = fs::openat(AT_FDCWD, &c, fs::O_RDONLY | fs::O_DIRECTORY | fs::O_CLOEXEC, 0) else { return };
+    let names: Vec<Vec<u8>> = fs::read_dir(&fd).filter_map(|e| e.ok()).map(|e| e.name).collect();
+    for name in names {
+        let Some(rest) = name.strip_prefix(b"tmp-") else { continue };
+        let Ok(rest) = core::str::from_utf8(rest) else { continue };
+        let mut f = rest.split('-');
+        let (_key, pid, start) = (f.next(), f.next().and_then(|p| p.parse::<u32>().ok()), f.next().and_then(|s| s.parse::<u64>().ok()));
+        if let (Some(pid), Some(start)) = (pid, start) {
+            if crate::network::proc_start(pid) != Some(start) {
+                let mut n = name.clone();
+                n.push(0);
+                let _ = fs::remove_all(fd.raw(), &n);
+            }
+        }
+    }
 }
 
 /// Removes unpack directories of pulls whose process is gone (`rootfs.tmp-<pid>-<start>-<n>`,

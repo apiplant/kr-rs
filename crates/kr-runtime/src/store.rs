@@ -583,12 +583,54 @@ impl Store {
         Ok(format!("{}/rootfs", self.image_dir(id)?))
     }
 
-    /// True once the flattened rootfs has been renamed into place.
+    // ---- shared layers (ADR-056) ----
+
+    /// `layers/`: one directory per layer (its own content, with overlay whiteouts), named by
+    /// the first 24 hex digits of the layer's diff_id, shared by every image that has the layer.
+    pub fn layers_dir(&self) -> String {
+        self.join("layers")
+    }
+
+    /// Key of a layer in `layers/`: lower-case hex of its diff_id without the `sha256:` prefix.
+    pub fn layer_key(diff_id: &str) -> Option<String> {
+        let h = diff_id.strip_prefix("sha256:").unwrap_or(diff_id);
+        (h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).then(|| h[..24].to_string())
+    }
+
+    pub fn layer_path(&self, key: &str) -> String {
+        format!("{}/{key}", self.layers_dir())
+    }
+
+    pub fn has_layer(&self, key: &str) -> bool {
+        cpath(&self.layer_path(key)).ok().is_some_and(|p| fs::newfstatat(AT_FDCWD, &p, fs::AT_SYMLINK_NOFOLLOW).is_ok_and(|s| s.is_dir()))
+    }
+
+    /// The layer keys of an image installed as shared layers, base first.
+    pub fn image_layers(&self, id: &ImageId) -> Option<Vec<String>> {
+        let data = fs::read_file(&cpath(&format!("{}/layers", self.image_dir(id).ok()?)).ok()?, 1 << 16).ok()?;
+        let keys: Vec<String> = core::str::from_utf8(&data).ok()?.lines().map(|l| l.to_string()).filter(|l| !l.is_empty()).collect();
+        (!keys.is_empty() && keys.iter().all(|k| k.len() == 24 && k.bytes().all(|b| b.is_ascii_hexdigit()))).then_some(keys)
+    }
+
+    /// True once the image can be run: a flattened rootfs has been renamed into place, or every
+    /// layer of its shared-layer list is present.
     pub fn has_image(&self, id: &ImageId) -> bool {
-        match self.rootfs_path(id).and_then(|p| cpath(&p)) {
+        let flat = match self.rootfs_path(id).and_then(|p| cpath(&p)) {
             Ok(p) => fs::newfstatat(AT_FDCWD, &p, fs::AT_SYMLINK_NOFOLLOW).is_ok_and(|s| s.is_dir()),
             Err(_) => false,
+        };
+        flat || self.image_layers(id).is_some_and(|l| l.iter().all(|k| self.has_layer(k)))
+    }
+
+    /// What goes into the overlay's `lowerdir=` for the image: its flattened rootfs, or its
+    /// layers top first, separated by `:`.
+    pub fn lower_dirs(&self, id: &ImageId) -> Result<String> {
+        let flat = self.rootfs_path(id)?;
+        if cpath(&flat).ok().is_some_and(|p| fs::newfstatat(AT_FDCWD, &p, fs::AT_SYMLINK_NOFOLLOW).is_ok_and(|s| s.is_dir())) {
+            return Ok(flat);
         }
+        let keys = self.image_layers(id).ok_or(Error::Image("image has no rootfs and no layers"))?;
+        Ok(keys.iter().rev().map(|k| self.layer_path(k)).collect::<Vec<_>>().join(":"))
     }
 
     pub fn image_config(&self, id: &ImageId) -> Result<ImageConfig> {
@@ -633,7 +675,7 @@ impl Store {
             return None;
         }
         let cfg = self.image_config(&id).ok()?;
-        let rootfs = cpath(&self.rootfs_path(&id).ok()?).ok()?;
+        let rootfs = cpath(&self.lower_dirs(&id).ok()?).ok()?;
         Some((id, cfg, rootfs))
     }
 

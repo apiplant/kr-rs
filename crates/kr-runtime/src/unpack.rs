@@ -57,6 +57,7 @@ pub struct Stats {
 }
 
 const ATFLAG_NOFOLLOW: i32 = fs::AT_SYMLINK_NOFOLLOW;
+const S_IFCHR: u32 = 0o020000;
 
 fn fnv(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -112,6 +113,10 @@ struct Unpacker<'a> {
     created: BTreeSet<u64>,
     dirs: BTreeMap<String, Fixup>,
     cur: Option<Cur>,
+    /// Unpacking one layer into an empty directory for use as an overlayfs lower layer (ADR-056):
+    /// whiteouts become `0:0` character devices and opaque directories carry the overlay xattrs
+    /// instead of deleting what lower layers hold.
+    overlay: bool,
 }
 
 fn ts(sec: i64) -> [Timespec; 2] {
@@ -124,7 +129,7 @@ fn ignorable_perm(e: Errno) -> bool {
 }
 
 impl<'a> Unpacker<'a> {
-    fn new(root: i32, lim: &'a Limits) -> Self {
+    fn new(root: i32, lim: &'a Limits, overlay: bool) -> Self {
         Unpacker {
             root,
             lim,
@@ -133,6 +138,7 @@ impl<'a> Unpacker<'a> {
             created: BTreeSet::new(),
             dirs: BTreeMap::new(),
             cur: None,
+            overlay,
         }
     }
 
@@ -356,6 +362,14 @@ impl<'a> Unpacker<'a> {
         if !valid_name(name) || self.created.contains(&fnv(target)) {
             return Ok(());
         }
+        if self.overlay {
+            // The lower layers are not here: leave a whiteout for the overlay to honour.
+            let pf = self.open_dir(parent, true)?;
+            fs::remove_all(pf.raw(), &cname(name)).ctx("replace with whiteout")?;
+            fs::mknodat(pf.raw(), &cname(name), S_IFCHR, 0).ctx("whiteout device")?;
+            self.mark_created(target);
+            return Ok(());
+        }
         let pf = match self.open_dir(parent, false) {
             Ok(f) => f,
             Err(Error::Io(_, Errno(ENOENT))) | Err(Error::Io(_, Errno(ENOTDIR))) => return Ok(()),
@@ -366,6 +380,21 @@ impl<'a> Unpacker<'a> {
 
     /// `.wh..wh..opq`: empty `dir` of everything that did not come from this layer.
     fn opaque(&mut self, dir: &str) -> Result<()> {
+        if self.overlay {
+            // `trusted.` is what a mount by real root reads, `user.` what one with `userxattr`
+            // (inside a user namespace) reads: set what the filesystem allows, at least one.
+            self.open_dir(dir, true)?; // exists now (an O_PATH fd cannot carry xattrs)
+            let d = if dir.is_empty() {
+                fs::open_in_root(self.root, b".\0", fs::O_RDONLY | fs::O_DIRECTORY, 0).ctx("open root")?
+            } else {
+                fs::open_in_root(self.root, &cname(dir), fs::O_RDONLY | fs::O_DIRECTORY | fs::O_NOFOLLOW, 0).ctx("open opaque dir")?
+            };
+            let mut ok = false;
+            for name in [&b"trusted.overlay.opaque\0"[..], &b"user.overlay.opaque\0"[..]] {
+                ok |= fs::fsetxattr(d.raw(), name, b"y", 0).is_ok();
+            }
+            return if ok { Ok(()) } else { Err(Error::Io("opaque directory xattr", Errno(fs::ENOTSUP))) };
+        }
         let d = if dir.is_empty() {
             fs::open_in_root(self.root, b".\0", fs::O_RDONLY | fs::O_DIRECTORY, 0).ctx("open root")?
         } else {
@@ -442,8 +471,8 @@ impl<'a> Unpacker<'a> {
     }
 }
 
-fn run(root: i32, src: &mut dyn FnMut(&mut [u8]) -> Result<usize>, lim: &Limits, gzip: bool) -> Result<Stats> {
-    let mut u = Unpacker::new(root, lim);
+fn run(root: i32, src: &mut dyn FnMut(&mut [u8]) -> Result<usize>, lim: &Limits, gzip: bool, overlay: bool) -> Result<Stats> {
+    let mut u = Unpacker::new(root, lim, overlay);
     let mut tr = TarReader::new();
     let mut gz = GzDecoder::new();
     let mut buf = alloc::vec![0u8; 64 * 1024];
@@ -491,7 +520,7 @@ pub fn unpack_layer(
     src: &mut dyn FnMut(&mut [u8]) -> Result<usize>,
     limits: &Limits,
 ) -> Result<Stats> {
-    run(rootfs_dirfd, src, limits, true)
+    run(rootfs_dirfd, src, limits, true, false)
 }
 
 /// Like [`unpack_layer`] for an uncompressed tar stream.
@@ -500,7 +529,7 @@ pub fn unpack_tar_layer(
     src: &mut dyn FnMut(&mut [u8]) -> Result<usize>,
     limits: &Limits,
 ) -> Result<Stats> {
-    run(rootfs_dirfd, src, limits, false)
+    run(rootfs_dirfd, src, limits, false, false)
 }
 
 /// Unpacks a layer file/fd (`gzip` selects the compression).
@@ -513,5 +542,19 @@ pub fn unpack_layer_fd(rootfs_dirfd: i32, layer_fd: i32, gzip: bool, limits: &Li
             }
         }
     };
-    run(rootfs_dirfd, &mut src, limits, gzip)
+    run(rootfs_dirfd, &mut src, limits, gzip, false)
+}
+
+/// Like [`unpack_layer_fd`] into an empty directory that becomes an overlayfs lower layer: the
+/// layer's own content, with whiteouts and opaque directories in the overlay's representation.
+pub fn unpack_layer_overlay_fd(layer_dirfd: i32, layer_fd: i32, gzip: bool, limits: &Limits) -> Result<Stats> {
+    let mut src = |b: &mut [u8]| -> Result<usize> {
+        loop {
+            match kr_sys::read(layer_fd, b) {
+                Err(Errno(kr_sys::EINTR)) => continue,
+                r => return r.ctx("read layer"),
+            }
+        }
+    };
+    run(layer_dirfd, &mut src, limits, gzip, true)
 }
