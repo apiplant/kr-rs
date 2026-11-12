@@ -14,8 +14,6 @@ Ordered by impact. Size: S days, M a week or two, L more.
     The CA, service-account key and encryption config now replicate through the Raft log (RESOLVED 320). Left: the Docker script `tools/test/ha.sh keysync` has not been run; HTTPS/Raft listeners need a rolling restart after a CA step (no hot reload of listener trust); `finish` of a CA rotation cannot tell whether every node renewed its certificates (hence `--yes`); `secrets-encrypt status` has no per-key object counts for the cluster; `kr pki rotate` without `admin.kubeconfig` assumes port 6443 unless `--port`.
 11. **aarch64 on real hardware, and CI** — L
     k3s ships arm64 as a first-class target. Cross-built kr binaries run only under qemu-user (`tools/test/aarch64.sh`), where namespaces, cgroups, clone3 and mounts do not work, so the kubelet/runtime/apiserver paths have never run on aarch64. Needs a real arm64 host and a CI job.
-136. **CSI: driver volume statistics** — *ADR-041*, S
-    Expansion is done (RESOLVED 328). Volume stats still come from `statfs` (as upstream for local volumes); the driver's `NodeGetVolumeStats` is implemented in `Csi::volume_stats` but not called by the kubelet's `kubelet_volume_stats_*` (it is synchronous). Needs a test with a real driver.
 199. **Kubelet metrics endpoints** — *ADR-048*, M
     `/metrics/cadvisor`, `/metrics` and `/metrics/probes` are served (RESOLVED 327); missing: `container_fs_*` (writable-layer usage), per-container network (cAdvisor reports the pod's interfaces too), `container_spec_*`, and most kubelet internals histograms (PLEG, runtime operations). Not run against a live Prometheus here.
 183. **Audit parity** (remaining of #180-#184) — *ADR-046, ADR-029*, M

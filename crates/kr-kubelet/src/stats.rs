@@ -8,7 +8,7 @@
 
 use crate::{CState, Client, Kubelet};
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::future::Future;
@@ -375,6 +375,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let mut out = Vec::new();
         for p in self.pods.borrow().values() {
             for (volume, claim, path) in p.pvcs.iter().flatten() {
+                // Driver-reported numbers (NodeGetVolumeStats, refreshed by `volume_stats_loop`).
+                if let Some(c) = self.vol_cache.borrow().get(path) {
+                    out.push(VolStat { ns: p.ns.clone(), pod: p.name.clone(), volume: volume.clone(), claim: claim.clone(), capacity: c.capacity_bytes, used: c.used_bytes, available: c.available_bytes, inodes: c.inodes, inodes_used: c.inodes_used, inodes_free: c.inodes_free });
+                    continue;
+                }
                 let Ok([bs, blocks, bfree, bavail, files, ffree]) = kr_sys::ns::statfs(path.as_bytes()) else { continue };
                 out.push(VolStat {
                     ns: p.ns.clone(),
@@ -391,6 +396,36 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             }
         }
         out
+    }
+
+    /// Every minute: asks the CSI drivers that offer GET_VOLUME_STATS for their volume numbers
+    /// (statfs is the fallback inside [`crate::csi::Csi::volume_stats`] for the rest) and keeps
+    /// them for `/metrics` and `/stats/summary`, so scraping never calls a driver. A volume the
+    /// driver reports abnormal raises a `VolumeConditionAbnormal` event once (again after it
+    /// recovered and failed again), as upstream's kubelet does.
+    pub async fn volume_stats_loop(self: &alloc::rc::Rc<Self>) {
+        loop {
+            kr_rt::exec::sleep(60_000).await;
+            let mut cache = BTreeMap::new();
+            let mut bad = BTreeSet::new();
+            for s in self.csi.volume_stats().await {
+                let Some(path) = self.csi.publish_path(&s.pod_uid, &s.pv) else { continue };
+                if let Some(msg) = &s.abnormal {
+                    bad.insert(path.clone());
+                    if !self.vol_abnormal.borrow().contains(&path) {
+                        let pod = self.pods.borrow().get(&s.pod_uid).map(|p| (p.ns.clone(), p.name.clone()));
+                        if let Some((ns, name)) = pod {
+                            let o = |f: Vec<(&str, Value)>| Value::Object(f.into_iter().map(|(k, v)| (String::from(k), v)).collect());
+                            let pod = o(alloc::vec![("metadata", o(alloc::vec![("namespace", Value::from(ns.as_str())), ("name", Value::from(name.as_str())), ("uid", Value::from(s.pod_uid.as_str()))]))]);
+                            self.emit_event(&pod, "Warning", "VolumeConditionAbnormal", &alloc::format!("Volume {} is abnormal: {msg}", s.pv)).await;
+                        }
+                    }
+                }
+                cache.insert(path, s);
+            }
+            *self.vol_cache.borrow_mut() = cache;
+            *self.vol_abnormal.borrow_mut() = bad;
+        }
     }
 
     pub fn internals(&self) -> Internals {

@@ -671,3 +671,5 @@
 
 332. **WireGuard pod-network backend** — *fixed* (#319, ADR-062)
     `KR_NET_BACKEND=wireguard` (k3s `wireguard-native`): kernel WireGuard device `kr.wg` through rtnetlink plus generic netlink (family resolved by name), per-node X25519 key in `<root>/wireguard.key` (0600), public key and endpoint in node annotations, peers and routes reconciled from the Node list. Tests: `netlink::wireguard::tests`, `wireguard_peer_allowed_ips_follow_the_shared_families`, `wireguard_endpoint_annotation_parses`. Kernel run: KNOWN_ISSUES section B.
+333. **CSI: driver volume statistics** — *fixed* (#136, ADR-041)
+    The kubelet `volume_stats_loop` calls `Csi::volume_stats` once a minute (`NodeGetVolumeStats` for drivers with GET_VOLUME_STATS, `statfs` of a verified mount otherwise) and caches the result by publish path; `kubelet_volume_stats_*` and `/stats/summary` read the cache (statfs fallback before the first pass), so scraping never calls a driver. An abnormal `volume_condition` raises a Warning event `VolumeConditionAbnormal` on the pod once per transition. Test: `csi::tests::volume_condition_is_decoded` and the stats cases. Not run against a real driver (section B).

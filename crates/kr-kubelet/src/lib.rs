@@ -278,6 +278,10 @@ pub struct Kubelet<C: Client> {
     notify: Notify,
     devices: Rc<deviceplugin::Plugins>,
     csi: Rc<csi::Csi>,
+    /// CSI volume numbers from the last `volume_stats_loop` pass (publish path -> stats), and the
+    /// volumes already reported abnormal.
+    vol_cache: RefCell<BTreeMap<String, csi::VolumeStats>>,
+    vol_abnormal: RefCell<alloc::collections::BTreeSet<String>>,
     /// Image pulls in flight or recently failed (image ref -> state).
     pulls: RefCell<BTreeMap<String, Pull>>,
     /// Images pulled successfully by this kubelet (pullPolicy Always / :latest satisfied).
@@ -334,7 +338,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     pub fn new(c: C, cfg: Config, store: Store) -> Rc<Self> {
         let devices = deviceplugin::Plugins::new(&deviceplugin::default_dir(&cfg.root));
         let csi = csi::Csi::new(&cfg.node_name);
-        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), starting: RefCell::new(alloc::collections::BTreeSet::new()), notify: Notify::default(), devices, csi, pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()), adopted: Cell::new((0, 0)), survive: Cell::new(false), netpol: Rc::new(netpol::Ctl::default()), probe_counts: RefCell::new(BTreeMap::new()), started_s: now_ms() as i64 / 1000 })
+        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), starting: RefCell::new(alloc::collections::BTreeSet::new()), notify: Notify::default(), devices, csi, vol_cache: RefCell::new(BTreeMap::new()), vol_abnormal: RefCell::new(alloc::collections::BTreeSet::new()), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()), adopted: Cell::new((0, 0)), survive: Cell::new(false), netpol: Rc::new(netpol::Ctl::default()), probe_counts: RefCell::new(BTreeMap::new()), started_s: now_ms() as i64 / 1000 })
     }
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
@@ -470,6 +474,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         kr_rt::exec::spawn(async move { ev.eviction_loop().await });
         let lm = self.clone();
         kr_rt::exec::spawn(async move { lm.log_mark_loop().await });
+        let vs = self.clone();
+        kr_rt::exec::spawn(async move { vs.volume_stats_loop().await });
         let gc = self.clone();
         kr_rt::exec::spawn(async move { gc.image_gc_loop().await });
         let mut swept = false;

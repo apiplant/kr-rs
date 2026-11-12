@@ -118,11 +118,22 @@ fn decode_caps(b: &[u8]) -> Result<Vec<u64>, ()> {
     Ok(caps)
 }
 
-/// `NodeGetVolumeStatsResponse` -> (bytes, inodes) as (available, total, used).
-#[allow(dead_code)] // for the kubelet metrics endpoint (no caller yet)
-fn decode_stats(b: &[u8]) -> Result<([u64; 3], [u64; 3]), ()> {
-    let (mut bytes, mut inodes) = ([0; 3], [0; 3]);
+/// `NodeGetVolumeStatsResponse` -> (bytes, inodes) as (available, total, used), and the
+/// `volume_condition` message when the driver reports the volume abnormal.
+fn decode_stats(b: &[u8]) -> Result<([u64; 3], [u64; 3], Option<String>), ()> {
+    let (mut bytes, mut inodes, mut abnormal) = ([0; 3], [0; 3], None);
     walk(b, |k, f| {
+        if k == 2 {
+            let (mut bad, mut msg) = (false, String::new());
+            let _ = walk(f.as_bytes().unwrap_or(&[]), |k, f| match k {
+                1 => bad = f.as_varint().unwrap_or(0) != 0,
+                2 => msg = String::from_utf8_lossy(f.as_bytes().unwrap_or(&[])).into_owned(),
+                _ => {}
+            });
+            if bad {
+                abnormal = Some(msg);
+            }
+        }
         if k != 1 {
             return;
         }
@@ -138,12 +149,11 @@ fn decode_stats(b: &[u8]) -> Result<([u64; 3], [u64; 3]), ()> {
             _ => {}
         }
     })?;
-    Ok((bytes, inodes))
+    Ok((bytes, inodes, abnormal))
 }
 
-/// Usage of one volume mounted for a pod, for a (future) kubelet metrics endpoint
-/// (`kubelet_volume_stats_*`; `pod_uid` and `pv` identify the series).
-#[allow(dead_code)] // for the kubelet metrics endpoint (no caller yet)
+/// Usage of one volume mounted for a pod (`kubelet_volume_stats_*`; `pod_uid` and `pv`
+/// identify the series). `abnormal` carries the driver's `volume_condition` message.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VolumeStats {
     pub pod_uid: String,
@@ -154,6 +164,7 @@ pub struct VolumeStats {
     pub inodes: u64,
     pub inodes_used: u64,
     pub inodes_free: u64,
+    pub abnormal: Option<String>,
 }
 
 /// Unique volume name as the kubelet reports it in `status.volumesInUse`.
@@ -737,7 +748,6 @@ impl Csi {
     /// Usage of every volume mounted for a pod: `NodeGetVolumeStats` when the driver offers
     /// GET_VOLUME_STATS, otherwise `statfs` of the publish path. Volumes that cannot be read
     /// are left out.
-    #[allow(dead_code)] // for the kubelet metrics endpoint (no caller yet)
     pub async fn volume_stats(&self) -> Vec<VolumeStats> {
         let Some(root) = self.root.as_deref() else { return Vec::new() };
         let mut out = Vec::new();
@@ -759,7 +769,8 @@ impl Csi {
                     }
                     _ => None,
                 };
-                if let Some(([avail, total, used], [ifree, itotal, iused])) = via_driver {
+                if let Some(([avail, total, used], [ifree, itotal, iused], abnormal)) = via_driver {
+                    s.abnormal = abnormal;
                     (s.available_bytes, s.capacity_bytes, s.used_bytes, s.inodes_free, s.inodes, s.inodes_used) = (avail, total, used, ifree, itotal, iused);
                 } else if !is_mount_point(&target) {
                     continue; // nothing mounted there (a failed publish): statfs would report the parent filesystem
@@ -1178,6 +1189,26 @@ pub(crate) mod tests {
             csi.report_in_use(&fake).await;
             assert_eq!(fake.log.borrow().last().unwrap().2, r#"{"status":{"volumesInUse":[]}}"#);
         });
+    }
+
+    #[test]
+    fn volume_condition_is_decoded() {
+        let mut w = Writer::new();
+        w.message(1, |w| {
+            w.varint(1, 5).varint(2, 10).varint(3, 5).varint(4, 1);
+        });
+        assert_eq!(decode_stats(w.as_bytes()).unwrap().2, None);
+        w.message(2, |w| {
+            w.varint(1, 1).string(2, "disk degraded");
+        });
+        let (bytes, _, ab) = decode_stats(w.as_bytes()).unwrap();
+        assert_eq!(bytes, [5, 10, 5]);
+        assert_eq!(ab.as_deref(), Some("disk degraded"));
+        let mut ok = Writer::new();
+        ok.message(2, |w| {
+            w.varint(1, 0).string(2, "fine");
+        });
+        assert_eq!(decode_stats(ok.as_bytes()).unwrap().2, None);
     }
 
     #[test]
