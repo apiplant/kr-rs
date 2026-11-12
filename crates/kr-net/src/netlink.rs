@@ -179,6 +179,44 @@ impl Netlink {
     }
 }
 
+impl Netlink {
+    /// Sends `msgs` (one message with NLM_F_ACK) and returns the payload messages the kernel
+    /// answers with (header included) up to its ack or the end of the dump.
+    pub fn request(&self, msgs: &NlBuf) -> Result<Vec<Vec<u8>>, Errno> {
+        assert!(msgs.msg.is_none(), "unterminated netlink message");
+        if kr_sys::write(self.fd.raw(), msgs.bytes())? != msgs.bytes().len() {
+            return Err(Errno(5));
+        }
+        let mut out = Vec::new();
+        let mut buf = alloc::vec![0u8; 32 * 1024];
+        loop {
+            let n = match kr_sys::read(self.fd.raw(), &mut buf) {
+                Err(Errno(4)) => continue,
+                r => r?,
+            };
+            let mut off = 0;
+            while off + 16 <= n {
+                let len = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+                let ty = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
+                if len < 16 || off + len > n {
+                    return Err(Errno(74));
+                }
+                match ty {
+                    NLMSG_ERROR if len >= 20 => {
+                        let e = i32::from_ne_bytes(buf[off + 16..off + 20].try_into().unwrap());
+                        return if e == 0 { Ok(out) } else { Err(Errno(-e)) };
+                    }
+                    NLMSG_DONE => return Ok(out),
+                    _ => out.push(buf[off..off + len].to_vec()),
+                }
+                off += align4(len);
+            }
+        }
+    }
+}
+
+pub mod wireguard;
+
 // ---- rtnetlink ----
 
 const RTM_NEWLINK: u16 = 16;

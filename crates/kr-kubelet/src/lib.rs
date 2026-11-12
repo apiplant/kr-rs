@@ -73,6 +73,8 @@ pub struct Config {
     pub node_ip: [u8; 16],
     /// Pod network backend: VXLAN overlay (true) or host-gw routes (false, needs one L2 segment).
     pub vxlan: bool,
+    /// WireGuard backend (`KR_NET_BACKEND=wireguard`, ADR-062); `vxlan` is false then.
+    pub wireguard: bool,
     /// Hard eviction: MemAvailable (bytes) below which the node is under memory pressure.
     pub eviction_memory_bytes: u64,
     /// The node also runs the control plane (`kr server`): it gets the control-plane role label.
@@ -340,6 +342,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         if self.cfg.vxlan && self.cfg.network {
             // Before any sandbox: pod interfaces get the tunnel MTU (uplink - VXLAN overhead).
             network::set_pod_mtu(uplink_mtu().saturating_sub(50));
+        }
+        if self.cfg.wireguard && self.cfg.network {
+            network::set_pod_mtu(self.wg_mtu());
         }
         // Sandboxes die with the previous kr process (even after SIGKILL), so every pod lease is
         // stale. Leases of `kr ctr run` processes are kept while that process runs.
@@ -839,6 +844,109 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
     }
 
+    fn wg_mtu(&self) -> u32 {
+        kr_net::netlink::wireguard::tunnel_mtu(uplink_mtu(), kr_sys::unmap4(self.cfg.node_ip).is_none())
+    }
+
+    /// WireGuard overlay (root mode, ADR-062): device `kr.wg`, this node's public key and
+    /// endpoint in node annotations, and per peer node a WireGuard peer (allowed IPs = its pod
+    /// CIDRs) plus routes of those CIDRs via the device. Peers are only pushed to the kernel when
+    /// the desired set changed.
+    async fn wireguard_loop(&self) {
+        use kr_net::netlink::{self, wireguard as wg, RTPROT_KR};
+        let key_path = alloc::format!("{}/wireguard.key", self.cfg.root);
+        let port = kr_runtime::store::env_var("KR_WIREGUARD_PORT").and_then(|v| v.parse().ok()).unwrap_or(wg::DEFAULT_PORT);
+        let private = match wg::load_or_create_key(&key_path) {
+            Ok(k) => k,
+            Err(e) => {
+                kr_rt::eprint(alloc::format!("kubelet: wireguard: cannot use the key file {key_path}: errno {}\n", e.0).as_bytes());
+                return;
+            }
+        };
+        let public = wg::key_b64(&kr_crypto::x25519::public_key(&private));
+        let my_endpoint = alloc::format!("{}:{port}", kr_net::tcp::fmt_ip16(self.cfg.node_ip));
+        let v6_underlay = kr_sys::unmap4(self.cfg.node_ip).is_none();
+        let mut applied: Option<Vec<wg::Peer>> = None;
+        let mut failed = false;
+        loop {
+            if let (Ok(list), Ok(nl)) = (self.c.list("/api/v1/nodes", "").await, netlink::Netlink::route()) {
+                let mut mine = None;
+                let mut annotated = false;
+                let mut peers = Vec::new();
+                for n in list.get("items").and_then(Value::as_array).unwrap_or(&[]) {
+                    let Some((pn, nfam)) = node_podnet(n) else { continue };
+                    let ann = |k| n.pointer(&["metadata", "annotations", k]).and_then(Value::as_str);
+                    if meta(n, "name") == self.cfg.node_name {
+                        self.check_families(nfam);
+                        annotated = ann(WG_KEY_KEY) == Some(public.as_str()) && ann(WG_ENDPOINT_KEY) == Some(my_endpoint.as_str()) && ann(BACKEND_KEY) == Some("wireguard");
+                        mine = Some(pn);
+                        continue;
+                    }
+                    if let Some(theirs) = backend_mismatch("wireguard", ann(BACKEND_KEY)) {
+                        self.warn_backend(&meta(n, "name"), "wireguard", theirs);
+                        continue;
+                    }
+                    let Some(key) = ann(WG_KEY_KEY).and_then(wg::parse_key) else { continue };
+                    let endpoint = ann(WG_ENDPOINT_KEY).and_then(parse_endpoint).or_else(|| internal_ip(n, v6_underlay).map(|ip| (ip, port)));
+                    let Some(endpoint) = endpoint else { continue };
+                    peers.push(wg::Peer { key, endpoint, allowed: peer_allowed(pn, nfam, self.fam.get()) });
+                }
+                if !annotated && mine.is_some() {
+                    let p = alloc::format!(r#"{{"metadata":{{"annotations":{{"{WG_KEY_KEY}":"{public}","{WG_ENDPOINT_KEY}":"{my_endpoint}","{BACKEND_KEY}":"wireguard"}}}}}}"#);
+                    if let Ok(p) = json::parse(p.as_bytes()) {
+                        let _ = self.c.patch(&alloc::format!("/api/v1/nodes/{}", self.cfg.node_name), "application/merge-patch+json", &p).await;
+                    }
+                }
+                if let Some(pn) = mine {
+                    let peers = wg::normalize(peers);
+                    match nl.wireguard_ensure(WG_DEV.as_bytes(), self.wg_mtu()) {
+                        Err(e) => {
+                            if !failed {
+                                kr_rt::eprint(alloc::format!("kubelet: wireguard: cannot create {WG_DEV}: {} (errno {})\n", wg::explain(e), e.0).as_bytes());
+                            }
+                            failed = true;
+                        }
+                        Ok(idx) => {
+                            failed = false;
+                            if applied.as_ref() != Some(&peers) {
+                                match nl.wireguard_set(idx, &private, port, &peers) {
+                                    Ok(()) => applied = Some(peers.clone()),
+                                    Err(e) => kr_rt::eprint(alloc::format!("kubelet: wireguard: configuring {WG_DEV}: {} (errno {})\n", wg::explain(e), e.0).as_bytes()),
+                                }
+                            }
+                            if self.fam.get().v4 {
+                                let _ = nl.addr_add(idx, pn.subnet, 32);
+                            }
+                            if nl.link_up(idx).is_ok() {
+                                let mut want4 = Vec::new();
+                                for p in &peers {
+                                    for (ip, len) in &p.allowed {
+                                        match kr_sys::unmap4(*ip) {
+                                            Some(a) => want4.push((a, len - 96)),
+                                            None => {
+                                                let _ = nl.route_add6_proto(*ip, *len, None, idx, RTPROT_KR);
+                                            }
+                                        }
+                                    }
+                                }
+                                let have: Vec<_> = nl.routes_by_proto(RTPROT_KR).unwrap_or_default();
+                                let del: Vec<_> = have.iter().filter(|h| !want4.contains(&(h.0, h.1))).map(|h| (h.0, h.1)).collect();
+                                let add: Vec<_> = want4.iter().filter(|w| !have.iter().any(|h| (h.0, h.1) == **w)).collect();
+                                for (d, l) in del {
+                                    let _ = nl.route_del(d, l, RTPROT_KR);
+                                }
+                                for (d, l) in add {
+                                    let _ = nl.route_add_proto(*d, *l, None, idx, RTPROT_KR);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            kr_rt::exec::sleep(5000).await;
+        }
+    }
+
     /// The cluster's families for this node changed since the kubelet started (the API server was
     /// restarted with another `KR_POD_FAMILIES`): pods keep the old addresses until this kr restarts.
     fn check_families(&self, now: network::Families) {
@@ -877,6 +985,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     /// host-gw routing (root mode): a route to every other node's pod subnet via its
     /// InternalIP. Nodes must share an L2 segment (no overlay yet).
     async fn route_loop(&self) {
+        if self.cfg.wireguard {
+            return self.wireguard_loop().await;
+        }
         if self.cfg.vxlan {
             return self.vxlan_loop().await;
         }
@@ -2728,6 +2839,27 @@ const VXLAN_DEV: &str = "kr.vxlan";
 const VTEP_MAC_KEY: &str = "kr.io/vtep-mac";
 const VTEP_IP_KEY: &str = "kr.io/vtep-ip";
 const BACKEND_KEY: &str = "kr.io/net-backend";
+const WG_DEV: &str = "kr.wg";
+const WG_KEY_KEY: &str = "kr.io/wireguard-public-key";
+const WG_ENDPOINT_KEY: &str = "kr.io/wireguard-endpoint";
+
+/// `ip:port` or `[ip6]:port` from the endpoint annotation, 16-byte form.
+fn parse_endpoint(s: &str) -> Option<([u8; 16], u16)> {
+    let (ip, port) = s.rsplit_once(':')?;
+    Some((kr_net::tcp::parse_ip16(ip.trim_start_matches('[').trim_end_matches(']'))?, port.parse().ok()?))
+}
+
+/// A peer node's WireGuard allowed IPs: its pod subnet(s) of the families both sides run.
+fn peer_allowed(pn: network::PodNet, nfam: network::Families, mine: network::Families) -> Vec<([u8; 16], u8)> {
+    let mut v = Vec::new();
+    if mine.v4 && nfam.v4 {
+        v.push((kr_sys::map4(pn.subnet), 96 + pn.prefix));
+    }
+    if mine.v6 && nfam.v6 {
+        v.push((network::subnet6(pn.subnet), network::POD_PREFIX6));
+    }
+    v
+}
 
 /// The peer's backend when it differs from ours. A peer without the annotation (older kr,
 /// or not registered its backend yet) is not a mismatch: VXLAN still needs its VTEP annotations.
@@ -2779,7 +2911,8 @@ fn route_diff<A: PartialEq + Copy>(want: &[(A, u8, A)], have: &[(A, u8, Option<A
 
 #[cfg(test)]
 mod route_tests {
-    use super::{backend_mismatch, route_diff, set_diff};
+    use super::{backend_mismatch, parse_endpoint, peer_allowed, route_diff, set_diff};
+    use kr_runtime::network;
 
     #[test]
     fn backend_mismatch_detected() {
@@ -2787,6 +2920,23 @@ mod route_tests {
         assert_eq!(backend_mismatch("vxlan", None), None);
         assert_eq!(backend_mismatch("vxlan", Some("host-gw")), Some("host-gw"));
         assert_eq!(backend_mismatch("host-gw", Some("vxlan")), Some("vxlan"));
+    }
+
+    #[test]
+    fn wireguard_peer_allowed_ips_follow_the_shared_families() {
+        let pn = network::PodNet::parse("10.88.3.0/24").unwrap();
+        let both = network::Families::DUAL;
+        let v4 = network::Families { v4: true, v6: false };
+        assert_eq!(peer_allowed(pn, both, both), alloc::vec![(kr_sys::map4([10, 88, 3, 0]), 120), (network::subnet6(pn.subnet), network::POD_PREFIX6)]);
+        assert_eq!(peer_allowed(pn, v4, both), alloc::vec![(kr_sys::map4([10, 88, 3, 0]), 120)]);
+        assert_eq!(peer_allowed(pn, both, v4).len(), 1);
+    }
+
+    #[test]
+    fn wireguard_endpoint_annotation_parses() {
+        assert_eq!(parse_endpoint("192.168.1.2:51820"), Some((kr_sys::map4([192, 168, 1, 2]), 51820)));
+        assert_eq!(parse_endpoint("[fd00::1]:7").map(|e| e.1), Some(7));
+        assert_eq!(parse_endpoint("nonsense"), None);
     }
 
     #[test]

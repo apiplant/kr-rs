@@ -726,7 +726,7 @@ fn start_kubelet(api: &Rc<kr_apiserver::api::ApiServer>, disabled: kr_apiserver:
     let cgroups = cgroups_available();
     let node_ip = primary_addr();
     let (labels, taints) = crate::install::node_settings()?;
-    let cfg = kr_kubelet::Config { labels, taints, external_ip: crate::install::external_ip(), disabled, node_name: name, root: String::from(store.root()), network: ns::getuid() == 0, cgroups, node_ip, vxlan: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() != Some("host-gw"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env(), control_plane: true };
+    let cfg = kr_kubelet::Config { labels, taints, external_ip: crate::install::external_ip(), disabled, node_name: name, root: String::from(store.root()), network: ns::getuid() == 0, cgroups, node_ip, vxlan: !matches!(kr_runtime::store::env_var("KR_NET_BACKEND").as_deref(), Some("host-gw" | "wireguard")), wireguard: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() == Some("wireguard"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env(), control_plane: true };
     let client = kr_apiserver::client::InProcess::new(api.clone(), "kubelet");
     Ok(kr_kubelet::Kubelet::new(client, cfg, store))
 }

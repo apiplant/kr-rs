@@ -50,7 +50,7 @@ kr token create --ttl 24h --data /var/lib/kr
 sudo kr agent --server https://SERVER:6443 --token TOKEN
 ```
 
-Agents get a pod subnet from the server and reach each other over VXLAN (default) or host routes (`KR_NET_BACKEND=host-gw`).
+Agents get a pod subnet from the server and reach each other over VXLAN (default), host routes (`KR_NET_BACKEND=host-gw`) or encrypted WireGuard tunnels (`KR_NET_BACKEND=wireguard`, needs the `wireguard` kernel module).
 
 ### High availability
 
@@ -95,7 +95,7 @@ cluster-init: true
 | Variable | Effect |
 |---|---|
 | `KR_REGISTRY_MIRRORS` | `registry.k8s.io=http://host:5000,docker.io=https://cache:5000` pull-through mirrors |
-| `KR_NET_BACKEND` | `vxlan` (default) or `host-gw` |
+| `KR_NET_BACKEND` | `vxlan` (default), `host-gw` or `wireguard` |
 | `KR_ROOT` | where images, pod state and IP leases live |
 
 ## Benchmarks

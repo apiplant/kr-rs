@@ -668,3 +668,6 @@
 
 331. **Helm controller and manifest pruning** — *fixed* (#154, ADR-061, ADR-043)
     `helm.cattle.io/v1` `HelmChart` and `HelmChartConfig` (chart, repo, version, targetNamespace, createNamespace, set, valuesContent, chartContent, bootstrap, authSecret, repoCA, jobImage, failurePolicy, backOffLimit ...) run as k3s does: an install/upgrade Job per chart (`rancher/klipper-helm`, configurable) replaced when the spec or values change, an uninstall Job behind a finalizer, status conditions, `--disable helm-controller`. Objects created from `<data dir>/manifests` are deleted when their file or their entry in it goes away (state in ConfigMap `kube-system/kr-manifests`).
+
+332. **WireGuard pod-network backend** — *fixed* (#319, ADR-062)
+    `KR_NET_BACKEND=wireguard` (k3s `wireguard-native`): kernel WireGuard device `kr.wg` through rtnetlink plus generic netlink (family resolved by name), per-node X25519 key in `<root>/wireguard.key` (0600), public key and endpoint in node annotations, peers and routes reconciled from the Node list. Tests: `netlink::wireguard::tests`, `wireguard_peer_allowed_ips_follow_the_shared_families`, `wireguard_endpoint_annotation_parses`. Kernel run: KNOWN_ISSUES section B.

@@ -319,7 +319,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
         Ok(v) => v,
         Err(e) => return fail(&e),
     };
-    let cfg = kr_kubelet::Config { labels, taints, external_ip: crate::install::external_ip(), disabled, node_name: name.clone(), root: String::from(store.root()), network: ns::getuid() == 0, cgroups: cgroups_available(), node_ip: ip, vxlan: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() != Some("host-gw"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env(), control_plane: false };
+    let cfg = kr_kubelet::Config { labels, taints, external_ip: crate::install::external_ip(), disabled, node_name: name.clone(), root: String::from(store.root()), network: ns::getuid() == 0, cgroups: cgroups_available(), node_ip: ip, vxlan: !matches!(kr_runtime::store::env_var("KR_NET_BACKEND").as_deref(), Some("host-gw" | "wireguard")), wireguard: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() == Some("wireguard"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env(), control_plane: false };
     let rotation = (remote.clone(), pki_dir.clone(), name.clone(), ip, tls.clone());
     let tracker = remote.clone();
     let (ca_remote, ca_dir, ca_tls) = (remote.clone(), pki_dir.clone(), tls.clone());
