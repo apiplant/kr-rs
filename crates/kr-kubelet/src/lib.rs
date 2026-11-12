@@ -573,6 +573,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let mut state = evict::PressureState::default();
         let mut grace = evict::DeviceGrace::default();
         let grace_ms = evict::device_grace_ms();
+        let pdb_wait_ms = evict::device_pdb_wait_ms();
+        let mut blocked: BTreeMap<String, u64> = BTreeMap::new();
         loop {
             kr_rt::exec::sleep(10_000).await;
             let pressure = evict::under_pressure(node::memory_available_ki(), self.cfg.eviction_memory_bytes);
@@ -587,7 +589,31 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let unhealthy = self.devices.unhealthy_pods();
             let bad: Vec<String> = unhealthy.iter().map(|u| u.0.clone()).collect();
             let due = grace.due(&bad, now_ms(), grace_ms);
+            blocked.retain(|u, _| bad.contains(u));
             for (uid, msg) in unhealthy.into_iter().filter(|u| due.contains(&u.0)) {
+                // Through the eviction API first: a PodDisruptionBudget can hold the pod back (up
+                // to the wait), a bare pod or a controller's pod is deleted and replaced where a
+                // healthy device exists. Without the permission (an agent's node identity), or
+                // after the wait, the pod fails in place (reason Evicted).
+                let target = self.pods.borrow().get(&uid).filter(|p| p.evicted.is_none() && p.failed_setup.is_none()).map(|p| (p.ns.clone(), p.name.clone()));
+                let Some((ns, name)) = target else { continue };
+                let body = alloc::format!(r#"{{"apiVersion":"policy/v1","kind":"Eviction","metadata":{{"name":"{name}","namespace":"{ns}"}}}}"#);
+                let body = json::parse(body.as_bytes()).unwrap_or(Value::Null);
+                let answer = self.c.create(&alloc::format!("/api/v1/namespaces/{ns}/pods/{name}/eviction"), &body).await.err().map(|e| e.code);
+                let mut since = blocked.get(&uid).copied();
+                let action = evict::device_eviction(answer, &mut since, now_ms(), pdb_wait_ms);
+                match since {
+                    Some(t) => drop(blocked.insert(uid.clone(), t)),
+                    None => drop(blocked.remove(&uid)),
+                }
+                match action {
+                    evict::DeviceEviction::Evicted => {
+                        kr_rt::eprint(alloc::format!("kubelet: evicted pod {ns}/{name}: {msg}\n").as_bytes());
+                        continue;
+                    }
+                    evict::DeviceEviction::Wait => continue,
+                    evict::DeviceEviction::Fail => {}
+                }
                 let hit = self.pods.borrow_mut().get_mut(&uid).filter(|p| p.evicted.is_none() && p.failed_setup.is_none()).map(|p| p.evicted = Some(msg)).is_some();
                 if hit {
                     self.kill_now(&uid);

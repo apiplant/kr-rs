@@ -24,6 +24,40 @@ pub fn device_grace_ms() -> u64 {
     kr_runtime::store::env_var("KR_DEVICE_UNHEALTHY_GRACE").and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(30).saturating_mul(1000)
 }
 
+/// Seconds a pod whose PodDisruptionBudget forbids its eviction may keep an unhealthy device
+/// before it is failed anyway (`KR_DEVICE_UNHEALTHY_PDB_WAIT`, default 600).
+pub fn device_pdb_wait_ms() -> u64 {
+    kr_runtime::store::env_var("KR_DEVICE_UNHEALTHY_PDB_WAIT").and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(600).saturating_mul(1000)
+}
+
+/// What to do with a pod on an unhealthy device after asking the eviction API.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeviceEviction {
+    /// The pod is being deleted (or is gone).
+    Evicted,
+    /// A PodDisruptionBudget has no room yet: ask again later.
+    Wait,
+    /// Not possible (no permission, API error) or waited long enough: fail the pod in place.
+    Fail,
+}
+
+/// `answer`: the HTTP status of the eviction request, None for success. `blocked_since` is when
+/// a budget first refused this pod (set here).
+pub fn device_eviction(answer: Option<u16>, blocked_since: &mut Option<u64>, now_ms: u64, wait_ms: u64) -> DeviceEviction {
+    match answer {
+        None => DeviceEviction::Evicted,
+        Some(429) => {
+            let first = *blocked_since.get_or_insert(now_ms);
+            if now_ms.saturating_sub(first) < wait_ms {
+                DeviceEviction::Wait
+            } else {
+                DeviceEviction::Fail
+            }
+        }
+        Some(_) => DeviceEviction::Fail,
+    }
+}
+
 /// Remembers since when pods have continuously held an unhealthy device.
 #[derive(Default)]
 pub struct DeviceGrace {
@@ -95,6 +129,20 @@ pub fn message(threshold: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn device_eviction_waits_for_a_budget_then_fails_in_place() {
+        let mut since = None;
+        assert_eq!(device_eviction(None, &mut since, 1000, 600_000), DeviceEviction::Evicted);
+        assert_eq!(device_eviction(Some(429), &mut since, 1000, 600_000), DeviceEviction::Wait);
+        assert_eq!(since, Some(1000));
+        assert_eq!(device_eviction(Some(429), &mut since, 599_999, 600_000), DeviceEviction::Wait);
+        assert_eq!(device_eviction(Some(429), &mut since, 601_000, 600_000), DeviceEviction::Fail);
+        // No permission or any other failure: fail at once.
+        assert_eq!(device_eviction(Some(403), &mut None, 0, 600_000), DeviceEviction::Fail);
+        // A wait of zero never waits.
+        assert_eq!(device_eviction(Some(429), &mut None, 5, 0), DeviceEviction::Fail);
+    }
+
     use super::*;
 
     fn c(uid: &str, qos: &'static str, usage: u64, request: u64) -> Candidate {
