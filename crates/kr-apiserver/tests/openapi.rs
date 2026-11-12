@@ -134,3 +134,26 @@ fn cached_documents_follow_the_crd_set() {
     assert_ne!(v2_after, v2_before, "a new CRD must invalidate the v2 document");
     assert_ne!(idx_after, idx_before, "a new CRD must invalidate the v3 index");
 }
+
+#[test]
+fn cached_documents_follow_a_crd_deletion() {
+    let api = server();
+    let size = |p: &str| json::to_string(&call(&api, "GET", p, "application/json", "").1);
+    let base = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions";
+    let (v2_none, idx_none) = (size("/openapi/v2"), size("/openapi/v3"));
+    assert_eq!(call(&api, "POST", base, "application/json", CRD).0, 201);
+    let (v2_with, idx_with) = (size("/openapi/v2"), size("/openapi/v3")); // cached again, with the CRD
+    assert_ne!(v2_with, v2_none);
+    // Deletion waits for the cleanup finalizer; the CRD is served until the finalizer is gone.
+    assert_eq!(call(&api, "DELETE", &alloc_path(base), "application/json", "").0, 200);
+    let gone = call(&api, "PATCH", &alloc_path(base), "application/merge-patch+json", r#"{"metadata":{"finalizers":null}}"#).0;
+    assert_eq!(gone, 200);
+    assert_eq!(call(&api, "GET", &alloc_path(base), "application/json", "").0, 404, "the CRD must be gone");
+    assert_eq!(size("/openapi/v2"), v2_none, "deleting a CRD must invalidate the v2 document");
+    assert_eq!(size("/openapi/v3"), idx_none, "deleting a CRD must invalidate the v3 index");
+    assert_ne!(size("/openapi/v3"), idx_with);
+}
+
+fn alloc_path(base: &str) -> String {
+    format!("{base}/foos.test.example.com")
+}

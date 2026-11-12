@@ -167,11 +167,6 @@ ADR-047. Default `["secrets"]`; `plural` or `plural.group` (e.g. `configmaps`, `
 227. **Starting a container still forks the whole kubelet process twice** — *ADR-050*
     The wait for the container setup no longer blocks (RESOLVED, container shim await). What is left is two `clone3` forks of the server process (page tables of ~200 MB resident: about 3-5 ms each, so ~8 ms of the loop per container start, far below the stall threshold), `store.create_container`, `apply_fs_group` and the pod-log setup. Worth doing only if the stall report ever names a container start again; then: a small fork-server helper, or spawning `kr shim` with the spec on a pipe instead of forking, and checking the cheap preconditions (volumes, mounts) before creating the container directories so a failing start (for example `default/bm`) does less work per retry.
 
-228. **No test that deleting a CRD refreshes the cached OpenAPI documents** — *test gap, #210*
-    `cached_documents_follow_the_crd_set` covers creation only: CRD deletion goes through a finalizer and is not synchronous in the unit test server, so the invalidation in `unregister_crd` and `reload_crds` is untested. Add a test that completes the finalizer flow and checks `/openapi/v2` again.
-
-235. **`client_vs_openssl_*` interop tests are flaky under a loaded machine** — *test*
-    `kr_client_vs_s_server` (`kr-crypto/tests/tls_openssl.rs`) asserts on `s_server`'s stdout right after killing its stdin; under a fully loaded workspace test run it once saw an empty stdout ("s_server stdout: ..."). Not related to TLS behaviour (it passed 6 reruns and the next workspace run). Wait for `s_server` to print before asserting, or poll with a timeout.
 # Accepted limitations (by design, or not planned for now)
 153. **No VolumeSnapshot support** — *missing compared with k3s*
     k3s can run the external snapshotter. kr ships no `VolumeSnapshot*` CRDs or controller and the CSI node side does not exercise snapshots; an external snapshot-controller with its CRDs may work but is untested.

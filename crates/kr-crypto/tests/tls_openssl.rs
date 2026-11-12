@@ -117,6 +117,25 @@ fn kr_client_vs_s_server(tag: &str, extra: &[&str], ed_server: bool, expect_suit
     // s_server -quiet echoes what it receives on stdout; send a line, then reply via its stdin.
     c.write(b"hello from kr\n").unwrap();
     drive(&mut c, &mut sock, |c| !c.has_output());
+    // Wait until s_server has printed what we sent: it may still be reading the socket when we
+    // close, and then exits without ever echoing it.
+    let mut stdout = srv.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut all = Vec::new();
+        let mut b = [0u8; 256];
+        while let Ok(n) = std::io::Read::read(&mut stdout, &mut b) {
+            if n == 0 {
+                break;
+            }
+            all.extend_from_slice(&b[..n]);
+            if all.windows(13).any(|w| w == b"hello from kr") {
+                let _ = tx.send(all.clone());
+                return;
+            }
+        }
+        let _ = tx.send(all);
+    });
     srv.stdin.as_mut().unwrap().write_all(b"hello from openssl\n").unwrap();
     let mut got = Vec::new();
     drive(&mut c, &mut sock, |c| {
@@ -129,8 +148,10 @@ fn kr_client_vs_s_server(tag: &str, extra: &[&str], ed_server: bool, expect_suit
     c.close();
     sock.write_all(&c.take_output()).unwrap();
     drop(srv.stdin.take());
-    let out = srv.wait_with_output().unwrap();
-    assert!(String::from_utf8_lossy(&out.stdout).contains("hello from kr"), "s_server stdout: {}", String::from_utf8_lossy(&out.stdout));
+    let out = rx.recv_timeout(Duration::from_secs(10)).unwrap_or_default();
+    let _ = srv.kill();
+    let _ = srv.wait();
+    assert!(String::from_utf8_lossy(&out).contains("hello from kr"), "s_server stdout: {}", String::from_utf8_lossy(&out));
 }
 
 #[test]

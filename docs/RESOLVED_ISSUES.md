@@ -445,3 +445,9 @@
 
 242. **New pods started one after the other: CNI setup (~575 ms with Calico) was serial** — *fixed, to be confirmed on the cluster*
     `sync_all` now hands the first sync of a pod that has no sandbox (admission, sandbox, CNI ADD) to its own task (`Kubelet::starting`, at most `MAX_STARTING` = 4 at once, a few because Calico's IPAM serialises on its datastore). While a pod's task runs the pass leaves that pod alone (no terminate, probes or status race); the task wakes the loop when done. 30 new pods should take about 4-5 s instead of 17 s. Tests: the kubelet suite still passes; the live effect needs a restart.
+
+243. **No test that deleting a CRD refreshes the cached OpenAPI documents** — *fixed* (was #228)
+    `openapi.rs::cached_documents_follow_a_crd_deletion` creates a CRD, deletes it, removes the cleanup finalizer and checks that `/openapi/v2` and the `/openapi/v3` index are back to their pre-CRD content.
+
+244. **`client_vs_openssl_*` interop tests were flaky under load** — *fixed* (was #235)
+    The test closed the connection and then read `s_server`'s stdout once it exited, but `s_server` may exit (stdin closed) before it has processed the data still in the socket. It now waits (10 s at most) until `s_server` has printed what the client sent, then kills it. Five consecutive runs pass.
