@@ -454,3 +454,6 @@
 
 246. **Default ClusterRoleBindings and the extension-apiserver Role were not reconciled on upgrade** — *fixed* (was #214; remainder in #245)
     At start-up a default ClusterRoleBinding (label `kubernetes.io/bootstrapping: rbac-defaults`, annotation `autoupdate` not `"false"`) gains the subjects of the current release that it lacks (extra subjects stay, `roleRef` is immutable); the `kube-system` `extension-apiserver-authentication-reader` Role gains missing rules like the ClusterRoles. Test: `rbac_reconcile.rs::default_bindings_gain_missing_subjects_unless_frozen`.
+
+247. **Requests to aggregated APIs took 300-560 ms (Calico `projectcalico.org/v3`)** — *fixed* (was #225)
+    Pooled per-APIService clients (230a): measured on the live cluster 50-86 ms per request, three runs each on three resources. Only the first requests after a restart are slower (320-380 ms), noted under #226.
