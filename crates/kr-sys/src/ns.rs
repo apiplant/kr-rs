@@ -34,6 +34,7 @@ mod n {
     pub const SIGNALFD4: usize = 289;
     pub const WAITID: usize = 247;
     pub const SETNS: usize = 308;
+    pub const UNSHARE: usize = 272;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -68,6 +69,7 @@ mod n {
     pub const SIGNALFD4: usize = 74;
     pub const WAITID: usize = 95;
     pub const SETNS: usize = 268;
+    pub const UNSHARE: usize = 97;
 }
 
 pub const CLONE_NEWNS: u64 = 0x0002_0000;
@@ -649,6 +651,12 @@ pub fn close_range_checked(first: u32, last: u32) -> Result<()> {
 pub fn setns(pidfd: &Fd, nstype: u64) -> Result<()> {
     // SAFETY: plain integer arguments.
     check(unsafe { syscall2(n::SETNS, pidfd.raw() as usize, nstype as usize) }).map(|_| ())
+}
+
+/// Moves the caller into new namespaces of the `CLONE_NEW*` kinds in `flags`.
+pub fn unshare(flags: u64) -> Result<()> {
+    // SAFETY: plain integer argument.
+    check(unsafe { syscall1(n::UNSHARE, flags as usize) }).map(|_| ())
 }
 
 /// Sleeps until a signal arrives (used by the pod sandbox process).

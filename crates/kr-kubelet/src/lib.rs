@@ -295,6 +295,9 @@ pub struct Kubelet<C: Client> {
     survive: Cell<bool>,
     /// NetworkPolicy controller state (ADR-049): pods announce their IP before their containers start.
     netpol: Rc<netpol::Ctl>,
+    /// Probe results by (namespace, pod, container, probe type, success), for `/metrics/probes`.
+    probe_counts: RefCell<BTreeMap<(String, String, String, &'static str, bool), u64>>,
+    started_s: i64,
 }
 
 enum PullGate {
@@ -320,7 +323,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     pub fn new(c: C, cfg: Config, store: Store) -> Rc<Self> {
         let devices = deviceplugin::Plugins::new(&deviceplugin::default_dir(&cfg.root));
         let csi = csi::Csi::new(&cfg.node_name);
-        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), starting: RefCell::new(alloc::collections::BTreeSet::new()), notify: Notify::default(), devices, csi, pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()), adopted: Cell::new((0, 0)), survive: Cell::new(false), netpol: Rc::new(netpol::Ctl::default()) })
+        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), starting: RefCell::new(alloc::collections::BTreeSet::new()), notify: Notify::default(), devices, csi, pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()), adopted: Cell::new((0, 0)), survive: Cell::new(false), netpol: Rc::new(netpol::Ctl::default()), probe_counts: RefCell::new(BTreeMap::new()), started_s: now_ms() as i64 / 1000 })
     }
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
@@ -2047,9 +2050,17 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
 
     fn probe_done(&self, uid: &str, ci: usize, pi: usize, ok: bool) {
         let mut pods = self.pods.borrow_mut();
-        let Some(c) = pods.get_mut(uid).and_then(|p| p.ctrs.get_mut(ci)) else { return };
+        let Some(p) = pods.get_mut(uid) else { return };
+        let (pns, pname) = (p.ns.clone(), p.name.clone());
+        let Some(c) = p.ctrs.get_mut(ci) else { return };
         let Some((kind, st)) = c.probes.get_mut(pi) else { return };
         let kind = *kind;
+        let label = match kind {
+            probe::Kind::Startup => "Startup",
+            probe::Kind::Liveness => "Liveness",
+            probe::Kind::Readiness => "Readiness",
+        };
+        *self.probe_counts.borrow_mut().entry((pns, pname, c.name.clone(), label, ok)).or_insert(0) += 1;
         let Some(verdict) = st.record(ok, now_ms()) else { return };
         match (kind, verdict) {
             (probe::Kind::Startup, true) => c.started = true,

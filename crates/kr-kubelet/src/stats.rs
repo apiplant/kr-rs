@@ -17,9 +17,60 @@ use kr_apiserver::object::{obj, ApiError};
 use kr_fmt::json::{self, Value};
 use kr_net::http1::server::{Body, Response};
 
+/// What cAdvisor reports beyond CPU and working set (`/metrics/cadvisor`).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Cad {
+    pub image: String,
+    /// Container id (the `name` label) and cgroup path (the `id` label).
+    pub cid: String,
+    pub path: String,
+    pub started_s: i64,
+    pub user_secs: f64,
+    pub system_secs: f64,
+    pub periods: u64,
+    pub throttled_periods: u64,
+    pub throttled_secs: f64,
+    pub usage: u64,
+    pub rss: u64,
+    pub cache: u64,
+}
+
+/// Counters of one network interface of a pod's sandbox (`/proc/<pid>/net/dev`).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Iface {
+    pub name: String,
+    pub rx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_errors: u64,
+    pub rx_dropped: u64,
+    pub tx_bytes: u64,
+    pub tx_packets: u64,
+    pub tx_errors: u64,
+    pub tx_dropped: u64,
+}
+
+/// Network of one pod.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct PodNet {
+    pub ns: String,
+    pub pod: String,
+    pub path: String,
+    pub ifaces: Vec<Iface>,
+}
+
+/// Counts for the kubelet's own `/metrics`.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Internals {
+    pub pods: u64,
+    pub containers: u64,
+    pub started_s: i64,
+    pub node: String,
+}
+
 /// One container's usage.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct CtrStat {
+    pub cad: Cad,
     pub ns: String,
     pub pod: String,
     pub container: String,
@@ -49,6 +100,7 @@ pub struct Sample {
     pub node_cpu: Option<f64>,
     pub node_mem: Option<u64>,
     pub ctrs: Vec<CtrStat>,
+    pub nets: Vec<PodNet>,
 }
 
 fn num(s: &[u8]) -> Option<u64> {
@@ -80,6 +132,101 @@ pub fn parse_cpu_stat(text: &str) -> Option<u64> {
 pub fn working_set(current: u64, stat: &str) -> u64 {
     let inactive = stat.lines().find_map(|l| l.strip_prefix("inactive_file ")?.trim().parse::<u64>().ok()).unwrap_or(0);
     current.saturating_sub(inactive)
+}
+
+/// The interfaces of `/proc/<pid>/net/dev` other than `lo`.
+pub fn parse_net_dev(text: &str) -> Vec<Iface> {
+    text.lines()
+        .filter_map(|l| {
+            let (name, rest) = l.split_once(':')?;
+            let name = name.trim();
+            if name == "lo" {
+                return None;
+            }
+            let f: Vec<u64> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            (f.len() >= 12).then(|| Iface { name: name.to_string(), rx_bytes: f[0], rx_packets: f[1], rx_errors: f[2], rx_dropped: f[3], tx_bytes: f[8], tx_packets: f[9], tx_errors: f[10], tx_dropped: f[11] })
+        })
+        .collect()
+}
+
+/// A `key value` line of a cgroup flat-keyed file.
+pub fn stat_field(text: &str, key: &str) -> Option<u64> {
+    text.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix(' ')?.trim().parse().ok())
+}
+
+/// One probe outcome counter (`prober_probe_total`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeCount {
+    pub ns: String,
+    pub pod: String,
+    pub container: String,
+    pub kind: &'static str,
+    pub ok: bool,
+    pub n: u64,
+}
+
+/// Prometheus text of `GET /metrics/cadvisor`: the series cAdvisor exports and dashboards use.
+pub fn render_cadvisor(s: &Sample) -> String {
+    use core::fmt::Write;
+    let mut o = String::new();
+    let ts = s.ts_ms;
+    let lbl = |c: &CtrStat| alloc::format!("container=\"{}\",id=\"{}\",image=\"{}\",name=\"{}\",namespace=\"{}\",pod=\"{}\"", label(&c.container), label(&c.cad.path), label(&c.cad.image), label(&c.cad.cid), label(&c.ns), label(&c.pod));
+    let ctr: [(&str, &str, &str, fn(&CtrStat) -> String); 11] = [
+        ("container_cpu_usage_seconds_total", "Cumulative cpu time consumed in seconds.", "counter", |c| c.cpu_secs.to_string()),
+        ("container_cpu_user_seconds_total", "Cumulative user cpu time consumed in seconds.", "counter", |c| c.cad.user_secs.to_string()),
+        ("container_cpu_system_seconds_total", "Cumulative system cpu time consumed in seconds.", "counter", |c| c.cad.system_secs.to_string()),
+        ("container_cpu_cfs_periods_total", "Number of elapsed enforcement period intervals.", "counter", |c| c.cad.periods.to_string()),
+        ("container_cpu_cfs_throttled_periods_total", "Number of throttled period intervals.", "counter", |c| c.cad.throttled_periods.to_string()),
+        ("container_cpu_cfs_throttled_seconds_total", "Total time duration the container has been throttled.", "counter", |c| c.cad.throttled_secs.to_string()),
+        ("container_memory_working_set_bytes", "Current working set in bytes.", "gauge", |c| c.mem.to_string()),
+        ("container_memory_usage_bytes", "Current memory usage in bytes, including all memory regardless of when it was accessed.", "gauge", |c| c.cad.usage.to_string()),
+        ("container_memory_rss", "Size of RSS in bytes.", "gauge", |c| c.cad.rss.to_string()),
+        ("container_memory_cache", "Number of bytes of page cache memory.", "gauge", |c| c.cad.cache.to_string()),
+        ("container_start_time_seconds", "Start time of the container since unix epoch in seconds.", "gauge", |c| c.cad.started_s.to_string()),
+    ];
+    for (name, help, ty, f) in &ctr {
+        let _ = write!(o, "# HELP {name} {help}\n# TYPE {name} {ty}\n");
+        for c in &s.ctrs {
+            let _ = writeln!(o, "{name}{{{}}} {} {ts}", lbl(c), f(c));
+        }
+    }
+    let _ = write!(o, "# HELP container_last_seen Last time a container was seen by the exporter\n# TYPE container_last_seen gauge\n");
+    for c in &s.ctrs {
+        let _ = writeln!(o, "container_last_seen{{{}}} {} {ts}", lbl(c), ts / 1000);
+    }
+    let nets: [(&str, &str, fn(&Iface) -> u64); 8] = [
+        ("container_network_receive_bytes_total", "Cumulative count of bytes received", |i| i.rx_bytes),
+        ("container_network_receive_packets_total", "Cumulative count of packets received", |i| i.rx_packets),
+        ("container_network_receive_errors_total", "Cumulative count of errors encountered while receiving", |i| i.rx_errors),
+        ("container_network_receive_packets_dropped_total", "Cumulative count of packets dropped while receiving", |i| i.rx_dropped),
+        ("container_network_transmit_bytes_total", "Cumulative count of bytes transmitted", |i| i.tx_bytes),
+        ("container_network_transmit_packets_total", "Cumulative count of packets transmitted", |i| i.tx_packets),
+        ("container_network_transmit_errors_total", "Cumulative count of errors encountered while transmitting", |i| i.tx_errors),
+        ("container_network_transmit_packets_dropped_total", "Cumulative count of packets dropped while transmitting", |i| i.tx_dropped),
+    ];
+    for (name, help, f) in nets {
+        let _ = write!(o, "# HELP {name} {help}\n# TYPE {name} counter\n");
+        for p in &s.nets {
+            for i in &p.ifaces {
+                let _ = writeln!(o, "{name}{{id=\"{}\",interface=\"{}\",namespace=\"{}\",pod=\"{}\"}} {} {ts}", label(&p.path), label(&i.name), label(&p.ns), label(&p.pod), f(i));
+            }
+        }
+    }
+    let cores = read(b"/proc/cpuinfo\0").map_or(0, |t| t.lines().filter(|l| l.starts_with("processor")).count());
+    let _ = write!(o, "# HELP machine_cpu_cores Number of logical CPU cores.\n# TYPE machine_cpu_cores gauge\nmachine_cpu_cores {cores}\n");
+    let mem = read(b"/proc/meminfo\0").and_then(|t| t.lines().find_map(|l| num(l.strip_prefix("MemTotal:")?.as_bytes()))).unwrap_or(0) * 1024;
+    let _ = write!(o, "# HELP machine_memory_bytes Amount of memory installed on the machine.\n# TYPE machine_memory_bytes gauge\nmachine_memory_bytes {mem}\n");
+    o
+}
+
+/// Prometheus text of `GET /metrics/probes`.
+pub fn render_probes(c: &[ProbeCount]) -> String {
+    use core::fmt::Write;
+    let mut o = String::from("# HELP prober_probe_total Cumulative number of a liveness, readiness or startup probe for a container by result.\n# TYPE prober_probe_total counter\n");
+    for p in c {
+        let _ = writeln!(o, "prober_probe_total{{container=\"{}\",namespace=\"{}\",pod=\"{}\",probe_type=\"{}\",result=\"{}\"}} {}", label(&p.container), label(&p.ns), label(&p.pod), p.kind, if p.ok { "successful" } else { "failed" }, p.n);
+    }
+    o
 }
 
 fn read(path: &[u8]) -> Option<String> {
@@ -136,9 +283,13 @@ pub fn render(s: &Sample) -> String {
 }
 
 /// The kubelet's own metrics (`GET /metrics`): the usage of every claim mounted by a pod here.
-pub fn render_kubelet(vols: &[VolStat]) -> String {
+pub fn render_kubelet(vols: &[VolStat], k: &Internals) -> String {
     use core::fmt::Write;
     let mut o = String::new();
+    let _ = write!(o, "# HELP kubelet_running_pods Number of pods that have a running pod sandbox\n# TYPE kubelet_running_pods gauge\nkubelet_running_pods {}\n", k.pods);
+    let _ = write!(o, "# HELP kubelet_running_containers Number of containers currently running\n# TYPE kubelet_running_containers gauge\nkubelet_running_containers{{container_state=\"running\"}} {}\n", k.containers);
+    let _ = write!(o, "# HELP kubelet_node_name The node's name. The count is always 1.\n# TYPE kubelet_node_name gauge\nkubelet_node_name{{node=\"{}\"}} 1\n", label(&k.node));
+    let _ = write!(o, "# HELP process_start_time_seconds Start time of the process since unix epoch in seconds.\n# TYPE process_start_time_seconds gauge\nprocess_start_time_seconds {}\n", k.started_s);
     let fields: [(&str, &str, fn(&VolStat) -> u64); 6] = [
         ("kubelet_volume_stats_capacity_bytes", "Capacity in bytes of the volume", |v| v.capacity),
         ("kubelet_volume_stats_used_bytes", "Number of used bytes in the volume", |v| v.used),
@@ -242,9 +393,20 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         out
     }
 
+    pub fn internals(&self) -> Internals {
+        let pods = self.pods.borrow();
+        let containers = pods.values().flat_map(|p| p.ctrs.iter()).filter(|c| matches!(c.state, CState::Running { .. })).count() as u64;
+        Internals { pods: pods.values().filter(|p| p.sandbox.is_some()).count() as u64, containers, started_s: self.started_s, node: self.cfg.node_name.clone() }
+    }
+
+    /// Probe outcomes since the kubelet started, sorted for stable output.
+    pub fn probe_counts(&self) -> Vec<ProbeCount> {
+        self.probe_counts.borrow().iter().map(|((ns, pod, container, kind, ok), n)| ProbeCount { ns: ns.clone(), pod: pod.clone(), container: container.clone(), kind, ok: *ok, n: *n }).collect()
+    }
+
     /// Measures the node and every running container that has a cgroup.
     pub fn sample(&self) -> Sample {
-        let mut s = Sample { ts_ms: wall_ms(), node_cpu: read(b"/proc/stat\0").and_then(|t| parse_proc_stat(&t)), node_mem: read(b"/proc/meminfo\0").and_then(|t| parse_meminfo(&t)), ctrs: Vec::new() };
+        let mut s = Sample { ts_ms: wall_ms(), node_cpu: read(b"/proc/stat\0").and_then(|t| parse_proc_stat(&t)), node_mem: read(b"/proc/meminfo\0").and_then(|t| parse_meminfo(&t)), ctrs: Vec::new(), nets: Vec::new() };
         if !self.cfg.cgroups {
             return s;
         }
@@ -256,7 +418,30 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 let Some(usec) = read_at(g.dir.raw(), b"cpu.stat\0").and_then(|t| parse_cpu_stat(&t)) else { continue };
                 let cur = read_at(g.dir.raw(), b"memory.current\0").and_then(|t| t.trim().parse().ok()).unwrap_or(0);
                 let mem = working_set(cur, &read_at(g.dir.raw(), b"memory.stat\0").unwrap_or_default());
-                s.ctrs.push(CtrStat { ns: p.ns.clone(), pod: p.name.clone(), container: c.name.clone(), cpu_secs: usec as f64 / 1e6, mem });
+                let cpu = read_at(g.dir.raw(), b"cpu.stat\0").unwrap_or_default();
+                let ms = read_at(g.dir.raw(), b"memory.stat\0").unwrap_or_default();
+                let secs = |k: &str| stat_field(&cpu, k).unwrap_or(0) as f64 / 1e6;
+                let CState::Running { started_at, .. } = &c.state else { continue };
+                let cad = Cad {
+                    image: c.image.clone(),
+                    cid: id.clone(),
+                    path: alloc::format!("/{}/{}", String::from_utf8_lossy(cg.rel()), id),
+                    started_s: *started_at,
+                    user_secs: secs("user_usec"),
+                    system_secs: secs("system_usec"),
+                    periods: stat_field(&cpu, "nr_periods").unwrap_or(0),
+                    throttled_periods: stat_field(&cpu, "nr_throttled").unwrap_or(0),
+                    throttled_secs: secs("throttled_usec"),
+                    usage: cur,
+                    rss: stat_field(&ms, "anon").unwrap_or(0),
+                    cache: stat_field(&ms, "file").unwrap_or(0),
+                };
+                s.ctrs.push(CtrStat { ns: p.ns.clone(), pod: p.name.clone(), container: c.name.clone(), cpu_secs: usec as f64 / 1e6, mem, cad });
+            }
+            if let Some(sb) = &p.sandbox {
+                if let Some(t) = read(alloc::format!("/proc/{}/net/dev\0", sb.pid).as_bytes()) {
+                    s.nets.push(PodNet { ns: p.ns.clone(), pod: p.name.clone(), path: alloc::format!("/{}", String::from_utf8_lossy(cg.rel())), ifaces: parse_net_dev(&t) });
+                }
             }
         }
         s
@@ -269,7 +454,9 @@ pub fn respond<C: Client + Clone + 'static>(k: &Kubelet<C>, what: &str) -> Resul
     match what {
         "resource" => Ok(Response::new(200, render(&k.sample()).into_bytes()).with_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")),
         "summary" => Ok(Response::new(200, summary(&k.cfg.node_name, &k.sample(), &k.volume_stats()).into_bytes()).with_header("Content-Type", "application/json")),
-        "kubelet" => Ok(Response::new(200, render_kubelet(&k.volume_stats()).into_bytes()).with_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")),
+        "cadvisor" => Ok(Response::new(200, render_cadvisor(&k.sample()).into_bytes()).with_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")),
+        "probes" => Ok(Response::new(200, render_probes(&k.probe_counts()).into_bytes()).with_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")),
+        "kubelet" => Ok(Response::new(200, render_kubelet(&k.volume_stats(), &k.internals()).into_bytes()).with_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")),
         _ => Err(ApiError::not_found("metrics", what)),
     }
 }
@@ -335,16 +522,18 @@ mod tests {
             node_cpu: Some(12.5),
             node_mem: Some(2 << 30),
             ctrs: alloc::vec![
-                CtrStat { ns: "default".into(), pod: "web".into(), container: "app".into(), cpu_secs: 1.5, mem: 4096 },
-                CtrStat { ns: "default".into(), pod: "web".into(), container: "side\"car".into(), cpu_secs: 0.5, mem: 1024 },
+                CtrStat { ns: "default".into(), pod: "web".into(), container: "app".into(), cpu_secs: 1.5, mem: 4096, ..Default::default() },
+                CtrStat { ns: "default".into(), pod: "web".into(), container: "side\"car".into(), cpu_secs: 0.5, mem: 1024, ..Default::default() },
             ],
+            nets: Vec::new(),
         }
     }
 
     #[test]
     fn volume_stats_are_rendered_once_per_claim_and_listed_in_the_summary() {
         let v = |pod: &str| VolStat { ns: "d".into(), pod: pod.into(), volume: "data".into(), claim: "db".into(), capacity: 1000, used: 400, available: 600, inodes: 50, inodes_used: 5, inodes_free: 45 };
-        let text = render_kubelet(&[v("a"), v("b")]);
+        let text = render_kubelet(&[v("a"), v("b")], &Internals { pods: 2, containers: 3, started_s: 5, node: "n1".into() });
+        assert!(text.contains("kubelet_running_containers{container_state=\"running\"} 3") && text.contains("kubelet_node_name{node=\"n1\"} 1"));
         assert_eq!(text.matches("kubelet_volume_stats_used_bytes{namespace=\"d\",persistentvolumeclaim=\"db\"} 400").count(), 1, "{text}");
         assert!(text.contains("# TYPE kubelet_volume_stats_inodes_free gauge") && text.contains("kubelet_volume_stats_capacity_bytes{namespace=\"d\",persistentvolumeclaim=\"db\"} 1000"));
         let s = json::parse(summary("n1", &sample(), &[v("a")]).as_bytes()).unwrap();
@@ -380,5 +569,25 @@ mod tests {
         let pods = v.get("pods").and_then(Value::as_array).unwrap();
         assert_eq!(pods.len(), 1);
         assert_eq!(pods[0].get("containers").and_then(Value::as_array).map(|c| c.len()), Some(2));
+    }
+
+    #[test]
+    fn cadvisor_series_and_parsers() {
+        let net = "Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n    lo: 100 2 0 0 0 0 0 0 100 2 0 0 0 0 0 0\n  eth0: 5000 40 1 2 0 0 0 0 7000 50 3 4 0 0 0 0\n";
+        let i = parse_net_dev(net);
+        assert_eq!(i.len(), 1);
+        assert_eq!((i[0].rx_bytes, i[0].rx_dropped, i[0].tx_bytes, i[0].tx_errors), (5000, 2, 7000, 3));
+        assert_eq!(stat_field("nr_periods 10\nnr_throttled 4\nthrottled_usec 2500000\n", "nr_throttled"), Some(4));
+        assert_eq!(stat_field("anon 7\nanon_thp 9\n", "anon"), Some(7));
+        let mut s = sample();
+        s.ctrs[0].cad = Cad { image: "nginx:1".into(), cid: "abc".into(), path: "/kubepods/x/abc".into(), throttled_periods: 4, periods: 10, throttled_secs: 2.5, rss: 99, usage: 5000, ..Default::default() };
+        s.nets.push(PodNet { ns: "default".into(), pod: "web".into(), path: "/kubepods/x".into(), ifaces: i });
+        let t = render_cadvisor(&s);
+        assert!(t.contains("container_cpu_cfs_throttled_periods_total{container=\"app\",id=\"/kubepods/x/abc\",image=\"nginx:1\",name=\"abc\",namespace=\"default\",pod=\"web\"} 4 "), "{t}");
+        for m in ["container_cpu_cfs_periods_total", "container_cpu_cfs_throttled_seconds_total", "container_memory_rss", "container_memory_usage_bytes", "container_network_transmit_bytes_total{id=\"/kubepods/x\",interface=\"eth0\",namespace=\"default\",pod=\"web\"} 7000", "container_network_receive_bytes_total"] {
+            assert!(t.contains(m), "{m}");
+        }
+        let p = render_probes(&[ProbeCount { ns: "d".into(), pod: "p".into(), container: "c".into(), kind: "Liveness", ok: false, n: 3 }]);
+        assert!(p.contains("prober_probe_total{container=\"c\",namespace=\"d\",pod=\"p\",probe_type=\"Liveness\",result=\"failed\"} 3"));
     }
 }

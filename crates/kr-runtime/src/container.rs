@@ -583,6 +583,7 @@ const STEPS: &[&str] = &[
     "clone propagating volume",
     "run hook",
     "apply AppArmor/SELinux label",
+    "unshare cgroup namespace",
 ];
 
 /// Index of "run hook" in `STEPS`.
@@ -839,7 +840,13 @@ pub fn start(spec: &RunSpec) -> Result<Running, RunError> {
         return start_in_sandbox(spec, sb, cgroup, rootless(uid), full_map);
     }
 
-    let mut flags = ns::CLONE_NEWNS | ns::CLONE_NEWPID | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC | ns::CLONE_NEWNET | ns::CLONE_NEWCGROUP;
+    // With a cgroup the new process is placed in it by CLONE_INTO_CGROUP, but a cgroup namespace
+    // created by the same clone is rooted at the *parent's* cgroup, so the container would see
+    // the host's `cpu.max`/`memory.max` instead of its own limits: `child` unshares it afterwards.
+    let mut flags = ns::CLONE_NEWNS | ns::CLONE_NEWPID | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC | ns::CLONE_NEWNET;
+    if cgroup.is_none() {
+        flags |= ns::CLONE_NEWCGROUP;
+    }
     if spec.userns {
         flags |= ns::CLONE_NEWUSER;
     }
@@ -1183,7 +1190,10 @@ fn start_in_sandbox(spec: &RunSpec, sb: &Sandbox, cgroup: Option<Cgroup>, rootle
         if let Err(e) = ns::setns(&sb.pidfd, setns_flags) {
             report_exit(&rep_w, 24, e);
         }
-        let mut args = CloneArgs { flags: ns::CLONE_NEWNS | ns::CLONE_NEWPID | ns::CLONE_NEWCGROUP | ns::CLONE_PARENT, ..Default::default() };
+        let mut args = CloneArgs { flags: ns::CLONE_NEWNS | ns::CLONE_NEWPID | ns::CLONE_PARENT, ..Default::default() };
+        if cgroup.is_none() {
+            args.flags |= ns::CLONE_NEWCGROUP;
+        }
         // clone3 rejects exit_signal with CLONE_PARENT; the child inherits ours (SIGCHLD), so kr
         // (its new parent) is notified and can reap it.
         if let Some(cg) = &cgroup {
@@ -1305,10 +1315,32 @@ fn open_mount_target(path: &[u8], dir: bool) -> Result<Fd, Errno> {
 }
 
 /// Bind-mounts each volume from the old root (still attached at /.oldroot).
-fn mount_volumes(mounts: &[Mount], trees: &[Option<kr_sys::Fd>]) -> Result<(), Errno> {
+fn mount_volumes(mounts: &[Mount], trees: &[Option<kr_sys::Fd>], rootless: bool) -> Result<(), Errno> {
     for (i, m) in mounts.iter().enumerate() {
         if m.source.first() != Some(&b'/') || m.target.first() != Some(&b'/') {
             return Err(Errno(22));
+        }
+        // An image volume of a layered image: the source is the overlay's `lowerdir` list (top
+        // layer first, separated by ':'), not a directory. Mount those layers read-only.
+        if m.sub_path.is_none() && m.source.contains(&b':') {
+            let mut opts = b"lowerdir=".to_vec();
+            for (j, layer) in m.source.split(|&b| b == b':').enumerate() {
+                if j > 0 {
+                    opts.push(b':');
+                }
+                opts.extend_from_slice(b"/.oldroot");
+                opts.extend_from_slice(layer);
+            }
+            if rootless {
+                opts.extend_from_slice(b",userxattr");
+            }
+            opts.push(0);
+            let target = open_mount_target(&m.target, true)?;
+            let mut fdpath = b"/proc/self/fd/".to_vec();
+            fdpath.extend_from_slice(&fmt_u32(target.raw() as u32));
+            fdpath.push(0);
+            ns::mount(Some(b"overlay\0"), &fdpath, Some(b"overlay\0"), ns::MS_RDONLY, Some(&opts))?;
+            continue;
         }
         // Keeps the resolved subPath fd open until the bind mount is done.
         let mut _sub_fd = None;
@@ -1378,6 +1410,12 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
     }
     // The supervisor blocks signals it reads through a signalfd; the mask would survive execve.
     let _ = ns::sigmask_reset();
+    // Already inside the container's cgroup (CLONE_INTO_CGROUP): this namespace is rooted there.
+    if !spec.limits.is_empty() {
+        if let Err(e) = ns::unshare(ns::CLONE_NEWCGROUP) {
+            return (31, e);
+        }
+    }
     if let Some(t) = spec.tty_fd {
         for dst in 0..3 {
             if let Err(e) = ns::dup_to(t, dst) {
@@ -1473,7 +1511,7 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
         let _ = ns::mount(Some(b"cgroup\0"), b"/sys/fs/cgroup\0", Some(b"cgroup2\0"), ns::MS_RDONLY | ns::MS_NOSUID | ns::MS_NODEV | ns::MS_NOEXEC, None);
     }
 
-    step!(25, mount_volumes(spec.mounts, &trees));
+    step!(25, mount_volumes(spec.mounts, &trees, rootless));
     step!(STEP_HOOK, run_create_container_hooks(spec, host_pid, hook_log.as_ref()));
     if spec.readonly_root {
         step!(27, ns::mount(None, b"/\0", None, ns::MS_BIND | ns::MS_REMOUNT | ns::MS_RDONLY, None));

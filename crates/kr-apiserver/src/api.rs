@@ -1572,7 +1572,7 @@ impl ApiServer {
     /// `pods/<name>[:port]/proxy[/path]`: relays the request to the pod's IP (default port: the
     /// first container port, else 80).
     /// `nodes/<name>/proxy/<path>` for the kubelet endpoints kr serves: `metrics` (volume
-    /// statistics), `metrics/resource`, `stats/summary` and `healthz`. Only the node this server's
+    /// statistics), `metrics/resource`, `metrics/cadvisor`, `metrics/probes`, `stats/summary` and `healthz`. Only the node this server's
     /// own kubelet runs on; an agent's kubelet is scraped on its port 10250.
     fn node_kubelet(&self, req: &Req, node: &str) -> R<Reply> {
         let rest = req.path.split_once("/proxy").map_or("", |(_, r)| r).trim_matches('/');
@@ -1580,6 +1580,8 @@ impl ApiServer {
             "healthz" => return Ok(Reply::Http(kr_net::http1::server::Response::new(200, b"ok".to_vec()).with_header("Content-Type", "text/plain"))),
             "metrics" => "kubelet",
             "metrics/resource" => "resource",
+            "metrics/cadvisor" => "cadvisor",
+            "metrics/probes" => "probes",
             "stats/summary" => "summary",
             _ => return Err(ApiError::not_found("path", &alloc::format!("/{rest}"))),
         };

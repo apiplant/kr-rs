@@ -326,7 +326,7 @@ pub async fn serve(proxy: Rc<dyn NodeProxy>, node: String, tls: Rc<core::cell::R
                     Ok(r) => r,
                     Err(e) => Response::new(e.code, e.to_status_json().into_bytes()).with_header("Content-Type", "application/json"),
                 },
-                ["metrics", "resource"] | ["stats", "summary"] => match proxy.pod_subresource("metrics", parts[1], "", &node, None, "", &[]) {
+                ["metrics", "resource" | "cadvisor" | "probes"] | ["stats", "summary"] => match proxy.pod_subresource("metrics", parts[1], "", &node, None, "", &[]) {
                     Ok(r) => r,
                     Err(e) => Response::new(e.code, e.to_status_json().into_bytes()).with_header("Content-Type", "application/json"),
                 },
