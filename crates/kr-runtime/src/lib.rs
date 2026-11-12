@@ -14,5 +14,7 @@ pub mod network;
 pub mod pull;
 pub mod registries;
 pub mod security;
+pub mod seccomp;
+pub mod syscalls;
 pub mod store;
 pub mod unpack;

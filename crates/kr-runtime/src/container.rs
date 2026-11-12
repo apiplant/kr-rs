@@ -87,6 +87,10 @@ pub struct RunSpec<'a> {
     /// `securityContext.capabilities` resolved to capability numbers (see `security::resolve_caps`);
     /// `None` is the default set. Ignored when `privileged`.
     pub caps: Option<&'a [u32]>,
+    /// `securityContext.seccompProfile`: `None` is the default filter (`security::default_filter`),
+    /// `Some(&[])` runs unconfined, any other program is a compiled `Localhost` profile
+    /// (`seccomp::compile`). Ignored when `privileged`.
+    pub seccomp: Option<&'a [kr_sys::ns::SockFilter]>,
     /// Run in a user namespace (rootless). False = rootful (host userns), matching k3s default.
     pub userns: bool,
     /// OCI lifecycle hooks (CDI `hooks`); see `crate::hooks`. Use `hooks::NONE` for none.
@@ -130,6 +134,8 @@ pub struct ExecCtx {
     pub privileged: bool,
     /// `securityContext.capabilities` resolved; None = the default set.
     pub caps: Option<Vec<u32>>,
+    /// The container's seccomp filter, with the meaning of [`RunSpec::seccomp`].
+    pub seccomp: Option<Vec<kr_sys::ns::SockFilter>>,
 }
 
 /// What `exec_in` needs to enter a running container.
@@ -260,7 +266,7 @@ pub fn exec_in(target: &ExecTarget, spec: &ExecSpec) -> Result<Running, RunError
         let ctx = &target.ctx;
         let user = if spec.user.is_empty() { &ctx.user[..] } else { spec.user };
         let groups = if spec.extra_groups.is_empty() { &ctx.groups[..] } else { spec.extra_groups };
-        let _ = drop_and_exec(spec.cwd, user, full_map, spec.argv, spec.env, groups, ctx.privileged, ctx.caps.as_deref());
+        let _ = drop_and_exec(spec.cwd, user, full_map, spec.argv, spec.env, groups, ctx.privileged, ctx.caps.as_deref(), ctx.seccomp.as_deref());
         127
     })
 }
@@ -1477,7 +1483,7 @@ fn child(spec: &RunSpec, go: &Fd, rootless: bool, full_map: bool, in_sandbox: bo
             return (STEP_HOOK, f.errno());
         }
     }
-    drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups, spec.privileged, spec.caps)
+    drop_and_exec(spec.cwd, spec.user, full_map, spec.argv, spec.env, spec.extra_groups, spec.privileged, spec.caps, spec.seccomp)
 }
 
 /// `createContainer` hooks. They run with the host root as their root and the container's whole
@@ -1501,7 +1507,7 @@ fn run_create_container_hooks(spec: &RunSpec, host_pid: i32, log: Option<&Fd>) -
 
 /// The common tail of every process start inside a container: cwd, user, capabilities,
 /// NO_NEW_PRIVS, seccomp, execve. Only returns on failure.
-fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env: &[Vec<u8>], extra_groups: &[u32], privileged: bool, caps: Option<&[u32]>) -> (u8, Errno) {
+fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env: &[Vec<u8>], extra_groups: &[u32], privileged: bool, caps: Option<&[u32]>, seccomp: Option<&[kr_sys::ns::SockFilter]>) -> (u8, Errno) {
     macro_rules! step {
         ($i:expr, $e:expr) => {
             if let Err(e) = $e {
@@ -1541,8 +1547,17 @@ fn drop_and_exec(cwd: &[u8], user: &[u8], full_map: bool, argv: &[Vec<u8>], env:
         step!(16, security::finish_drop(caps.unwrap_or(security::DEFAULT_CAPS)));
         step!(13, ns::prctl(ns::PR_SET_NO_NEW_PRIVS, 1));
         // Built before installing: the filter must be the last thing before execve.
-        let filter = security::default_filter();
-        step!(17, ns::seccomp_set_filter(&filter));
+        let default;
+        let filter: &[kr_sys::ns::SockFilter] = match seccomp {
+            Some(p) => p,
+            None => {
+                default = security::default_filter();
+                &default
+            }
+        };
+        if !filter.is_empty() {
+            step!(17, ns::seccomp_set_filter(filter));
+        }
     }
     exec_argv(argv, env)
 }

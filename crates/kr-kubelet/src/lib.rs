@@ -1307,7 +1307,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             c.seq = r.seq;
             c.state = CState::Running { started_at: r.started_at, id: r.cid.clone() };
             c.signaller = Some(running.signaller());
-            c.target = Some(running.target().with_ctx(spec::exec_ctx(&pod, &cspec, "")));
+            c.target = Some(running.target().with_ctx(spec::exec_ctx(&pod, &cspec, "", &spec::seccomp_dir(&self.cfg.root))));
             c.proc = Some((r.pid, r.start));
             c.shim = r.shim;
             c.io = (r.io_fd >= 0).then_some((r.shim, r.io_fd, r.tty));
@@ -1588,6 +1588,15 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             }
             None => None,
         };
+        // securityContext.seccompProfile: Localhost files are read here; a bad one is a config error.
+        let seccomp = match spec::seccomp_filter(pod, cspec.unwrap_or(&Value::Null), caps.as_deref(), &spec::seccomp_dir(&self.cfg.root)) {
+            Ok(f) => f,
+            Err(m) => {
+                self.set_waiting(uid, i, "CreateContainerConfigError", m);
+                self.backoff(uid, i);
+                return;
+            }
+        };
         let ctx_user = built.user.clone().into_bytes();
         let ctx_groups = built.extra_groups.clone();
         let ctx_privileged = cspec.and_then(|c| c.pointer(&["securityContext", "privileged"])).and_then(Value::as_bool).unwrap_or(false);
@@ -1654,6 +1663,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             readonly_root: cspec.and_then(|c| c.pointer(&["securityContext", "readOnlyRootFilesystem"])).and_then(Value::as_bool).unwrap_or(false),
             privileged: cspec.and_then(|c| c.pointer(&["securityContext", "privileged"])).and_then(Value::as_bool).unwrap_or(false),
             caps: caps.as_deref(),
+            seccomp: seccomp.as_deref(),
             userns: {
                 let host_users = pod.pointer(&["spec", "hostUsers"]).and_then(Value::as_bool);
                 if kr_sys::ns::getuid() != 0 {
@@ -1729,7 +1739,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                     c.resize_restart = false;
                     c.seq = seq;
                     c.signaller = Some(running.signaller());
-                    c.target = Some(running.target().with_ctx(container::ExecCtx { user: ctx_user, groups: ctx_groups, privileged: ctx_privileged, caps: caps.clone() }));
+                    c.target = Some(running.target().with_ctx(container::ExecCtx { user: ctx_user, groups: ctx_groups, privileged: ctx_privileged, caps: caps.clone(), seccomp: seccomp.clone() }));
                     c.state = CState::Running { started_at: started, id: cid.clone() };
                     c.proc = kr_runtime::network::proc_start(running.pid as u32).map(|st| (running.pid, st));
                     c.shim = running.shim_pid();

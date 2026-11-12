@@ -28,7 +28,7 @@ pub struct Built {
 /// containers adopted after a restart; a started container passes what it was started with).
 /// `image_user` is the image's USER, unknown to an adopted container: such a container keeps
 /// the spec's `runAsUser` only.
-pub fn exec_ctx(pod: &Value, ctr: &Value, image_user: &str) -> container::ExecCtx {
+pub fn exec_ctx(pod: &Value, ctr: &Value, image_user: &str, seccomp_dir: &str) -> container::ExecCtx {
     let sc = |k: &str| ctr.pointer(&["securityContext", k]).or_else(|| pod.pointer(&["spec", "securityContext", k])).and_then(Value::as_i64);
     let user = match (sc("runAsUser"), sc("runAsGroup")) {
         (Some(u), Some(g)) => alloc::format!("{u}:{g}"),
@@ -44,7 +44,46 @@ pub fn exec_ctx(pod: &Value, ctr: &Value, image_user: &str) -> container::ExecCt
         let names = |f: &str| -> Vec<&str> { c.get(f).and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_str).collect() };
         kr_runtime::security::resolve_caps(&names("add"), &names("drop")).ok()
     });
-    container::ExecCtx { user: user.into_bytes(), groups, privileged: ctr.pointer(&["securityContext", "privileged"]).and_then(Value::as_bool).unwrap_or(false), caps }
+    container::ExecCtx { user: user.into_bytes(), groups, privileged: ctr.pointer(&["securityContext", "privileged"]).and_then(Value::as_bool).unwrap_or(false), seccomp: seccomp_filter(pod, ctr, caps.as_deref(), seccomp_dir).ok().flatten(), caps }
+}
+
+/// Directory of `Localhost` seccomp profiles: `<kubelet dir>/seccomp` as upstream
+/// (`/var/lib/kubelet`, or `KR_KUBELET_DIR`); a rootless kubelet uses `<root>/seccomp`.
+pub fn seccomp_dir(root: &str) -> String {
+    if kr_sys::ns::getuid() == 0 {
+        alloc::format!("{}/seccomp", kr_runtime::store::env_var("KR_KUBELET_DIR").filter(|d| d.starts_with('/')).unwrap_or_else(|| "/var/lib/kubelet".to_string()))
+    } else {
+        alloc::format!("{root}/seccomp")
+    }
+}
+
+/// The seccomp filter of a container, from `securityContext.seccompProfile` (the container's, else
+/// the pod's): `None` = the default filter (no profile or `RuntimeDefault`), `Some(empty)` =
+/// `Unconfined`, `Localhost` = the profile file below `dir`, compiled for the container's
+/// bounding capabilities. A file that is missing, outside `dir` or not a valid profile is an error
+/// the container reports (as upstream refuses to start it).
+pub fn seccomp_filter(pod: &Value, ctr: &Value, caps: Option<&[u32]>, dir: &str) -> Result<Option<Vec<kr_sys::ns::SockFilter>>, String> {
+    let Some(p) = ctr.pointer(&["securityContext", "seccompProfile"]).or_else(|| pod.pointer(&["spec", "securityContext", "seccompProfile"])) else { return Ok(None) };
+    match p.get("type").and_then(Value::as_str).unwrap_or("") {
+        "RuntimeDefault" => Ok(None),
+        "Unconfined" => Ok(Some(Vec::new())),
+        "Localhost" => {
+            let name = p.get("localhostProfile").and_then(Value::as_str).filter(|n| !n.is_empty()).ok_or("seccompProfile type Localhost needs localhostProfile")?;
+            if name.starts_with('/') || name.split('/').any(|c| c == ".." || c.is_empty()) {
+                return Err(alloc::format!("seccomp profile {name:?}: must be a relative path below {dir}"));
+            }
+            let root = kr_sys::ns::open(alloc::format!("{dir}\0").as_bytes(), kr_sys::ns::O_RDONLY | kr_sys::ns::O_DIRECTORY | kr_sys::O_CLOEXEC, 0).map_err(|_| alloc::format!("seccomp profile {name:?}: {dir} does not exist"))?;
+            // The kernel resolves the name with the profile directory as the root: nothing it
+            // reaches (symlinks included) can leave the directory.
+            let fd = kr_sys::fs::open_in_root(root.raw(), alloc::format!("{name}\0").as_bytes(), kr_sys::fs::O_RDONLY, 0).map_err(|e| alloc::format!("seccomp profile {name:?}: cannot open below {dir} (errno {})", e.0))?;
+            let mut text = Vec::new();
+            kr_sys::fs::read_to_end(fd.raw(), &mut text, 4 << 20).map_err(|_| alloc::format!("seccomp profile {name:?}: cannot read"))?;
+            let text = String::from_utf8(text).map_err(|_| alloc::format!("seccomp profile {name:?}: not UTF-8"))?;
+            let bounding: Vec<u32> = caps.map(<[u32]>::to_vec).unwrap_or_else(|| kr_runtime::security::DEFAULT_CAPS.to_vec());
+            kr_runtime::seccomp::compile(&text, &bounding).map(Some).map_err(|e| alloc::format!("seccomp profile {name:?}: {e}"))
+        }
+        other => Err(alloc::format!("seccompProfile type {other:?} is not valid")),
+    }
 }
 
 /// Host file backing a container's terminationMessagePath.

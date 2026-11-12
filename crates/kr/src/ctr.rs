@@ -222,6 +222,7 @@ fn run(mut args: Args) -> i32 {
         readonly_root: false,
             privileged: false,
             caps: None,
+            seccomp: None,
             userns: kr_runtime::container::userns_enabled(),
             hooks: &hooks,
     };
@@ -526,6 +527,7 @@ fn run_dir(mut args: Args) -> i32 {
         readonly_root: false,
             privileged: false,
             caps: None,
+            seccomp: None,
             userns: kr_runtime::container::userns_enabled(),
             hooks: &kr_runtime::hooks::NONE,
     };
@@ -604,6 +606,7 @@ fn pod_demo(mut args: Args) -> i32 {
             readonly_root: false,
             privileged: false,
             caps: None,
+            seccomp: None,
             userns: kr_runtime::container::userns_enabled(),
             hooks: &kr_runtime::hooks::NONE,
         };

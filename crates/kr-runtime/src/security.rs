@@ -8,6 +8,8 @@ use alloc::vec::Vec;
 use kr_sys::ns::{self, SockFilter};
 use kr_sys::Errno;
 
+pub(crate) use arch::{AUDIT_ARCH, X32_BIT};
+
 /// Docker's default capability set.
 pub const DEFAULT_CAPS: &[u32] = &[
     0,  // CHOWN
@@ -34,6 +36,10 @@ const CAP_NAMES: &[&str] = &[
     "AUDIT_WRITE", "AUDIT_CONTROL", "SETFCAP", "MAC_OVERRIDE", "MAC_ADMIN", "SYSLOG", "WAKE_ALARM", "BLOCK_SUSPEND", "AUDIT_READ",
     "PERFMON", "BPF", "CHECKPOINT_RESTORE",
 ];
+
+pub(crate) fn cap_number_pub(name: &str) -> Option<u32> {
+    cap_number(name)
+}
 
 fn cap_number(name: &str) -> Option<u32> {
     let n = name.strip_prefix("CAP_").unwrap_or(name);
@@ -145,7 +151,7 @@ pub fn finish_drop(keep: &[u32]) -> Result<(), Errno> {
 }
 
 #[cfg(target_arch = "x86_64")]
-mod arch {
+pub(crate) mod arch {
     pub const AUDIT_ARCH: u32 = 0xC000_003E;
     /// x32 ABI syscalls have this bit set; they bypass a native-number filter, so kill them.
     pub const X32_BIT: Option<u32> = Some(0x4000_0000);
@@ -169,7 +175,7 @@ mod arch {
 }
 
 #[cfg(target_arch = "aarch64")]
-mod arch {
+pub(crate) mod arch {
     pub const AUDIT_ARCH: u32 = 0xC000_00B7;
     pub const X32_BIT: Option<u32> = None;
     pub const CLONE: u32 = 220;
@@ -199,6 +205,11 @@ const LD_W_ABS: u16 = 0x20;
 const JEQ_K: u16 = 0x15;
 const JGE_K: u16 = 0x35;
 const JSET_K: u16 = 0x45;
+const JGT_K: u16 = 0x25;
+#[cfg(target_arch = "x86_64")]
+const MAX_KNOWN: u32 = crate::syscalls::X86_64_MAX;
+#[cfg(target_arch = "aarch64")]
+const MAX_KNOWN: u32 = crate::syscalls::AARCH64_MAX;
 const RET_K: u16 = 0x06;
 
 const RET_KILL_PROCESS: u32 = 0x8000_0000;
@@ -234,6 +245,10 @@ pub fn default_filter() -> Vec<SockFilter> {
         p.push(ins(JEQ_K, 0, 1, nr));
         p.push(ins(RET_K, 0, 0, ret_errno(EPERM)));
     }
+    // Syscalls newer than this build knows (the table of `syscalls.rs`) are refused the way a kernel
+    // without them would: a new kernel interface is not reachable before somebody has looked at it.
+    p.push(ins(JGT_K, 0, 1, MAX_KNOWN));
+    p.push(ins(RET_K, 0, 0, ret_errno(ENOSYS)));
     p.push(ins(JEQ_K, 0, 1, CLONE3));
     p.push(ins(RET_K, 0, 0, ret_errno(ENOSYS)));
     p.push(ins(JEQ_K, 0, 3, arch::CLONE));

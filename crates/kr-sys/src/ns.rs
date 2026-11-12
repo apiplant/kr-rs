@@ -440,7 +440,7 @@ pub fn capset(keep: u64) -> Result<()> {
 
 /// One classic-BPF instruction (`struct sock_filter`).
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SockFilter {
     pub code: u16,
     pub jt: u8,
