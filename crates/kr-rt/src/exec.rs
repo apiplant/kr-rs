@@ -102,7 +102,11 @@ pub fn phase(name: &'static str) {
 
 /// Records what the current poll is working on (printed in stall reports). Reuses one buffer.
 pub fn detail(method: &str, path: &str) {
-    let mut d = stall().detail.borrow_mut();
+    // Host/test builds run requests on several threads; the executor state is single-threaded.
+    if cfg!(any(test, feature = "host")) {
+        return;
+    }
+    let Ok(mut d) = stall().detail.try_borrow_mut() else { return };
     d.clear();
     d.push_str(method);
     d.push(' ');
@@ -144,7 +148,7 @@ fn note_poll(started_ns: u64, origin: &core::panic::Location<'static>) {
     let now = now_ms();
     if now >= stall().last_log_ms.get() + 1000 {
         stall().last_log_ms.set(now);
-        crate::eprint(alloc::format!("kr: event loop stalled for {} ms in one task poll of the task spawned at {}:{}, last phase {:?}, request {:?} ({} stalls so far, longest {} ms)\n", us / 1000, origin.file(), origin.line(), stall().phase.get(), stall().detail.borrow().as_str(), n + 1, max.max(us) / 1000).as_bytes());
+        crate::eprint(alloc::format!("kr: event loop stalled for {} ms in one task poll of the task spawned at {}:{}, last phase {:?}, request {:?} ({} stalls so far, longest {} ms)\n", us / 1000, origin.file(), origin.line(), stall().phase.get(), stall().detail.try_borrow().map(|d| d.clone()).unwrap_or_default(), n + 1, max.max(us) / 1000).as_bytes());
     }
 }
 
@@ -368,7 +372,9 @@ fn run_queue() {
             stall().phase.set("");
             let t0 = now_ns();
             stall().poll_start_ns.set(t0);
-            stall().detail.borrow_mut().clear();
+            if let Ok(mut d) = stall().detail.try_borrow_mut() {
+                d.clear();
+            }
             let done = f.as_mut().poll(&mut cx).is_ready();
             note_poll(t0, task.origin);
             if done || task.abort_pending.get() {
