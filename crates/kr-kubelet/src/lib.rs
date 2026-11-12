@@ -293,6 +293,8 @@ pub struct Kubelet<C: Client> {
     adopted: Cell<(u32, u32)>,
     /// Shims and re-adoption are available (kernel prerequisites met).
     survive: Cell<bool>,
+    /// NetworkPolicy controller state (ADR-049): pods announce their IP before their containers start.
+    netpol: Rc<netpol::Ctl>,
 }
 
 enum PullGate {
@@ -318,7 +320,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     pub fn new(c: C, cfg: Config, store: Store) -> Rc<Self> {
         let devices = deviceplugin::Plugins::new(&deviceplugin::default_dir(&cfg.root));
         let csi = csi::Csi::new(&cfg.node_name);
-        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), starting: RefCell::new(alloc::collections::BTreeSet::new()), notify: Notify::default(), devices, csi, pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()), adopted: Cell::new((0, 0)), survive: Cell::new(false) })
+        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), starting: RefCell::new(alloc::collections::BTreeSet::new()), notify: Notify::default(), devices, csi, pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()), adopted: Cell::new((0, 0)), survive: Cell::new(false), netpol: Rc::new(netpol::Ctl::default()) })
     }
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
@@ -439,7 +441,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         if self.cfg.network {
             let me = self.clone();
             kr_rt::exec::spawn(async move { me.route_loop().await });
-            kr_rt::exec::spawn(netpol::run(self.c.clone(), self.cfg.node_name.clone()));
+            kr_rt::exec::spawn(netpol::run(self.c.clone(), self.cfg.node_name.clone(), self.netpol.clone()));
         }
         let hb = self.clone();
         kr_rt::exec::spawn(async move { node::heartbeat_loop(&hb.c, &hb.cfg, &hb.devices).await });
@@ -1574,7 +1576,14 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         p.lease = lease;
         p.ip = ip.filter(|_| host_net || self.fam.get().v4);
         p.ip6 = if host_net { Some(self.cfg.node_ip).filter(|a| kr_sys::unmap4(*a).is_none()) } else if use_cni { net_ip6 } else { net.and_then(|n| n.ip6) };
+        let announce: Vec<String> = [p.ip.map(|a| kr_net::tcp::fmt_ip16(kr_sys::map4(a))), p.ip6.map(kr_net::tcp::fmt_ip16)].into_iter().flatten().collect();
         drop(pods);
+        // Pre-start hook (#203): install the pod's NetworkPolicy chain from the address just
+        // allocated, before any container runs, instead of waiting for the status report.
+        if !host_net && !use_cni && self.cfg.network && !announce.is_empty() && netpol::enabled() {
+            self.netpol.announce(meta(pod, "namespace"), meta(pod, "name"), announce);
+            self.netpol.sync(&self.c, &self.cfg.node_name).await;
+        }
         self.persist(uid);
         Ok(())
     }

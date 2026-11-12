@@ -312,9 +312,62 @@ fn program(chains: &[NpChain]) -> bool {
     ok
 }
 
+/// The controller's state, shared by the loop and the kubelet's pod start path. A pod's IP is
+/// allocated before the API server hears of it (its first status report comes after the
+/// containers start), so the start path registers it here ([`Ctl::announce`]) and runs a pass
+/// ([`Ctl::sync`]) before the first container starts: the pod's chain exists from the first packet.
+#[derive(Default)]
+pub struct Ctl {
+    /// `namespace/name` -> IPs allocated by this kubelet that the API does not show yet.
+    pending: core::cell::RefCell<alloc::collections::BTreeMap<String, Vec<String>>>,
+    last: core::cell::RefCell<Option<Vec<NpChain>>>,
+}
+
+/// Gives pods in `pending` that have no IPs in the API yet their announced ones and forgets
+/// entries the API has caught up with (or whose pod is gone).
+fn overlay(pods: &mut [Value], pending: &mut alloc::collections::BTreeMap<String, Vec<String>>) {
+    let mut seen: Vec<String> = Vec::new();
+    for p in pods.iter_mut() {
+        let key = alloc::format!("{}/{}", meta(p, "namespace"), meta(p, "name"));
+        let Some(ips) = pending.get(&key) else { continue };
+        let has = p.pointer(&["status", "podIP"]).and_then(Value::as_str).is_some_and(|s| !s.is_empty()) || p.pointer(&["status", "podIPs"]).and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+        if has {
+            continue;
+        }
+        seen.push(key);
+        let mut st = p.get("status").cloned().unwrap_or_else(|| Value::Object(Vec::new()));
+        st.set("podIPs", Value::Array(ips.iter().map(|ip| Value::Object(alloc::vec![("ip".to_string(), Value::from(ip.as_str()))])).collect()));
+        p.set("status", st);
+    }
+    pending.retain(|k, _| seen.contains(k));
+}
+
+impl Ctl {
+    /// Registers the addresses of a pod about to start.
+    pub fn announce(&self, ns: &str, name: &str, ips: Vec<String>) {
+        self.pending.borrow_mut().insert(alloc::format!("{ns}/{name}"), ips);
+    }
+
+    /// One pass: list, compute, program when changed. A failed list keeps the current rules.
+    pub async fn sync<C: Client>(&self, c: &C, node: &str) {
+        let got = (
+            items(c.list("/api/v1/pods", "").await),
+            items(c.list("/api/v1/namespaces", "").await),
+            items(c.list("/apis/networking.k8s.io/v1/networkpolicies", "").await),
+        );
+        if let (Some(mut pods), Some(nss), Some(pols)) = got {
+            overlay(&mut pods, &mut self.pending.borrow_mut());
+            let chains = compute(&pods, &nss, &pols, node);
+            if self.last.borrow().as_ref() != Some(&chains) && program(&chains) {
+                *self.last.borrow_mut() = Some(chains);
+            }
+        }
+    }
+}
+
 /// Controller loop (root nodes with the built-in bridge). Returns at once when disabled; then
 /// removes tables a previous run (with enforcement on) left behind.
-pub async fn run<C: Client + Clone + 'static>(c: C, node: String) {
+pub async fn run<C: Client + Clone + 'static>(c: C, node: String, ctl: Rc<Ctl>) {
     if !enabled() {
         for fam in [PolFam::Inet, PolFam::Bridge] {
             let _ = kr_net::nft::delete_netpol(fam);
@@ -338,20 +391,8 @@ pub async fn run<C: Client + Clone + 'static>(c: C, node: String) {
             }
         });
     }
-    let mut last: Option<Vec<NpChain>> = None;
     loop {
-        let got = (
-            items(c.list("/api/v1/pods", "").await),
-            items(c.list("/api/v1/namespaces", "").await),
-            items(c.list("/apis/networking.k8s.io/v1/networkpolicies", "").await),
-        );
-        // a failed list keeps the current rules
-        if let (Some(pods), Some(nss), Some(pols)) = got {
-            let chains = compute(&pods, &nss, &pols, &node);
-            if last.as_ref() != Some(&chains) && program(&chains) {
-                last = Some(chains);
-            }
-        }
+        ctl.sync(&c, &node).await;
         wake.wait(30_000).await;
         kr_rt::exec::sleep(500).await; // let a burst of changes finish; bounds the work under churn
     }
@@ -360,6 +401,22 @@ pub async fn run<C: Client + Clone + 'static>(c: C, node: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn announced_ips_stand_in_until_the_api_has_them() {
+        let mut pods = [j(r#"{"metadata":{"namespace":"d","name":"a"},"spec":{"nodeName":"n1","containers":[]},"status":{"phase":"Pending"}}"#), pod("d", "b", "10.88.0.7", "{}", "n1")];
+        let mut pending = alloc::collections::BTreeMap::new();
+        pending.insert("d/a".to_string(), alloc::vec!["10.88.0.9".to_string()]);
+        pending.insert("d/b".to_string(), alloc::vec!["10.88.0.7".to_string()]);
+        pending.insert("d/gone".to_string(), alloc::vec!["10.88.0.8".to_string()]);
+        overlay(&mut pods, &mut pending);
+        assert_eq!(pods[0].pointer(&["status", "podIPs"]).and_then(Value::as_array).unwrap().len(), 1);
+        // The pod with the pre-start IP is selected by a default-deny policy at once.
+        let pols = [pol("d", r#"{"podSelector":{},"policyTypes":["Ingress"]}"#)];
+        assert!(chain(&compute(&pods, &[nsobj("d", "{}")], &pols, "n1"), [10, 88, 0, 9], true).is_some());
+        // The entry the API caught up with and the one without a pod are forgotten; "a" stays.
+        assert_eq!(pending.keys().collect::<Vec<_>>(), ["d/a"]);
+    }
 
     fn j(s: &str) -> Value {
         kr_fmt::json::parse(s.as_bytes()).unwrap()

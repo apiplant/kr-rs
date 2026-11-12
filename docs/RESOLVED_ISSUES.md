@@ -628,3 +628,6 @@
 
 317. **ServiceLB re-evaluated every Service on every event** — *fixed* (#174, ADR-042)
     The watches now feed a `Tracker` that turns events into queue keys: a Service event enqueues that Service (plus the Services sharing one of its ports, whose clash outcome may change), an EndpointSlice event enqueues its owning Service, and a Node event enqueues "all" only when the node's Ready state or published addresses changed (heartbeats enqueue nothing). A key reconciles one Service (`sync_one`; EndpointSlices read per namespace); the periodic resync still does a full pass. Tests: `tracker_*` in `servicelb.rs`.
+
+318. **A new pod was open for up to ~0.5 s (NetworkPolicy)** — *fixed* (#203, ADR-049)
+    The pod's chain needed its IP, which reached the API only with the first status report. Now the kubelet, after it allocates the address and before any container starts (end of sandbox setup, built-in bridge only), registers it in the policy controller (`netpol::Ctl::announce`) and runs a pass (`Ctl::sync`), which overlays the announced IPs onto pods the API shows without any. The overlay entry is dropped once the API has the IPs. Test: `announced_ips_stand_in_until_the_api_has_them`; the kernel side is the existing nft tests. Not run on a live cluster here (no root).

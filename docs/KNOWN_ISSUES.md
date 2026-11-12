@@ -56,8 +56,6 @@ Ordered by impact. Size: S days, M a week or two, L more.
     Scheduled snapshots exist (`--snapshot-interval`, `--snapshot-keep`); k3s can also upload to S3 (`etcd-snapshot --s3*`) and restore from it, the usual off-host backup in production. Needs: SigV4 signing (HMAC-SHA256 exists), a streaming PUT, list/prune by retention.
 321. **`kubectl get endpoints` has no ENDPOINTS column** — *new*, S
     Only NAME and AGE are printed: the Table conversion for `Endpoints` is missing.
-203. **NetworkPolicy: a new pod is open for up to ~0.5 s** — *ADR-049*, M
-    The pod's chain needs its IP, which reaches the API only with its first status report. Fix: the kubelet installs the chain from the address it allocates, before the container starts.
 322. **Embedded registry mirror** — *new, lower priority*, L
     k3s (1.29+) can share images peer to peer between nodes (`--embedded-registry`, Spegel). Not needed for production; listed so the gap is known.
 
