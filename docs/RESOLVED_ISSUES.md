@@ -392,3 +392,6 @@
 
 216. **Kubelet fsynced on the event loop (100+ ms stalls at start-up and at every pod start)** — *fixed*
     Found with the stall watchdog (#213a): the kubelet main loop stalled 100–160 ms per pod while adopting pods because `persist` rewrote each pod's adoption record with `write_file_atomic`, which fsyncs. `persist` now skips the write when the file already holds the same content, and the regenerable per-pod files (`resolv.conf`, `/etc/hosts`, projected Secret/ConfigMap/ServiceAccount volume files) use the new `write_file_atomic_nosync` (atomic rename, no fsync). Takes effect after a restart.
+
+217. **Kubelet pod sync was one uninterrupted poll of the event loop** — *fixed, to be confirmed by the stall log*
+    With the in-process client every await in `sync_all` completes immediately, so syncing all pods (status computation, merge patches through the API, persist) ran as a single poll of 100–170 ms (stall log: last phase `sync_all: report_status`). `sync_all` now yields to the executor every 5 ms (`yield_now`), and `report_status`, the storage gc and the gone-pods step carry phase labels. Other loops that call the in-process client for many objects (controllers, ServiceLB, CSR, APF seeding) may have the same shape: check them if the stall log names them.

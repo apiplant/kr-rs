@@ -816,9 +816,12 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             self.on_exit(e);
         }
         let q = alloc::format!("fieldSelector=spec.nodeName%3D{}", self.cfg.node_name);
+        kr_rt::exec::phase("sync_all: list pods");
         let Ok(list) = self.c.list("/api/v1/pods", &q).await else { return false };
+        kr_rt::exec::phase("sync_all: copy list");
         let desired: Vec<Value> = list.get("items").and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
         let mut seen = Vec::new();
+        let mut slice = now_ms();
         for pod in &desired {
             let uid = meta(pod, "uid").to_string();
             seen.push(uid.clone());
@@ -837,7 +840,14 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             }
             kr_rt::exec::phase("sync_all: report_status");
             self.report_status(&uid, pod).await;
+            // The in-process client never suspends, so without this the whole pod list is one
+            // poll of the event loop: give the API server and Raft a turn every few ms.
+            if now_ms().saturating_sub(slice) >= 5 {
+                kr_rt::exec::yield_now().await;
+                slice = now_ms();
+            }
         }
+        kr_rt::exec::phase("sync_all: storage gc");
         // Directories of deleted local-path PVs, every 30 s.
         static LAST_STORAGE_GC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
         let t = now_ms();
@@ -845,6 +855,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             LAST_STORAGE_GC.store(t, core::sync::atomic::Ordering::Relaxed);
             spec::gc_storage(&self.c).await;
         }
+        kr_rt::exec::phase("sync_all: gone pods");
         // Pods deleted from the API: stop immediately (the object is already gone).
         let gone: Vec<String> = self.pods.borrow().keys().filter(|k| !seen.contains(k)).cloned().collect();
         for uid in gone {
@@ -2046,6 +2057,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let mut pods = self.pods.borrow_mut();
             let Some(p) = pods.get_mut(uid) else { return };
             let policy = pod.pointer(&["spec", "restartPolicy"]).and_then(Value::as_str).unwrap_or("Always");
+            kr_rt::exec::phase("report_status: status_json");
             let mut status = status_json(p, policy);
             if let Some(r) = pod.pointer(&["spec", "resources"]).filter(|r| r.as_object().is_some_and(|m| !m.is_empty())) {
                 status.set("resources", r.clone());
@@ -2054,6 +2066,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             keep_foreign_conditions(pod, &mut status);
             (status, alloc::format!("/api/v1/namespaces/{}/pods/{}/status", p.ns, p.name))
         };
+        kr_rt::exec::phase("report_status: serialise");
         let text = json::to_string(&status);
         // The node controller marks pods of an unreachable node not Ready; when this kubelet is
         // back and the API disagrees with what it computed, write again despite the cache.
@@ -2089,6 +2102,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             }
         }
         let patch = Value::Object(alloc::vec![(String::from("status"), status)]);
+        kr_rt::exec::phase("report_status: patch");
         if self.c.patch(&path, "application/merge-patch+json", &patch).await.is_ok() {
             if let Some(p) = self.pods.borrow_mut().get_mut(uid) {
                 p.last_status = text;
