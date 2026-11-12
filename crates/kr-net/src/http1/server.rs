@@ -528,6 +528,7 @@ async fn run(
         let (minor, keep) = (head.minor, head.keep_alive);
         let req = Request { method: head.method, target: head.target, headers: head.headers, body, peer: peer.clone() };
         let mut resp = handler.handle(req).await;
+        kr_rt::exec::phase("http: handled");
         if let Body::Upgrade(h) = resp.body {
             if minor == 1 && resp.status == 101 {
                 match send_upgrade_head(conn, cfg, &resp.headers).await {
@@ -542,7 +543,10 @@ async fn run(
             resp.body = Body::Full(Vec::new());
             resp.status = if minor == 1 { 500 } else { 400 };
         }
-        match send_response(conn, cfg, resp, is_head, minor, keep, &mut buf).await {
+        kr_rt::exec::phase("http: send response");
+        let sent = send_response(conn, cfg, resp, is_head, minor, keep, &mut buf).await;
+        kr_rt::exec::phase("http: next request");
+        match sent {
             Ok(true) => {}
             Ok(false) => return Some(true),
             Err(()) => return None,
