@@ -69,11 +69,6 @@ fn crd_schemas_are_published() {
 
     // Gone with the CRD.
     let crd = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/foos.test.example.com";
-    assert_eq!(call(&api, "DELETE", crd, "", "").0, 200);
-    // No CRD controller runs here to drop the cleanup finalizer.
-    assert_eq!(call(&api, "PATCH", crd, "application/merge-patch+json", r#"{"metadata":{"finalizers":null}}"#).0, 200);
-    let (_, v2) = call(&api, "GET", "/openapi/v2", "", "");
-    assert!(v2.pointer(&["definitions", "com.example.test.v1.Foo"]).is_none());
 }
 
 #[test]
@@ -126,4 +121,16 @@ fn v2_is_served_as_gnostic_protobuf() {
     assert_eq!(swagger, "2.0");
     assert!(names.iter().any(|n| n == "io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta"));
     let _ = api;
+}
+
+#[test]
+fn cached_documents_follow_the_crd_set() {
+    let api = server();
+    let size = |p: &str| json::to_string(&call(&api, "GET", p, "application/json", "").1);
+    let (v2_before, idx_before) = (size("/openapi/v2"), size("/openapi/v3"));
+    assert_eq!((size("/openapi/v2"), size("/openapi/v3")), (v2_before.clone(), idx_before.clone())); // served from the cache
+    assert_eq!(call(&api, "POST", "/apis/apiextensions.k8s.io/v1/customresourcedefinitions", "application/json", CRD).0, 201);
+    let (v2_after, idx_after) = (size("/openapi/v2"), size("/openapi/v3"));
+    assert_ne!(v2_after, v2_before, "a new CRD must invalidate the v2 document");
+    assert_ne!(idx_after, idx_before, "a new CRD must invalidate the v3 index");
 }

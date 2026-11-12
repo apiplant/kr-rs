@@ -386,3 +386,6 @@
 
 213a. **No stall watchdog, no Raft priority, fixed election timeout** — *fixed* (rest stays as #213)
     `kr-rt::exec` measures every task poll: polls longer than `KR_STALL_WARN_MS` (default 100, 0 = off) are counted (`exec::stall_stats()`) and logged at most once a second ("event loop stalled for N ms in one task poll"). `exec::spawn_priority` queues a task at the front of the run queue whenever it is woken; the Raft driver (`Cluster::run`) uses it, so heartbeats and votes are processed before API work in each round. `KR_RAFT_ELECTION_MS` (default 1000; actual timeout 1–2x) sets the election timeout via `cluster::set_election_timeout_ms`. Test: `exec::tests::priority_tasks_run_first_and_stalls_are_counted`.
+
+210a. **OpenAPI documents were rebuilt on every request** — *fixed* (rest stays as #210)
+    `/openapi/v2` (JSON and protobuf), `/openapi/v3` and `/openapi/v3/<group-version>` are cached in `ApiServer::oa_cache` and dropped whenever the CRD set changes (`register_crd`, `unregister_crd`, `reload_crds`). Test: `cached_documents_follow_the_crd_set`.

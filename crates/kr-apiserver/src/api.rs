@@ -119,6 +119,8 @@ pub struct ApiServer {
     node_cert_secs: core::cell::Cell<i64>,
     /// Served versions of established CustomResourceDefinitions.
     custom: RefCell<Vec<crate::crd::Custom>>,
+    /// Serialised OpenAPI documents by request key; dropped whenever the CRD set changes (#210).
+    oa_cache: RefCell<alloc::collections::BTreeMap<String, Vec<u8>>>,
     /// Group commit: writes reach the log synchronously, fsync happens off the event loop.
     committer: crate::durable::Committer,
     /// HA mode (ADR-026): the store is replicated by this Raft driver.
@@ -269,7 +271,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default() };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), oa_cache: RefCell::new(alloc::collections::BTreeMap::new()), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default() };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -291,9 +293,21 @@ impl ApiServer {
         self.custom.borrow().iter().map(|c| c.res).collect()
     }
 
+    /// An OpenAPI document, built once per CRD-set generation: the documents are large (the whole
+    /// API schema) and kubectl and every controller-runtime client fetch them repeatedly.
+    fn oa_cached(&self, key: &str, build: impl FnOnce() -> Option<Vec<u8>>) -> Option<Vec<u8>> {
+        if let Some(b) = self.oa_cache.borrow().get(key) {
+            return Some(b.clone());
+        }
+        let b = build()?;
+        self.oa_cache.borrow_mut().insert(key.to_string(), b.clone());
+        Some(b)
+    }
+
     /// (Re)registers the served versions of a stored CRD.
     fn register_crd(&self, crd: &Value) {
         let name = crd.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("");
+        self.oa_cache.borrow_mut().clear();
         let mut all = self.custom.borrow_mut();
         let fresh = crate::crd::build(crd, &all);
         all.retain(|c| c.crd != name);
@@ -304,6 +318,7 @@ impl ApiServer {
     fn unregister_crd(&self, crd: &Value) {
         let name = crd.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("");
         let res = self.custom.borrow().iter().find(|c| c.crd == name).map(|c| c.res);
+        self.oa_cache.borrow_mut().clear();
         self.custom.borrow_mut().retain(|c| c.crd != name);
         if let Some(r) = res {
             let mut store = self.store.borrow_mut();
@@ -1226,15 +1241,21 @@ impl ApiServer {
                 crate::aggregator::merge_groups(self, &mut doc);
                 return Ok(Reply::Json(200, json::to_string(&doc)));
             }
-            ["openapi", "v3"] => return Ok(Reply::Json(200, crate::openapi::index(&extra))),
+            ["openapi", "v3"] => {
+                let b = self.oa_cached("v3", || Some(crate::openapi::index(&extra).into_bytes())).unwrap_or_default();
+                return Ok(Reply::Json(200, String::from_utf8(b).unwrap_or_default()));
+            }
             ["openapi", "v2"] if req.accept.is_some_and(|a| a.contains("proto-openapi.spec.v2")) => {
-                let body = crate::openapi::v2_proto(&self.custom.borrow());
+                let body = self.oa_cached("v2proto", || Some(crate::openapi::v2_proto(&self.custom.borrow()))).unwrap_or_default();
                 return Ok(Reply::Http(kr_net::http1::server::Response::new(200, body).with_header("Content-Type", "application/com.github.proto-openapi.spec.v2@v1.0+protobuf")));
             }
-            ["openapi", "v2"] => return Ok(Reply::Json(200, crate::openapi::v2(&self.custom.borrow()))),
+            ["openapi", "v2"] => {
+                let b = self.oa_cached("v2", || Some(crate::openapi::v2(&self.custom.borrow()).into_bytes())).unwrap_or_default();
+                return Ok(Reply::Json(200, String::from_utf8(b).unwrap_or_default()));
+            }
             ["openapi", "v3", rest @ ..] => {
                 let p = rest.join("/");
-                return crate::openapi::group_version(&extra, &self.custom.borrow(), &p).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("openapi", &p));
+                return self.oa_cached(&alloc::format!("v3/{p}"), || crate::openapi::group_version(&extra, &self.custom.borrow(), &p).map(String::into_bytes)).and_then(|b| String::from_utf8(b).ok()).map(|b| Reply::Json(200, b)).ok_or_else(|| ApiError::not_found("openapi", &p));
             }
             ["apis", g] => {
                 if let Some(d) = crate::aggregator::group_doc_for(self, g).filter(|_| discovery::group(&extra, g).is_none()) {
@@ -1834,6 +1855,7 @@ impl ApiServer {
         let (crds, _) = self.store.borrow().list(&r.prefix(), None, 0);
         let crds: Vec<Value> = crds.iter().filter_map(|kv| json::parse(&kv.value).ok()).collect();
         let names: Vec<String> = crds.iter().filter_map(|v| v.pointer(&["metadata", "name"]).and_then(Value::as_str).map(String::from)).collect();
+        self.oa_cache.borrow_mut().clear();
         self.custom.borrow_mut().retain(|c| names.iter().any(|n| *n == c.crd));
         for v in &crds {
             self.register_crd(v);
