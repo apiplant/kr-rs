@@ -1,4 +1,6 @@
-//! `kr snapshot save|restore` and scheduled snapshots (`kr server --snapshot-interval`).
+//! `kr snapshot save|restore|list|delete` and scheduled snapshots (`kr server --snapshot-interval`),
+//! optionally also to S3-compatible storage (`--snapshot-s3*` on the server, `--s3*` on the CLI;
+//! ADR-061).
 //!
 //! The archive is a tarball (`kr_store::bundle`) holding `kr-snapshot/store` (a `Store::image`,
 //! the `KRSNAP1` format of ADR-006), `META`, and the key material a restore on a new machine
@@ -11,16 +13,24 @@
 
 use crate::{pki, server};
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use kr_net::registry::RegConnector;
+use kr_net::s3::{Creds, S3Config, S3};
 use kr_rt::{eprint, print, Args};
 use kr_store::bundle::{self, Member};
 use kr_store::Store;
 use kr_sys::{fs, ns, Errno};
 
 const USAGE: &[u8] = b"usage:
-  kr snapshot save <file> [--data DIR] [--committed-only]
+  kr snapshot save [<file>] [--data DIR] [--committed-only] [S3]   (<file> is optional with --s3: upload only)
   kr snapshot restore <file> [--data DIR] [--force]
+  kr snapshot restore --s3 <name> [S3] [--data DIR] [--force]
+  kr snapshot list [--data DIR] [S3]
+  kr snapshot delete <name> [--data DIR] [S3]    (the S3 object with --s3, else the local snapshot)
+S3: --s3 [--s3-endpoint HOST[:PORT]|URL] --s3-bucket B [--s3-folder DIR] [--s3-region R] [--s3-access-key K] [--s3-secret-key S]
+    [--s3-session-token T] [--s3-insecure] [--s3-endpoint-ca FILE] [--s3-skip-ssl-verify]
+    (credentials default to $KR_S3_ACCESS_KEY / $KR_S3_SECRET_KEY / $KR_S3_SESSION_TOKEN, then the AWS_* variables)
 ";
 const PREFIX: &str = "kr-snapshot/";
 /// (path relative to the data dir, mode, required)
@@ -152,11 +162,131 @@ pub fn write_file(file: &str, bytes: &[u8]) -> Result<(), String> {
     fs::renameat2(fs::AT_FDCWD, &cstr(&tmp), fs::AT_FDCWD, &cstr(file), 0).map_err(|e| format!("rename {tmp}: errno {}", e.0))
 }
 
+/// `--snapshot-s3*` (server) or `--s3*` (CLI) options, collected while parsing arguments.
+#[derive(Default, Clone)]
+pub struct S3Opts {
+    enabled: bool,
+    endpoint: String,
+    endpoint_ca: Option<String>,
+    bucket: String,
+    folder: String,
+    region: String,
+    access_key: Option<String>,
+    secret_key: Option<String>,
+    session_token: Option<String>,
+    insecure: bool,
+    skip_verify: bool,
+}
+
+/// What a validated [`S3Opts`] resolves to.
+#[derive(Clone)]
+pub struct S3Settings {
+    cfg: S3Config,
+    ca_pem: Option<String>,
+    skip_verify: bool,
+}
+
+/// Flags without a value (they must not swallow the next argument).
+pub fn is_s3_bool_flag(flag: &[u8], prefix: &str) -> bool {
+    flag == prefix.as_bytes() || flag == format!("{prefix}-insecure").as_bytes() || flag == format!("{prefix}-skip-ssl-verify").as_bytes()
+}
+
+impl S3Opts {
+    /// Takes `flag` (with `val`, from `--flag=val` or the next argument) if it is one of ours.
+    pub fn flag(&mut self, prefix: &str, flag: &str, val: Option<&str>) -> Result<bool, String> {
+        let Some(sfx) = flag.strip_prefix(prefix) else { return Ok(false) };
+        let need = || val.map(String::from).ok_or_else(|| format!("{flag} needs a value"));
+        let boolean = || match val {
+            None | Some("true") => Ok(true),
+            Some("false") => Ok(false),
+            Some(_) => Err(format!("{flag} takes true or false")),
+        };
+        match sfx {
+            "" => self.enabled = boolean()?,
+            "-insecure" => self.insecure = boolean()?,
+            "-skip-ssl-verify" => self.skip_verify = boolean()?,
+            "-endpoint" => self.endpoint = need()?,
+            "-endpoint-ca" => self.endpoint_ca = Some(need()?),
+            "-bucket" => self.bucket = need()?,
+            "-folder" => self.folder = need()?,
+            "-region" => self.region = need()?,
+            "-access-key" => self.access_key = Some(need()?),
+            "-secret-key" => self.secret_key = Some(need()?),
+            "-session-token" => self.session_token = Some(need()?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Whether any S3 option was given at all (without `--s3` they would be ignored silently).
+    fn touched(&self) -> bool {
+        self.enabled || !self.bucket.is_empty() || !self.endpoint.is_empty() || self.access_key.is_some() || self.secret_key.is_some()
+    }
+
+    pub fn finish(self, prefix: &str) -> Result<Option<S3Settings>, String> {
+        if !self.enabled {
+            return if self.touched() { Err(format!("S3 options need {prefix}")) } else { Ok(None) };
+        }
+        if self.bucket.is_empty() {
+            return Err(format!("{prefix} needs {prefix}-bucket"));
+        }
+        let env = |names: &[&str]| names.iter().find_map(|n| kr_runtime::store::env_var(n).filter(|v| !v.is_empty()));
+        let access_key = self.access_key.or_else(|| env(&["KR_S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID"])).ok_or("no S3 access key (--*-access-key or $KR_S3_ACCESS_KEY)")?;
+        let secret_key = self.secret_key.or_else(|| env(&["KR_S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"])).ok_or("no S3 secret key (--*-secret-key or $KR_S3_SECRET_KEY)")?;
+        let session_token = self.session_token.or_else(|| env(&["KR_S3_SESSION_TOKEN", "AWS_SESSION_TOKEN"]));
+        let ca_pem = match &self.endpoint_ca {
+            Some(f) => Some(String::from_utf8(read_opt(f)?.ok_or_else(|| format!("{f}: no such file"))?).map_err(|_| format!("{f} is not UTF-8 PEM"))?),
+            None => None,
+        };
+        let cfg = S3Config {
+            endpoint: self.endpoint,
+            bucket: self.bucket,
+            folder: self.folder.trim_matches('/').into(),
+            region: if self.region.is_empty() { "us-east-1".into() } else { self.region },
+            creds: Creds { access_key, secret_key, session_token },
+            insecure: self.insecure,
+        };
+        Ok(Some(S3Settings { cfg, ca_pem, skip_verify: self.skip_verify }))
+    }
+}
+
+impl S3Settings {
+    fn client(&self) -> Result<S3<RegConnector>, String> {
+        // Trust anchors: $KR_CA_BUNDLE or the system bundle, plus the endpoint CA.
+        let mut pem = match kr_runtime::store::env_var("KR_CA_BUNDLE") {
+            Some(p) => String::from_utf8(read_opt(&p)?.unwrap_or_default()).unwrap_or_default(),
+            None => ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"].iter().find_map(|p| read_opt(p).ok().flatten()).and_then(|b| String::from_utf8(b).ok()).unwrap_or_default(),
+        };
+        if let Some(ca) = &self.ca_pem {
+            pem.push('\n');
+            pem.push_str(ca);
+        }
+        let conn = RegConnector::new(&pem, None, self.skip_verify).map_err(|e| format!("S3 TLS setup: {e:?}"))?;
+        Ok(S3::new(conn, self.cfg.clone(), pki::now))
+    }
+
+    fn describe(&self, name: &str) -> String {
+        let folder = if self.cfg.folder.is_empty() { String::new() } else { format!("{}/", self.cfg.folder) };
+        format!("s3://{}/{folder}{name}", self.cfg.bucket)
+    }
+}
+
+/// `kr-snapshot-<zero padded unix time>.tar`
+fn snapshot_name(t: i64) -> String {
+    format!("kr-snapshot-{t:012}.tar")
+}
+
+fn name_time(name: &str) -> Option<i64> {
+    name.strip_prefix("kr-snapshot-")?.strip_suffix(".tar")?.parse().ok()
+}
+
 pub fn main(mut args: Args) -> i32 {
     let sub = args.next();
     let r = match sub {
         Some(b"save") => save(args),
         Some(b"restore") => restore(args),
+        Some(b"list") => list(args),
+        Some(b"delete") => delete(args),
         _ => Err((String::from("unknown subcommand"), true)),
     };
     match r {
@@ -175,37 +305,139 @@ pub fn main(mut args: Args) -> i32 {
 
 type R = Result<(), (String, bool)>;
 
-fn parse(mut args: Args, flags: &[&str]) -> Result<(String, Option<String>, Vec<String>), (String, bool)> {
+struct Parsed {
+    pos: Option<String>,
+    data: Option<String>,
+    flags: Vec<String>,
+    s3: Option<S3Settings>,
+}
+
+fn parse(mut args: Args, flags: &[&str]) -> Result<Parsed, (String, bool)> {
     let u = |e: String| (e, true);
-    let file = utf8(args.next().ok_or_else(|| u("missing <file>".into()))?).map_err(u)?;
-    let (mut data, mut set) = (None, Vec::new());
+    let (mut pos, mut data, mut set, mut opts) = (None, None, Vec::new(), S3Opts::default());
     while let Some(a) = args.next() {
         let a = utf8(a).map_err(u)?;
-        if a == "--data" {
-            data = Some(utf8(args.next().ok_or_else(|| u("--data needs a value".into()))?).map_err(u)?);
-        } else if flags.contains(&a.as_str()) {
-            set.push(a);
+        let (name, inline) = match a.split_once('=') {
+            Some((n, v)) if a.starts_with("--") => (n.to_string(), Some(v.to_string())),
+            _ => (a.clone(), None),
+        };
+        if name == "--data" {
+            data = Some(match inline {
+                Some(v) => v,
+                None => utf8(args.next().ok_or_else(|| u("--data needs a value".into()))?).map_err(u)?,
+            });
+        } else if flags.contains(&name.as_str()) {
+            set.push(name);
+        } else if name.starts_with("--s3") {
+            let val = match inline {
+                Some(v) => Some(v),
+                None if is_s3_bool_flag(name.as_bytes(), "--s3") => None,
+                None => Some(utf8(args.next().ok_or_else(|| u(format!("{name} needs a value")))?).map_err(u)?),
+            };
+            if !opts.flag("--s3", &name, val.as_deref()).map_err(u)? {
+                return Err(u(format!("unknown flag {name}")));
+            }
+        } else if name.starts_with("--") {
+            return Err(u(format!("unknown flag {name}")));
+        } else if pos.is_none() {
+            pos = Some(a);
         } else {
-            return Err(u(format!("unknown flag {a}")));
+            return Err(u(format!("unexpected argument {a}")));
         }
     }
-    Ok((file, data, set))
+    let s3 = opts.finish("--s3").map_err(u)?;
+    Ok(Parsed { pos, data, flags: set, s3 })
 }
 
 fn save(args: Args) -> R {
-    let (file, data, flags) = parse(args, &["--committed-only"])?;
-    let data = data.unwrap_or_else(server::data_dir);
-    let (bytes, rev) = build(&data, !flags.is_empty()).map_err(|e| (e, false))?;
-    write_file(&file, &bytes).map_err(|e| (e, false))?;
-    print(format!("{file}: revision {rev}, {} bytes (contains the cluster CA and service-account keys: keep it private)\n", bytes.len()).as_bytes());
+    let p = parse(args, &["--committed-only"])?;
+    if p.pos.is_none() && p.s3.is_none() {
+        return Err(("missing <file>".into(), true));
+    }
+    let data = p.data.unwrap_or_else(server::data_dir);
+    let (bytes, rev) = build(&data, !p.flags.is_empty()).map_err(|e| (e, false))?;
+    if let Some(file) = &p.pos {
+        write_file(file, &bytes).map_err(|e| (e, false))?;
+        print(format!("{file}: revision {rev}, {} bytes (contains the cluster CA and service-account keys: keep it private)\n", bytes.len()).as_bytes());
+    }
+    if let Some(s3) = &p.s3 {
+        let name = snapshot_name(pki::now());
+        let c = s3.client().map_err(|e| (e, false))?;
+        let (n, len) = (name.clone(), bytes.len());
+        kr_rt::exec::block_on(async move { c.put(&n, &bytes).await }).map_err(|e| (e, false))?;
+        print(format!("{}: revision {rev}, {len} bytes (contains the cluster CA and service-account keys; protect the bucket)\n", s3.describe(&name)).as_bytes());
+    }
+    Ok(())
+}
+
+fn list(args: Args) -> R {
+    let p = parse(args, &[])?;
+    if p.pos.is_some() {
+        return Err(("list takes no <file>".into(), true));
+    }
+    let data = p.data.unwrap_or_else(server::data_dir);
+    let mut rows: Vec<(String, String, u64, String)> = Vec::new();
+    let dir = format!("{data}/snapshots");
+    if let Ok(fd) = fs::openat(fs::AT_FDCWD, &cstr(&dir), fs::O_RDONLY | fs::O_DIRECTORY | fs::O_CLOEXEC, 0) {
+        for e in fs::read_dir(&fd).filter_map(|e| e.ok()) {
+            let name = String::from_utf8_lossy(&e.name).into_owned();
+            if let Some(t) = name_time(&name) {
+                let size = fs::newfstatat(fs::AT_FDCWD, &cstr(&format!("{dir}/{name}")), fs::AT_SYMLINK_NOFOLLOW).map_or(0, |s| s.size.max(0) as u64);
+                rows.push((name.clone(), kr_net::s3::amz_date(t), size, format!("{dir}/{name}")));
+            }
+        }
+    }
+    if let Some(s3) = &p.s3 {
+        let c = s3.client().map_err(|e| (e, false))?;
+        for o in kr_rt::exec::block_on(async move { c.list("kr-snapshot-").await }).map_err(|e| (e, false))? {
+            if let Some(t) = name_time(&o.name) {
+                rows.push((o.name.clone(), kr_net::s3::amz_date(t), o.size, s3.describe(&o.name)));
+            }
+        }
+    }
+    rows.sort();
+    print(format!("{:<30} {:<17} {:>12}  LOCATION\n", "NAME", "CREATED", "SIZE").as_bytes());
+    for (name, created, size, loc) in &rows {
+        print(format!("{name:<30} {created:<17} {size:>12}  {loc}\n").as_bytes());
+    }
+    Ok(())
+}
+
+fn delete(args: Args) -> R {
+    let p = parse(args, &[])?;
+    let name = p.pos.ok_or_else(|| ("missing <name>".to_string(), true))?;
+    if name_time(&name).is_none() {
+        return Err((format!("{name} is not a snapshot name (kr-snapshot-<time>.tar; see `kr snapshot list`)"), false));
+    }
+    if let Some(s3) = &p.s3 {
+        let c = s3.client().map_err(|e| (e, false))?;
+        let n = name.clone();
+        kr_rt::exec::block_on(async move { c.delete(&n).await }).map_err(|e| (e, false))?;
+        print(format!("deleted {}\n", s3.describe(&name)).as_bytes());
+    } else {
+        let data = p.data.unwrap_or_else(server::data_dir);
+        let f = format!("{data}/snapshots/{name}");
+        fs::unlinkat(fs::AT_FDCWD, &cstr(&f), 0).map_err(|e| (format!("delete {f}: errno {}", e.0), false))?;
+        print(format!("deleted {f}\n").as_bytes());
+    }
     Ok(())
 }
 
 fn restore(args: Args) -> R {
-    let (file, data, flags) = parse(args, &["--force"])?;
-    let (data, force) = (data.unwrap_or_else(server::data_dir), !flags.is_empty());
+    let p = parse(args, &["--force"])?;
+    let file = p.pos.ok_or_else(|| ("missing <file> (or <name> with --s3)".to_string(), true))?;
+    let (data, force) = (p.data.unwrap_or_else(server::data_dir), !p.flags.is_empty());
     let e = |m: String| (m, false);
-    let raw = read_opt(&file).map_err(e)?.ok_or_else(|| e(format!("{file}: no such file")))?;
+    let raw = match &p.s3 {
+        Some(s3) => {
+            let c = s3.client().map_err(e)?;
+            let f = file.clone();
+            let b = kr_rt::exec::block_on(async move { c.get(&f).await }).map_err(e)?;
+            print(format!("downloaded {} ({} bytes)\n", s3.describe(&file), b.len()).as_bytes());
+            b
+        }
+        None => read_opt(&file).map_err(e)?.ok_or_else(|| e(format!("{file}: no such file")))?,
+    };
     let members = bundle::decode(&raw).map_err(|x| e(format!("{file}: {x:?}")))?;
     let get = |n: &str| members.iter().find(|m| m.name.strip_prefix(PREFIX) == Some(n));
     let meta = get("META").map(|m| String::from_utf8_lossy(&m.data).into_owned()).unwrap_or_default();
@@ -276,21 +508,37 @@ pub fn parse_duration(s: &str) -> Option<u64> {
 }
 
 /// Writes `<data>/snapshots/kr-snapshot-<unix time>.tar` every `interval_s` seconds and keeps
-/// the newest `keep`.
-pub async fn schedule(data: String, interval_s: u64, keep: usize) {
+/// the newest `keep`; with `s3` the same archive is uploaded and the bucket folder pruned alike.
+pub async fn schedule(data: String, interval_s: u64, keep: usize, s3: Option<S3Settings>) {
     let dir = format!("{data}/snapshots");
     loop {
         kr_rt::exec::sleep(interval_s.saturating_mul(1000)).await;
-        let r = server::mkdir_p(&dir).and_then(|_| build(&data, false)).and_then(|(b, rev)| {
-            let f = format!("{dir}/kr-snapshot-{:012}.tar", pki::now());
-            write_file(&f, &b).map(|_| (f, rev))
-        });
-        match r {
-            Ok((f, rev)) => print(format!("kr server: wrote snapshot {f} (revision {rev})\n").as_bytes()),
+        let built = build(&data, false);
+        let name = snapshot_name(pki::now());
+        match &built {
+            Ok((b, rev)) => {
+                let f = format!("{dir}/{name}");
+                match server::mkdir_p(&dir).and_then(|_| write_file(&f, b)) {
+                    Ok(()) => print(format!("kr server: wrote snapshot {f} (revision {rev})\n").as_bytes()),
+                    Err(e) => eprint(format!("kr server: scheduled snapshot failed: {e}\n").as_bytes()),
+                }
+            }
             Err(e) => eprint(format!("kr server: scheduled snapshot failed: {e}\n").as_bytes()),
         }
         prune(&dir, keep);
+        if let (Some(s3), Ok((b, rev))) = (&s3, &built) {
+            match upload(s3, &name, b, keep).await {
+                Ok(pruned) => print(format!("kr server: uploaded snapshot {} (revision {rev}){}\n", s3.describe(&name), if pruned > 0 { format!(", pruned {pruned} old") } else { String::new() }).as_bytes()),
+                Err(e) => eprint(format!("kr server: snapshot upload to S3 failed: {e}\n").as_bytes()),
+            }
+        }
     }
+}
+
+async fn upload(s3: &S3Settings, name: &str, bytes: &[u8], keep: usize) -> Result<usize, String> {
+    let c = s3.client()?;
+    c.put(name, bytes).await?;
+    Ok(c.prune("kr-snapshot-", ".tar", keep).await?.len())
 }
 
 fn prune(dir: &str, keep: usize) {

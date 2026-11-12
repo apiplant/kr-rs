@@ -23,8 +23,6 @@ Ordered by impact. Size: S days, M a week or two, L more.
     - In-process audit covers writes only (reads of controllers would dominate the log) and has no source IP; requests forwarded between HA servers are audited by the receiving server only.
 146. **Server-side apply: generate the list/map table from OpenAPI** — *ADR-021, ADR-028*, M
     The table is name based, so uncommon fields may differ from structured-merge-diff (unsure: `secretRef`/`configMapRef` atomicity, `envFrom`, `volumeClaimTemplates`). Empty keyed/set lists own nothing; CRD list-map-key defaults are not applied before computing keys. No known workload is affected; compare against a real API server to find more.
-320. **Snapshots to S3-compatible storage** — *new*, M
-    Scheduled snapshots exist (`--snapshot-interval`, `--snapshot-keep`); k3s can also upload to S3 (`etcd-snapshot --s3*`) and restore from it, the usual off-host backup in production. Needs: SigV4 signing (HMAC-SHA256 exists), a streaming PUT, list/prune by retention.
 322. **Embedded registry mirror** — *new, lower priority*, L
     k3s (1.29+) can share images peer to peer between nodes (`--embedded-registry`, Spegel). Not needed for production; listed so the gap is known.
 
@@ -41,6 +39,7 @@ Each is a test run, not new code, unless the run finds a bug.
 - **#156 agent CA follow**: `track_ca`/`Remote::set_roots` never ran against a real agent (`tools/test/two-node.sh`, privileged container); nothing checks the agents' kubelet serving certificates were re-issued before `finish`.
 - **#179 upgrade script**: `tools/upgrade/kr-upgrade.sh` only ran with `--dry-run`. It treats `Ready=True` as healthy, which is already true right after the restart; it picks `kr-server` over `kr-agent` by `systemctl is-enabled`.
 - **#137 / #136 CSI block, inline and generic ephemeral volumes, expansion with a real driver**: only fake drivers ran. Check with a real driver (e.g. Longhorn, or the csi-driver-host-path): a `volumeMode: Block` claim in `volumeDevices` (device visible in the container, I/O works, device-cgroup allows only it; kr adds no supplemental group for the device's group), an inline `csi:` volume of an `Ephemeral`-capable driver, a generic ephemeral volume, and offline plus online expansion including `NodeResizeError` recovery.
+- **#320 S3 against AWS itself**: the S3 client ran against MinIO (HTTP and HTTPS, `tools/test/snapshot-s3.sh`; multipart with `KR_S3_TEST_*`, `crates/kr-net/tests/s3.rs`) and its signatures match AWS's published SigV4 examples, but never against AWS S3: virtual-hosted addressing (`<bucket>.s3.<region>.amazonaws.com`), `--snapshot-s3-session-token` (STS) and a bucket in a region other than the one in `--snapshot-s3-region` (AWS answers 301/400, which is reported, not followed) are untested. Other providers (R2, Ceph, Backblaze) likewise.
 - **#175 registry base paths**: a pull through a registry served under a path was never run (parsing only).
 - **Ctrl-C of `kr server`** (fixed, `clear_pdeathsig` now also calls `setsid`): Ctrl-C the server and check the next start adopts the pods.
 - **GPU (needs NVIDIA hardware)**:
@@ -156,7 +155,7 @@ Nothing to do unless the stated trigger happens.
 227. **Starting a container forks the kubelet twice (~8 ms of the loop)** — *ADR-050*
     Below the stall threshold and never named by a stall report; the fix (fork-server helper or `kr shim` with the spec on a pipe) rewrites the container-start path. Revisit only if a stall report names a container start.
 53. **Binary size** — *watch*
-    4.75 MB on x86_64 after the WireGuard backend (#319, ADR-062; about 5 KB of it is the backend itself, the rest other work merged since); 4.54 MB on x86_64 (2026-11-13; 3.10 MB on 2026-11-01, 2.87 MB on 2026-10-27); the 2 MB agent budget in PLAN.md is exceeded. Measure before adding large features; avoid `{:?}` on large types; keep `opt-level = "z"` + LTO + strip.
+    4.93 MB on x86_64 after RSA client keys (#175, ADR-063) and snapshots to S3 (#320, ADR-064): master was 4.86 MB (measured) before the two, so about +61 KB together. 4.75 MB on x86_64 after the WireGuard backend (#319, ADR-062; about 5 KB of it is the backend itself, the rest other work merged since); 4.54 MB on x86_64 (2026-11-13; 3.10 MB on 2026-11-01, 2.87 MB on 2026-10-27); the 2 MB agent budget in PLAN.md is exceeded. Measure before adding large features; avoid `{:?}` on large types; keep `opt-level = "z"` + LTO + strip.
 60. **TLS handshake cost** (+125) — *watch*
     P-256 is a constant-time fixed 4-bit window: ~0.5 ms sign, ~0.95 ms verify. A full kr TLS 1.3 handshake is ~2.3 ms vs k3s ~1.6 ms (crypto tuned for size); warm requests are faster (0.5 vs 1.1 ms), and resumption (ADR-051) makes reconnect storms cheap. Revisit if the full-handshake rate matters (#208).
 97. **HA (kr-raft, ADR-026) design limits**

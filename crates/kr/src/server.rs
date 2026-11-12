@@ -399,6 +399,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
     }
     let (mut port, mut data, mut cluster_init) = (6443u16, None, false);
     let (mut snap_every, mut snap_keep) = (None::<u64>, 5usize);
+    let mut s3_opts = crate::snapshot::S3Opts::default();
     let mut enc_on = true;
     let (mut audit_policy, mut audit_path, mut audit_max, mut audit_backup, mut psa_config) = (None::<String>, None::<String>, 100u64, 5usize, None::<String>);
     let (mut audit_legacy, mut audit_age) = (false, 0u64);
@@ -411,7 +412,9 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
             Some(i) if a.starts_with(b"--") => (&a[..i], Some(&a[i + 1..])),
             _ => (a, None),
         };
-        let v = if a == b"--cluster-init" { inline } else { inline.or_else(|| args.next()) }.and_then(|v| core::str::from_utf8(v).ok());
+        // Switches take no value (so the next argument stays a flag); `--flag=false` still works.
+        let switch = a == b"--cluster-init" || crate::snapshot::is_s3_bool_flag(a, "--snapshot-s3");
+        let v = if switch { inline } else { inline.or_else(|| args.next()) }.and_then(|v| core::str::from_utf8(v).ok());
         if let Some(val) = v {
             if inst.take(a, val) {
                 continue;
@@ -456,13 +459,25 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
             (b"--audit-log-format", Some(v)) if v == "json" || v == "legacy" => audit_legacy = v == "legacy",
             (b"--pod-security-config", Some(v)) => psa_config = Some(String::from(v)),
             (b"--helm-job-image", Some(v)) => helm_image = Some(String::from(v)),
-            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h [--snapshot-keep 5]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--pod-security-config FILE] [--config FILE] [--tls-san NAME]... [--node-name NAME] [--node-label K=V]... [--node-taint K=V:EFFECT]... [--node-ip IP] [--node-external-ip IP] [--disable COMPONENT]... [--helm-job-image IMAGE] [--cluster-cidr CIDR] [--service-cidr CIDR] [--cluster-domain NAME] [--flannel-backend vxlan|host-gw|wireguard-native] [--proxy-mode userspace|nftables] [--max-pods N] [--private-registry FILE] (more keys: README, configuration file)"),
+            (f, v) if f.starts_with(b"--snapshot-s3") => match core::str::from_utf8(f).map(|f| s3_opts.flag("--snapshot-s3", f, v)) {
+                Ok(Ok(true)) => {}
+                Ok(Err(e)) => return fail(&e),
+                _ => return fail(&format!("unknown or incomplete flag {}", String::from_utf8_lossy(f))),
+            },
+            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h [--snapshot-keep 5] [--snapshot-s3 --snapshot-s3-bucket B [--snapshot-s3-endpoint HOST:PORT] [--snapshot-s3-folder DIR] [--snapshot-s3-region R] [--snapshot-s3-access-key K --snapshot-s3-secret-key S] [--snapshot-s3-insecure] [--snapshot-s3-endpoint-ca FILE] [--snapshot-s3-skip-ssl-verify]]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--pod-security-config FILE] [--config FILE] [--tls-san NAME]... [--node-name NAME] [--node-label K=V]... [--node-taint K=V:EFFECT]... [--node-ip IP] [--node-external-ip IP] [--disable COMPONENT]... [--helm-job-image IMAGE] [--cluster-cidr CIDR] [--service-cidr CIDR] [--cluster-domain NAME] [--flannel-backend vxlan|host-gw|wireguard-native] [--proxy-mode userspace|nftables] [--max-pods N] [--private-registry FILE] (more keys: README, configuration file)"),
         }
     }
     if let Err(e) = crate::install::publish(&inst) {
         return fail(&e);
     }
     let disabled = crate::install::disabled().unwrap_or_default();
+    let snap_s3 = match s3_opts.finish("--snapshot-s3") {
+        Ok(v) => v,
+        Err(e) => return fail(&e),
+    };
+    if snap_s3.is_some() && snap_every.is_none() {
+        return fail("--snapshot-s3 uploads the scheduled snapshots: set --snapshot-interval too (or use `kr snapshot save --s3`)");
+    }
     let data = data.unwrap_or_else(data_dir);
     if cluster_init && join_url.is_some() {
         return fail("--cluster-init starts a new cluster; --server joins an existing one");
@@ -674,7 +689,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
             }
         }
         if let Some(every) = snap_every {
-            kr_rt::exec::spawn(crate::snapshot::schedule(snapshot_data, every, snap_keep));
+            kr_rt::exec::spawn(crate::snapshot::schedule(snapshot_data, every, snap_keep, snap_s3));
         }
         let local: Option<Rc<dyn kr_apiserver::api::NodeProxy>> = kubelet.as_ref().map(|k| Rc::new(kr_kubelet::stream::Proxy(k.clone())) as Rc<dyn kr_apiserver::api::NodeProxy>);
         let local_dial: Option<Rc<dyn kr_apiserver::podproxy::PodDialer>> = kubelet.as_ref().map(|k| Rc::new(kr_kubelet::stream::Proxy(k.clone())) as Rc<dyn kr_apiserver::podproxy::PodDialer>);

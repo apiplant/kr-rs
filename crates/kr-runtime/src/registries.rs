@@ -316,7 +316,6 @@ impl P<'_> {
                     // refused (Go's RE2 has none either).
                     let mut kind = b'(';
                     let mut flags = self.flags;
-                    let mut scoped = false;
                     if self.s.get(self.i) == Some(&b'?') {
                         let k = *self.s.get(self.i + 1)?;
                         match k {
@@ -354,12 +353,12 @@ impl P<'_> {
                                         b'U' => flags.u = on,
                                         b'-' if on => on = false,
                                         b')' | b':' => {
-                                            scoped = f == b':';
                                             break;
                                         }
                                         _ => return None,
                                     }
                                 }
+                                let scoped = self.s[self.i - 1] == b':';
                                 if !scoped {
                                     // `(?i)` changes the flags for the rest of the enclosing group.
                                     self.flags = flags;

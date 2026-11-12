@@ -22,7 +22,7 @@ use kr_fmt::json::Value;
 pub const DEFAULT_PATH: &str = "/etc/kr/config.yaml";
 
 /// Flags that take no value: `true` emits the bare flag, `false` nothing.
-const BOOL_FLAGS: &[&str] = &["cluster-init"];
+const BOOL_FLAGS: &[&str] = &["cluster-init", "snapshot-s3", "snapshot-s3-insecure", "snapshot-s3-skip-ssl-verify"];
 
 /// `disable-<name>: true` keys that k3s has as boolean flags.
 const DISABLE_BOOLS: &[&str] = &["network-policy", "helm-controller"];
@@ -364,6 +364,13 @@ mod tests {
     fn false_bool_and_leading_dashes() {
         let a = run(&[], &[(DEFAULT_PATH, "cluster-init: false\n\"--data\": /x\n")], None).unwrap();
         assert_eq!(a, s(&["--data", "/x"]));
+    }
+
+    #[test]
+    fn snapshot_s3_switches_are_bare_flags() {
+        let cfg = "snapshot-interval: 6h\nsnapshot-s3: true\nsnapshot-s3-insecure: false\nsnapshot-s3-bucket: b\nsnapshot-s3-endpoint: minio:9000\n";
+        let a = run(&[], &[(DEFAULT_PATH, cfg)], None).unwrap();
+        assert_eq!(a, s(&["--snapshot-interval", "6h", "--snapshot-s3", "--snapshot-s3-bucket", "b", "--snapshot-s3-endpoint", "minio:9000"]));
     }
 
     #[test]
