@@ -932,15 +932,37 @@ pub async fn refresh_volumes<C: Client>(c: &C, csi: &crate::csi::Csi, pod: &Valu
 /// PVC -> bound PV -> host directory (`hostPath` or `local`). The directory is created when
 /// missing, world-writable like local-path-provisioner. An unbound claim is an error the caller
 /// retries (the pod stays in ContainerCreating).
-async fn pvc_source<C: Client>(c: &C, csi: &crate::csi::Csi, pod: &Value, ns: &str, claim: &str, claim_readonly: bool) -> Result<String, String> {
+///
+/// `ephemeral`: a generic ephemeral volume, whose claim must be owned by the pod. `want_block`:
+/// the container uses it through `volumeDevices` (the PV must be `volumeMode: Block`; a
+/// `volumeMounts` use needs Filesystem). A block PV yields the device file or node.
+async fn pvc_source<C: Client>(c: &C, csi: &crate::csi::Csi, pod: &Value, ns: &str, claim: &str, claim_readonly: bool, ephemeral: bool, want_block: bool) -> Result<String, String> {
     let pvc = c.get(&alloc::format!("/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}")).await.map_err(|_| alloc::format!("persistentvolumeclaim \"{claim}\" not found"))?;
+    if ephemeral {
+        let owned = pvc.pointer(&["metadata", "ownerReferences"]).and_then(Value::as_array).is_some_and(|o| o.iter().any(|r| r.get("controller").and_then(Value::as_bool) == Some(true) && r.get("uid").and_then(Value::as_str) == Some(meta(pod, "uid"))));
+        if !owned {
+            return Err(alloc::format!("persistentvolumeclaim \"{claim}\" was not created for the pod"));
+        }
+    }
     let pv_name = pvc.pointer(&["spec", "volumeName"]).and_then(Value::as_str).unwrap_or("");
     if pv_name.is_empty() || pvc.pointer(&["status", "phase"]).and_then(Value::as_str) != Some("Bound") {
         return Err(alloc::format!("persistentvolumeclaim \"{claim}\" not bound"));
     }
     let pv = c.get(&alloc::format!("/api/v1/persistentvolumes/{pv_name}")).await.map_err(|_| alloc::format!("persistentvolume \"{pv_name}\" not found"))?;
+    let block = pv.pointer(&["spec", "volumeMode"]).and_then(Value::as_str) == Some("Block");
+    if block != want_block {
+        return Err(if block { alloc::format!("persistentvolumeclaim \"{claim}\" is a raw block volume: use volumeDevices, not volumeMounts") } else { alloc::format!("persistentvolumeclaim \"{claim}\" is not a raw block volume: use volumeMounts, not volumeDevices") });
+    }
     if pv.pointer(&["spec", "csi"]).is_some() {
         return csi.mount_pv(c, pod, &pv, claim_readonly).await;
+    }
+    if block {
+        // A `local` volume of mode Block names the device node itself.
+        let path = pv.pointer(&["spec", "local", "path"]).and_then(Value::as_str).filter(|p| p.starts_with('/') && !p.split('/').any(|s| s == "..")).ok_or_else(|| alloc::format!("persistentvolume \"{pv_name}\": a block volume needs a CSI or local source"))?;
+        if kr_runtime::devfilter::rule_for(path.as_bytes(), true).is_none() {
+            return Err(alloc::format!("persistentvolume \"{pv_name}\": {path} is not a device node"));
+        }
+        return Ok(path.to_string());
     }
     let path = ["hostPath", "local"].iter().find_map(|k| pv.pointer(&["spec", k, "path"]).and_then(Value::as_str)).ok_or_else(|| alloc::format!("persistentvolume \"{pv_name}\": unsupported volume source"))?;
     if !path.starts_with('/') || path.split('/').any(|s| s == "..") {
@@ -972,13 +994,22 @@ pub async fn pvc_paths<C: Client>(c: &C, csi: &crate::csi::Csi, pod: &Value) -> 
     let (ns, uid) = (meta(pod, "namespace"), meta(pod, "uid"));
     let mut out = Vec::new();
     for vol in pod.pointer(&["spec", "volumes"]).and_then(Value::as_array).unwrap_or(&[]) {
-        let (Some(name), Some(claim)) = (vol.get("name").and_then(Value::as_str), vol.pointer(&["persistentVolumeClaim", "claimName"]).and_then(Value::as_str)) else { continue };
+        let Some(name) = vol.get("name").and_then(Value::as_str) else { continue };
+        let claim = match vol.pointer(&["persistentVolumeClaim", "claimName"]).and_then(Value::as_str) {
+            Some(c) => c.to_string(),
+            None if vol.get("ephemeral").is_some() => alloc::format!("{}-{name}", meta(pod, "name")),
+            None => continue,
+        };
+        let claim = claim.as_str();
         let Ok(pvc) = c.get(&alloc::format!("/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}")).await else { continue };
         let pv_name = pvc.pointer(&["spec", "volumeName"]).and_then(Value::as_str).unwrap_or("");
         if pv_name.is_empty() {
             continue;
         }
         let Ok(pv) = c.get(&alloc::format!("/api/v1/persistentvolumes/{pv_name}")).await else { continue };
+        if pv.pointer(&["spec", "volumeMode"]).and_then(Value::as_str) == Some("Block") {
+            continue; // a device file has no filesystem usage
+        }
         let path = if pv.pointer(&["spec", "csi"]).is_some() {
             csi.publish_path(uid, pv_name)
         } else {
@@ -1063,7 +1094,11 @@ async fn volume_source<C: Client>(c: &C, csi: &crate::csi::Csi, pod: &Value, vol
         }
         r.map(|()| Some(dir))
     } else if let Some(p) = vol.get("persistentVolumeClaim") {
-        pvc_source(c, csi, pod, meta(pod, "namespace"), p.get("claimName").and_then(Value::as_str).unwrap_or(""), p.get("readOnly").and_then(Value::as_bool).unwrap_or(false)).await.map(Some)
+        pvc_source(c, csi, pod, meta(pod, "namespace"), p.get("claimName").and_then(Value::as_str).unwrap_or(""), p.get("readOnly").and_then(Value::as_bool).unwrap_or(false), false, false).await.map(Some)
+    } else if vol.get("ephemeral").is_some() {
+        pvc_source(c, csi, pod, meta(pod, "namespace"), &alloc::format!("{}-{name}", meta(pod, "name")), false, true, false).await.map(Some)
+    } else if vol.get("csi").is_some() {
+        csi.mount_ephemeral(c, pod, vol).await.map(Some)
     } else {
         // Other types: not yet (KNOWN_ISSUES); mounted as an empty dir.
         kr_runtime::store::mkdir_p(&dir, 0o755).map_err(|_| String::from("cannot create volume dir"))?;
@@ -1210,6 +1245,24 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
             Some(other) => return Err(alloc::format!("unsupported mountPropagation {other}")),
         };
         mounts.push(Mount { source: src.into_bytes(), sub_path, target: target.as_bytes().to_vec(), readonly: ro, prop });
+    }
+    // volumeDevices: raw block volumes, bind-mounted as device files. The container's device
+    // cgroup filter allows exactly these devices (read-only for a read-only claim).
+    for vd in ctr.get("volumeDevices").and_then(Value::as_array).unwrap_or(&[]) {
+        let name = vd.get("name").and_then(Value::as_str).unwrap_or("");
+        let target = vd.get("devicePath").and_then(Value::as_str).unwrap_or("");
+        if !target.starts_with('/') || target.split('/').any(|c| c == "..") {
+            return Err(alloc::format!("invalid devicePath {target:?} for volume {name}"));
+        }
+        let vol = vols.iter().find(|v| v.get("name").and_then(Value::as_str) == Some(name)).ok_or_else(|| alloc::format!("volume {name} not found"))?;
+        let (claim, ro, eph) = match (vol.pointer(&["persistentVolumeClaim", "claimName"]).and_then(Value::as_str), vol.get("ephemeral")) {
+            (Some(cn), _) => (cn.to_string(), vol.pointer(&["persistentVolumeClaim", "readOnly"]).and_then(Value::as_bool).unwrap_or(false), false),
+            (None, Some(_)) => (alloc::format!("{}-{name}", meta(pod, "name")), false, true),
+            _ => return Err(alloc::format!("volume {name} is not a persistent volume claim: volumeDevices needs one")),
+        };
+        let src = pvc_source(c, csi, pod, ns, &claim, ro, eph, true).await?;
+        mounts.retain(|m| m.target != target.as_bytes());
+        mounts.push(Mount { source: src.into_bytes(), sub_path: None, target: target.as_bytes().to_vec(), readonly: ro, prop: container::Prop::Private });
     }
     // terminationMessagePath: a fresh world-writable file per start (any runAsUser must be able to
     // write it), read back by the kubelet once the container exits.
@@ -1478,5 +1531,36 @@ mod lsm_tests {
         assert_eq!(lsm(r#"{"spec":{}}"#, r#"{"name":"c"}"#, &host(false, true)).unwrap().selinux_process, None);
         let c = r#"{"name":"c","securityContext":{"seLinuxOptions":{"type":"spc_t"}}}"#;
         assert_eq!(lsm(pod, c, &host(false, true)).unwrap().selinux_process.as_deref(), Some("system_u:system_r:spc_t:s0:c1,c2"));
+    }
+}
+
+#[cfg(test)]
+mod block_volume_tests {
+    use super::*;
+    use crate::csi::tests::{obj, Fake};
+
+    #[test]
+    fn block_and_filesystem_claims_are_not_interchangeable_and_ephemeral_claims_must_be_owned() {
+        let _g = crate::deviceplugin::tests::lock();
+        let csi = crate::csi::Csi::new("n1");
+        let mut fake = Fake::default();
+        let pod = obj(r#"{"metadata":{"name":"app","namespace":"ns","uid":"pu"}}"#);
+        let claim = |vol: &str, owner: &str| alloc::format!(r#"{{"metadata":{{"ownerReferences":[{owner}]}},"spec":{{"volumeName":"{vol}"}},"status":{{"phase":"Bound"}}}}"#);
+        fake.objs.insert("/api/v1/namespaces/ns/persistentvolumeclaims/blk".into(), obj(&claim("pv-blk", "")));
+        fake.objs.insert("/api/v1/namespaces/ns/persistentvolumeclaims/fs".into(), obj(&claim("pv-fs", "")));
+        fake.objs.insert("/api/v1/persistentvolumes/pv-blk".into(), obj(r#"{"spec":{"volumeMode":"Block","local":{"path":"/dev/null"}}}"#));
+        fake.objs.insert("/api/v1/persistentvolumes/pv-fs".into(), obj(r#"{"spec":{"hostPath":{"path":"/nonexistent-kr-test"}}}"#));
+        fake.objs.insert("/api/v1/namespaces/ns/persistentvolumeclaims/app-scratch".into(), obj(&claim("pv-blk", r#"{"uid":"pu","controller":true}"#)));
+        fake.objs.insert("/api/v1/namespaces/ns/persistentvolumeclaims/app-other".into(), obj(&claim("pv-blk", r#"{"uid":"someone-else","controller":true}"#)));
+        kr_rt::exec::block_on(async move {
+            // volumeDevices of a block claim: the device file.
+            assert_eq!(pvc_source(&fake, &csi, &pod, "ns", "blk", false, false, true).await.unwrap(), "/dev/null");
+            // volumeMounts of a block claim, and volumeDevices of a filesystem claim, are refused.
+            assert!(pvc_source(&fake, &csi, &pod, "ns", "blk", false, false, false).await.unwrap_err().contains("use volumeDevices"));
+            assert!(pvc_source(&fake, &csi, &pod, "ns", "fs", false, false, true).await.unwrap_err().contains("use volumeMounts"));
+            // Generic ephemeral: only a claim the pod controls.
+            assert_eq!(pvc_source(&fake, &csi, &pod, "ns", "app-scratch", false, true, true).await.unwrap(), "/dev/null");
+            assert!(pvc_source(&fake, &csi, &pod, "ns", "app-other", false, true, true).await.unwrap_err().contains("was not created for the pod"));
+        });
     }
 }

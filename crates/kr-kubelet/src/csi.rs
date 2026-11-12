@@ -868,7 +868,7 @@ fn write_private(path: &str, data: &[u8]) -> Result<(), ()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use kr_apiserver::client::{Result as ApiResult, Watch};
     use kr_apiserver::object::ApiError;
@@ -959,9 +959,9 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Fake {
-        objs: BTreeMap<String, Value>,
-        log: RefCell<Vec<(String, String, String)>>,
+    pub(crate) struct Fake {
+        pub(crate) objs: BTreeMap<String, Value>,
+        pub(crate) log: RefCell<Vec<(String, String, String)>>,
     }
 
     impl Api for Fake {
@@ -991,7 +991,7 @@ mod tests {
         }
     }
 
-    fn obj(s: &str) -> Value {
+    pub(crate) fn obj(s: &str) -> Value {
         json::parse_str(s).unwrap()
     }
 
