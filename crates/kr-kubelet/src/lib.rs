@@ -103,6 +103,15 @@ fn is_pod_uid(owner: &[u8]) -> bool {
     owner.len() == 36 && owner.iter().filter(|b| **b == b'-').count() == 4
 }
 
+/// Logs a pod sync step that took 40 ms or more (the step and the pod), then restarts the lap.
+fn slow_step(step: &str, pod: &Value, lap: &mut u64) {
+    let t = now_ms();
+    if t.saturating_sub(*lap) >= 40 {
+        kr_rt::eprint(alloc::format!("kubelet: slow {step} {}ms for pod {}/{}\n", t - *lap, meta(pod, "namespace"), meta(pod, "name")).as_bytes());
+    }
+    *lap = t;
+}
+
 fn now_ms() -> u64 {
     kr_rt::exec::now_ms()
 }
@@ -825,21 +834,28 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         for pod in &desired {
             let uid = meta(pod, "uid").to_string();
             seen.push(uid.clone());
+            let mut lap = now_ms();
             if pod.pointer(&["metadata", "deletionTimestamp"]).is_some() {
                 kr_rt::exec::phase("sync_all: terminate");
                 self.terminate(&uid, pod).await;
+                slow_step("terminate", pod, &mut lap);
             } else {
                 kr_rt::exec::phase("sync_all: sync_pod");
                 self.sync_pod(&uid, pod).await;
+                slow_step("sync_pod", pod, &mut lap);
                 kr_rt::exec::phase("sync_all: apply_resize");
                 self.apply_resize(&uid, pod);
+                slow_step("apply_resize", pod, &mut lap);
                 kr_rt::exec::phase("sync_all: run_probes");
                 self.run_probes(&uid, pod);
+                slow_step("run_probes", pod, &mut lap);
                 kr_rt::exec::phase("sync_all: refresh_volumes");
                 self.refresh_volumes(&uid, pod).await;
+                slow_step("refresh_volumes", pod, &mut lap);
             }
             kr_rt::exec::phase("sync_all: report_status");
             self.report_status(&uid, pod).await;
+            slow_step("report_status", pod, &mut lap);
             // The in-process client never suspends, so without this the whole pod list is one
             // poll of the event loop: give the API server and Raft a turn every few ms.
             if now_ms().saturating_sub(slice) >= 5 {
