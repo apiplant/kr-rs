@@ -120,7 +120,7 @@ pub(crate) fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
             dns.push(host);
         }
         let name = Name { common_name: "kube-apiserver".into(), organizations: Vec::new() };
-        let mut ips = alloc::vec![alloc::vec![127, 0, 0, 1], alloc::vec![10, 96, 0, 1]];
+        let mut ips = alloc::vec![alloc::vec![127, 0, 0, 1], kr_net::cidr::service_ip(0, 1).to_vec()];
         let adv = primary_addr();
         if adv != kr_sys::map4([127, 0, 0, 1]) {
             ips.push(kr_net::tcp::ip_bytes16(adv));

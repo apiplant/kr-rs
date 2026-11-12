@@ -86,16 +86,25 @@ fn kr_main(mut args: Args) -> i32 {
                 }
             }
         }
-        Some(b"ctr") => ctr::main(args),
+        Some(b"ctr") => match init_cidrs() {
+            Ok(()) => ctr::main(args),
+            Err(m) => bad_config(&m),
+        },
         Some(b"pki") => pki::main(args),
         Some(b"certificate") => pki::main(args),
         Some(b"snapshot") => snapshot::main(args),
         Some(b"secrets-encrypt") => secrets_encrypt::main(args),
         Some(b"server") => {
+            if let Err(m) = init_cidrs() {
+                return bad_config(&m);
+            }
             sys::raise_nofile_limit();
             server::main(args)
         }
         Some(b"agent") => {
+            if let Err(m) = init_cidrs() {
+                return bad_config(&m);
+            }
             sys::raise_nofile_limit();
             agent::main(args)
         }
@@ -109,6 +118,18 @@ fn kr_main(mut args: Args) -> i32 {
             2
         }
     }
+}
+
+/// `KR_POD_CIDR` / `KR_SERVICE_CIDR` (see `kr_net::cidr`): the same on the server and every agent.
+fn init_cidrs() -> Result<(), alloc::string::String> {
+    let pod = kr_runtime::store::env_var("KR_POD_CIDR");
+    let svc = kr_runtime::store::env_var("KR_SERVICE_CIDR");
+    kr_net::cidr::init(pod.as_deref(), svc.as_deref())
+}
+
+fn bad_config(msg: &str) -> i32 {
+    eprint(alloc::format!("kr: {msg}\n").as_bytes());
+    2
 }
 
 fn parse_port(s: &[u8]) -> Option<u16> {

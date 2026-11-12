@@ -141,7 +141,7 @@ Numbers will vary with hardware; the commands to reproduce them are in `tools/te
 **Networking**
 - Built-in bridge and veth pod network with host-local IPAM, no CNI plugins
 - Cross-node VXLAN or host-gw, NAT through nftables over netlink (no `iptables`/`nft` binaries needed)
-- IPv4, IPv6 or dual stack (`KR_POD_FAMILIES=4`, `6` or `4,6`, default `4,6` on the server): pods get an address in each configured family (`10.88.N.0/24`, `fd00:88:0:N::/64` per node), Services get ClusterIPs from `10.96.0.0/16` and/or `fd00:96::/112` (`ipFamilies`, `ipFamilyPolicy`), with AAAA records, per-family EndpointSlices and VXLAN across nodes. Hosts may be IPv4, IPv6 or both (join, Raft, kubelet and VXLAN run over an IPv6 underlay), and rootless NAT handles both
+- IPv4, IPv6 or dual stack (`KR_POD_FAMILIES=4`, `6` or `4,6`, default `4,6` on the server): pods get an address in each configured family (`10.88.N.0/24`, `fd00:88:0:N::/64` per node; the IPv4 pod and Service networks are `KR_POD_CIDR` / `KR_SERVICE_CIDR`, any `A.B.0.0/16`, set before the first start and the same on every node, k3s's `--cluster-cidr` and `--service-cidr`), Services get ClusterIPs from `10.96.0.0/16` and/or `fd00:96::/112` (`ipFamilies`, `ipFamilyPolicy`), with AAAA records, per-family EndpointSlices and VXLAN across nodes. Hosts may be IPv4, IPv6 or both (join, Raft, kubelet and VXLAN run over an IPv6 underlay), and rootless NAT handles both
 - Service proxy for ClusterIP, NodePort and hostPort (with ClientIP affinity), in-process cluster DNS (`cluster.local`, pod and service records, ExternalName)
 
 ## How it is built

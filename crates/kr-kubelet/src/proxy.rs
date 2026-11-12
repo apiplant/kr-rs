@@ -23,8 +23,12 @@ use kr_rt::exec::{Async, JoinHandle};
 use kr_runtime::container::{self, Running, Sandbox};
 use kr_sys::{ns, Errno, Fd};
 
-pub const SERVICE_CIDR: ([u8; 4], u8) = ([10, 96, 0, 0], 16);
-const POD_CIDR: ([u8; 4], u8) = ([10, 88, 0, 0], 16);
+fn service_cidr() -> ([u8; 4], u8) {
+    kr_net::cidr::service_cidr()
+}
+fn pod_cidr() -> ([u8; 4], u8) {
+    kr_net::cidr::pod_cidr()
+}
 /// The IPv6 twins (dual stack): Service CIDR `fd00:96::/112`, pod networks under `fd00:88::/32`.
 pub const SERVICE_CIDR6: ([u8; 16], u8) = ([0xfd, 0, 0, 0x96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 112);
 const POD_NET6: [u8; 4] = [0xfd, 0, 0, 0x88];
@@ -42,7 +46,7 @@ const UDP: u8 = 2;
 /// Whether a (mapped or real) address is in the pod network of either family.
 fn in_pod_net(ip: Ip) -> bool {
     match kr_sys::unmap4(ip) {
-        Some(v4) => in_cidr(v4, POD_CIDR),
+        Some(v4) => in_cidr(v4, pod_cidr()),
         None => ip[..4] == POD_NET6,
     }
 }
@@ -186,7 +190,7 @@ impl NodeNet {
 
     /// Makes the Service CIDR locally deliverable in the node namespace.
     pub fn setup(&self) -> Result<(), Errno> {
-        self.op(OP_LOCAL_ROUTE, 0, kr_sys::map4(SERVICE_CIDR.0), SERVICE_CIDR.1 as u16)?;
+        self.op(OP_LOCAL_ROUTE, 0, kr_sys::map4(service_cidr().0), service_cidr().1 as u16)?;
         // The IPv6 half is best effort (a kernel without IPv6 keeps working single-stack).
         let _ = self.op(OP_LOCAL_ROUTE, 0, SERVICE_CIDR6.0, SERVICE_CIDR6.1 as u16);
         Ok(())
@@ -203,7 +207,7 @@ impl NodeNet {
         // proxy closes first leave TIME_WAIT sockets, which the kernel only reuses on loopback
         // (tcp_tw_reuse=2); to the node address ~28k connections exhaust the ephemeral ports.
         let ip = match kr_sys::unmap4(ip) {
-            Some(v4) if proto == TCP && !in_cidr(v4, POD_CIDR) && is_local(v4) => kr_sys::map4([127, 0, 0, 1]),
+            Some(v4) if proto == TCP && !in_cidr(v4, pod_cidr()) && is_local(v4) => kr_sys::map4([127, 0, 0, 1]),
             _ => ip,
         };
         if matches!(self, NodeNet::Factory { .. }) && !in_pod_net(ip) {

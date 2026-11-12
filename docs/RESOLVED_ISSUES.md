@@ -496,3 +496,6 @@
 
 260. **Device plugins: `Allocate` is called per container** — *closed, same as upstream* (was #141)
     Upstream's device manager also sends one `Allocate` per container (a request with a single `ContainerAllocateRequest`); kr does the same, with a cached plugin connection. `allocate_batch` (one call for several containers) stays available but is not needed.
+
+261. **Pod and Service networks were fixed constants** — *fixed* (part of #132, ADR-053)
+    `KR_POD_CIDR` (default `10.88.0.0/16`) and `KR_SERVICE_CIDR` (`10.96.0.0/16`), each `A.B.0.0/16`, are read at start by `kr server`, `agent` and `ctr`; node `podCIDR`s, the ServiceCIDR object, the `kubernetes` and `kube-dns` ClusterIPs, ClusterIP validation/allocation, the proxy route, masquerade, the pods' resolver address, the certificate SAN and the DNS server all follow. Invalid or equal values stop the start with a message. Tests: `kr_net::cidr::tests`, `tools/test/cidrs.sh` on a rootless server (Services `10.201.0.1/10`, a new Service `10.201.0.11`, an address outside refused, pod `10.200.*`, resolv.conf, a service name resolved, bad value refused).

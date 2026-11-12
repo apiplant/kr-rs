@@ -17,11 +17,10 @@ pub use kr_net::tcp::Families;
 
 pub const BRIDGE: &[u8] = b"kr0";
 /// The cluster pod network; each node gets a /24 of it (`spec.podCIDR`).
-pub const CLUSTER_CIDR: ([u8; 4], u8) = ([10, 88, 0, 0], 16);
-/// Defaults for standalone use (`kr ctr`): the first /24.
-pub const SUBNET: [u8; 4] = [10, 88, 0, 0];
+pub fn cluster_cidr() -> ([u8; 4], u8) {
+    kr_net::cidr::pod_cidr()
+}
 pub const PREFIX: u8 = 24;
-pub const GATEWAY: [u8; 4] = [10, 88, 0, 1];
 
 /// A node's pod subnet: bridge gateway is the first address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +32,7 @@ pub struct PodNet {
 
 impl Default for PodNet {
     fn default() -> Self {
-        PodNet { subnet: SUBNET, prefix: PREFIX, gateway: GATEWAY }
+        PodNet::for_index(0)
     }
 }
 
@@ -56,7 +55,8 @@ impl PodNet {
 impl PodNet {
     /// The node subnet for pod-network number `n` (`10.88.N.0/24`, whose IPv6 twin is `fd00:88:0:N::/64`).
     pub fn for_index(n: u8) -> PodNet {
-        PodNet { subnet: [10, 88, n, 0], prefix: PREFIX, gateway: [10, 88, n, 1] }
+        let p = kr_net::cidr::pod_prefix();
+        PodNet { subnet: [p[0], p[1], n, 0], prefix: PREFIX, gateway: [p[0], p[1], n, 1] }
     }
 
     /// From a Node's `spec.podCIDRs`: the node's subnet and the families the pod network carries.
@@ -188,7 +188,7 @@ pub fn setup_host_with(pn: &PodNet, fam: Families) -> Result<(), Errno> {
         }
     }
     if fam.v4 {
-        kr_net::nft::ensure_masquerade(&kr_net::nft::Masquerade { table: NFT_TABLE, cidr: CLUSTER_CIDR.0, prefix: CLUSTER_CIDR.1, bridge: BRIDGE })?;
+        kr_net::nft::ensure_masquerade(&kr_net::nft::Masquerade { table: NFT_TABLE, cidr: cluster_cidr().0, prefix: cluster_cidr().1, bridge: BRIDGE })?;
     }
     // IPv6 pods (fd00:88::/32) leave NATed too; a host or kernel without IPv6 NAT stays single-stack.
     if fam.v6 {

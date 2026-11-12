@@ -14,7 +14,10 @@ use kr_net::dnsserver::{self, EndpointRecord, PortRecord, ServiceRecord, Zone};
 use kr_net::tcp::{IpAddr, SocketAddr};
 use kr_rt::exec::Async;
 
-pub const DNS_IP: [u8; 4] = [10, 96, 0, 10];
+/// The `kube-dns` Service's IPv4 ClusterIP: the Service network's `.0.10`.
+pub fn dns_ip() -> [u8; 4] {
+    kr_net::cidr::service_ip(0, 10)
+}
 /// The `kube-dns` Service's IPv6 ClusterIP (`fd00:96::a`).
 pub const DNS_IP6: [u8; 16] = [0xfd, 0, 0, 0x96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a];
 
@@ -136,7 +139,7 @@ pub async fn run<C: Client + Clone + 'static>(c: C, net: Rc<NodeNet>, fam: kr_ne
     let upstream: Vec<SocketAddr> = kr_net::dns::Config::system()
         .nameservers
         .into_iter()
-        .filter(|ip| !matches!(ip, IpAddr::V4(a) if *a == DNS_IP) && !matches!(ip, IpAddr::V6(a) if *a == DNS_IP6))
+        .filter(|ip| !matches!(ip, IpAddr::V4(a) if *a == dns_ip()) && !matches!(ip, IpAddr::V6(a) if *a == DNS_IP6))
         .map(|ip| SocketAddr { ip, port: 53 })
         .collect();
     let zone = Rc::new(ClusterZone { domain: crate::cluster_domain(), ..Default::default() });
@@ -144,7 +147,7 @@ pub async fn run<C: Client + Clone + 'static>(c: C, net: Rc<NodeNet>, fam: kr_ne
     let z: Rc<dyn Zone> = zone.clone();
     if fam.v4 {
         let (udp, tcp) = loop {
-            match (net.listen(2, kr_sys::map4(DNS_IP), 53), net.listen(1, kr_sys::map4(DNS_IP), 53)) {
+            match (net.listen(2, kr_sys::map4(dns_ip()), 53), net.listen(1, kr_sys::map4(dns_ip()), 53)) {
                 (Ok(u), Ok(t)) => break (u, t),
                 _ => kr_rt::exec::sleep(1000).await, // the service route may not exist yet
             }

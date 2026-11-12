@@ -551,7 +551,7 @@ mod imp {
     }
 
     fn in_cluster_cidr(ip: [u8; 4]) -> bool {
-        ip[0] == 10 && ((ip[1] & 0xf0) == 96 || ip[1] == 88) // 10.96.0.0/12, 10.88.0.0/16
+        ip[..2] == crate::cidr::pod_prefix() || ip[..2] == crate::cidr::service_prefix()
     }
 
     /// `None` means "not ours: forward".

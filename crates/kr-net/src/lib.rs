@@ -10,6 +10,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod cidr;
 pub mod dns;
 pub mod dnsserver;
 pub mod grpc;

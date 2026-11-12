@@ -271,7 +271,10 @@ const FAMILIES_KEY: &str = "/kr/pod-families";
 fn pod_net_index(c: &str) -> Option<u32> {
     match c.strip_prefix("fd00:88:0:") {
         Some(rest) => u32::from_str_radix(rest.split(':').next().filter(|s| !s.is_empty()).unwrap_or("0"), 16).ok(),
-        None => c.strip_prefix("10.88.")?.split('.').next()?.parse().ok(),
+        None => {
+            let p = kr_net::cidr::pod_prefix();
+            c.strip_prefix(alloc::format!("{}.{}.", p[0], p[1]).as_str())?.split('.').next()?.parse().ok()
+        }
     }
 }
 
@@ -661,7 +664,11 @@ impl ApiServer {
         // The default ServiceCIDR (the allocator's range) and the mandatory API priority and
         // fairness objects ([`crate::apf`]).
         let scr = resources::find("networking.k8s.io", "v1", "servicecidrs").unwrap();
-        self.bootstrap_managed(scr, "kubernetes", "ServiceCIDR", r#"{"metadata":{"name":"kubernetes"},"spec":{"cidrs":["10.96.0.0/16"]},"status":{"conditions":[{"type":"Ready","status":"True","reason":"","message":"Kubernetes Service CIDR is ready","lastTransitionTime":"1970-01-01T00:00:00Z"}]}}"#, &["spec"]);
+        let svc_cidr = {
+            let c = kr_net::cidr::service_cidr();
+            alloc::format!("{}.{}.0.0/16", c.0[0], c.0[1])
+        };
+        self.bootstrap_managed(scr, "kubernetes", "ServiceCIDR", &r#"{"metadata":{"name":"kubernetes"},"spec":{"cidrs":["10.96.0.0/16"]},"status":{"conditions":[{"type":"Ready","status":"True","reason":"","message":"Kubernetes Service CIDR is ready","lastTransitionTime":"1970-01-01T00:00:00Z"}]}}"#.replace("10.96.0.0/16", &svc_cidr), &["spec"]);
         crate::apf::seed(self);
         let scr = resources::find("storage.k8s.io", "v1", "storageclasses").unwrap();
         self.bootstrap_managed(scr, "local-path", "StorageClass", r#"{"metadata":{"name":"local-path","annotations":{"storageclass.kubernetes.io/is-default-class":"true"}},"provisioner":"kr.io/local-path","reclaimPolicy":"Delete","volumeBindingMode":"WaitForFirstConsumer"}"#, &["provisioner", "reclaimPolicy", "volumeBindingMode"]);
@@ -2836,8 +2843,9 @@ impl ApiServer {
                             "None".into()
                         } else {
                             let a = crate::object::parse_ipv4(&g).ok_or_else(|| ApiError::invalid("spec.clusterIP: must be a valid IPv4 address"))?;
-                            if a[0] != 10 || a[1] != 96 {
-                                return Err(ApiError::invalid("spec.clusterIP: not in the service CIDR 10.96.0.0/16"));
+                            if a[..2] != kr_net::cidr::service_prefix() {
+                                let p = kr_net::cidr::service_prefix();
+                                return Err(ApiError::invalid(alloc::format!("spec.clusterIP: not in the service CIDR {}.{}.0.0/16", p[0], p[1])));
                             }
                             if self.cluster_ips_in_use().contains(&a) {
                                 return Err(ApiError::invalid(alloc::format!("spec.clusterIP: Invalid value: {g:?}: provided IP is already allocated")));
@@ -3052,11 +3060,11 @@ impl ApiServer {
             .collect()
     }
 
-    /// Lowest free address in 10.96.0.0/16 from .11 up (.1 = kubernetes, .10 = DNS).
+    /// Lowest free address in the Service network from .11 up (.1 = kubernetes, .10 = DNS).
     fn allocate_cluster_ip(&self) -> R<String> {
         let used = self.cluster_ips_in_use();
         (11u32..65535)
-            .map(|n| [10, 96, (n >> 8) as u8, n as u8])
+            .map(|n| kr_net::cidr::service_ip((n >> 8) as u8, n as u8))
             .find(|a| a[3] != 0 && a[3] != 255 && !used.contains(a))
             .map(|a| alloc::format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]))
             .ok_or_else(|| ApiError::new(422, "Invalid", "service CIDR exhausted"))
@@ -3135,7 +3143,8 @@ impl ApiServer {
         let fam = self.pod_families();
         let mut v = Vec::new();
         if fam.v4 {
-            v.push(alloc::format!("10.88.{n}.0/24"));
+            let p = kr_net::cidr::pod_prefix();
+            v.push(alloc::format!("{}.{}.{n}.0/24", p[0], p[1]));
         }
         if fam.v6 {
             v.push(if n == 0 { String::from("fd00:88:0::/64") } else { alloc::format!("fd00:88:0:{n:x}::/64") });
@@ -3178,7 +3187,9 @@ impl ApiServer {
         } else {
             String::from(kube)
         };
-        self.bootstrap_object(svc, Some("default"), "kubernetes", "Service", &kube);
+        let sp = kr_net::cidr::service_prefix();
+        let with_net = |j: String| j.replace("10.96.", &alloc::format!("{}.{}.", sp[0], sp[1]));
+        self.bootstrap_object(svc, Some("default"), "kubernetes", "Service", &with_net(kube));
         // The endpoints follow the API server's current address (re-written on every start).
         let body = alloc::format!(r#"{{"metadata":{{"name":"kubernetes","labels":{{"endpointslice.kubernetes.io/skip-mirror":"true"}}}},"subsets":[{{"addresses":[{ips}],"ports":[{{"name":"https","port":{port},"protocol":"TCP"}}]}}]}}"#);
         let key = ep.key(Some("default"), "kubernetes");
@@ -3206,7 +3217,7 @@ impl ApiServer {
         } else {
             String::from(dns)
         };
-        self.bootstrap_object(svc, Some("kube-system"), "kube-dns", "Service", &dns);
+        self.bootstrap_object(svc, Some("kube-system"), "kube-dns", "Service", &with_net(dns));
         self.sync()
     }
 

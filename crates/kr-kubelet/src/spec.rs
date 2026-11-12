@@ -160,7 +160,7 @@ pub fn write_resolv_conf(pod_dir: &str, pod: &Value, rootless_pod: bool, fam: kr
         "Default" => host_resolv_conf(rootless_pod, fam),
         "ClusterFirstWithHostNet" | "ClusterFirst" if !(host_net && policy == "ClusterFirst") => {
             {
-                let ns_ip = if fam.v4 { String::from("10.96.0.10") } else { kr_net::tcp::ipv6_string(crate::dns::DNS_IP6) };
+                let ns_ip = if fam.v4 { { let d = crate::dns::dns_ip(); alloc::format!("{}.{}.{}.{}", d[0], d[1], d[2], d[3]) } } else { kr_net::tcp::ipv6_string(crate::dns::DNS_IP6) };
                 {
                     let d = crate::cluster_domain();
                     alloc::format!("search {ns}.svc.{d} svc.{d} {d}\nnameserver {ns_ip}\noptions ndots:5\n")
