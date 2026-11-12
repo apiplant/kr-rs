@@ -272,6 +272,7 @@ pub struct Auditor {
     legacy: core::cell::Cell<bool>,
     /// `--audit-log-maxage`: backups older than this many days are removed (0: keep).
     max_age_days: core::cell::Cell<u64>,
+    webhook: RefCell<Option<Rc<crate::audit_webhook::Webhook>>>,
 }
 
 /// The one-second flusher ([`spawn_flusher`]) writes the buffer; a request only flushes inline when
@@ -284,12 +285,21 @@ impl Auditor {
     pub fn open(policy: Policy, path: &str, max_mb: u64, max_backup: usize) -> Auditor {
         let stdout = path == "-";
         let sink = Sink { path: if stdout { String::new() } else { path.to_string() }, fd: None, size: 0, warned: false };
-        Auditor { policy, sink: RefCell::new(sink), buf: RefCell::new(Vec::new()), max_bytes: max_mb.saturating_mul(1024 * 1024), max_backup, legacy: core::cell::Cell::new(false), max_age_days: core::cell::Cell::new(0) }
+        Auditor { policy, sink: RefCell::new(sink), buf: RefCell::new(Vec::new()), max_bytes: max_mb.saturating_mul(1024 * 1024), max_backup, legacy: core::cell::Cell::new(false), max_age_days: core::cell::Cell::new(0), webhook: RefCell::new(None) }
     }
 
     pub fn set_format(&self, legacy: bool, max_age_days: u64) {
         self.legacy.set(legacy);
         self.max_age_days.set(max_age_days);
+    }
+
+    /// Adds the webhook backend (events go to it as well as to the log).
+    pub fn set_webhook(&self, w: Rc<crate::audit_webhook::Webhook>) {
+        *self.webhook.borrow_mut() = Some(w);
+    }
+
+    pub fn webhook(&self) -> Option<Rc<crate::audit_webhook::Webhook>> {
+        self.webhook.borrow().clone()
     }
 
     fn emit(&self, ev: &Value) {
@@ -298,6 +308,9 @@ impl Auditor {
 
     /// Queues an event that is already serialised.
     pub fn emit_text(&self, ev: &str) {
+        if let Some(w) = self.webhook.borrow().as_ref() {
+            w.push(ev);
+        }
         let legacy_line;
         let ev = if self.legacy.get() {
             legacy_line = json::parse(ev.as_bytes()).map(|v| legacy_text(&v)).unwrap_or_else(|_| ev.to_string());
@@ -490,6 +503,10 @@ impl Hub {
     pub fn take_annotations(&self) -> Vec<(String, String)> {
         core::mem::take(&mut *self.psa_ann.borrow_mut())
     }
+    /// The blocking-mode webhook, if configured (the transport waits on it before replying).
+    pub fn blocking_webhook(&self) -> Option<Rc<crate::audit_webhook::Webhook>> {
+        self.auditor().and_then(|a| a.webhook()).filter(|w| w.mode() != crate::audit_webhook::Mode::Batch)
+    }
     fn auditor(&self) -> Option<Rc<Auditor>> {
         self.auditor.borrow().clone()
     }
@@ -673,7 +690,35 @@ pub fn finish(api: &alloc::rc::Rc<ApiServer>, p: Option<Pending>, resp: &mut kr_
             }
         }
     }
+    // An upgraded connection (exec, attach, port-forward) gets its ResponseComplete when it closes.
+    if let (Some(pp), kr_net::http1::server::Body::Upgrade(_)) = (&p, &resp.body) {
+        if !pp.decision.as_ref().is_some_and(|d| d.omit_stages.iter().any(|s| s == "ResponseComplete")) {
+            let mut pp = pp.clone();
+            pp.psa = ann.clone();
+            let status = resp.status;
+            let body = core::mem::replace(&mut resp.body, kr_net::http1::server::Body::Full(Vec::new()));
+            if let kr_net::http1::server::Body::Upgrade(h) = body {
+                let done = Completing { inner: Box::new(Empty), api: api.clone(), p: Some(pp), status };
+                resp.body = kr_net::http1::server::Body::Upgrade(Box::new(move |conn: Box<dyn kr_net::http1::server::UpgradedConn>| -> kr_net::http1::server::UpgradeFuture {
+                    Box::pin(async move {
+                        let mut done = done;
+                        h.upgrade(conn).await;
+                        done.complete();
+                    })
+                }));
+            }
+        }
+    }
     finish_started(api, p, resp, ann)
+}
+
+/// An already finished stream (the carrier of [`Completing`] for upgraded connections).
+struct Empty;
+
+impl kr_net::http1::server::ResponseStream for Empty {
+    fn poll_next(&mut self, _: &mut core::task::Context<'_>) -> core::task::Poll<Option<Vec<u8>>> {
+        core::task::Poll::Ready(None)
+    }
 }
 
 /// A response stream that records `ResponseComplete` when it ends or is dropped.

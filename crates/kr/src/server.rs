@@ -353,7 +353,23 @@ fn server_tls(pki_dir: &str) -> Result<(Rc<ServerConfig>, Rc<kr_crypto::tls::Cli
 
 /// Reads the audit policy and Pod Security configuration and installs them; returns the audit
 /// writer (its flush timer starts inside the executor). `--audit-log-path off` disables auditing.
-fn audit_setup(data: &str, policy: Option<&str>, path: Option<&str>, max_mb: u64, backups: usize, fmt: (bool, u64), psa: Option<&str>, api: &kr_apiserver::api::ApiServer) -> Result<Option<Rc<kr_apiserver::audit::Auditor>>, String> {
+/// `--audit-webhook-*` flags.
+struct AuditWebhook {
+    file: Option<String>,
+    mode: String,
+    max_size: usize,
+    max_wait_s: u64,
+    buffer: usize,
+    backoff_s: u64,
+}
+
+impl Default for AuditWebhook {
+    fn default() -> Self {
+        AuditWebhook { file: None, mode: String::from("batch"), max_size: 400, max_wait_s: 30, buffer: 10_000, backoff_s: 10 }
+    }
+}
+
+fn audit_setup(data: &str, policy: Option<&str>, path: Option<&str>, max_mb: u64, backups: usize, fmt: (bool, u64), psa: Option<&str>, aw: &AuditWebhook, api: &kr_apiserver::api::ApiServer) -> Result<Option<Rc<kr_apiserver::audit::Auditor>>, String> {
     let read = |p: &str| -> Result<String, String> { String::from_utf8(fs::read_file(&[p.as_bytes(), &[0]].concat(), 1 << 20).map_err(|_| format!("cannot read {p}"))?).map_err(|_| format!("{p} is not UTF-8")) };
     if let Some(p) = psa {
         *api.audit.psa.borrow_mut() = kr_apiserver::psa::Config::parse(&read(p)?)?;
@@ -363,6 +379,9 @@ fn audit_setup(data: &str, policy: Option<&str>, path: Option<&str>, max_mb: u64
     }
     let path = path.map(String::from).unwrap_or_else(|| format!("{data}/audit/audit.log"));
     if path == "off" {
+        if aw.file.is_some() {
+            return Err(String::from("--audit-webhook-config-file needs auditing: do not set --audit-log-path off"));
+        }
         return Ok(None);
     }
     let policy = match policy {
@@ -371,6 +390,22 @@ fn audit_setup(data: &str, policy: Option<&str>, path: Option<&str>, max_mb: u64
     };
     let a = Rc::new(kr_apiserver::audit::Auditor::open(policy, &path, max_mb, backups));
     a.set_format(fmt.0, fmt.1);
+    if let Some(f) = &aw.file {
+        let mode = kr_apiserver::audit_webhook::Mode::parse(&aw.mode).ok_or("--audit-webhook-mode takes batch, blocking or blocking-strict")?;
+        let text = read(f)?;
+        let rd = |p: &str| -> Result<Vec<u8>, String> {
+            // Paths in the kubeconfig are relative to it.
+            let full = if p.starts_with('/') { String::from(p) } else { format!("{}/{p}", f.rsplit_once('/').map(|x| x.0).unwrap_or(".")) };
+            fs::read_file(&[full.as_bytes(), &[0]].concat(), 1 << 20).map_err(|_| format!("cannot read {full}"))
+        };
+        let mut c = kr_apiserver::audit_webhook::Config::from_kubeconfig(&text, &rd)?;
+        c.mode = mode;
+        c.max_size = aw.max_size.max(1);
+        c.max_wait_ms = aw.max_wait_s * 1000;
+        c.buffer = aw.buffer;
+        c.backoff_ms = aw.backoff_s * 1000;
+        a.set_webhook(kr_apiserver::audit_webhook::Webhook::new(c));
+    }
     api.audit.set_auditor(a.clone());
     Ok(Some(a))
 }
@@ -403,6 +438,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
     let mut enc_on = true;
     let (mut audit_policy, mut audit_path, mut audit_max, mut audit_backup, mut psa_config) = (None::<String>, None::<String>, 100u64, 5usize, None::<String>);
     let (mut audit_legacy, mut audit_age) = (false, 0u64);
+    let mut aw = AuditWebhook::default();
     let (mut join_url, mut token, mut token_file): (Option<String>, Option<String>, Option<String>) = (None, None, None);
     let mut inst = crate::install::Install::default();
     let mut helm_image: Option<String> = None;
@@ -457,6 +493,18 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
             (b"--audit-log-maxbackup", Some(v)) => audit_backup = v.parse().unwrap_or(usize::MAX),
             (b"--audit-log-maxage", Some(v)) => audit_age = v.parse().unwrap_or(u64::MAX),
             (b"--audit-log-format", Some(v)) if v == "json" || v == "legacy" => audit_legacy = v == "legacy",
+            (b"--audit-webhook-config-file", Some(v)) => aw.file = Some(String::from(v)),
+            (b"--audit-webhook-mode", Some(v)) => aw.mode = String::from(v),
+            (b"--audit-webhook-batch-max-size", Some(v)) => aw.max_size = v.parse().unwrap_or(0),
+            (b"--audit-webhook-batch-max-wait", Some(v)) => match crate::snapshot::parse_duration(v) {
+                Some(s) => aw.max_wait_s = s,
+                None => return fail("bad --audit-webhook-batch-max-wait"),
+            },
+            (b"--audit-webhook-batch-buffer-size", Some(v)) => aw.buffer = v.parse().unwrap_or(0),
+            (b"--audit-webhook-initial-backoff", Some(v)) => match crate::snapshot::parse_duration(v) {
+                Some(s) => aw.backoff_s = s,
+                None => return fail("bad --audit-webhook-initial-backoff"),
+            },
             (b"--pod-security-config", Some(v)) => psa_config = Some(String::from(v)),
             (b"--helm-job-image", Some(v)) => helm_image = Some(String::from(v)),
             (f, v) if f.starts_with(b"--snapshot-s3") => match core::str::from_utf8(f).map(|f| s3_opts.flag("--snapshot-s3", f, v)) {
@@ -464,7 +512,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
                 Ok(Err(e)) => return fail(&e),
                 _ => return fail(&format!("unknown or incomplete flag {}", String::from_utf8_lossy(f))),
             },
-            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h [--snapshot-keep 5] [--snapshot-s3 --snapshot-s3-bucket B [--snapshot-s3-endpoint HOST:PORT] [--snapshot-s3-folder DIR] [--snapshot-s3-region R] [--snapshot-s3-access-key K --snapshot-s3-secret-key S] [--snapshot-s3-insecure] [--snapshot-s3-endpoint-ca FILE] [--snapshot-s3-skip-ssl-verify]]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--pod-security-config FILE] [--config FILE] [--tls-san NAME]... [--node-name NAME] [--node-label K=V]... [--node-taint K=V:EFFECT]... [--node-ip IP] [--node-external-ip IP] [--disable COMPONENT]... [--helm-job-image IMAGE] [--cluster-cidr CIDR] [--service-cidr CIDR] [--cluster-domain NAME] [--flannel-backend vxlan|host-gw|wireguard-native] [--proxy-mode userspace|nftables] [--max-pods N] [--private-registry FILE] (more keys: README, configuration file)"),
+            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h [--snapshot-keep 5] [--snapshot-s3 --snapshot-s3-bucket B [--snapshot-s3-endpoint HOST:PORT] [--snapshot-s3-folder DIR] [--snapshot-s3-region R] [--snapshot-s3-access-key K --snapshot-s3-secret-key S] [--snapshot-s3-insecure] [--snapshot-s3-endpoint-ca FILE] [--snapshot-s3-skip-ssl-verify]]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--audit-log-maxage DAYS] [--audit-log-format json|legacy] [--audit-webhook-config-file KUBECONFIG [--audit-webhook-mode batch|blocking|blocking-strict] [--audit-webhook-batch-max-size N] [--audit-webhook-batch-max-wait 30s] [--audit-webhook-batch-buffer-size N] [--audit-webhook-initial-backoff 10s]] [--pod-security-config FILE] [--config FILE] [--tls-san NAME]... [--node-name NAME] [--node-label K=V]... [--node-taint K=V:EFFECT]... [--node-ip IP] [--node-external-ip IP] [--disable COMPONENT]... [--helm-job-image IMAGE] [--cluster-cidr CIDR] [--service-cidr CIDR] [--cluster-domain NAME] [--flannel-backend vxlan|host-gw|wireguard-native] [--proxy-mode userspace|nftables] [--max-pods N] [--private-registry FILE] (more keys: README, configuration file)"),
         }
     }
     if let Err(e) = crate::install::publish(&inst) {
@@ -556,7 +604,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
         api.set_encryption_reloader(Rc::new(move || crate::secrets_encrypt::load(&data, false, false)));
     }
     // Audit log (ADR-046) and Pod Security configuration.
-    let auditor = match audit_setup(&data, audit_policy.as_deref(), audit_path.as_deref(), audit_max, audit_backup, (audit_legacy, audit_age), psa_config.as_deref(), &api) {
+    let auditor = match audit_setup(&data, audit_policy.as_deref(), audit_path.as_deref(), audit_max, audit_backup, (audit_legacy, audit_age), psa_config.as_deref(), &aw, &api) {
         Ok(a) => a,
         Err(e) => return fail(&e),
     };
@@ -661,6 +709,9 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
     let manifest_dir = kr_controllers::manifests::dir(&data);
     match kr_rt::exec::block_on(async move {
         if let Some(a) = auditor {
+            if let Some(w) = a.webhook().filter(|w| w.mode() == kr_apiserver::audit_webhook::Mode::Batch) {
+                w.spawn_batcher();
+            }
             kr_apiserver::audit::spawn_flusher(a);
         }
         let cfg = kr_controllers::Config { now: pki::now, evict: kr_controllers::nodelifecycle::Limits::from_lookup(kr_runtime::store::env_var), disabled, helm_image: helm_image.clone().or_else(|| kr_runtime::store::env_var("KR_HELM_JOB_IMAGE").filter(|v| !v.is_empty())).map(|i| &*alloc::boxed::Box::leak(i.into_boxed_str())), ..kr_controllers::Config::default() };

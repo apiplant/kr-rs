@@ -49,7 +49,7 @@ brew tap apiplant/tap && brew install apiplant/tap/kr-rs`}
 
       <Section>
         <H2>Or build from source</H2>
-        <CopyBlock command={`cargo build --release          # produces target/release/kr (about 2.9 MB)`} />
+        <CopyBlock command={`cargo build --release          # produces target/release/kr (about 4.9 MB)`} />
       </Section>
 
       <Section>

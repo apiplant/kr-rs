@@ -1450,7 +1450,7 @@ impl ApiServer {
                      # HELP kr_event_loop_stall_max_seconds Longest stalled poll since start.\n# TYPE kr_event_loop_stall_max_seconds gauge\nkr_event_loop_stall_max_seconds {:.6}\n\
                      # HELP kr_offload_jobs_total Jobs answered by the offload workers.\n# TYPE kr_offload_jobs_total counter\nkr_offload_jobs_total{{class=\"fast\"}} {fast}\nkr_offload_jobs_total{{class=\"slow\"}} {slow}\n",
                     st.stalls, st.total_us as f64 / 1e6, st.max_us as f64 / 1e6
-                ) + &self.apf.metrics();
+                ) + &self.apf.metrics() + &crate::audit_webhook::metrics();
                 return Ok(Reply::Http(kr_net::http1::server::Response::new(200, body.into_bytes()).with_header("Content-Type", "text/plain; version=0.0.4")));
             }
             "/kr/encryption/reload" if req.method == "POST" => {

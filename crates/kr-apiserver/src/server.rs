@@ -41,18 +41,28 @@ pub async fn handle(api: &Rc<ApiServer>, req: Request) -> Response {
     let (t0, method, path) = (kr_rt::exec::now_ms(), req.method.clone(), alloc::string::String::from(req.path()));
     let pf = core::cell::RefCell::new(None);
     let ann = core::cell::RefCell::new(alloc::vec::Vec::new());
+    let audit_hdr = req.header("audit-id").map(|s| String::from(s.trim()));
     let audit = crate::audit::begin(api, &req, user_from_certs(req.peer.client_certs.as_deref()));
     let (aid, cached) = (audit.as_ref().map(|p| String::from(p.id())), audit.as_ref().and_then(|p| p.caller()));
     let mut resp = handle_inner(api, req, &pf, cached, &ann).await;
     kr_rt::exec::phase("http: audit finish");
     crate::audit::finish(api, audit, &mut resp, ann.into_inner());
+    // Audit webhook in blocking mode: the reply waits for the events to be accepted.
+    if let Some(w) = api.audit.blocking_webhook() {
+        if !w.sync().await && w.mode() == crate::audit_webhook::Mode::BlockingStrict {
+            resp = Response::new(500, br#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"Internal error occurred: failed to send audit events","reason":"InternalError","code":500}"#.to_vec()).with_header("Content-Type", "application/json");
+        }
+    }
     kr_rt::exec::phase("http: response built");
     if let Some((flow, level)) = pf.into_inner() {
         resp = resp.with_header("X-Kubernetes-PF-FlowSchema-UID", &flow).with_header("X-Kubernetes-PF-PriorityLevel-UID", &level);
     }
-    if let Some(id) = aid {
-        resp = resp.with_header("Audit-ID", &id);
-    }
+    // Audit-ID is returned on every request, audited or not (upstream), keeping a client's own.
+    let id = aid.unwrap_or_else(|| match audit_hdr {
+        Some(i) if !i.is_empty() && i.len() <= 64 && i.bytes().all(|b| b.is_ascii_graphic()) => i,
+        _ => crate::object::uuid4(|b| kr_sys::getrandom(b)),
+    });
+    resp = resp.with_header("Audit-ID", &id);
     if resp.status == 429 {
         resp = resp.with_header("Retry-After", "1");
     }

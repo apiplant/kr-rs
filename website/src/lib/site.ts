@@ -21,12 +21,12 @@ export const SITE = {
   pkg: "kr",
   bins: ["kr"],
   badges: ["Rust", "no libc", "0 crates", "Conformance 460/460", "Apache-2.0"],
-  hero: { pre: "Kubernetes in ", accent: "one 3 MB binary", post: "." },
+  hero: { pre: "Kubernetes in ", accent: "one 5 MB binary", post: "." },
   lead: "API server, datastore, scheduler, controllers, kubelet, container runtime, pod network, service proxy and cluster DNS in a single static executable. Written in Rust with no libc and no third-party crates. Runs unmodified kubectl and standard workloads.",
   heroNote:
     "Passes the Kubernetes v1.37 conformance suite: 460 of 460 specs on two nodes. The server idles at 7 MB of RAM and the node is Ready in under a second.",
   stats: [
-    { value: "2.9 MB", label: "static binary, x86_64" },
+    { value: "4.9 MB", label: "static binary, x86_64" },
     { value: "7.4 MB", label: "server RSS, idle" },
     { value: "< 1 s", label: "start to node Ready" },
     { value: "460 / 460", label: "conformance specs" },

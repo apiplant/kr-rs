@@ -12,6 +12,7 @@ extern crate std;
 pub mod admit;
 pub mod apf;
 pub mod audit;
+pub mod audit_webhook;
 pub mod aggregator;
 pub mod api;
 pub mod client;

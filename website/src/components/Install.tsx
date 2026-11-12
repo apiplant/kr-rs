@@ -114,7 +114,7 @@ export function InstallSteps() {
           <span class="font-mono text-xs text-faint">03</span>
           <h3 class="mt-3 text-base font-semibold tracking-tight text-ink">Or build from source</h3>
           <p class="mt-2 text-sm leading-relaxed text-muted">
-            Needs a Rust nightly toolchain. The result is one static file of about 2.9 MB. Host requirements: Linux
+            Needs a Rust nightly toolchain. The result is one static file of about 4.9 MB. Host requirements: Linux
             5.10 or newer on x86_64 or aarch64, cgroup v2, overlayfs, and root for the full feature set. Kernel 5.9
             is enough for pods to survive restarts.
           </p>

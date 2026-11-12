@@ -6,7 +6,7 @@ export function DocsOverview() {
     <DocsLayout>
       <H1>Documentation</H1>
       <Lead>
-        <IC>kr</IC> is a Kubernetes distribution in a single static binary of about 2.9 MB, written in Rust with no
+        <IC>kr</IC> is a Kubernetes distribution in a single static binary of about 4.9 MB, written in Rust with no
         libc and no third-party crates. It is the API server, datastore, scheduler, controllers, kubelet, container
         runtime, pod network, service proxy and cluster DNS in one executable.
       </Lead>

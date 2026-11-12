@@ -1,6 +1,6 @@
 # kr
 
-A Kubernetes distribution in a single static binary of about 2.9 MB, written in Rust with no libc and no third-party crates.
+A Kubernetes distribution in a single static binary of about 4.9 MB, written in Rust with no libc and no third-party crates.
 
 `kr` is the API server, datastore, scheduler, controllers, kubelet, container runtime, pod network, service proxy and cluster DNS in one executable. It is built to idle in single-digit megabytes, start in well under a second, and run unmodified `kubectl` and standard workloads. It passes the Kubernetes v1.37 conformance suite (460 of 460 specs on a two-node cluster, 458 of 460 on one node; see [Conformance](#conformance)).
 
@@ -25,7 +25,7 @@ $ kubectl get pods
 Requirements: Linux 5.10 or newer on x86_64 or aarch64, cgroup v2, overlayfs, and root for the full feature set (pod networking, cgroup limits). A rootless mode exists with reduced networking. Building needs a Rust nightly toolchain.
 
 ```sh
-cargo build --release          # produces target/release/kr (about 2.9 MB)
+cargo build --release          # produces target/release/kr (about 4.9 MB)
 ```
 
 ### Single node
@@ -125,9 +125,9 @@ Measured on one 32-core x86_64 Linux machine, each node in a privileged Docker c
 
 | | x86_64 | aarch64 |
 |---|---|---|
-| `kr` binary (stripped, `opt-level=z`, LTO, `panic=abort`) | **2.87 MB** | **2.32 MB** |
+| `kr` binary (stripped, `opt-level=z`, LTO, `panic=abort`) | **4.90 MB** | **3.96 MB** |
 | Third-party crates | 0 | 0 |
-| Rust source (13 workspace crates) | about 58,600 lines | |
+| Rust source (13 workspace crates) | about 105,000 lines | |
 
 For scale: the binary contains the TLS 1.3 stack, X.509, the HTTP/1.1 and WebSocket stacks, the Raft and storage engines, the OCI runtime, the API server with its generated protobuf tables, and the controllers.
 

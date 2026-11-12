@@ -59,7 +59,7 @@ export function Footer() {
             </span>
           </div>
           <p class="mt-3 max-w-xs text-sm leading-relaxed text-faint">
-            A Kubernetes distribution in one static binary of about 3 MB: no libc, no third-party crates, conformance-passing.
+            A Kubernetes distribution in one static binary of about 5 MB: no libc, no third-party crates, conformance-passing.
           </p>
         </div>
 

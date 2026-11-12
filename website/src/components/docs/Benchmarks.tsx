@@ -15,15 +15,15 @@ export function DocsBenchmarks() {
         <Table
           head={["", "x86_64", "aarch64"]}
           rows={[
-            ["kr binary (stripped, opt-level=z, LTO, panic=abort)", "2.87 MB", "2.32 MB"],
+            ["kr binary (stripped, opt-level=z, LTO, panic=abort)", "4.90 MB", "3.96 MB"],
             ["Third-party crates", "0", "0"],
-            ["Rust source (13 workspace crates)", "about 58,600 lines", ""],
+            ["Rust source (13 workspace crates)", "about 105,000 lines", ""],
           ]}
         />
         <P>
           For scale, the binary contains the TLS 1.3 stack, X.509, the HTTP/1.1 and WebSocket stacks, the Raft and
           storage engines, the OCI runtime, the API server with its generated protobuf tables, and the controllers.
-          The binary has since grown to about 3.1 MB on x86_64 with the later features; size is watched before each
+          The binary was 2.87 MB (x86_64) and 2.32 MB (aarch64) in October 2026 and has grown with the later features; size is watched before each
           large addition.
         </P>
       </Section>
