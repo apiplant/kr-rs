@@ -14,6 +14,8 @@ use kr_sys::ns;
 const USAGE: &[u8] = b"usage:
   kr ctr pull <image>
   kr ctr import <file.tar[.gz]>...
+  kr ctr rmi <image|id>...      remove images (refuses images a container uses)
+  kr ctr rmi --prune            remove every unused image and unreferenced blob
   kr ctr run [--memory 64Mi] [--cpus 500m] [--pids 64] [--user uid[:gid]] [--cdi vendor/class=name] <image> [--] [cmd args...]
   kr ctr run-dir [limits...] <rootfs> <state-dir> [--] <cmd> [args...]
 ";
@@ -24,6 +26,7 @@ pub fn main(mut args: Args) -> i32 {
     match args.next() {
         Some(b"pull") => pull(args),
         Some(b"import") => crate::ctr_import::run(args),
+        Some(b"rmi") => crate::ctr_rmi::run(args),
         Some(b"run") => run(args),
         Some(b"run-dir") => run_dir(args),
         Some(b"pod-demo") => pod_demo(args),
@@ -140,7 +143,7 @@ fn run(mut args: Args) -> i32 {
             return fail(&format!("pull: {e:?}"));
         }
     }
-    let Some((_, cfg, mut rootfs)) = store.image(&image) else { return fail("image vanished after pull") };
+    let Some((img_id, cfg, mut rootfs)) = store.image(&image) else { return fail("image vanished after pull") };
     rootfs.pop(); // store returns it NUL-terminated
 
     // OCI semantics: entrypoint + (override or image cmd).
@@ -171,6 +174,7 @@ fn run(mut args: Args) -> i32 {
             return fail(&format!("create container: {e:?}"));
         }
     };
+    store.set_container_image(&id, &img_id);
     // Rootless containers resolve through the egress driver's forwarder; with a root bridge the
     // host's own resolvers are reachable (loopback stubs are not, so those get the forwarder too).
     let resolv = format!("{}/resolv.conf", dirs.root);

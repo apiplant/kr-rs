@@ -49,3 +49,28 @@ fn removing_an_image_keeps_shared_layers_and_blobs() {
     assert!(s.images().is_empty());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn find_image_sweep_and_legacy_container_dirs() {
+    let root = std::env::temp_dir().join(format!("krrt-gc2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let s = Store::open(Some(root.to_str().unwrap())).unwrap();
+    let a = install(&s, &root, b"{\"a\":1}", b"layer a", "aaaaaaaaaaaaaaaaaaaaaaaa", "example.com/a:1");
+    assert_eq!(s.find_image("example.com/a:1"), Some(a.clone()));
+    assert_eq!(s.find_image(&a.0[..12]), Some(a.clone()));
+    assert_eq!(s.find_image(&format!("sha256:{}", a.0)), Some(a.clone()));
+    assert_eq!(s.find_image("example.com/nope:1"), None);
+    // A blob no manifest names goes (when old enough); the image's own stay.
+    let stray = b"stray";
+    s.put_blob(&Digest::parse(&format!("sha256:{}", hex(stray))).unwrap(), stray).unwrap();
+    assert_eq!(s.sweep_blobs(i64::MAX / 2, 3600), 1);
+    assert_eq!(s.sweep_blobs(i64::MAX / 2, 3600), 0);
+    // A container directory with a record protects its image.
+    let c = s.create_container("c1").unwrap();
+    s.set_container_image("c1", &a);
+    assert!(s.images_in_use().unwrap().contains(&a.0));
+    // Without a record the set is unknown, as the directory is newer than the boot.
+    std::fs::remove_file(format!("{}/image", c.root)).unwrap();
+    assert!(s.images_in_use().is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}

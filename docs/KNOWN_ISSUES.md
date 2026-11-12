@@ -33,8 +33,6 @@ Ordered by impact. Size: S days, M a week or two, L more.
     - `Audit-ID` is returned only when the request is audited (upstream returns it always); backups are named `audit-<UTC time>.log`, not compressed.
     - `ResponseComplete` is not recorded for upgraded connections (exec/attach/portforward, `101`), only `ResponseStarted`; no `requestObject` for them.
     - In-process audit covers writes only (reads of controllers would dominate the log) and has no source IP; requests forwarded between HA servers are audited by the receiving server only.
-130. **Images: manual removal** — *ADR-056, ADR-057*, S
-    No `crictl rmi` equivalent (k3s: `k3s crictl rmi`, `rmi --prune`). Add `kr ctr rmi [--prune]` reusing the GC's in-use check. Also: the GC waits while any container directory lacks an image record (containers of the previous release, `kr run`); blobs of images installed before the layered store that no manifest names are never removed (one-off migration sweep).
 175. **`registries.yaml`: RSA client keys and regex flags** — *ADR-027, ADR-044*, S–M
     A registry that needs an RSA client key is unsupported (kr-crypto signs with P-256/Ed25519 only); common with corporate registries. `rewrite` refuses flags such as `(?i)` which Go's regexp (k3s) accepts. (Look-behind is refused, but Go's RE2 has none either: not a gap. Look-ahead goes beyond k3s.) Only one client certificate per registry config.
 146. **Server-side apply: generate the list/map table from OpenAPI** — *ADR-021, ADR-028*, M

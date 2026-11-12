@@ -6,6 +6,7 @@ extern crate alloc;
 mod agent;
 mod ctr;
 mod ctr_import;
+mod ctr_rmi;
 mod keysync;
 mod manifests;
 mod offload;

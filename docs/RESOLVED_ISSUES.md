@@ -648,3 +648,6 @@
 
 324. **Audit parity: streams, in-process writers, PSA annotations, identity** — *fixed* (#180, #181, #182, #184; part of #183, ADR-046)
     `Audit-ID` header, single authentication per audited request (the audit hook hands the pre-impersonation identity to the handler), `ResponseComplete` when a watch/log stream ends, in-process controller/kubelet writes audited as their `system:kr:<component>` user, Pod Security `audit-violations`/`enforce-policy` annotations recorded by admission (after the decision, also denied requests and updates), `--audit-log-format legacy`, `--audit-log-maxage`.
+
+325. **Images: manual removal (#130)** — *fixed*
+    `kr ctr rmi <image|id>...` (reference, id or 12+ hex prefix) and `kr ctr rmi --prune`; both refuse images a container directory records (`images_in_use`), and `--prune` also sweeps blobs no manifest names older than an hour (`Store::sweep_blobs`). `kr ctr run` records its image; a record-less container directory older than the boot no longer stalls the garbage collector (ADR-057). Tests in `kr-runtime/tests/gc.rs`.

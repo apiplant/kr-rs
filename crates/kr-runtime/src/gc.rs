@@ -29,15 +29,68 @@ impl Store {
     }
 
     /// Image ids used by the containers that exist; `None` when some container directory has no
-    /// record (created by an older release or by `kr run`), meaning the set is unknown.
+    /// record (created by an older release or by an old `kr run`) and may still be running,
+    /// meaning the set is unknown. A record-less directory last modified before the node booted
+    /// cannot belong to a running container and is ignored.
     pub fn images_in_use(&self) -> Option<BTreeSet<String>> {
+        let boot = boot_time();
         let mut out = BTreeSet::new();
         for c in self.list_dir("containers") {
-            let p = cpath(&format!("{}/containers/{c}/image", self.root().trim_end_matches('/'))).ok()?;
-            let id = fs::read_file(&p, 128).ok().and_then(|d| String::from_utf8(d).ok())?;
-            out.insert(id.trim().to_string());
+            let dir = format!("{}/containers/{c}", self.root().trim_end_matches('/'));
+            let rec = cpath(&format!("{dir}/image")).ok().and_then(|p| fs::read_file(&p, 128).ok()).and_then(|d| String::from_utf8(d).ok());
+            match rec {
+                Some(id) => {
+                    out.insert(id.trim().to_string());
+                }
+                None => {
+                    let old = cpath(&dir).ok().and_then(|p| fs::newfstatat(AT_FDCWD, &p, fs::AT_SYMLINK_NOFOLLOW).ok()).is_some_and(|st| boot.is_some_and(|b| st.mtime_sec < b));
+                    if !old {
+                        return None;
+                    }
+                }
+            }
         }
         Some(out)
+    }
+
+    /// Resolves a user-given reference or (a prefix of at least 12 hex digits of) an image id to
+    /// the installed image it names.
+    pub fn find_image(&self, name: &str) -> Option<ImageId> {
+        let name = name.strip_prefix("sha256:").unwrap_or(name);
+        if let Some(id) = self.resolve_ref(name).filter(|id| self.has_image(id)) {
+            return Some(id);
+        }
+        if name.len() >= 12 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let m: Vec<ImageId> = self.images().into_iter().map(|(i, _)| i).filter(|i| i.0.starts_with(name)).collect();
+            if m.len() == 1 {
+                return m.into_iter().next();
+            }
+        }
+        None
+    }
+
+    /// Deletes blobs older than `min_age` seconds that no installed image's manifest names:
+    /// leftovers of images installed before the layered store, aborted pulls. Returns the count;
+    /// 0 when some manifest cannot be read (then nothing can be said to be unused). The caller
+    /// must make sure no pull is installing.
+    pub fn sweep_blobs(&self, now: i64, min_age: i64) -> usize {
+        let mut keep = BTreeSet::new();
+        for (id, _) in self.images() {
+            match self.blobs_of(&id) {
+                Some(b) => keep.extend(b.into_iter().filter_map(|d| d.strip_prefix("sha256:").map(ToString::to_string))),
+                None => return 0,
+            }
+        }
+        let mut n = 0;
+        for name in self.list_dir("blobs/sha256") {
+            let path = format!("{}/blobs/sha256/{name}", self.root().trim_end_matches('/'));
+            let Ok(p) = cpath(&path) else { continue };
+            let Ok(st) = fs::newfstatat(AT_FDCWD, &p, fs::AT_SYMLINK_NOFOLLOW) else { continue };
+            if st.is_file() && !keep.contains(&name) && now - st.mtime_sec >= min_age {
+                n += fs::unlinkat(AT_FDCWD, &p, 0).is_ok() as usize;
+            }
+        }
+        n
     }
 
     fn list_dir(&self, sub: &str) -> Vec<String> {
@@ -125,4 +178,10 @@ impl Store {
         }
         Ok((nl, nb))
     }
+}
+
+/// Seconds since the epoch at which the node booted (`btime` of /proc/stat).
+fn boot_time() -> Option<i64> {
+    let d = fs::read_file(&cpath("/proc/stat").ok()?, 1 << 16).ok()?;
+    core::str::from_utf8(&d).ok()?.lines().find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok())
 }
