@@ -29,6 +29,12 @@ $KR secrets-encrypt rotate-key --data $D
 start
 K create secret generic s2 --from-literal=pw=second >/dev/null
 check "old secret readable after rotation" "$(K get secret s1 -o jsonpath='{.data.pw}' | base64 -d)" hunter2-PLAINTEXT
+# Online re-encryption (#188): s1 still holds the old key's ciphertext; rewrite through the running server.
+KEY=$($KR secrets-encrypt status --data $D | awk '/\(writes\)/{print $1}')
+$KR secrets-encrypt reencrypt --online --data $D --server https://127.0.0.1:$PORT
+sleep 1.5
+check "online reencrypt: every stored secret uses the newest key" "$($KR secrets-encrypt status --data $D 2>/dev/null | awk '/stored objects/{f=1;next} f&&NF{print $1}' | tr -d : | sort -u | tr '\n' ' ')" "$KEY "
+check "online reencrypt: the secret still reads back" "$(K get secret s1 -o jsonpath='{.data.pw}' | base64 -d)" hunter2-PLAINTEXT
 stop
 $KR secrets-encrypt reencrypt --data $D
 check "no plaintext after reencrypt (snapshot)" "$(grep -c "hunter2-PLAINTEXT\|$HID" $D/db/snapshot)" 0

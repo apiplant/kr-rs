@@ -2398,7 +2398,11 @@ impl ApiServer {
             ssa::store(&mut new, entries);
         }
         // Upstream skips the write when nothing but timestamps and the resourceVersion changed.
-        if crate::ssa::comparable(&old) == crate::ssa::comparable(&new) {
+        // `?krReencrypt=true` from a system:masters caller forces it, so that `kr secrets-encrypt
+        // reencrypt --online` can rewrite stored values with the current key (upstream does this
+        // with its transformer's "stale" check).
+        let force = q.get("krReencrypt") == Some("true") && req.user.as_ref().is_some_and(is_masters);
+        if !force && crate::ssa::comparable(&old) == crate::ssa::comparable(&new) {
             return Ok(Reply::ok(&old));
         }
         if q.get("dryRun") == Some("All") {

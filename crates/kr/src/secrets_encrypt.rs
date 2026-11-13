@@ -17,7 +17,9 @@ use kr_rt::{eprint, print, Args};
 use kr_store::{Codec, Store};
 use kr_sys::fs;
 
-const USAGE: &str = "usage: kr secrets-encrypt status|rotate-key|reencrypt|disable [--data DIR]";
+const USAGE: &str = "usage: kr secrets-encrypt status|rotate-key|reencrypt|disable [--data DIR] [--online [--server URL]]
+  reencrypt --online  rewrites every stored object of the configured resources through the running API
+                      server (no stop; in HA too, once every server runs the same key set)";
 
 fn fail(msg: &str) -> i32 {
     eprint(b"kr secrets-encrypt: ");
@@ -118,6 +120,53 @@ fn reencrypt(data: &str, cfg: &Config) -> Result<usize, String> {
     Ok(n)
 }
 
+/// Rewrites every object of the configured resources through the API with the current key
+/// (`?krReencrypt=true` makes the server write even though nothing else changed).
+fn reencrypt_online(data: &str, cfg: &Config, server: &str) -> Result<usize, String> {
+    use kr_apiserver::client::{Remote, RemoteAuth};
+    let read = |f: &str| fs::read_file(&pki::path(&format!("{data}/pki"), f), 1 << 20).ok().and_then(|b| String::from_utf8(b).ok());
+    let (Some(ca_pem), Some(chain), Some(key)) = (read("ca.pem"), read("admin.pem"), read("admin.key")) else {
+        return Err("cannot read the server's admin credentials (run on the server, or pass --data)".into());
+    };
+    let remote = Remote::new(server, RemoteAuth::ClientCert { chain, key }, &ca_pem).map_err(|e| e.message)?;
+    let resources = cfg.resources.clone();
+    kr_rt::exec::block_on(async move {
+        use kr_apiserver::client::Client;
+        let mut done = 0usize;
+        for spec in &resources {
+            let (plural, group) = spec.split_once('.').unwrap_or((spec.as_str(), ""));
+            let Some(res) = kr_apiserver::resources::RESOURCES.iter().find(|r| r.plural == plural && r.group == group) else {
+                return Err(format!("{spec}: not a built-in resource; rewrite custom resources with no-op updates (kubectl) instead"));
+            };
+            let api_version = if group.is_empty() { String::from(res.version) } else { format!("{group}/{}", res.version) };
+            let root = if group.is_empty() { format!("/api/{}", res.version) } else { format!("/apis/{api_version}") };
+            let base = format!("{root}/{plural}");
+            let list = remote.list(&base, "").await.map_err(|e| format!("list {spec}: {} {}", e.code, e.message))?;
+            for item in list.get("items").and_then(kr_fmt::json::Value::as_array).unwrap_or(&[]) {
+                let name = kr_apiserver::client::meta(item, "name");
+                let ns = kr_apiserver::client::meta(item, "namespace");
+                let path = if res.namespaced { format!("{root}/namespaces/{ns}/{plural}/{name}") } else { format!("{base}/{name}") };
+                // The list gives items without kind/apiVersion; a conflict (changed meanwhile) is retried once with a fresh copy.
+                for attempt in 0..2 {
+                    let mut obj = if attempt == 0 { item.clone() } else { remote.get(&path).await.map_err(|e| format!("get {path}: {} {}", e.code, e.message))? };
+                    obj.set("apiVersion", kr_fmt::json::Value::from(api_version.as_str()));
+                    obj.set("kind", kr_fmt::json::Value::from(res.kind));
+                    match remote.update(&format!("{path}?krReencrypt=true"), &obj).await {
+                        Ok(_) => {
+                            done += 1;
+                            break;
+                        }
+                        Err(e) if e.code == 409 && attempt == 0 => continue,
+                        Err(e) if e.code == 404 => break, // deleted meanwhile
+                        Err(e) => return Err(format!("{path}: {} {}", e.code, e.message)),
+                    }
+                }
+            }
+        }
+        Ok(done)
+    })
+}
+
 fn ns_exists(p: &str) -> bool {
     fs::newfstatat(fs::AT_FDCWD, &pki::path(p, ""), fs::AT_SYMLINK_NOFOLLOW).is_ok()
 }
@@ -125,9 +174,15 @@ fn ns_exists(p: &str) -> bool {
 pub fn main(mut args: Args) -> i32 {
     let Some(cmd) = args.next().map(|c| c.to_vec()) else { return fail(USAGE) };
     let mut data = server::data_dir();
+    let (mut online, mut server_url) = (false, String::from("https://127.0.0.1:6443"));
     while let Some(a) = args.next() {
+        if a == b"--online" {
+            online = true;
+            continue;
+        }
         match (a, args.next().and_then(|v| core::str::from_utf8(v).ok())) {
             (b"--data", Some(d)) => data = String::from(d),
+            (b"--server", Some(u)) => server_url = String::from(u.trim_end_matches('/')),
             _ => return fail(USAGE),
         }
     }
@@ -139,7 +194,13 @@ pub fn main(mut args: Args) -> i32 {
                 let mut cfg = need()?;
                 let name = cfg.rotate(rng, pki::now());
                 write_config(&data, &cfg)?;
-                print(format!("added key {name} as the first key; restart `kr server` to use it, then run `kr secrets-encrypt reencrypt` (server stopped) to rewrite stored Secrets with it\n").as_bytes());
+                print(format!("added key {name} as the first key; restart `kr server` to use it, then run `kr secrets-encrypt reencrypt --online` (server running) to rewrite stored Secrets with it\n").as_bytes());
+                Ok(())
+            }
+            b"reencrypt" if online => {
+                let cfg = need()?;
+                let n = reencrypt_online(&data, &cfg, &server_url)?;
+                print(format!("rewrote {n} objects through the running server; they now use {} (in HA the old ciphertext stays in the Raft log until the next snapshot)\n", if cfg.identity_first { "plaintext" } else { &cfg.keys[0].name }).as_bytes());
                 Ok(())
             }
             b"reencrypt" => {
