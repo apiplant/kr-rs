@@ -55,6 +55,8 @@ const SETTINGS: &[(&str, &str, Translate)] = &[
     ("service-node-port-range", "KR_NODE_PORT_RANGE", port_range),
     ("resolv-conf", "KR_RESOLV_CONF", plain),
     ("system-default-registry", "KR_SYSTEM_DEFAULT_REGISTRY", registry_prefix),
+    ("image-credential-provider-config", "KR_CREDENTIAL_PROVIDER_CONFIG", plain),
+    ("image-credential-provider-bin-dir", "KR_CREDENTIAL_PROVIDER_BIN_DIR", plain),
 ];
 
 /// `644`, `0644` or `0o644`; at most 0o777.

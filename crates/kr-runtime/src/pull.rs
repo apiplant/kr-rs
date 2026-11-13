@@ -124,6 +124,10 @@ async fn pull_full(store: &Store, image_ref: &str, creds: &[Cred], limits: &Limi
     }
     let upstream = Reference::parse(image_ref)?;
     let regs = Registries::load()?;
+    // Credential provider plugins (#364) first in the list: pull secrets win on equal specificity.
+    let provided = crate::credprovider::credentials_for(image_ref, &upstream.registry, &upstream.repository).await;
+    let creds: Vec<Cred> = if provided.is_empty() { creds.to_vec() } else { provided.into_iter().chain(creds.iter().cloned()).collect() };
+    let creds = &creds[..];
     // Mirrors first (in order, with their own credentials, never the pod's), then the
     // upstream with the pod's credentials; the upstream's error is the one reported.
     let mut last: Option<Error> = None;

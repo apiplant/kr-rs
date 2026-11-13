@@ -8,6 +8,7 @@ pub mod cgroup;
 pub mod config;
 pub mod cron;
 pub mod container;
+pub mod credprovider;
 pub mod devfilter;
 pub mod gc;
 pub mod hooks;
