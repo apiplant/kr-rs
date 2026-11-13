@@ -130,7 +130,7 @@ fn kr_main(mut args: Args) -> i32 {
             0
         }
         _ => {
-            eprint(b"usage: kr <version | echo [port] | ctr ... | pki ... | certificate rotate | snapshot save|restore ... | secrets-encrypt status|rotate-key|reencrypt|disable ... | server [--config FILE] ... | agent [--config FILE] ... | token create ... | sleep-test>\n");
+            eprint(b"usage: kr <version | echo [port] | ctr ... | pki ... | certificate rotate | snapshot save|restore ... | secrets-encrypt status|rotate-key|reencrypt|disable ... | server [--config FILE] ... | agent [--config FILE] ... | token create|list|delete|generate|rotate ... | sleep-test>\n");
             2
         }
     }

@@ -176,7 +176,7 @@ fn replicate(data: &str, port: Option<u16>, files: &[(&str, String)]) -> Result<
     Ok(())
 }
 
-fn replicate_current(data: &str, port: Option<u16>, names: &[&str]) -> Result<(), String> {
+pub(crate) fn replicate_current(data: &str, port: Option<u16>, names: &[&str]) -> Result<(), String> {
     let files: Vec<(&str, String)> = names.iter().filter_map(|n| read_text(&format!("{data}/{n}")).ok().map(|t| (*n, t))).collect();
     replicate(data, port, &files).map_err(|e| format!("{e}; the local files are changed - run `kr pki rotate --ca sync` once the cluster is reachable"))
 }
