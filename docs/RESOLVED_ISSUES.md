@@ -604,3 +604,6 @@
 
 309. **Re-encrypting stored Secrets needed the server stopped** — *fixed for `reencrypt`* (part of #188)
     `kr secrets-encrypt reencrypt --online [--server URL]` lists each configured built-in resource through the API with the admin certificate and writes every object back with `?krReencrypt=true`, which makes the server write although nothing changed (only for `system:masters`; a no-op update is otherwise skipped, as upstream). Checked by `tools/test/encrypt.sh`: after a key rotation and restart, every stored secret uses the newest key and still reads back.
+
+310. **The cluster CA could not be rotated** — *fixed for one server* (part of #156)
+    `kr pki rotate --ca prepare|activate|finish [--yes]` (`rotate.rs`): `prepare` creates the new CA (`ca-next.*`) and writes the bundle old+new to `ca.pem`; `activate` keeps the old CA as `ca-old.*`, writes the bundle new+old with the new key as `ca.key`, updates the hash in `node-token` and re-issues the leaf certificates and the admin kubeconfig; `finish --yes` leaves only the new CA in `ca.pem` and moves the old files aside. The server and agents already trust every certificate in `ca.pem`. Test: `tools/test/ca-rotate.sh`.
