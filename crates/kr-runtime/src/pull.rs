@@ -85,7 +85,6 @@ async fn pull_full(store: &Store, image_ref: &str, creds: &[Cred], limits: &Limi
     let regs = Registries::load()?;
     // Mirrors first (in order, with their own credentials, never the pod's), then the
     // upstream with the pod's credentials; the upstream's error is the one reported.
-    let mut chosen = None;
     let mut last: Option<Error> = None;
     for a in regs.attempts(&upstream.registry, &upstream.repository) {
         let hcfg = regs.host_cfg(&a.host);
@@ -103,14 +102,21 @@ async fn pull_full(store: &Store, image_ref: &str, creds: &[Cred], limits: &Limi
         reg.set_credential(if a.is_mirror { cfg_cred } else { lookup(creds, &upstream.registry, &upstream.repository).cloned().or(cfg_cred) });
         let r = Reference { registry: a.host.clone(), repository: a.repository.clone(), ..upstream.clone() };
         match reg.resolve(&r).await {
-            Ok(image) => {
-                chosen = Some((reg, r, image));
-                break;
-            }
+            Ok(image) => match finish(store, reg, r, image, image_ref, limits).await {
+                Ok(id) => return Ok(id),
+                // A mirror that answered the manifest but cannot deliver the blobs: the next endpoint
+                // (and finally the upstream) is tried.
+                Err(e) if a.is_mirror => last = Some(e),
+                Err(e) => return Err(e),
+            },
             Err(e) => last = Some(e.into()),
         }
     }
-    let Some((mut reg, r, image)) = chosen else { return Err(last.unwrap_or(Error::Image("no registry to pull from"))) };
+    Err(last.unwrap_or(Error::Image("no registry to pull from")))
+}
+
+/// Downloads the blobs of a resolved image from `reg` and installs it.
+async fn finish(store: &Store, mut reg: Registry<RegConnector>, r: Reference, image: kr_net::registry::Image, image_ref: &str, limits: &Limits) -> Result<ImageId> {
     if image.manifest.layers.len() > MAX_LAYERS {
         return Err(Error::Image("too many layers"));
     }

@@ -57,7 +57,10 @@ pub struct Attempt {
     pub is_mirror: bool,
 }
 
-fn endpoint(e: &str) -> Option<(String, bool)> {
+/// An endpoint: (`host[:port]`, plain http, repository prefix). A path `/v2/<prefix>` (the form
+/// Harbor, Artifactory and Nexus proxy projects use) puts `<prefix>/` in front of the repository
+/// name; a bare `/v2` is the registry root.
+fn endpoint(e: &str) -> Option<(String, bool, String)> {
     let e = e.trim();
     let (plain, host) = match e.split_once("://") {
         Some(("http", h)) => (true, h),
@@ -65,9 +68,15 @@ fn endpoint(e: &str) -> Option<(String, bool)> {
         Some(_) => return None,
         None => (false, e),
     };
-    let host = host.trim_end_matches('/');
-    // Mirrors with a path prefix (`https://h/v2/prefix`) are not supported.
-    (!host.is_empty() && !host.contains('/')).then(|| (host.to_string(), plain))
+    let (host, path) = match host.split_once('/') {
+        Some((h, p)) => (h, p.trim_matches('/')),
+        None => (host, ""),
+    };
+    let prefix = match path {
+        "" | "v2" => "",
+        p => p.strip_prefix("v2/")?, // any other path would need a base path in the registry client
+    };
+    (!host.is_empty() && !prefix.split('/').any(|c| c == "." || c == "..")).then(|| (host.to_string(), plain, prefix.to_string()))
 }
 
 fn s(v: &Value, k: &str) -> Option<String> {
@@ -88,8 +97,8 @@ impl Registries {
             for (reg, v) in m {
                 let mut mirror = Mirror::default();
                 match v.get("endpoint") {
-                    Some(Value::String(e)) => mirror.endpoints.extend(endpoint(e).map(|(h, p)| fmt_ep(&h, p))),
-                    Some(Value::Array(a)) => mirror.endpoints.extend(a.iter().filter_map(Value::as_str).filter_map(endpoint).map(|(h, p)| fmt_ep(&h, p))),
+                    Some(Value::String(e)) => mirror.endpoints.extend(endpoint(e).map(|(h, p, x)| fmt_ep(&h, p, &x))),
+                    Some(Value::Array(a)) => mirror.endpoints.extend(a.iter().filter_map(Value::as_str).filter_map(endpoint).map(|(h, p, x)| fmt_ep(&h, p, &x))),
                     _ => {}
                 }
                 if let Some(rw) = v.get("rewrite").and_then(Value::as_object) {
@@ -135,9 +144,9 @@ impl Registries {
         let mut out = Registries::default();
         for e in v.split(',') {
             let Some((from, to)) = e.trim().split_once('=') else { continue };
-            let Some((h, p)) = endpoint(to) else { continue };
+            let Some((h, p, x)) = endpoint(to) else { continue };
             let key = registry_key(from);
-            let ep = fmt_ep(&h, p);
+            let ep = fmt_ep(&h, p, &x);
             match out.mirrors.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, m)) => m.endpoints.push(ep),
                 None => out.mirrors.push((key, Mirror { endpoints: alloc::vec![ep], rewrites: Vec::new() })),
@@ -203,8 +212,9 @@ impl Registries {
         if let Some(m) = m {
             let repo = m.rewrites.iter().find_map(|(re, to)| Regex::new(re)?.replace(repository, to)).unwrap_or_else(|| repository.to_string());
             for e in &m.endpoints {
-                if let Some((host, plain_http)) = endpoint(e) {
-                    out.push(Attempt { host, plain_http, repository: repo.clone(), is_mirror: true });
+                if let Some((host, plain_http, prefix)) = endpoint(e) {
+                    let repository = if prefix.is_empty() { repo.clone() } else { alloc::format!("{prefix}/{repo}") };
+                    out.push(Attempt { host, plain_http, repository, is_mirror: true });
                 }
             }
         }
@@ -213,8 +223,9 @@ impl Registries {
     }
 }
 
-fn fmt_ep(host: &str, plain: bool) -> String {
-    alloc::format!("{}://{host}", if plain { "http" } else { "https" })
+fn fmt_ep(host: &str, plain: bool, prefix: &str) -> String {
+    let path = if prefix.is_empty() { String::new() } else { alloc::format!("/v2/{prefix}") };
+    alloc::format!("{}://{host}{path}", if plain { "http" } else { "https" })
 }
 
 // ---- a small backtracking regex: literals . [] \d\w\s * + ? () | ^ $ ----
@@ -283,22 +294,40 @@ impl P<'_> {
                 b'*' | b'+' | b'?' | b'{' => return None,
                 c => Node::Char(c),
             };
-            let node = match self.s.get(self.i) {
-                Some(b'*') => Node::Repeat(Box::new(node), 0, usize::MAX),
-                Some(b'+') => Node::Repeat(Box::new(node), 1, usize::MAX),
-                Some(b'?') => Node::Repeat(Box::new(node), 0, 1),
+            let (node, adv) = match self.s.get(self.i) {
+                Some(b'*') => (Node::Repeat(Box::new(node), 0, usize::MAX), 1),
+                Some(b'+') => (Node::Repeat(Box::new(node), 1, usize::MAX), 1),
+                Some(b'?') => (Node::Repeat(Box::new(node), 0, 1), 1),
+                Some(b'{') => {
+                    let (min, max, len) = self.braces()?;
+                    (Node::Repeat(Box::new(node), min, max), len)
+                }
                 _ => {
                     alts.last_mut()?.push(node);
                     continue;
                 }
             };
-            self.i += 1;
+            self.i += adv;
             if self.s.get(self.i) == Some(&b'?') {
                 return None; // lazy quantifiers
             }
             alts.last_mut()?.push(node);
         }
         (depth == 0).then_some(alts)
+    }
+
+    /// `{n}`, `{n,}` or `{n,m}` at the cursor: (min, max, bytes consumed). Counts stay small.
+    fn braces(&self) -> Option<(usize, usize, usize)> {
+        let rest = self.s.get(self.i + 1..)?;
+        let end = rest.iter().position(|&b| b == b'}')?;
+        let body = core::str::from_utf8(&rest[..end]).ok()?;
+        let num = |t: &str| (!t.is_empty() && t.len() <= 3 && t.bytes().all(|b| b.is_ascii_digit())).then(|| t.parse::<usize>().ok()).flatten();
+        let (min, max) = match body.split_once(',') {
+            None => (num(body)?, num(body)?),
+            Some((a, "")) => (num(a)?, usize::MAX),
+            Some((a, b)) => (num(a)?, num(b)?),
+        };
+        (min <= max && max <= 1000 || max == usize::MAX).then_some((min, max, end + 2))
     }
 
     fn escape(&mut self, in_class: bool) -> Option<Node> {
@@ -516,6 +545,12 @@ configs:
         assert_eq!(c.tls.ca_file.as_deref(), Some("/etc/ca.pem"));
         assert_eq!(r.host_cfg("10.0.0.4:5000").unwrap().auth.as_ref().unwrap().token.as_deref(), Some("tok"));
         assert!(r.host_cfg("other").is_none());
+        // a path prefix on a mirror endpoint goes in front of the repository
+        let p = Registries::parse("mirrors:\n  docker.io:\n    endpoint:\n      - https://harbor.local/v2/proxy\n      - https://plain.local/v2\n").unwrap();
+        let a = p.attempts("docker.io", "library/nginx");
+        assert_eq!((a[0].host.as_str(), a[0].repository.as_str()), ("harbor.local", "proxy/library/nginx"));
+        assert_eq!((a[1].host.as_str(), a[1].repository.as_str()), ("plain.local", "library/nginx"));
+        assert!(Registries::parse("mirrors:\n  a:\n    endpoint: https://h/artifactory/api\n").unwrap().mirrors[0].1.endpoints.is_empty(), "other paths are not supported and are ignored");
         // a `*` entry is the default for registries without their own entry
         let w = Registries::parse("configs:\n  \"*\":\n    auth:\n      username: all\n  cache.local:\n    auth:\n      username: own\n").unwrap();
         assert_eq!(w.host_cfg("anything.io").unwrap().auth.as_ref().unwrap().username, "all");
@@ -556,6 +591,10 @@ configs:
         let r = Regex::new("a+b?c[0-9]\\.").unwrap();
         assert!(r.is_match("zaaac7."));
         assert!(!r.is_match("ac."));
-        assert!(Regex::new("(a").is_none() && Regex::new("a{2}").is_none());
+        assert!(Regex::new("(a").is_none() && Regex::new("a{2").is_none() && Regex::new("a{3,2}").is_none() && Regex::new("a{x}").is_none());
+        let r = Regex::new("^lib/(a{2,3})-([0-9]{2})$").unwrap();
+        assert_eq!(r.replace("lib/aaa-42", "\\2\\1").unwrap(), "42aaa");
+        assert!(r.replace("lib/a-42", "x").is_none() && r.replace("lib/aaaa-42", "x").is_none() && r.replace("lib/aa-4", "x").is_none());
+        assert!(Regex::new("x{2,}y").unwrap().is_match("xxxy") && !Regex::new("^x{2,}y").unwrap().is_match("xy"));
     }
 }

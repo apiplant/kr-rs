@@ -595,3 +595,6 @@
 
 306. **Rotating the service-account key invalidated every token** — *fixed for one server* (part of #177)
     The signer can hold verify-only keys: `kr pki rotate --service-account-key` appends the old `sa.key` to `pki/sa-old.pem` (0600, part of `kr snapshot`), the server loads it, tokens signed by an old key verify (the header `kid` picks the key) and the JWKS publishes all keys. New tokens use the new key. Unit test `tokens_of_an_earlier_key_verify_while_it_is_kept`; end to end `tools/test/sa-rotate.sh`.
+
+307. **Mirror path prefixes, `{n,m}` in rewrite, and no retry of blobs on the next endpoint** — *fixed* (part of #175)
+    `endpoint` accepts `https://host/v2/<prefix>` (prefix prepended to the repository); the rewrite regex supports `{n}`, `{n,}`, `{n,m}` (counts up to 1000); `pull` splits into resolve and `finish`, so a mirror whose blobs fail hands over to the next endpoint and then the upstream.
