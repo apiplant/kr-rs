@@ -12,6 +12,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use kr_archive::gzip::GzDecoder;
+use kr_archive::zstd::ZstdDecoder;
 use kr_archive::tar::{self, Entry, Event, Kind, TarReader, Whiteout};
 use kr_net::sha256::{hex, Sha256};
 use kr_sys::fs::{self, ENOENT, ENOTDIR};
@@ -475,6 +476,9 @@ fn run(root: i32, src: &mut dyn FnMut(&mut [u8]) -> Result<usize>, lim: &Limits,
     let mut u = Unpacker::new(root, lim, overlay);
     let mut tr = TarReader::new();
     let mut gz = GzDecoder::new();
+    let mut zst = ZstdDecoder::new();
+    let mut is_zstd = false;
+    let mut first = true;
     let mut buf = alloc::vec![0u8; 64 * 1024];
     let mut total: u64 = 0;
     let mut hash = Sha256::new();
@@ -483,7 +487,21 @@ fn run(root: i32, src: &mut dyn FnMut(&mut [u8]) -> Result<usize>, lim: &Limits,
         if n == 0 {
             break;
         }
-        if gzip {
+        // A layer called gzip may be zstd (media type `...tar+zstd`): the magic tells.
+        if first {
+            first = false;
+            is_zstd = gzip && buf[..n].starts_with(&[0x28, 0xb5, 0x2f, 0xfd]);
+        }
+        if is_zstd {
+            zst.feed(&buf[..n], &mut |out: &[u8]| -> Result<()> {
+                total += out.len() as u64;
+                if total > lim.max_bytes {
+                    return Err(Error::Limit("layer exceeds the uncompressed size limit"));
+                }
+                hash.update(out);
+                tr.feed(out, &mut |ev| u.event(ev)).map_err(Error::from)
+            })?;
+        } else if gzip {
             gz.feed(&buf[..n], &mut |out: &[u8]| -> Result<()> {
                 total += out.len() as u64;
                 if total > lim.max_bytes {
@@ -501,7 +519,9 @@ fn run(root: i32, src: &mut dyn FnMut(&mut [u8]) -> Result<usize>, lim: &Limits,
             tr.feed(&buf[..n], &mut |ev| u.event(ev)).map_err(Error::from)?;
         }
     }
-    if gzip {
+    if is_zstd {
+        zst.finish().map_err(Error::Archive)?;
+    } else if gzip {
         gz.finish().map_err(Error::Archive)?;
     }
     tr.finish().map_err(Error::Archive)?;

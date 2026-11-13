@@ -123,3 +123,54 @@ fn imports_oci_layout() {
     assert!(import_file(&store2, f.to_str().unwrap()).is_err());
     let _ = std::fs::remove_dir_all(&base);
 }
+
+fn zstd(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut c = Command::new("zstd").args(["-3", "-c"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut stdin = c.stdin.take()?;
+    let d = data.to_vec();
+    let t = std::thread::spawn(move || {
+        let _ = stdin.write_all(&d);
+    });
+    let out = c.wait_with_output().ok()?;
+    t.join().ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// k3s's own air-gap archives are `.tar.zst` (#176).
+#[test]
+fn imports_zstd_archives_and_zstd_layers() {
+    let Some(z) = zstd(b"x") else { return };
+    let _ = z;
+    let base = tmp("zstd");
+    let store = Store::open(Some(base.join("store").to_str().unwrap())).unwrap();
+    // the whole archive zstd-compressed
+    let f = base.join("a.tar.zst");
+    std::fs::write(&f, zstd(&docker_archive("example.com/z/whole:1")).unwrap()).unwrap();
+    import_file(&store, f.to_str().unwrap()).unwrap();
+    let (_, cfg, rootfs) = store.image("example.com/z/whole:1").expect("registered");
+    assert_eq!(cfg.cmd, ["/bin/hello"]);
+    let root = String::from_utf8(rootfs[..rootfs.len() - 1].to_vec()).unwrap();
+    assert_eq!(std::fs::read(format!("{root}/bin/hello")).unwrap(), b"hi there");
+    // a plain archive whose layer is zstd-compressed
+    let (layer, cfg) = image();
+    let mut t = Tar::new();
+    t.file("abc.json", 0o644, &cfg);
+    t.dir("l1", 0o755);
+    t.file("l1/layer.tar", 0o644, &zstd(&layer).unwrap());
+    t.file("manifest.json", 0o644, b"[{\"Config\":\"abc.json\",\"RepoTags\":[\"example.com/z/layer:1\"],\"Layers\":[\"l1/layer.tar\"]}]");
+    let f2 = base.join("b.tar");
+    std::fs::write(&f2, t.finish()).unwrap();
+    import_file(&store, f2.to_str().unwrap()).unwrap();
+    let (_, _, rootfs) = store.image("example.com/z/layer:1").expect("registered");
+    let root = String::from_utf8(rootfs[..rootfs.len() - 1].to_vec()).unwrap();
+    assert_eq!(std::fs::read(format!("{root}/bin/hello")).unwrap(), b"hi there");
+    // a truncated archive is refused
+    let mut cut = zstd(&docker_archive("example.com/z/cut:1")).unwrap();
+    cut.truncate(cut.len() - 6);
+    let f3 = base.join("c.tar.zst");
+    std::fs::write(&f3, cut).unwrap();
+    assert!(import_file(&store, f3.to_str().unwrap()).is_err());
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -143,9 +143,6 @@ async fn finish(store: &Store, mut reg: Registry<RegConnector>, r: Reference, im
     let mut gz: Vec<bool> = Vec::new();
     for l in &image.manifest.layers {
         let mt = l.media_type.as_str();
-        if mt.contains("zstd") {
-            return Err(Error::Image("zstd-compressed layers are not supported"));
-        }
         gz.push(!(mt.ends_with(".tar") && !mt.contains("gzip")));
     }
     for l in &image.manifest.layers {

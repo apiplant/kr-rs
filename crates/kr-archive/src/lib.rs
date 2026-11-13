@@ -28,6 +28,7 @@ pub mod crc32;
 pub mod gzip;
 pub mod inflate;
 pub mod tar;
+pub mod zstd;
 
 use core::fmt;
 
@@ -64,6 +65,9 @@ pub enum Error<E = ()> {
     SizeMismatch,
     TrailingGarbage,
 
+    // --- zstd ---
+    Zstd(&'static str),
+
     // --- tar ---
     BadChecksum,
     BadNumber,
@@ -81,6 +85,7 @@ impl<E> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::UnsupportedType(t) => write!(f, "unsupported tar type flag {:#04x}", t),
+            Error::Zstd(why) => write!(f, "zstd: {why}"),
             _ => f.write_str(self.name()),
         }
     }
@@ -110,6 +115,7 @@ impl<E> Error<E> {
             Error::Crc32Mismatch => "gzip crc32 mismatch",
             Error::SizeMismatch => "gzip isize mismatch",
             Error::TrailingGarbage => "trailing garbage after gzip member",
+            Error::Zstd(_) => "zstd error",
             Error::BadChecksum => "tar header checksum mismatch",
             Error::BadNumber => "bad numeric field",
             Error::BadPax => "malformed pax record",
@@ -145,6 +151,7 @@ impl<E> Error<E> {
             Error::Crc32Mismatch => Error::Crc32Mismatch,
             Error::SizeMismatch => Error::SizeMismatch,
             Error::TrailingGarbage => Error::TrailingGarbage,
+            Error::Zstd(w) => Error::Zstd(w),
             Error::BadChecksum => Error::BadChecksum,
             Error::BadNumber => Error::BadNumber,
             Error::BadPax => Error::BadPax,

@@ -598,3 +598,6 @@
 
 307. **Mirror path prefixes, `{n,m}` in rewrite, and no retry of blobs on the next endpoint** — *fixed* (part of #175)
     `endpoint` accepts `https://host/v2/<prefix>` (prefix prepended to the repository); the rewrite regex supports `{n}`, `{n,}`, `{n,m}` (counts up to 1000); `pull` splits into resolve and `finish`, so a mirror whose blobs fail hands over to the next endpoint and then the upstream.
+
+308. **No zstd: `.tar.zst` archives and zstd layers were refused** — *fixed* (part of #176)
+    `kr-archive::zstd::ZstdDecoder` (RFC 8878: Huffman and FSE literals and sequences, repeat offsets, skippable frames, concatenated frames, windows up to 128 MiB; no dictionaries, checksum not verified) streams like the gzip decoder, at about 190 MB/s of output in release. Layers and archives are recognised by their magic, so `+zstd` media types, `.tar.zst` files and mislabelled gzip/zstd layers work in `unpack`, `import` and `pull`. Tested byte for byte against the `zstd` binary at levels 1 to 22, with `--long`, empty and incompressible input, 1-byte and 4 KiB chunking, concatenated frames, and 300 randomly damaged streams (no panic); `tests/import.rs` imports a `.tar.zst` archive and an archive with a zstd layer.

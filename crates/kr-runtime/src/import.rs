@@ -1,6 +1,6 @@
 //! Air-gap image import: `docker save` archives (`manifest.json`) and OCI image layouts
 //! (`index.json`) in `.tar` / `.tar.gz` files go into the image store without network
-//! (ADR-044). Zstd-compressed archives are refused (kr-archive has no zstd).
+//! (ADR-044). Archives and layers may be gzip- or zstd-compressed (kr-archive has a zstd decoder).
 use crate::pull::install_image;
 use crate::store::{cpath, mkdir_p, Ctx, Error, ImageConfig, ImageId, Result, Store};
 use crate::unpack::Limits;
@@ -8,6 +8,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use kr_archive::gzip::GzDecoder;
+use kr_archive::zstd::ZstdDecoder;
 use kr_archive::tar::{self, Event, Kind, TarReader};
 use kr_fmt::json::Value;
 use kr_net::registry::{self, Descriptor, Digest, Manifest};
@@ -19,6 +20,7 @@ const MAX_ARCHIVE_BYTES: u64 = 64 << 30;
 const MAX_JSON: usize = 16 << 20;
 const MT_LAYER: &str = "application/vnd.oci.image.layer.v1.tar";
 const MT_LAYER_GZ: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+const MT_LAYER_ZSTD: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
 
 /// Result of importing one file.
 #[derive(Debug)]
@@ -161,9 +163,6 @@ fn oci_index(store: &Store, root: &str, body: &[u8], name: Option<&str>, ids: &m
                 }
                 let mut descs = Vec::new();
                 for l in &im.layers {
-                    if l.media_type.contains("zstd") {
-                        return Err(Error::Image("zstd-compressed layers are not supported"));
-                    }
                     descs.push(layer_blob(store, &blob_file(root, &l.digest)?, Some(l.clone()))?);
                 }
                 let id = install(store, &cfg_raw, descs, Some(&raw))?;
@@ -196,9 +195,6 @@ fn layer_blob(store: &Store, path: &str, want: Option<Descriptor>) -> Result<Des
         size += n as u64;
         h.update(&buf[..n]);
     }
-    if magic == [0x28, 0xb5, 0x2f, 0xfd] {
-        return Err(Error::Image("zstd-compressed layers are not supported"));
-    }
     let digest = Digest::parse(&format!("sha256:{}", hex(&h.finalize())))?;
     if let Some(w) = &want {
         if w.digest != digest {
@@ -218,7 +214,8 @@ fn layer_blob(store: &Store, path: &str, want: Option<Descriptor>) -> Result<Des
         w.commit()?;
     }
     let gz = magic[..2] == [0x1f, 0x8b];
-    Ok(Descriptor { media_type: (if gz { MT_LAYER_GZ } else { MT_LAYER }).to_string(), digest, size })
+    let zstd = magic == [0x28, 0xb5, 0x2f, 0xfd];
+    Ok(Descriptor { media_type: (if zstd { MT_LAYER_ZSTD } else if gz { MT_LAYER_GZ } else { MT_LAYER }).to_string(), digest, size })
 }
 
 fn read(fd: &Fd, buf: &mut [u8]) -> Result<usize> {
@@ -254,7 +251,7 @@ fn install(store: &Store, cfg_json: &[u8], layers: Vec<Descriptor>, manifest: Op
         }
     };
     let _ = store.put_blob(&Digest::sha256_of(&raw), &raw);
-    let gz: Vec<bool> = layers.iter().map(|l| l.media_type.ends_with("gzip")).collect();
+    let gz: Vec<bool> = layers.iter().map(|l| l.media_type.ends_with("gzip") || l.media_type.contains("zstd")).collect();
     install_image(store, &id, &raw, cfg_json, &layers, &gz, &icfg.diff_ids, &Limits::default())?;
     Ok(id)
 }
@@ -282,6 +279,7 @@ fn extract(path: &str, dest: &str) -> Result<()> {
     let mut buf = alloc::vec![0u8; 64 << 10];
     let mut first = true;
     let mut gz: Option<GzDecoder> = None;
+    let mut zst: Option<ZstdDecoder> = None;
     let mut rd = TarReader::new();
     let mut cur: Option<Fd> = None;
     let mut total = 0u64;
@@ -326,19 +324,22 @@ fn extract(path: &str, dest: &str) -> Result<()> {
         if first {
             first = false;
             if chunk.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-                return Err(Error::Image("zstd-compressed archives are not supported (use .tar or .tar.gz)"));
-            }
-            if chunk.starts_with(&[0x1f, 0x8b]) {
+                zst = Some(ZstdDecoder::new());
+            } else if chunk.starts_with(&[0x1f, 0x8b]) {
                 gz = Some(GzDecoder::new());
             }
         }
-        match &mut gz {
-            Some(g) => g.feed(chunk, &mut sink).map_err(Error::from)?,
-            None => sink(chunk)?,
+        match (&mut gz, &mut zst) {
+            (Some(g), _) => g.feed(chunk, &mut sink).map_err(Error::from)?,
+            (_, Some(z)) => z.feed(chunk, &mut sink).map_err(Error::from)?,
+            _ => sink(chunk)?,
         }
     }
     if let Some(g) = &gz {
         g.finish().map_err(|e| Error::Archive(e))?;
+    }
+    if let Some(z) = &zst {
+        z.finish().map_err(|e| Error::Archive(e))?;
     }
     Ok(())
 }
