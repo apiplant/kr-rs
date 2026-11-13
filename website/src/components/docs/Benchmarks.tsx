@@ -45,7 +45,7 @@ export function DocsBenchmarks() {
         </P>
         <P>
           Since pods survive restarts, each running container also has a shim of about 1 MB resident. 200 pods cost
-          about 250 MB of shims.
+          about 213 MB of shims.
         </P>
       </Section>
 
@@ -56,8 +56,8 @@ export function DocsBenchmarks() {
           rows={[
             ["kr server to node Ready (server and one agent)", "about 2 s"],
             ["100 pause pods Deployment, cached image, on one agent", "about 8.6 s to all Running"],
-            ["200 pods Running, cached image", "about 38 s"],
-            ["Adopting 200 pods after a kill -9", "about 9 s"],
+            ["200 pods Running, cached image", "about 43 s"],
+            ["Adopting 200 pods after a kill -9", "about 3 s"],
             ["GET /version, new TLS 1.3 connection each time", "p50 1.9 ms, p99 5.5 ms"],
             ["GET /api/v1/namespaces/default/pods (100 pods, 436 KB)", "p50 5.0 ms, p99 8.3 ms"],
             ["New TLS connections under 40 parallel clients", "about 650 per second (client-bound), no failures"],
