@@ -36,7 +36,7 @@ struct Inner {
     /// to the next.
     servers: core::cell::RefCell<Vec<String>>,
     cur: core::cell::Cell<usize>,
-    roots: Vec<Vec<u8>>,
+    roots: core::cell::RefCell<Vec<Vec<u8>>>,
     bearer: Option<String>,
     unary: Http<TlsConnector>,
     /// Separate client (own pool, never reuses) with the long idle read limit.
@@ -97,17 +97,28 @@ impl Remote {
             TlsConnector::new(SystemResolver::system(), cfg),
             HttpConfig { read_timeout_ms: WATCH_IDLE_MS, max_redirects: 0, max_idle: 0, user_agent: "kr-node/0.0.1".to_string(), ..HttpConfig::default() },
         );
-        Ok(Remote { inner: Rc::new(Inner { servers: core::cell::RefCell::new(alloc::vec![base.to_string()]), cur: core::cell::Cell::new(0), roots, bearer, unary, watch }) })
+        Ok(Remote { inner: Rc::new(Inner { servers: core::cell::RefCell::new(alloc::vec![base.to_string()]), cur: core::cell::Cell::new(0), roots: core::cell::RefCell::new(roots), bearer, unary, watch }) })
     }
 
     /// Switches to a new client certificate (rotation). New connections use it; pooled and
     /// in-flight ones finish with the old one, which is still valid.
     pub fn set_client_cert(&self, chain: &str, key: &str) -> Result<()> {
         let cc = client_cert(chain, key)?;
-        let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: self.inner.roots.clone(), client_cert: Some(cc), alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
+        let cfg = Rc::new(ClientConfig { pinned_ca: None, roots: self.inner.roots.borrow().clone(), client_cert: Some(cc), alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
         self.inner.unary.connector().set_config(cfg.clone());
         self.inner.watch.connector().set_config(cfg);
         Ok(())
+    }
+
+    /// Switches to a new CA bundle (a CA rotation) together with the client certificate in use.
+    /// New connections trust the new roots; pooled ones finish with the old.
+    pub fn set_roots(&self, ca_pem: &str, chain: &str, key: &str) -> Result<()> {
+        let roots = x509::pem_decode_all(ca_pem, "CERTIFICATE").map_err(|_| bad("invalid CA bundle"))?;
+        if roots.is_empty() {
+            return Err(bad("CA bundle has no certificates"));
+        }
+        *self.inner.roots.borrow_mut() = roots;
+        self.set_client_cert(chain, key)
     }
 
     /// Replaces the server list (e.g. from the `kubernetes` endpoints), keeping the server in

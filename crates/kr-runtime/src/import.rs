@@ -111,7 +111,14 @@ pub fn import_file(store: &Store, path: &str) -> Result<Vec<ImageId>> {
         }
     } else if exists("index.json") {
         let idx = rd("index.json")?;
-        oci_index(store, &tmp.0, &idx, None, &mut ids, 0)?;
+        let mut skipped = Vec::new();
+        oci_index(store, &tmp.0, &idx, None, &mut ids, &mut skipped, 0)?;
+        for n in &skipped {
+            kr_rt::eprint(format!("kr: import {path}: {n} has no linux/{} image; skipped\n", registry::target_arch()).as_bytes());
+        }
+        if ids.is_empty() && !skipped.is_empty() {
+            return Err(Error::Image("the archive has no image for this platform"));
+        }
     } else {
         return Err(Error::Image("not an image archive (no manifest.json or index.json)"));
     }
@@ -134,7 +141,7 @@ fn blob_file(root: &str, d: &Digest) -> Result<String> {
     Ok(format!("{root}/blobs/sha256/{h}"))
 }
 
-fn oci_index(store: &Store, root: &str, body: &[u8], name: Option<&str>, ids: &mut Vec<ImageId>, depth: u32) -> Result<()> {
+fn oci_index(store: &Store, root: &str, body: &[u8], name: Option<&str>, ids: &mut Vec<ImageId>, skipped: &mut Vec<String>, depth: u32) -> Result<()> {
     if depth > 4 {
         return Err(Error::Image("OCI index nesting too deep"));
     }
@@ -152,9 +159,11 @@ fn oci_index(store: &Store, root: &str, body: &[u8], name: Option<&str>, ids: &m
             Manifest::Index(entries) => {
                 if let Ok(e) = registry::select_platform(&entries, "linux", registry::target_arch()) {
                     let sub = format!("{{\"manifests\":[{{\"digest\":\"{}\",\"mediaType\":\"{}\"}}]}}", e.descriptor.digest, e.descriptor.media_type);
-                    oci_index(store, root, sub.as_bytes(), nm, ids, depth + 1)?;
+                    oci_index(store, root, sub.as_bytes(), nm, ids, skipped, depth + 1)?;
+                } else {
+                    // an index without our platform: reported, the other images are still imported
+                    skipped.push(nm.unwrap_or(d.as_str()).to_string());
                 }
-                // an index without our platform is skipped (multi-arch archive)
             }
             Manifest::Image(im) => {
                 let cfg_raw = fs::read_file(&cpath(&blob_file(root, &im.config.digest)?)?, MAX_JSON).map_err(|e| Error::Io("read blob", e))?;

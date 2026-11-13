@@ -616,3 +616,9 @@
 
 313. **`registries.yaml` base paths and regex** — *fixed* (part of #175)
     Endpoint paths other than `/v2/<prefix>` set the base path the registry client puts in front of `/v2/`; `rewrite` supports lazy quantifiers, `(?:)`, `(?=)`, `(?!)` and replaces every match.
+
+314. **Agents had to be given the new CA by hand** — *fixed* (part of #156)
+    `GET /kr/ca-bundle` (public like `/cacerts`) returns the bundle in use; the agent's `track_ca` task fetches it every minute, writes `pki/ca.pem` when it differs, swaps the roots of its API client (`Remote::set_roots`) and reloads its kubelet API's client trust. Not run against a real agent.
+
+315. **Air-gap import details** — *fixed* (part of #176)
+    An agent started with `--data DIR` imports `DIR/images` too; an OCI archive whose index has no image for the node's platform is an error (`an_archive_without_this_platform_is_reported`), and a partial miss is reported on stderr.

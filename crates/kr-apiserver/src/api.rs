@@ -1371,6 +1371,12 @@ impl ApiServer {
             let pem = self.ca.borrow().as_ref().map(|(_, _, der)| kr_crypto::x509::pem_encode("CERTIFICATE", der)).ok_or_else(|| ApiError::not_found("cacerts", "ca"))?;
             return Ok(Reply::Json(200, pem));
         }
+        // The CA bundle in use (every CA the cluster still trusts): public like /cacerts, read by
+        // agents to follow a CA rotation.
+        if path == "/kr/ca-bundle" && req.method == "GET" {
+            let pem = self.sa.borrow().as_ref().map(|(_, p)| p.clone()).ok_or_else(|| ApiError::not_found("ca-bundle", "ca"))?;
+            return Ok(Reply::ok(&obj(alloc::vec![("caBundle", Value::String(pem))])));
+        }
         if path == "/kr/join" && req.method == "POST" {
             return self.join(req, &user);
         }

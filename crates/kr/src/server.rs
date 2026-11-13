@@ -685,7 +685,7 @@ pub fn cgroups_available() -> bool {
 /// The node agent embedded in the server (single-node mode).
 fn start_kubelet(api: &Rc<kr_apiserver::api::ApiServer>) -> Result<Rc<kr_kubelet::Kubelet<kr_apiserver::client::InProcess>>, String> {
     let store = kr_runtime::store::Store::open(None).map_err(|_| String::from("cannot open the image store"))?;
-    crate::ctr_import::import_startup(&store);
+    crate::ctr_import::import_startup(&store, None);
     let name = node_name();
     let cgroups = cgroups_available();
     let node_ip = primary_addr();

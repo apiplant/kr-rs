@@ -174,3 +174,29 @@ fn imports_zstd_archives_and_zstd_layers() {
     assert!(import_file(&store, f3.to_str().unwrap()).is_err());
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A multi-arch archive without the node's platform is an error, not an empty success (#176).
+#[test]
+fn an_archive_without_this_platform_is_reported() {
+    let base = tmp("platform");
+    let store = Store::open(Some(base.join("store").to_str().unwrap())).unwrap();
+    let inner = "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"size\":2},\"layers\":[]}";
+    let list = format!(
+        "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{}\",\"size\":{},\"platform\":{{\"os\":\"plan9\",\"architecture\":\"mips\"}}}}]}}",
+        sha(inner.as_bytes()), inner.len()
+    );
+    let index = format!(
+        "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"digest\":\"{}\",\"size\":{},\"annotations\":{{\"io.containerd.image.name\":\"registry.local/multi/app:1\"}}}}]}}",
+        sha(list.as_bytes()), list.len()
+    );
+    let blob = |d: &[u8]| format!("blobs/sha256/{}", &sha(d)["sha256:".len()..]);
+    let mut t = Tar::new();
+    t.file("index.json", 0o644, index.as_bytes());
+    t.file(&blob(list.as_bytes()), 0o644, list.as_bytes());
+    t.file(&blob(inner.as_bytes()), 0o644, inner.as_bytes());
+    let f = base.join("multi.tar");
+    std::fs::write(&f, t.finish()).unwrap();
+    let e = import_file(&store, f.to_str().unwrap()).unwrap_err();
+    assert!(format!("{e:?}").contains("no image for this platform"), "{e:?}");
+    let _ = std::fs::remove_dir_all(&base);
+}

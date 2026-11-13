@@ -141,6 +141,36 @@ async fn rotate(remote: Remote, pki_dir: String, name: String, ip: [u8; 16], ser
     }
 }
 
+/// Follows a CA rotation (`kr pki rotate --ca`): the cluster publishes its CA bundle at
+/// `/kr/ca-bundle`; when it differs from `pki/ca.pem` the agent stores it and trusts it from the
+/// next connection on (and for the clients of its kubelet API), so no file has to be copied by hand.
+async fn track_ca(remote: Remote, pki_dir: String, serving: Rc<core::cell::RefCell<Rc<kr_crypto::tls::ServerConfig>>>) {
+    loop {
+        kr_rt::exec::sleep(60_000).await;
+        let Ok(doc) = remote.get("/kr/ca-bundle").await else { continue };
+        let Some(bundle) = doc.get("caBundle").and_then(kr_fmt::json::Value::as_str) else { continue };
+        let read = |f: &str| fs::read_file(&pki::path(&pki_dir, f), 1 << 20).ok().and_then(|b| String::from_utf8(b).ok());
+        let Some(cur) = read("ca.pem") else { continue };
+        if bundle.trim() == cur.trim() || x509::pem_decode_all(bundle, "CERTIFICATE").map_or(true, |v| v.is_empty()) {
+            continue;
+        }
+        let tmp = "ca.pem.new";
+        let _ = fs::unlinkat(fs::AT_FDCWD, &pki::path(&pki_dir, tmp), 0);
+        if pki::write_new(&pki::path(&pki_dir, tmp), bundle.as_bytes(), 0o644).is_err() || fs::renameat2(fs::AT_FDCWD, &pki::path(&pki_dir, tmp), fs::AT_FDCWD, &pki::path(&pki_dir, "ca.pem"), 0).is_err() {
+            continue;
+        }
+        let (Some(chain), Some(key)) = (read("node.pem"), read("node.key")) else { continue };
+        if let Err(e) = remote.set_roots(bundle, &chain, &key) {
+            eprint(format!("kr agent: new CA bundle: {}\n", e.message).as_bytes());
+            continue;
+        }
+        if let Ok(cfg) = serving_config(&pki_dir) {
+            *serving.borrow_mut() = cfg;
+        }
+        print(b"kr agent: the cluster CA bundle changed; trusting the new one\n");
+    }
+}
+
 async fn renew(remote: &Remote, pki_dir: &str, name: &str, ip: [u8; 16]) -> Result<(), String> {
     let files = request_certs(remote, name, ip).await?;
     for (file, data, mode) in &files {
@@ -269,10 +299,11 @@ pub fn main(mut args: Args) -> i32 {
         Ok(s) => s,
         Err(_) => return fail("cannot open the image store"),
     };
-    crate::ctr_import::import_startup(&store);
+    crate::ctr_import::import_startup(&store, Some(&format!("{data}/images")));
     let cfg = kr_kubelet::Config { node_name: name.clone(), root: String::from(store.root()), network: ns::getuid() == 0, cgroups: cgroups_available(), node_ip: ip, vxlan: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() != Some("host-gw"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env(), control_plane: false };
     let rotation = (remote.clone(), pki_dir.clone(), name.clone(), ip, tls.clone());
     let tracker = remote.clone();
+    let (ca_remote, ca_dir, ca_tls) = (remote.clone(), pki_dir.clone(), tls.clone());
     let kubelet = kr_kubelet::Kubelet::new(remote, cfg, store);
     print(format!("kr agent: node {name} ({}) -> {server}\n", kr_net::tcp::fmt_ip16(ip)).as_bytes());
     kr_rt::exec::block_on(async move {
@@ -281,6 +312,7 @@ pub fn main(mut args: Args) -> i32 {
         let (r, d, n, ip, s) = rotation;
         kr_rt::exec::spawn(rotate(r, d, n, ip, s));
         kr_rt::exec::spawn(track_servers(tracker, servers_file));
+        kr_rt::exec::spawn(track_ca(ca_remote, ca_dir, ca_tls));
         kubelet.run().await;
     });
     0
