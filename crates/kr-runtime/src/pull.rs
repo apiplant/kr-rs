@@ -98,6 +98,7 @@ async fn pull_full(store: &Store, image_ref: &str, creds: &[Cred], limits: &Limi
         if a.plain_http {
             reg.allow_plain_http(&a.host);
         }
+        reg.set_base_path(&a.base_path);
         let cfg_cred = hcfg.and_then(|c| c.auth.clone());
         reg.set_credential(if a.is_mirror { cfg_cred } else { lookup(creds, &upstream.registry, &upstream.repository).cloned().or(cfg_cred) });
         let r = Reference { registry: a.host.clone(), repository: a.repository.clone(), ..upstream.clone() };

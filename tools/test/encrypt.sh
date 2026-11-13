@@ -50,5 +50,24 @@ sed -i 's/"identityFirst":true/"identityFirst":false/' $D/encryption-config.json
 $KR secrets-encrypt reencrypt --data $D >/dev/null
 sed -i 's/"secret":"[^"]*"/"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="/g' $D/encryption-config.json
 $KR server --data $D --port $PORT >$T/bad.log 2>&1; check "wrong key refuses to start" "$(grep -c 'cannot open the datastore' $T/bad.log)" 1
+# No restart at all: rotate, then disable, through the running server (#188).
+D=$T/srv2; PORT=$((PORT+1))
+start
+K create secret generic live1 --from-literal=pw=live-PLAINTEXT >/dev/null
+HID2=$(printf live-PLAINTEXT | base64)
+KEY1=$($KR secrets-encrypt status --data $D | awk '/\(writes\)/{print $1}')
+$KR secrets-encrypt rotate-key --online --data $D --server https://127.0.0.1:$PORT
+KEY2=$($KR secrets-encrypt status --data $D | awk '/\(writes\)/{print $1}')
+check "online rotate-key adds a key" "$([ "$KEY1" != "$KEY2" ] && echo yes)" yes
+sleep 1.5
+check "online rotate-key: everything uses the new key" "$($KR secrets-encrypt status --data $D 2>/dev/null | awk '/stored objects/{f=1;next} f&&NF{print $1}' | tr -d : | sort -u | tr '\n' ' ')" "$KEY2 "
+K create secret generic live2 --from-literal=pw=after >/dev/null
+sleep 1.5
+check "a secret written after the reload uses the new key" "$($KR secrets-encrypt status --data $D 2>/dev/null | awk '/stored objects/{f=1;next} f&&NF{print $1}' | tr -d : | sort -u | tr '\n' ' ')" "$KEY2 "
+$KR secrets-encrypt disable --online --data $D --server https://127.0.0.1:$PORT
+sleep 1.5
+check "online disable: the log now holds the plaintext again" "$([ "$(grep -c "$HID2" $D/db/log)" -gt 0 ] && echo yes)" yes
+check "online disable: the secret reads back" "$(K get secret live1 -o jsonpath='{.data.pw}' | base64 -d)" live-PLAINTEXT
+stop
 rm -rf $T
 exit $fail

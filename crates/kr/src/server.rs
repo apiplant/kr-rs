@@ -239,6 +239,10 @@ fn join_secrets(data: &str) -> Result<kr_apiserver::cluster::join::JoinSecrets, 
     if let Ok(b) = fs::read_file(&pki::path(data, kr_apiserver::encrypt::FILE), 1 << 20) {
         files.push((String::from(kr_apiserver::encrypt::FILE), String::from_utf8(b).map_err(|_| "encryption config is not UTF-8")?));
     }
+    // Optional: earlier service-account keys, so a new server verifies tokens issued before a rotation.
+    if let Ok(b) = fs::read_file(&pki::path(data, "pki/sa-old.pem"), 1 << 20) {
+        files.push((String::from("pki/sa-old.pem"), String::from_utf8(b).map_err(|_| "sa-old.pem is not UTF-8")?));
+    }
     let tok = &files[4].1;
     let token_secret = tok.trim().split_once("::server:").map(|(_, s)| String::from(s)).ok_or("bad server-token")?;
     Ok(kr_apiserver::cluster::join::JoinSecrets { token_secret, files })
@@ -270,6 +274,9 @@ async fn join_cluster(server: &str, token: &str, data: &str) -> Result<Vec<(u64,
     }
     if let Some(c) = files.get(kr_apiserver::encrypt::FILE).and_then(kr_fmt::json::Value::as_str) {
         pki::write_new(&pki::path(data, kr_apiserver::encrypt::FILE), c.as_bytes(), 0o600)?;
+    }
+    if let Some(c) = files.get("pki/sa-old.pem").and_then(kr_fmt::json::Value::as_str) {
+        pki::write_new(&pki::path(data, "pki/sa-old.pem"), c.as_bytes(), 0o600)?;
     }
     let servers = v.get("servers").and_then(kr_fmt::json::Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
     Ok(servers
@@ -483,6 +490,11 @@ pub fn main(mut args: Args) -> i32 {
         Ok(a) => Rc::new(a),
         Err(e) => return fail(&e.message),
     };
+    // `kr secrets-encrypt reload`: a new key or the plaintext switch applies without a restart.
+    {
+        let data = data.clone();
+        api.set_encryption_reloader(Rc::new(move || crate::secrets_encrypt::load(&data, false, false)));
+    }
     // Audit log (ADR-046) and Pod Security configuration.
     let auditor = match audit_setup(&data, audit_policy.as_deref(), audit_path.as_deref(), audit_max, audit_backup, psa_config.as_deref(), &api) {
         Ok(a) => a,

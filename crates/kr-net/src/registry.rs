@@ -525,6 +525,8 @@ pub struct Registry<C: Connector = TcpConnector> {
     /// Bearer tokens keyed by `registry/repository`, with their expiry (ms, `kr_rt` clock).
     tokens: Vec<(String, String, u64)>,
     plain_http: Vec<String>,
+    /// Path in front of `/v2/` for registries served below a path (`/artifactory/api/docker/x`).
+    base_path: String,
     tls_loopback: bool,
     os: String,
     arch: String,
@@ -559,7 +561,7 @@ fn is_loopback_host(hostport: &str) -> bool {
 
 impl<C: Connector> Registry<C> {
     pub fn with_client(http: Client<C>) -> Self {
-        Registry { http, cred: None, basic: None, tokens: Vec::new(), plain_http: Vec::new(), tls_loopback: false, os: "linux".to_string(), arch: target_arch().to_string() }
+        Registry { http, cred: None, basic: None, tokens: Vec::new(), plain_http: Vec::new(), base_path: String::new(), tls_loopback: false, os: "linux".to_string(), arch: target_arch().to_string() }
     }
 
     /// Credentials for this registry: sent only as Basic auth to the registry or its token
@@ -572,6 +574,11 @@ impl<C: Connector> Registry<C> {
     /// Uses https for loopback registries too (e.g. a local registry with its own CA).
     pub fn tls_for_loopback(&mut self) {
         self.tls_loopback = true;
+    }
+
+    /// A path under which the registry's `/v2/` API lives (leading slash, no trailing one).
+    pub fn set_base_path(&mut self, path: &str) {
+        self.base_path = path.trim_end_matches('/').to_string();
     }
 
     /// Allows plain HTTP for a non-loopback registry (`host[:port]`), like docker's insecure list.
@@ -587,7 +594,7 @@ impl<C: Connector> Registry<C> {
 
     fn base(&self, r: &Reference) -> String {
         let plain = (is_loopback_host(&r.registry) && !self.tls_loopback) || self.plain_http.contains(&r.registry);
-        format!("{}://{}", if plain { "http" } else { "https" }, r.endpoint())
+        format!("{}://{}{}", if plain { "http" } else { "https" }, r.endpoint(), self.base_path)
     }
 
     async fn fetch_token(&mut self, r: &Reference, challenge: Option<String>) -> Result<(String, u64)> {

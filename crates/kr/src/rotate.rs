@@ -16,7 +16,8 @@ use kr_sys::fs;
 const USAGE: &[u8] = b"usage: kr pki rotate [--data DIR] [--port 6443] [--service-account-key] [--ca prepare|activate|finish [--yes]]
   Issues the API server serving certificate, the server and admin client certificates and
   admin.kubeconfig again (same names and addresses, new keys, 365 days). Restart `kr server` after.
-  --service-account-key  also replace pki/sa.key (single server only). The old key is kept in
+  --service-account-key  also replace pki/sa.key (in HA copy sa.key and sa-old.pem to the other servers
+                         before restarting them). The old key is kept in
                          pki/sa-old.pem, so tokens issued so far keep verifying until you delete that
                          file and restart; new tokens are signed with the new key
   --ca prepare           (server stopped, single server) creates a new CA and puts both in ca.pem (old
@@ -199,9 +200,6 @@ fn run(data: &str, port: Option<u16>, sa: bool) -> Result<(), String> {
     }
     pki::load_ca(&pki_dir)?;
     let ha = exists(&format!("{data}/raft"));
-    if sa && ha {
-        return Err("--service-account-key in HA would leave the other servers with the old key; not supported yet (docs/KNOWN_ISSUES.md)".into());
-    }
     let port = port
         .or_else(|| fs::read_file(&cstr(&format!("{data}/admin.kubeconfig")), 1 << 20).ok().and_then(|b| kubeconfig_port(&String::from_utf8_lossy(&b))))
         .unwrap_or(6443);
@@ -252,5 +250,8 @@ fn run(data: &str, port: Option<u16>, sa: bool) -> Result<(), String> {
         fs::renameat2(fs::AT_FDCWD, &cstr(&tmp), fs::AT_FDCWD, &cstr(&path), 0).map_err(|e| format!("cannot write pki/sa-old.pem (errno {}); the old key is in {aside}", e.0))?;
     }
     print(format!("rotated {} files; the old ones are in {aside}\nrestart `kr server` to serve the new certificate; admin.kubeconfig was written again ({data}/admin.kubeconfig)\n", moved.len()).as_bytes());
+    if sa && ha {
+        print(b"HA: every server must hold the same service-account keys. Copy pki/sa.key and pki/sa-old.pem from this server to pki/ on each other server BEFORE restarting any of them (servers still on the old key reject tokens that a restarted server signs with the new one until they restart too), then restart the servers one at a time.\n");
+    }
     Ok(())
 }

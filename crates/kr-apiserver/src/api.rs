@@ -129,6 +129,8 @@ pub struct ApiServer {
     version: String,
     /// ServiceAccount token signer and the cluster CA PEM (for kube-root-ca.crt).
     sa: RefCell<Option<(crate::tokens::Signer, String)>>,
+    /// Re-reads the secrets-encryption config and returns the new codec (`POST /kr/encryption/reload`).
+    enc_reload: RefCell<Option<alloc::rc::Rc<dyn Fn() -> core::result::Result<Option<alloc::rc::Rc<dyn kr_store::Codec>>, String>>>>,
     node_proxy: RefCell<Option<alloc::rc::Rc<dyn NodeProxy>>>,
     pod_dialer: RefCell<Option<alloc::rc::Rc<dyn crate::podproxy::PodDialer>>>,
     /// Cluster CA (name, key, DER) for issuing node certificates at join.
@@ -300,7 +302,7 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), oa_cache: RefCell::new(alloc::collections::BTreeMap::new()), parsed: RefCell::new(ParseCache::default()), defer_lists: core::cell::Cell::new(false), list_job: RefCell::new(None), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), agg_http: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default() };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), enc_reload: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), oa_cache: RefCell::new(alloc::collections::BTreeMap::new()), parsed: RefCell::new(ParseCache::default()), defer_lists: core::cell::Cell::new(false), list_job: RefCell::new(None), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), agg_http: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default() };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -625,6 +627,11 @@ impl ApiServer {
 
     /// Enables ServiceAccount tokens (TokenRequest, bearer auth, admission) and creates the
     /// bootstrap RBAC policy and kube-root-ca.crt ConfigMaps.
+    /// Installs the function behind `POST /kr/encryption/reload`.
+    pub fn set_encryption_reloader(&self, f: alloc::rc::Rc<dyn Fn() -> core::result::Result<Option<alloc::rc::Rc<dyn kr_store::Codec>>, String>>) {
+        *self.enc_reload.borrow_mut() = Some(f);
+    }
+
     pub fn set_service_accounts(&self, signer: crate::tokens::Signer, ca_pem: String) -> Result<(), ApiError> {
         *self.sa.borrow_mut() = Some((signer, ca_pem));
         self.bootstrap_policy();
@@ -1395,6 +1402,20 @@ impl ApiServer {
                     st.stalls, st.total_us as f64 / 1e6, st.max_us as f64 / 1e6
                 ) + &self.apf.metrics();
                 return Ok(Reply::Http(kr_net::http1::server::Response::new(200, body.into_bytes()).with_header("Content-Type", "text/plain; version=0.0.4")));
+            }
+            "/kr/encryption/reload" if req.method == "POST" => {
+                if !req.user.as_ref().is_some_and(is_masters) {
+                    return Err(ApiError::new(403, "Forbidden", "only system:masters may reload the encryption configuration"));
+                }
+                let Some(reload) = self.enc_reload.borrow().clone() else { return Err(ApiError::invalid("this server cannot reload the encryption configuration")) };
+                match reload() {
+                    Ok(Some(codec)) => {
+                        self.store.borrow_mut().set_codec(codec);
+                        return Ok(Reply::Json(200, String::from(r#"{"status":"reloaded"}"#)));
+                    }
+                    Ok(None) => return Err(ApiError::invalid("no encryption-config.json: encryption is off")),
+                    Err(e) => return Err(ApiError::invalid(e)),
+                }
             }
             "/version" => {
                 return Ok(Reply::ok(&obj(alloc::vec![

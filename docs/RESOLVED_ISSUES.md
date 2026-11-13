@@ -607,3 +607,12 @@
 
 310. **The cluster CA could not be rotated** — *fixed for one server* (part of #156)
     `kr pki rotate --ca prepare|activate|finish [--yes]` (`rotate.rs`): `prepare` creates the new CA (`ca-next.*`) and writes the bundle old+new to `ca.pem`; `activate` keeps the old CA as `ca-old.*`, writes the bundle new+old with the new key as `ca.key`, updates the hash in `node-token` and re-issues the leaf certificates and the admin kubeconfig; `finish --yes` leaves only the new CA in `ca.pem` and moves the old files aside. The server and agents already trust every certificate in `ca.pem`. Test: `tools/test/ca-rotate.sh`.
+
+311. **Key changes of secrets encryption needed a restart** — *fixed* (part of #188)
+    `POST /kr/encryption/reload` (system:masters) makes the server re-read `encryption-config.json` and swap the store's codec; `kr secrets-encrypt reload`, `rotate-key --online` and `disable --online` use it with `reencrypt --online`, which now also rewrites custom resources (storage version and scope from the CRD). `tools/test/encrypt.sh` rotates and disables a running server and checks the log and the readback.
+
+312. **Service-account key rotation in HA** — *fixed* (part of #177)
+    `kr pki rotate --service-account-key` is allowed in HA and prints the copy-then-restart procedure; `sa-old.pem` is part of the join files so a new server verifies old tokens.
+
+313. **`registries.yaml` base paths and regex** — *fixed* (part of #175)
+    Endpoint paths other than `/v2/<prefix>` set the base path the registry client puts in front of `/v2/`; `rewrite` supports lazy quantifiers, `(?:)`, `(?=)`, `(?!)` and replaces every match.

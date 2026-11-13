@@ -17,7 +17,9 @@ use kr_rt::{eprint, print, Args};
 use kr_store::{Codec, Store};
 use kr_sys::fs;
 
-const USAGE: &str = "usage: kr secrets-encrypt status|rotate-key|reencrypt|disable [--data DIR] [--online [--server URL]]
+const USAGE: &str = "usage: kr secrets-encrypt status|rotate-key|reencrypt|disable|reload [--data DIR] [--online [--server URL]]
+  reload              makes the running server re-read encryption-config.json (no restart)
+  rotate-key --online adds a key, reloads and rewrites everything with it; disable --online likewise to plaintext
   reencrypt --online  rewrites every stored object of the configured resources through the running API
                       server (no stop; in HA too, once every server runs the same key set)";
 
@@ -122,35 +124,55 @@ fn reencrypt(data: &str, cfg: &Config) -> Result<usize, String> {
 
 /// Rewrites every object of the configured resources through the API with the current key
 /// (`?krReencrypt=true` makes the server write even though nothing else changed).
-fn reencrypt_online(data: &str, cfg: &Config, server: &str) -> Result<usize, String> {
+fn admin_remote(data: &str, server: &str) -> Result<kr_apiserver::client::Remote, String> {
     use kr_apiserver::client::{Remote, RemoteAuth};
     let read = |f: &str| fs::read_file(&pki::path(&format!("{data}/pki"), f), 1 << 20).ok().and_then(|b| String::from_utf8(b).ok());
     let (Some(ca_pem), Some(chain), Some(key)) = (read("ca.pem"), read("admin.pem"), read("admin.key")) else {
         return Err("cannot read the server's admin credentials (run on the server, or pass --data)".into());
     };
-    let remote = Remote::new(server, RemoteAuth::ClientCert { chain, key }, &ca_pem).map_err(|e| e.message)?;
+    Remote::new(server, RemoteAuth::ClientCert { chain, key }, &ca_pem).map_err(|e| e.message)
+}
+
+/// Makes the running server re-read `encryption-config.json` (a new first key, or the switch to
+/// plaintext) without a restart.
+fn reload_online(data: &str, server: &str) -> Result<(), String> {
+    use kr_apiserver::client::Client;
+    let remote = admin_remote(data, server)?;
+    kr_rt::exec::block_on(async move { remote.create("/kr/encryption/reload", &kr_fmt::json::Value::Object(Vec::new())).await.map(|_| ()).map_err(|e| format!("reload: {} {}", e.code, e.message)) })
+}
+
+fn reencrypt_online(data: &str, cfg: &Config, server: &str) -> Result<usize, String> {
+    let remote = admin_remote(data, server)?;
     let resources = cfg.resources.clone();
     kr_rt::exec::block_on(async move {
         use kr_apiserver::client::Client;
         let mut done = 0usize;
         for spec in &resources {
             let (plural, group) = spec.split_once('.').unwrap_or((spec.as_str(), ""));
-            let Some(res) = kr_apiserver::resources::RESOURCES.iter().find(|r| r.plural == plural && r.group == group) else {
-                return Err(format!("{spec}: not a built-in resource; rewrite custom resources with no-op updates (kubectl) instead"));
+            // (version, kind, namespaced): from the built-in table, else from the CRD.
+            let (version, kind, namespaced) = match kr_apiserver::resources::RESOURCES.iter().find(|r| r.plural == plural && r.group == group) {
+                Some(res) => (String::from(res.version), String::from(res.kind), res.namespaced),
+                None => {
+                    let crd = remote.get(&format!("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{plural}.{group}")).await.map_err(|e| format!("{spec}: not a built-in resource and no such CRD ({} {})", e.code, e.message))?;
+                    let versions = crd.pointer(&["spec", "versions"]).and_then(kr_fmt::json::Value::as_array).unwrap_or(&[]);
+                    let v = versions.iter().find(|v| v.get("storage").and_then(kr_fmt::json::Value::as_bool) == Some(true)).and_then(|v| v.get("name")).and_then(kr_fmt::json::Value::as_str).ok_or_else(|| format!("{spec}: CRD without a storage version"))?;
+                    let kind = crd.pointer(&["spec", "names", "kind"]).and_then(kr_fmt::json::Value::as_str).map(String::from).unwrap_or_default();
+                    (String::from(v), kind, crd.pointer(&["spec", "scope"]).and_then(kr_fmt::json::Value::as_str) == Some("Namespaced"))
+                }
             };
-            let api_version = if group.is_empty() { String::from(res.version) } else { format!("{group}/{}", res.version) };
-            let root = if group.is_empty() { format!("/api/{}", res.version) } else { format!("/apis/{api_version}") };
+            let api_version = if group.is_empty() { version.clone() } else { format!("{group}/{version}") };
+            let root = if group.is_empty() { format!("/api/{version}") } else { format!("/apis/{api_version}") };
             let base = format!("{root}/{plural}");
             let list = remote.list(&base, "").await.map_err(|e| format!("list {spec}: {} {}", e.code, e.message))?;
             for item in list.get("items").and_then(kr_fmt::json::Value::as_array).unwrap_or(&[]) {
                 let name = kr_apiserver::client::meta(item, "name");
                 let ns = kr_apiserver::client::meta(item, "namespace");
-                let path = if res.namespaced { format!("{root}/namespaces/{ns}/{plural}/{name}") } else { format!("{base}/{name}") };
+                let path = if namespaced { format!("{root}/namespaces/{ns}/{plural}/{name}") } else { format!("{base}/{name}") };
                 // The list gives items without kind/apiVersion; a conflict (changed meanwhile) is retried once with a fresh copy.
                 for attempt in 0..2 {
                     let mut obj = if attempt == 0 { item.clone() } else { remote.get(&path).await.map_err(|e| format!("get {path}: {} {}", e.code, e.message))? };
                     obj.set("apiVersion", kr_fmt::json::Value::from(api_version.as_str()));
-                    obj.set("kind", kr_fmt::json::Value::from(res.kind));
+                    obj.set("kind", kr_fmt::json::Value::from(kind.as_str()));
                     match remote.update(&format!("{path}?krReencrypt=true"), &obj).await {
                         Ok(_) => {
                             done += 1;
@@ -190,10 +212,21 @@ pub fn main(mut args: Args) -> i32 {
         let need = || read_config(&data)?.ok_or_else(|| format!("no {data}/{FILE}: start `kr server` once to create it"));
         match cmd.as_slice() {
             b"status" => status(&data),
+            b"reload" => {
+                reload_online(&data, &server_url)?;
+                print(b"the running server re-read encryption-config.json\n");
+                Ok(())
+            }
             b"rotate-key" => {
                 let mut cfg = need()?;
                 let name = cfg.rotate(rng, pki::now());
                 write_config(&data, &cfg)?;
+                if online {
+                    reload_online(&data, &server_url)?;
+                    let n = reencrypt_online(&data, &cfg, &server_url)?;
+                    print(format!("added key {name}; the running server uses it now and {n} objects were rewritten with it (no restart)\n").as_bytes());
+                    return Ok(());
+                }
                 print(format!("added key {name} as the first key; restart `kr server` to use it, then run `kr secrets-encrypt reencrypt --online` (server running) to rewrite stored Secrets with it\n").as_bytes());
                 Ok(())
             }
@@ -207,6 +240,15 @@ pub fn main(mut args: Args) -> i32 {
                 let cfg = need()?;
                 let n = reencrypt(&data, &cfg)?;
                 print(format!("rewrote the datastore: {n} objects now use {}\n", if cfg.identity_first { "plaintext" } else { &cfg.keys[0].name }).as_bytes());
+                Ok(())
+            }
+            b"disable" if online => {
+                let mut cfg = need()?;
+                cfg.identity_first = true;
+                write_config(&data, &cfg)?;
+                reload_online(&data, &server_url)?;
+                let n = reencrypt_online(&data, &cfg, &server_url)?;
+                print(format!("the running server now writes plaintext and {n} objects were rewritten as plaintext; keys stay in {data}/{FILE} for reading old data\n").as_bytes());
                 Ok(())
             }
             b"disable" => {

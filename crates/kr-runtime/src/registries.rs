@@ -55,12 +55,15 @@ pub struct Attempt {
     pub plain_http: bool,
     pub repository: String,
     pub is_mirror: bool,
+    /// Path under which the endpoint serves `/v2/` (empty for the usual root).
+    pub base_path: String,
 }
 
-/// An endpoint: (`host[:port]`, plain http, repository prefix). A path `/v2/<prefix>` (the form
-/// Harbor, Artifactory and Nexus proxy projects use) puts `<prefix>/` in front of the repository
-/// name; a bare `/v2` is the registry root.
-fn endpoint(e: &str) -> Option<(String, bool, String)> {
+/// An endpoint: (`host[:port]`, plain http, repository prefix, base path). A path `/v2/<prefix>`
+/// (the form Harbor, Artifactory and Nexus proxy projects use) puts `<prefix>/` in front of the
+/// repository name; a bare `/v2` is the registry root; any other path is the base the registry's
+/// `/v2/` API is served under.
+fn endpoint(e: &str) -> Option<(String, bool, String, String)> {
     let e = e.trim();
     let (plain, host) = match e.split_once("://") {
         Some(("http", h)) => (true, h),
@@ -72,11 +75,15 @@ fn endpoint(e: &str) -> Option<(String, bool, String)> {
         Some((h, p)) => (h, p.trim_matches('/')),
         None => (host, ""),
     };
-    let prefix = match path {
-        "" | "v2" => "",
-        p => p.strip_prefix("v2/")?, // any other path would need a base path in the registry client
+    let (prefix, base) = match path {
+        "" | "v2" => ("", ""),
+        p => match p.strip_prefix("v2/") {
+            Some(x) => (x, ""),
+            None => ("", p),
+        },
     };
-    (!host.is_empty() && !prefix.split('/').any(|c| c == "." || c == "..")).then(|| (host.to_string(), plain, prefix.to_string()))
+    let clean = |s: &str| !s.split('/').any(|c| c == "." || c == ".." || c.is_empty() && !s.is_empty());
+    (!host.is_empty() && clean(prefix) && clean(base) && !host.contains(['?', '#', '@'])).then(|| (host.to_string(), plain, prefix.to_string(), if base.is_empty() { String::new() } else { alloc::format!("/{base}") }))
 }
 
 fn s(v: &Value, k: &str) -> Option<String> {
@@ -97,8 +104,8 @@ impl Registries {
             for (reg, v) in m {
                 let mut mirror = Mirror::default();
                 match v.get("endpoint") {
-                    Some(Value::String(e)) => mirror.endpoints.extend(endpoint(e).map(|(h, p, x)| fmt_ep(&h, p, &x))),
-                    Some(Value::Array(a)) => mirror.endpoints.extend(a.iter().filter_map(Value::as_str).filter_map(endpoint).map(|(h, p, x)| fmt_ep(&h, p, &x))),
+                    Some(Value::String(e)) => mirror.endpoints.extend(endpoint(e).map(|(h, p, x, b)| fmt_ep(&h, p, &x, &b))),
+                    Some(Value::Array(a)) => mirror.endpoints.extend(a.iter().filter_map(Value::as_str).filter_map(endpoint).map(|(h, p, x, b)| fmt_ep(&h, p, &x, &b))),
                     _ => {}
                 }
                 if let Some(rw) = v.get("rewrite").and_then(Value::as_object) {
@@ -144,9 +151,9 @@ impl Registries {
         let mut out = Registries::default();
         for e in v.split(',') {
             let Some((from, to)) = e.trim().split_once('=') else { continue };
-            let Some((h, p, x)) = endpoint(to) else { continue };
+            let Some((h, p, x, b)) = endpoint(to) else { continue };
             let key = registry_key(from);
-            let ep = fmt_ep(&h, p, &x);
+            let ep = fmt_ep(&h, p, &x, &b);
             match out.mirrors.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, m)) => m.endpoints.push(ep),
                 None => out.mirrors.push((key, Mirror { endpoints: alloc::vec![ep], rewrites: Vec::new() })),
@@ -212,19 +219,19 @@ impl Registries {
         if let Some(m) = m {
             let repo = m.rewrites.iter().find_map(|(re, to)| Regex::new(re)?.replace(repository, to)).unwrap_or_else(|| repository.to_string());
             for e in &m.endpoints {
-                if let Some((host, plain_http, prefix)) = endpoint(e) {
+                if let Some((host, plain_http, prefix, base_path)) = endpoint(e) {
                     let repository = if prefix.is_empty() { repo.clone() } else { alloc::format!("{prefix}/{repo}") };
-                    out.push(Attempt { host, plain_http, repository, is_mirror: true });
+                    out.push(Attempt { host, plain_http, repository, is_mirror: true, base_path });
                 }
             }
         }
-        out.push(Attempt { host: registry.to_string(), plain_http: false, repository: repository.to_string(), is_mirror: false });
+        out.push(Attempt { host: registry.to_string(), plain_http: false, repository: repository.to_string(), is_mirror: false, base_path: String::new() });
         out
     }
 }
 
-fn fmt_ep(host: &str, plain: bool, prefix: &str) -> String {
-    let path = if prefix.is_empty() { String::new() } else { alloc::format!("/v2/{prefix}") };
+fn fmt_ep(host: &str, plain: bool, prefix: &str, base: &str) -> String {
+    let path = if !prefix.is_empty() { alloc::format!("/v2/{prefix}") } else { String::from(base) };
     alloc::format!("{}://{host}{path}", if plain { "http" } else { "https" })
 }
 
@@ -237,7 +244,12 @@ enum Node {
     Start,
     End,
     Group(usize, Vec<Vec<Node>>),
-    Repeat(Box<Node>, usize, usize),
+    /// `(?:...)`: grouping without a capture.
+    NonCap(Vec<Vec<Node>>),
+    /// `(?=...)` / `(?!...)`: a look-ahead (negated when true).
+    Look(Vec<Vec<Node>>, bool),
+    /// (node, min, max, lazy)
+    Repeat(Box<Node>, usize, usize, bool),
 }
 
 pub struct Regex {
@@ -274,17 +286,33 @@ impl P<'_> {
                     continue;
                 }
                 b'(' => {
-                    if self.s.get(self.i) == Some(&b'?') {
-                        return None;
-                    }
-                    self.groups += 1;
-                    let idx = self.groups;
+                    // `(?:`, `(?=` and `(?!` are supported; flags such as `(?i)` and look-behind are not.
+                    let kind = if self.s.get(self.i) == Some(&b'?') {
+                        let k = *self.s.get(self.i + 1)?;
+                        if !matches!(k, b':' | b'=' | b'!') {
+                            return None;
+                        }
+                        self.i += 2;
+                        k
+                    } else {
+                        b'('
+                    };
+                    let idx = if kind == b'(' {
+                        self.groups += 1;
+                        self.groups
+                    } else {
+                        0
+                    };
                     let inner = self.alt(depth + 1)?;
                     if self.s.get(self.i) != Some(&b')') {
                         return None;
                     }
                     self.i += 1;
-                    Node::Group(idx, inner)
+                    match kind {
+                        b'(' => Node::Group(idx, inner),
+                        b':' => Node::NonCap(inner),
+                        k => Node::Look(inner, k == b'!'),
+                    }
                 }
                 b'^' => Node::Start,
                 b'$' => Node::End,
@@ -295,12 +323,12 @@ impl P<'_> {
                 c => Node::Char(c),
             };
             let (node, adv) = match self.s.get(self.i) {
-                Some(b'*') => (Node::Repeat(Box::new(node), 0, usize::MAX), 1),
-                Some(b'+') => (Node::Repeat(Box::new(node), 1, usize::MAX), 1),
-                Some(b'?') => (Node::Repeat(Box::new(node), 0, 1), 1),
+                Some(b'*') => (Node::Repeat(Box::new(node), 0, usize::MAX, false), 1),
+                Some(b'+') => (Node::Repeat(Box::new(node), 1, usize::MAX, false), 1),
+                Some(b'?') => (Node::Repeat(Box::new(node), 0, 1, false), 1),
                 Some(b'{') => {
                     let (min, max, len) = self.braces()?;
-                    (Node::Repeat(Box::new(node), min, max), len)
+                    (Node::Repeat(Box::new(node), min, max, false), len)
                 }
                 _ => {
                     alts.last_mut()?.push(node);
@@ -308,9 +336,13 @@ impl P<'_> {
                 }
             };
             self.i += adv;
-            if self.s.get(self.i) == Some(&b'?') {
-                return None; // lazy quantifiers
-            }
+            let node = match node {
+                Node::Repeat(n, min, max, _) if self.s.get(self.i) == Some(&b'?') => {
+                    self.i += 1; // lazy: `*?`, `+?`, `??`, `{n,m}?`
+                    Node::Repeat(n, min, max, true)
+                }
+                n => n,
+            };
             alts.last_mut()?.push(node);
         }
         (depth == 0).then_some(alts)
@@ -428,7 +460,27 @@ fn m_seq(nodes: &[Node], s: &[u8], pos: usize, caps: &mut Caps, k: &mut dyn FnMu
             }
             false
         }
-        Node::Repeat(n, min, max) => rep(n, *min, *max, 0, rest, s, pos, caps, k, fuel),
+        Node::NonCap(alts) => {
+            for alt in alts {
+                let mut inner = |p: usize, c: &mut Caps| m_seq(rest, s, p, c, k, &mut 1_000_000);
+                if m_seq(alt, s, pos, caps, &mut inner, fuel) {
+                    return true;
+                }
+            }
+            false
+        }
+        Node::Look(alts, negate) => {
+            let mut found = false;
+            for alt in alts {
+                let mut scratch = caps.clone();
+                if m_seq(alt, s, pos, &mut scratch, &mut |_, _| true, fuel) {
+                    found = true;
+                    break;
+                }
+            }
+            found != *negate && m_seq(rest, s, pos, caps, k, fuel)
+        }
+        Node::Repeat(n, min, max, lazy) => rep(n, *min, *max, *lazy, 0, rest, s, pos, caps, k, fuel),
         n => match single(n, s, pos) {
             Some(np) => m_seq(rest, s, np, caps, k, fuel),
             None => false,
@@ -437,14 +489,18 @@ fn m_seq(nodes: &[Node], s: &[u8], pos: usize, caps: &mut Caps, k: &mut dyn FnMu
 }
 
 #[allow(clippy::too_many_arguments)]
-fn rep(n: &Node, min: usize, max: usize, count: usize, rest: &[Node], s: &[u8], pos: usize, caps: &mut Caps, k: &mut dyn FnMut(usize, &mut Caps) -> bool, fuel: &mut u32) -> bool {
+fn rep(n: &Node, min: usize, max: usize, lazy: bool, count: usize, rest: &[Node], s: &[u8], pos: usize, caps: &mut Caps, k: &mut dyn FnMut(usize, &mut Caps) -> bool, fuel: &mut u32) -> bool {
+    // A lazy repeat tries to stop first, a greedy one to go on first.
+    if lazy && count >= min && m_seq(rest, s, pos, caps, k, fuel) {
+        return true;
+    }
     if count < max {
-        let mut next = |p: usize, c: &mut Caps| (p != pos || count < min) && rep(n, min, max, count + 1, rest, s, p, c, k, &mut 1_000_000);
+        let mut next = |p: usize, c: &mut Caps| (p != pos || count < min) && rep(n, min, max, lazy, count + 1, rest, s, p, c, k, &mut 1_000_000);
         if m_seq(core::slice::from_ref(n), s, pos, caps, &mut next, fuel) {
             return true;
         }
     }
-    count >= min && m_seq(rest, s, pos, caps, k, fuel)
+    !lazy && count >= min && m_seq(rest, s, pos, caps, k, fuel)
 }
 
 impl Regex {
@@ -456,7 +512,11 @@ impl Regex {
 
     /// Leftmost match: (start, end, captures).
     fn find(&self, s: &[u8]) -> Option<(usize, usize, Caps)> {
-        for start in 0..=s.len() {
+        self.find_from(s, 0)
+    }
+
+    fn find_from(&self, s: &[u8], from: usize) -> Option<(usize, usize, Caps)> {
+        for start in from..=s.len() {
             let mut caps: Caps = alloc::vec![None; self.groups + 1];
             for alt in &self.alts {
                 let mut end = None;
@@ -478,32 +538,50 @@ impl Regex {
 
     /// Replaces the first match with `to` (`\1`..`\9` and `$1`..`$9` insert groups); `None`
     /// when the pattern does not match.
+    /// Replaces every non-overlapping match (like Go's `ReplaceAllString`, which containerd uses);
+    /// `None` when nothing matches.
     pub fn replace(&self, s: &str, to: &str) -> Option<String> {
         let b = s.as_bytes();
-        let (st, en, caps) = self.find(b)?;
-        let mut out = String::from(&s[..st]);
         let t = to.as_bytes();
-        let mut i = 0;
-        let mut lit = Vec::new();
-        while i < t.len() {
-            if (t[i] == b'\\' || t[i] == b'$') && t.get(i + 1).is_some_and(u8::is_ascii_digit) {
-                let g = (t[i + 1] - b'0') as usize;
-                if g == 0 {
-                    lit.extend_from_slice(&b[st..en]);
-                } else if let Some(Some((a, e))) = caps.get(g) {
-                    lit.extend_from_slice(&b[*a..*e]);
+        let mut out = String::new();
+        let (mut pos, mut copied, mut any) = (0usize, 0usize, false);
+        while pos <= b.len() {
+            let Some((st, en, caps)) = self.find_from(b, pos) else { break };
+            any = true;
+            out.push_str(&s[copied..st]);
+            let mut i = 0;
+            let mut lit = Vec::new();
+            while i < t.len() {
+                if (t[i] == b'\\' || t[i] == b'$') && t.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                    let g = (t[i + 1] - b'0') as usize;
+                    if g == 0 {
+                        lit.extend_from_slice(&b[st..en]);
+                    } else if let Some(Some((a, e))) = caps.get(g) {
+                        lit.extend_from_slice(&b[*a..*e]);
+                    }
+                    i += 2;
+                } else {
+                    lit.push(t[i]);
+                    i += 1;
                 }
-                i += 2;
-            } else {
-                lit.push(t[i]);
-                i += 1;
             }
+            out.push_str(&String::from_utf8_lossy(&lit));
+            copied = en;
+            // An empty match moves on by one character so the loop ends.
+            pos = if en == st {
+                let step = s[en..].chars().next().map_or(1, char::len_utf8);
+                out.push_str(&s[en..(en + step).min(s.len())]);
+                copied = (en + step).min(s.len());
+                en + step
+            } else {
+                en
+            };
         }
-        out.push_str(&String::from_utf8_lossy(&lit));
-        out.push_str(&s[en..]);
-        Some(out)
-    }
-}
+        any.then(|| {
+            out.push_str(&s[copied.min(s.len())..]);
+            out
+        })
+    }}
 
 #[cfg(test)]
 mod tests {
@@ -550,7 +628,12 @@ configs:
         let a = p.attempts("docker.io", "library/nginx");
         assert_eq!((a[0].host.as_str(), a[0].repository.as_str()), ("harbor.local", "proxy/library/nginx"));
         assert_eq!((a[1].host.as_str(), a[1].repository.as_str()), ("plain.local", "library/nginx"));
-        assert!(Registries::parse("mirrors:\n  a:\n    endpoint: https://h/artifactory/api\n").unwrap().mirrors[0].1.endpoints.is_empty(), "other paths are not supported and are ignored");
+        // any other path is the base the registry's /v2/ API lives under
+        let q = Registries::parse("mirrors:\n  docker.io:\n    endpoint: https://repo.local/artifactory/api/docker/hub/\n").unwrap();
+        let a = q.attempts("docker.io", "library/nginx");
+        assert_eq!((a[0].host.as_str(), a[0].base_path.as_str(), a[0].repository.as_str()), ("repo.local", "/artifactory/api/docker/hub", "library/nginx"));
+        assert!(a[1].base_path.is_empty());
+        assert!(endpoint("https://h/a/../b").is_none());
         // a `*` entry is the default for registries without their own entry
         let w = Registries::parse("configs:\n  \"*\":\n    auth:\n      username: all\n  cache.local:\n    auth:\n      username: own\n").unwrap();
         assert_eq!(w.host_cfg("anything.io").unwrap().auth.as_ref().unwrap().username, "all");
@@ -591,7 +674,14 @@ configs:
         let r = Regex::new("a+b?c[0-9]\\.").unwrap();
         assert!(r.is_match("zaaac7."));
         assert!(!r.is_match("ac."));
-        assert!(Regex::new("(a").is_none() && Regex::new("a{2").is_none() && Regex::new("a{3,2}").is_none() && Regex::new("a{x}").is_none());
+        // non-capturing groups, look-ahead, lazy quantifiers and replace-all
+        assert_eq!(Regex::new("^(?:docker\\.io|quay\\.io)/(.+)$").unwrap().replace("quay.io/a/b", "m/\\1").unwrap(), "m/a/b");
+        assert_eq!(Regex::new("^lib/(?!skip)(.*)$").unwrap().replace("lib/x", "y/\\1").unwrap(), "y/x");
+        assert!(Regex::new("^lib/(?!skip)(.*)$").unwrap().replace("lib/skip", "y").is_none());
+        assert!(Regex::new("^a(?=b)").unwrap().is_match("ab") && !Regex::new("^a(?=b)").unwrap().is_match("ac"));
+        assert_eq!(Regex::new("a.*?b").unwrap().replace("aXbYb", "_").unwrap(), "_Yb".replace("Yb", "Yb"));
+        assert_eq!(Regex::new("o").unwrap().replace("foo/bar-o", "0").unwrap(), "f00/bar-0");
+        assert!(Regex::new("(?i)x").is_none() && Regex::new("(?<=a)b").is_none() && Regex::new("(a").is_none() && Regex::new("a{2").is_none() && Regex::new("a{3,2}").is_none() && Regex::new("a{x}").is_none());
         let r = Regex::new("^lib/(a{2,3})-([0-9]{2})$").unwrap();
         assert_eq!(r.replace("lib/aaa-42", "\\2\\1").unwrap(), "42aaa");
         assert!(r.replace("lib/a-42", "x").is_none() && r.replace("lib/aaaa-42", "x").is_none() && r.replace("lib/aa-4", "x").is_none());
