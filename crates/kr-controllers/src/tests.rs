@@ -962,3 +962,28 @@ fn hpa_never_scales_down_when_a_metric_cannot_be_read() {
         feeder.abort();
     });
 }
+
+#[test]
+fn gc_collects_claims_and_configmaps_of_deleted_owners() {
+    scenario(|c| async move {
+        let p = c.create(PODS, &kr_fmt::json::parse_str(r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"owner","namespace":"default"},"spec":{"containers":[{"name":"c","image":"x"}]}}"#).unwrap()).await.unwrap();
+        let uid = str_at(&p, &["metadata", "uid"]).to_string();
+        let owned = |kind: &str, name: &str| {
+            let spec = if kind == "PersistentVolumeClaim" { r#","spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"1Mi"}}}"# } else { "" };
+            kr_fmt::json::parse_str(&alloc::format!(r#"{{"apiVersion":"v1","kind":"{kind}","metadata":{{"name":"{name}","namespace":"default","ownerReferences":[{{"apiVersion":"v1","kind":"Pod","name":"owner","uid":"{uid}","controller":true,"blockOwnerDeletion":true}}]}}{spec}}}"#)).unwrap()
+        };
+        const PVCS: &str = "/api/v1/namespaces/default/persistentvolumeclaims";
+        const CMS: &str = "/api/v1/namespaces/default/configmaps";
+        c.create(PVCS, &owned("PersistentVolumeClaim", "owner-v")).await.unwrap();
+        c.create(CMS, &owned("ConfigMap", "owner-cm")).await.unwrap();
+        // Owner alive: nothing is collected.
+        kr_rt::exec::sleep(300).await;
+        assert!(c.get(&alloc::format!("{PVCS}/owner-v")).await.is_ok());
+        c.delete(&alloc::format!("{PODS}/owner")).await.unwrap();
+        wait_until("claim and configmap collected", || async {
+            let gone = |o: Result<Value, _>| o.is_err() || o.is_ok_and(|v: Value| !str_at(&v, &["metadata", "deletionTimestamp"]).is_empty());
+            gone(c.get(&alloc::format!("{PVCS}/owner-v")).await) && gone(c.get(&alloc::format!("{CMS}/owner-cm")).await)
+        })
+        .await;
+    });
+}

@@ -1,7 +1,7 @@
 //! The garbage collector: deletes objects whose owners are gone (background propagation).
 //!
 //! A sweep runs every `Config::gc_ms` and immediately after a watch sees an owner kind lose an
-//! object. For each dependent kind (pods, ReplicaSets, ControllerRevisions, Jobs, EndpointSlices) it lists the
+//! object. For each dependent kind (`DEPENDENTS`: pods, ReplicaSets, PVCs, ConfigMaps, ...) it lists the
 //! objects first, then resolves every `ownerReferences` entry to a resource through
 //! `kr_apiserver::resources::RESOURCES` (by `apiVersion` and `kind`) and lists that resource
 //! once per sweep to learn which uids exist. A dependent is deleted when it has at least one
@@ -30,7 +30,14 @@ use kr_apiserver::resources::{Resource, RESOURCES};
 use kr_fmt::json::Value;
 
 /// Kinds whose objects may be garbage collected.
-const DEPENDENTS: &[&str] = &["pods", "replicasets", "controllerrevisions", "jobs", "endpointslices"];
+/// Upstream collects every resource; these are the built-ins that Kubernetes itself (generic
+/// ephemeral volumes: PVCs owned by their pod) and operators create with owner references.
+/// Custom resources are neither collected nor recognised as owners yet (KNOWN_ISSUES #358).
+const DEPENDENTS: &[&str] = &[
+    "pods", "replicasets", "controllerrevisions", "jobs", "endpointslices", "persistentvolumeclaims", "configmaps", "secrets",
+    "services", "serviceaccounts", "deployments", "statefulsets", "daemonsets", "cronjobs", "roles", "rolebindings",
+    "ingresses", "networkpolicies", "poddisruptionbudgets", "horizontalpodautoscalers", "leases",
+];
 /// Owner kinds watched for deletions.
 const OWNERS: &[(&str, &str)] = &[("", "services"), ("", "replicationcontrollers"), ("apps", "deployments"), ("apps", "replicasets"), ("apps", "statefulsets"), ("apps", "daemonsets"), ("batch", "jobs"), ("batch", "cronjobs")];
 

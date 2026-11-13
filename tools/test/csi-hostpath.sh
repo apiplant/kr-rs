@@ -92,7 +92,10 @@ check "generic ephemeral volume: claim deleted with the pod" "waitfor '! kubectl
 # Offline expansion (no pod), then online (mounted).
 check "offline: claim bound" "waitfor '[ \"\$(kubectl get pvc grow -o jsonpath={.status.phase})\" = Bound ]' 30"
 kubectl patch pvc grow -p '{"spec":{"resources":{"requests":{"storage":"32Mi"}}}}' >/dev/null
-check "offline expansion: capacity 32Mi" "waitfor '[ \"\$(kubectl get pvc grow -o jsonpath={.status.capacity.storage})\" = 32Mi ]' 40"
+# The driver needs node expansion for filesystem volumes: the volume grows now, the claim's
+# capacity only once a pod mounts it (FileSystemResizePending meanwhile), as upstream.
+check "offline expansion: volume grown to 32Mi" "waitfor '[ \"\$(kubectl get pv \$(kubectl get pvc grow -o jsonpath={.spec.volumeName}) -o jsonpath={.spec.capacity.storage})\" = 32Mi ]' 40"
+check "offline expansion: claim waits for a pod (FileSystemResizePending)" "waitfor 'kubectl get pvc grow -o jsonpath={.status.conditions[*].type} | grep -q FileSystemResizePending' 20"
 cat <<'Y' | kubectl apply -f - >/dev/null
 apiVersion: v1
 kind: Pod

@@ -1,6 +1,6 @@
 # Known Issues & Potential Problems
 
-Only work still to do lives here. Numbers are stable (other docs cite them); new items get the next free number (next: **358**). When something is fixed, move it to `RESOLVED_ISSUES.md` with the commit. When items are merged, the surviving item lists the absorbed numbers in its title so a search for either finds it.
+Only work still to do lives here. Numbers are stable (other docs cite them); new items get the next free number (next: **360**). When something is fixed, move it to `RESOLVED_ISSUES.md` with the commit. When items are merged, the surviving item lists the absorbed numbers in its title so a search for either finds it.
 
 Goal order: **(A) parity with k3s** (needed to call kr production ready) → **(B) verification** of code that exists but has not run on real systems → **(C) performance** beyond k3s → *Nice to have* (beyond k3s) → *Accepted limitations* (nothing to do unless a trigger happens).
 
@@ -9,11 +9,13 @@ Ordered by impact. Size: S days, M a week or two, L more.
 
 Nothing left: every parity item is closed (RESOLVED 342-345).
 
+358. **Garbage collection of custom resources** — *S*
+    The collector (`kr-controllers/src/gc.rs`) lists a fixed set of built-in dependent kinds (`DEPENDENTS`) and resolves owners only among built-in resources, so a custom resource is never collected and a reference to a custom-resource owner counts as alive (its dependents stay after the owner is deleted). Upstream collects every resource, including CRs, through discovery. Operators that set a CR as owner of their ConfigMaps, Secrets or Deployments rely on it. Fix: walk the served CRDs (and the remaining built-ins) as dependents and owners, with a watch-driven graph instead of listing every kind each sweep once that gets expensive.
+
 # B. Verification backlog (code exists, not run on real systems)
 Each is a test run, not new code, unless the run finds a bug. Left: what needs hardware, credentials or a host decision.
 
 - **#131 SELinux**: AppArmor ran on an Ubuntu 24.04 VM (`tools/test/apparmor-vm.sh`, RESOLVED 357). SELinux is still unrun: on Fedora/RHEL (enforcing, container-selinux), a pod with `seLinuxOptions.level` (`ps -Z`, `ls -Z` of the rootfs and `/dev/shm`) and the `context=` mounts.
-- **#137 / #136 CSI block, inline and generic ephemeral volumes, expansion with a real driver**: only fake drivers ran. Check with a real driver (e.g. Longhorn, or the csi-driver-host-path): a `volumeMode: Block` claim in `volumeDevices` (device visible in the container, I/O works, device-cgroup allows only it; kr adds no supplemental group for the device's group), an inline `csi:` volume of an `Ephemeral`-capable driver, a generic ephemeral volume, and offline plus online expansion including `NodeResizeError` recovery.
 - **#320 S3 against AWS itself**: the S3 client ran against MinIO (HTTP and HTTPS, `tools/test/snapshot-s3.sh`; multipart with `KR_S3_TEST_*`, `crates/kr-net/tests/s3.rs`) and its signatures match AWS's published SigV4 examples, but never against AWS S3: virtual-hosted addressing (`<bucket>.s3.<region>.amazonaws.com`), `--snapshot-s3-session-token` (STS) and a bucket in a region other than the one in `--snapshot-s3-region` (AWS answers 301/400, which is reported, not followed) are untested. Other providers (R2, Ceph, Backblaze) likewise.
 - **GPU, what an RTX 4090 cannot show** (#160, #167): time-slicing, MPS, CDI hooks, restarts and PodResources ran (`tools/test/gpu.sh`, RESOLVED 356). Left: MIG (`mixed`/`single`, `/dev/nvidia-caps/*`; needs an A100/H100-class GPU) and a real unhealthy GPU (XID) evicting its pods within ~10 s (#167; only a fake device plugin did).
 
