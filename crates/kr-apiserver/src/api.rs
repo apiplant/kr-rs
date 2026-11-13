@@ -1522,9 +1522,12 @@ impl ApiServer {
                 let b = self.oa_cached("v3", || Some(crate::openapi::index(&extra).into_bytes())).unwrap_or_default();
                 return Ok(Reply::Json(200, String::from_utf8(b).unwrap_or_default()));
             }
+            // The Accept names `...spec.v2@v1.0+protobuf`, but that is not a valid media type (Go's
+            // mime parser rejects the `@`, and kubectl's validation then fails): upstream answers
+            // application/octet-stream.
             ["openapi", "v2"] if req.accept.is_some_and(|a| a.contains("proto-openapi.spec.v2")) => {
                 let body = self.oa_cached("v2proto", || Some(crate::openapi::v2_proto(&self.custom.borrow()))).unwrap_or_default();
-                return Ok(Reply::Http(kr_net::http1::server::Response::new(200, body).with_header("Content-Type", "application/com.github.proto-openapi.spec.v2@v1.0+protobuf")));
+                return Ok(Reply::Http(kr_net::http1::server::Response::new(200, body).with_header("Content-Type", "application/octet-stream")));
             }
             ["openapi", "v2"] => {
                 let b = self.oa_cached("v2", || Some(crate::openapi::v2(&self.custom.borrow()).into_bytes())).unwrap_or_default();
