@@ -584,6 +584,92 @@ fn audit_setup(data: &str, policy: Option<&str>, path: Option<&str>, max_mb: u64
     Ok(Some(a))
 }
 
+/// `--oidc-*`, `--authentication-config`, `--authentication-token-webhook-*`,
+/// `--authorization-mode` / `--authorization-config` / `--authorization-webhook-*`,
+/// `--enable-admission-plugins`, `--admission-control-config-file` (settings, `KR_*` variables).
+fn ext_auth_setup(api: &kr_apiserver::api::ApiServer) -> Result<(), String> {
+    use kr_apiserver::extauth::{self, Authorizer, AuthorizerSpec, WebhookClient};
+    let env = |k: &str| kr_runtime::store::env_var(k).filter(|v| !v.trim().is_empty());
+    let read = |p: &str| -> Result<String, String> { String::from_utf8(fs::read_file(&[p.as_bytes(), &[0]].concat(), 4 << 20).map_err(|_| format!("cannot read {p}"))?).map_err(|_| format!("{p} is not UTF-8")) };
+    let secs = |k: &str, d: u64| env(k).and_then(|v| v.parse::<u64>().ok()).unwrap_or(d);
+    let kubeconfig = |path: &str| -> Result<kr_apiserver::audit_webhook::Config, String> {
+        let rd = |p: &str| -> Result<Vec<u8>, String> {
+            let full = if p.starts_with('/') { String::from(p) } else { format!("{}/{p}", path.rsplit_once('/').map(|x| x.0).unwrap_or(".")) };
+            fs::read_file(&[full.as_bytes(), &[0]].concat(), 1 << 20).map_err(|_| format!("cannot read {full}"))
+        };
+        kr_apiserver::audit_webhook::Config::from_kubeconfig(&read(path)?, &rd).map_err(|e| format!("{path}: {e}"))
+    };
+    // JWT authenticators.
+    let mut specs = match env("KR_AUTHENTICATION_CONFIG") {
+        Some(p) => kr_apiserver::jwt::parse_config(&read(&p)?)?,
+        None => Vec::new(),
+    };
+    if let Some(iss) = env("KR_OIDC_ISSUER_URL") {
+        if !specs.is_empty() {
+            return Err(String::from("--oidc-* and --authentication-config jwt authenticators are mutually exclusive"));
+        }
+        let ca = match env("KR_OIDC_CA_FILE") {
+            Some(f) => read(&f)?,
+            None => String::new(),
+        };
+        let o = |k: &str| env(k);
+        specs.push(kr_apiserver::jwt::oidc_spec(&iss, &o("KR_OIDC_CLIENT_ID").unwrap_or_default(), o("KR_OIDC_USERNAME_CLAIM").as_deref(), kr_runtime::store::env_var("KR_OIDC_USERNAME_PREFIX").as_deref(), o("KR_OIDC_GROUPS_CLAIM").as_deref(), o("KR_OIDC_GROUPS_PREFIX").as_deref(), o("KR_OIDC_REQUIRED_CLAIM").as_deref(), ca)?);
+    }
+    if !specs.is_empty() {
+        // Issuers without a CA in the configuration are checked against the system bundle.
+        let sys = [&b"/etc/ssl/certs/ca-certificates.crt\0"[..], b"/etc/pki/tls/certs/ca-bundle.crt\0"].iter().find_map(|p| fs::read_file(p, 4 << 20).ok()).and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
+        let roots = x509::pem_decode_all(&sys, "CERTIFICATE").unwrap_or_default();
+        for s in specs {
+            api.ext.jwt.borrow_mut().push(kr_apiserver::jwt::Jwt::new(s, &roots)?);
+        }
+    }
+    // Webhook token authentication.
+    if let Some(f) = env("KR_AUTHN_WEBHOOK_CONFIG") {
+        let version = env("KR_AUTHN_WEBHOOK_VERSION").unwrap_or_else(|| String::from("v1beta1"));
+        *api.ext.token_webhook.borrow_mut() = Some(extauth::TokenWebhook::new(WebhookClient::new(kubeconfig(&f)?, 10_000), &version, secs("KR_AUTHN_WEBHOOK_CACHE_TTL", 120))?);
+    }
+    // Authorizers.
+    let flag_webhook = env("KR_AUTHZ_WEBHOOK_CONFIG").map(|f| extauth::AuthzWebhookSpec {
+        name: String::from("webhook"),
+        kubeconfig: f,
+        version: env("KR_AUTHZ_WEBHOOK_VERSION").unwrap_or_else(|| String::from("v1beta1")),
+        timeout_ms: 30_000,
+        authorized_secs: secs("KR_AUTHZ_WEBHOOK_AUTHORIZED_TTL", 300),
+        unauthorized_secs: secs("KR_AUTHZ_WEBHOOK_UNAUTHORIZED_TTL", 30),
+        failure_deny: false,
+        conditions: Vec::new(),
+    });
+    let chain = match (env("KR_AUTHORIZATION_CONFIG"), env("KR_AUTHORIZATION_MODE")) {
+        (Some(_), Some(_)) => return Err(String::from("--authorization-config and --authorization-mode are mutually exclusive")),
+        (Some(p), None) => Some(extauth::parse_authz_config(&read(&p)?)?),
+        (None, Some(m)) => Some(extauth::parse_mode(&m, flag_webhook)?),
+        (None, None) if flag_webhook.is_some() => return Err(String::from("--authorization-webhook-config-file needs --authorization-mode with Webhook")),
+        (None, None) => None,
+    };
+    if let Some(chain) = chain {
+        let mut out = Vec::new();
+        for a in chain {
+            out.push(match a {
+                AuthorizerSpec::Node => Authorizer::Node,
+                AuthorizerSpec::Rbac => Authorizer::Rbac,
+                AuthorizerSpec::AlwaysAllow => Authorizer::AlwaysAllow,
+                AuthorizerSpec::AlwaysDeny => Authorizer::AlwaysDeny,
+                AuthorizerSpec::Webhook(w) => {
+                    let c = WebhookClient::new(kubeconfig(&w.kubeconfig)?, w.timeout_ms);
+                    Authorizer::Webhook(w.build(c)?)
+                }
+            });
+        }
+        *api.ext.authorizers.borrow_mut() = out;
+    }
+    // Admission plugins.
+    if let Some(names) = env("KR_ADMISSION_PLUGINS") {
+        let cfg = env("KR_ADMISSION_CONFIG").map(|p| read(&p)).transpose()?;
+        *api.ext.plugins.borrow_mut() = kr_apiserver::plugins::configure(&names, cfg.as_deref(), &read)?;
+    }
+    Ok(())
+}
+
 /// The secret the TLS ticket keys are derived from: HKDF over the service-account key with a
 /// purpose label, so the key itself is never used as a ticket key.
 pub fn ticket_secret(sa_key: &[u8; 32]) -> [u8; 32] {
@@ -802,6 +888,10 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
         Ok(a) => a,
         Err(e) => return fail(&e),
     };
+    // OIDC / webhook authentication, the authorizer chain, optional admission plugins (#362).
+    if let Err(e) = ext_auth_setup(&api) {
+        return fail(&e);
+    }
     // KR_POD_FAMILIES=4 | 6 | 4,6 (default): which address families pods and Services have. Set the
     // same on every server of an HA cluster; nodes follow from the podCIDRs they are given.
     match kr_runtime::store::env_var("KR_POD_FAMILIES").filter(|v| !v.is_empty()) {

@@ -23,6 +23,10 @@ fn user_from_certs(chain: Option<&[alloc::vec::Vec<u8>]>) -> Option<User> {
     Some(User { name, groups })
 }
 
+fn bearer_of(req: &Request) -> Option<&str> {
+    req.header("authorization").and_then(|a| a.strip_prefix("Bearer ").or_else(|| a.strip_prefix("bearer "))).map(str::trim)
+}
+
 struct Watch(WatchStream);
 
 impl ResponseStream for Watch {
@@ -42,9 +46,16 @@ pub async fn handle(api: &Rc<ApiServer>, req: Request) -> Response {
     let pf = core::cell::RefCell::new(None);
     let ann = core::cell::RefCell::new(alloc::vec::Vec::new());
     let audit_hdr = req.header("audit-id").map(|s| String::from(s.trim()));
-    let audit = crate::audit::begin(api, &req, user_from_certs(req.peer.client_certs.as_deref()));
+    let cert_user = user_from_certs(req.peer.client_certs.as_deref());
+    // Network-backed authentication (OIDC key refresh, token webhook) before the synchronous
+    // handler; a webhook identity is then treated like a certificate identity (#362).
+    let ext_user = match bearer_of(&req) {
+        Some(t) if cert_user.is_none() && req.header(forward::IDENTITY).is_none() => crate::extauth::authenticate(api, t).await,
+        _ => None,
+    };
+    let audit = crate::audit::begin(api, &req, cert_user.or_else(|| ext_user.clone()));
     let (aid, cached) = (audit.as_ref().map(|p| String::from(p.id())), audit.as_ref().and_then(|p| p.caller()));
-    let mut resp = handle_inner(api, req, &pf, cached, &ann).await;
+    let mut resp = handle_inner(api, req, &pf, cached.or(ext_user), &ann).await;
     kr_rt::exec::phase("http: audit finish");
     crate::audit::finish(api, audit, &mut resp, ann.into_inner());
     // Audit webhook in blocking mode: the reply waits for the events to be accepted.
@@ -89,9 +100,11 @@ async fn handle_inner(api: &Rc<ApiServer>, req: Request, pf: &core::cell::RefCel
         body: &req.body,
         user,
         headers: &req.headers,
-        bearer: req.header("authorization").filter(|_| !have_cached).and_then(|a| a.strip_prefix("Bearer ").or_else(|| a.strip_prefix("bearer "))).map(str::trim),
+        bearer: bearer_of(&req).filter(|_| !have_cached),
         authz_verb: None,
     };
+    // Webhook authorizers are asked here; the synchronous decision reads their cached answers.
+    crate::extauth::prefetch_authz(api, &r).await;
     // API priority and fairness (a request forwarded by another server was admitted there).
     let _permit = if is_forwarded {
         None
@@ -323,6 +336,7 @@ pub async fn serve(api: Rc<ApiServer>, listener: kr_rt::exec::Async<kr_sys::Fd>,
 async fn serve_slot(api: Rc<ApiServer>, listener: kr_rt::exec::Async<kr_sys::Fd>, tls: Rc<core::cell::RefCell<Rc<kr_crypto::tls::ServerConfig>>>) -> kr_net::Result<()> {
     // Parallel clients keep hundreds of idle connections; one over the cap is closed unanswered
     // (the client sees EOF), so the cap sits well above any realistic client count.
+    api.ext.start();
     let cfg = Rc::new(ServerConfig { tls_slot: Some(tls), idle_timeout_ms: 300_000, max_connections: 32_768, ..ServerConfig::default() });
     let handler = move |req: Request| -> HandlerFuture {
         let api = api.clone();

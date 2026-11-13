@@ -186,6 +186,8 @@ pub struct ApiServer {
     pub metrics: crate::metrics::Cache,
     /// Audit log writer and Pod Security configuration (ADR-046).
     pub audit: crate::audit::Hub,
+    /// OIDC/webhook authentication, the authorizer chain and optional admission plugins (#362).
+    pub ext: crate::extauth::Hub,
 }
 
 /// Default namespaces created on first start.
@@ -316,7 +318,7 @@ impl ApiServer {
         store.add_index(POD_NODE_INDEX, &pods, |b| json::string_at(b, &["spec", "nodeName"]).into_iter().collect());
         // Controllers list pods by label (endpoints, daemonsets, statefulsets, jobs, HPA).
         store.add_index(POD_LABEL_INDEX, &pods, |b| json::strings_under(b, &["metadata", "labels"]).into_iter().map(|(k, v)| alloc::format!("{k}={v}")).collect());
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), enc_reload: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), oa_cache: RefCell::new(alloc::collections::BTreeMap::new()), parsed: RefCell::new(ParseCache::default()), defer_lists: core::cell::Cell::new(false), list_job: RefCell::new(None), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), agg_http: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default(), disabled: Default::default(), compacting: Default::default() };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), enc_reload: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), oa_cache: RefCell::new(alloc::collections::BTreeMap::new()), parsed: RefCell::new(ParseCache::default()), defer_lists: core::cell::Cell::new(false), list_job: RefCell::new(None), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), agg_http: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default(), ext: Default::default(), disabled: Default::default(), compacting: Default::default() };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -953,6 +955,26 @@ impl ApiServer {
         if let Some(u) = self.bootstrap_user(token) {
             return Ok((u, None));
         }
+        // A token of a configured OIDC issuer is that authenticator's alone.
+        if let Some(r) = self.ext.verify_jwt(token, (self.now)()) {
+            return r.map(|u| (u, None));
+        }
+        let r = self.verify_sa(token, audiences);
+        if r.is_err() {
+            if let Some(Some(u)) = self.ext.token_cached(token) {
+                return Ok((u, None));
+            }
+        }
+        r
+    }
+
+    /// Whether a bearer token authenticates without the network (bootstrap, ServiceAccount,
+    /// cached OIDC keys, cached webhook answer).
+    pub(crate) fn bearer_valid(&self, token: &str) -> bool {
+        self.verify_bearer(token, &[]).is_ok()
+    }
+
+    fn verify_sa(&self, token: &str, audiences: &[String]) -> Result<(User, Option<(crate::tokens::Claims, Vec<String>)>), &'static str> {
         let sa = self.sa.borrow();
         let (signer, _) = sa.as_ref().ok_or("no service account issuer")?;
         let c = signer.verify(token, (self.now)()).ok_or("invalid bearer token")?;
@@ -1033,17 +1055,48 @@ impl ApiServer {
     /// RBAC decision for `a` (system:masters short-circuits).
     /// `body_name`: the created object's name, for POSTs (node identities only).
     fn authorize(&self, user: &User, a: &crate::rbac::Attrs, body_name: Option<&str>) -> bool {
+        self.authorize_with(user, a, body_name, &|w| w.lookup(user, a).unwrap_or_else(|| w.failure()))
+    }
+
+    /// The authorizer chain (default Node, RBAC; `--authorization-mode` or an
+    /// AuthorizationConfiguration); `webhook` gives a webhook authorizer's answer.
+    pub(crate) fn authorize_with(&self, user: &User, a: &crate::rbac::Attrs, body_name: Option<&str>, webhook: &dyn Fn(&alloc::rc::Rc<crate::extauth::AuthzWebhook>) -> crate::extauth::Verdict) -> bool {
+        use crate::extauth::{Authorizer, Verdict};
         use crate::node_authz::Decision;
         if is_masters(user) {
             return true;
         }
-        if let Some(node) = crate::node_authz::node_name(&user.name, &user.groups) {
-            match crate::node_authz::decide(node, a, body_name, &StorePods(self)) {
-                Decision::Allow => return true,
-                Decision::Deny => return false,
-                Decision::NoOpinion => {}
+        let chain = self.ext.authorizers.borrow().clone();
+        let chain = if chain.is_empty() { alloc::vec![Authorizer::Node, Authorizer::Rbac] } else { chain };
+        for az in &chain {
+            match az {
+                Authorizer::Node => {
+                    if let Some(node) = crate::node_authz::node_name(&user.name, &user.groups) {
+                        match crate::node_authz::decide(node, a, body_name, &StorePods(self)) {
+                            Decision::Allow => return true,
+                            Decision::Deny => return false,
+                            Decision::NoOpinion => {}
+                        }
+                    }
+                }
+                Authorizer::Rbac => {
+                    if self.rbac_allows(user, a) {
+                        return true;
+                    }
+                }
+                Authorizer::Webhook(w) => match webhook(w) {
+                    Verdict::Allow => return true,
+                    Verdict::Deny => return false,
+                    Verdict::NoOpinion => {}
+                },
+                Authorizer::AlwaysAllow => return true,
+                Authorizer::AlwaysDeny => return false,
             }
         }
+        false
+    }
+
+    fn rbac_allows(&self, user: &User, a: &crate::rbac::Attrs) -> bool {
         let store = self.store.borrow();
         let list = |group: &str, plural: &str, ns: Option<&str>| -> Vec<Value> {
             let Some(r) = resources::find(group, "v1", plural) else { return Vec::new() };
@@ -1374,7 +1427,33 @@ impl ApiServer {
         self.check_authorized(req, user, resource.as_ref(), &q, &segs)
     }
 
+    /// The authorization attributes of `req` (and the created object's name for node
+    /// identities), as [`ApiServer::authorize_request`] derives them.
+    pub(crate) fn request_attrs(&self, req: &Req, user: &User) -> Option<(crate::rbac::Attrs, Option<String>)> {
+        let path = req.path.trim_end_matches('/');
+        let q = Query::parse(req.query).ok()?;
+        let segs: Vec<&str> = path.split('/').skip(1).collect();
+        let extra = self.extra();
+        let resource = match segs.as_slice() {
+            ["api", "v1", rest @ ..] if !rest.is_empty() => parse_route(&extra, "", "v1", rest),
+            ["apis", g, v, rest @ ..] if !rest.is_empty() => parse_route(&extra, g, v, rest),
+            _ => None,
+        };
+        Some(self.attrs_of(req, user, resource.as_ref(), &q, &segs))
+    }
+
     fn check_authorized(&self, req: &Req, user: &User, resource: Option<&Route>, q: &Query, segs: &[&str]) -> R<()> {
+        let (attrs, body_name) = self.attrs_of(req, user, resource, q, segs);
+        if !self.authorize(user, &attrs, body_name.as_deref()) {
+            if user.name == "system:anonymous" {
+                return Err(ApiError::new(401, "Unauthorized", "Unauthorized"));
+            }
+            return Err(Self::forbidden(user, &attrs));
+        }
+        Ok(())
+    }
+
+    fn attrs_of(&self, req: &Req, user: &User, resource: Option<&Route>, q: &Query, segs: &[&str]) -> (crate::rbac::Attrs, Option<String>) {
         let path = req.path.trim_end_matches('/');
         let attrs = match resource {
             Some(rt) => crate::rbac::Attrs {
@@ -1406,13 +1485,7 @@ impl ApiServer {
             }
             _ => None,
         };
-        if !self.authorize(user, &attrs, body_name.as_deref()) {
-            if user.name == "system:anonymous" {
-                return Err(ApiError::new(401, "Unauthorized", "Unauthorized"));
-            }
-            return Err(Self::forbidden(user, &attrs));
-        }
-        Ok(())
+        (attrs, body_name)
     }
 
     fn route(&self, req: &Req) -> R<Reply> {
@@ -2370,6 +2443,10 @@ impl ApiServer {
             self.admit_pod(o, &ns)?;
             self.admit_priority(o)?;
             self.admit_pod_classes(o, &ns)?;
+            self.admit_plugins_pod(o, &ns, true)?;
+        }
+        if rt.res.plural == "events" && (rt.res.group.is_empty() || rt.res.group == "events.k8s.io") {
+            self.admit_event_rate(o, rt.namespace.as_deref().unwrap_or(""))?;
         }
         self.admit_pod_security(rt, o, None)?;
         if rt.res.plural == "jobs" {
@@ -2494,6 +2571,9 @@ impl ApiServer {
                     return Err(ApiError::invalid(alloc::format!("PriorityClass.scheduling.k8s.io \"{name}\" is invalid: {f}: Forbidden: may not be changed in an update.")));
                 }
             }
+        }
+        if !status && rt.res.plural == "pods" && rt.res.group.is_empty() {
+            self.admit_plugins_pod(&mut new, rt.namespace.as_deref().unwrap_or(""), false)?;
         }
         if !status {
             self.admit_pod_security(rt, &new, Some(&old))?;
@@ -3618,6 +3698,29 @@ impl ApiServer {
             }
         }
         Ok(())
+    }
+
+    /// The optional pod admission plugins (AlwaysPullImages; PodNodeSelector on create).
+    fn admit_plugins_pod(&self, o: &mut Value, ns: &str, create: bool) -> R<()> {
+        let p = self.ext.plugins.borrow();
+        if p.always_pull {
+            crate::plugins::always_pull(o);
+        }
+        if let Some(sel) = p.node_selector.as_ref().filter(|_| create) {
+            let nsr = resources::find("", "v1", "namespaces").unwrap();
+            let ann = self.store.borrow().get(&nsr.key(None, ns)).and_then(|kv| json::parse(&kv.value).ok()).and_then(|n| n.pointer(&["metadata", "annotations", crate::plugins::NODE_SELECTOR_ANNOTATION]).and_then(Value::as_str).map(String::from));
+            let name = o.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("").to_string();
+            sel.admit(o, ns, ann.as_deref()).map_err(|e| ApiError::new(403, "Forbidden", alloc::format!("pods \"{name}\" is forbidden: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// EventRateLimit for a new Event.
+    fn admit_event_rate(&self, o: &Value, ns: &str) -> R<()> {
+        let p = self.ext.plugins.borrow();
+        let Some(l) = p.event_rate.as_ref() else { return Ok(()) };
+        let user = self.audit.user.borrow().clone();
+        l.admit(ns, &user, o, kr_rt::exec::now_ms()).map_err(|e| ApiError::new(429, "TooManyRequests", e))
     }
 
     /// Sysctl validation, then the RuntimeClass and LimitRanger admission plugins for a new pod.
