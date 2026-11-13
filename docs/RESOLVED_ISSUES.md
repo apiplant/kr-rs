@@ -562,3 +562,27 @@
 
 282. **Load-balancer addresses were not served in userspace mode and `loadBalancerSourceRanges` was ignored** — *fixed* (part of #174)
     The userspace proxy now listens on a Service's `externalIPs` and its `status.loadBalancer.ingress` addresses at the Service port (before, only the node port was served, so the published ServiceLB address did not answer), and both datapaths enforce `spec.loadBalancerSourceRanges` on the load-balancer addresses: userspace drops connections and datagrams from outside the ranges at accept; nftables jumps to a per-address chain that returns for local sources and listed ranges and drops the rest (`Svc.limits`). Checked against a real kernel (`tools/test/nft-proxy.sh`, scenarios `lb-ranges`, `lb-ranges-prefix`) and by a unit test of the range match.
+
+283. **No VolumeSnapshot support** — *closed as k3s parity* (#153)
+    k3s's packaged components are coredns, traefik, local-storage, metrics-server and servicelb (docs.k3s.io, packaged components); it ships no snapshot controller or VolumeSnapshot CRDs either, so an external snapshotter is installed as a normal workload in both. (ADR-045.)
+
+284. **The kubelet does not request serving certificates; no ClusterTrustBundles** — *closed as k3s parity* (#173)
+    k3s passes the kubelet its serving certificate and key from the agent configuration (`ServingKubeletCert`/`ServingKubeletKey` in `pkg/daemons/agent/agent.go`, no `serverTLSBootstrap`), so its kubelet creates no CSRs either. `ClusterTrustBundle` is beta and off by default in Kubernetes 1.33 to 1.36 (stable only from 1.37, per the feature-gates page), so k3s does not enable it by default. CSR garbage collection and the `system:masters` subject check are done (RESOLVED 256, 273).
+
+285. **The secrets-encryption key sits next to the data (no KMS or envelope key)** — *closed as k3s parity* (#190)
+    k3s writes its encryption config to `<data dir>/cred/encryption-config.json` with a random AES-CBC or secretbox key and an identity fallback, and configures no KMS provider (`pkg/daemons/control/deps/deps.go`). Protect the data dir and any `kr snapshot` archive as credentials.
+
+286. **Decrypted Secrets live in memory** — *closed as parity* (#191)
+    kube-apiserver, which k3s embeds unchanged, keeps decoded objects in its watch cache; kr does the same. Memory dumps expose them in both.
+
+287. **A driver upgrade does not reach running pods** — *closed as parity* (#163)
+    Device libraries are bind-mounted when a container is created, as the OCI runtime and CDI do under containerd in k3s: a running container keeps the files it started with, and the pod must be restarted to see a new driver. Not testable here (no way to upgrade a driver under a running pod), so this rests on the mount semantics, not on a run.
+
+288. **Certificate rotation needs a restart** — *closed as k3s parity* (part of #177)
+    `k3s certificate rotate` also requires stopping the service first (docs.k3s.io, certificate). What k3s does better, an overlap period for the service-account key, stays open in #177.
+
+289. **Only secrets are encrypted, and the list is edited by hand** — *closed as k3s parity* (part of #193)
+    k3s generates an encryption config whose only resource is `secrets` and has no command for the list; kr offers more. The hazard of removing a resource that still holds ciphertext remains in #193.
+
+290. **HPA custom and external metrics need an adapter** — *closed as k3s parity* (part of #196)
+    k3s packages metrics-server only, so `custom.metrics.k8s.io` and `external.metrics.k8s.io` need a separately installed adapter there too. `status.krHistory` stays open in #196.
