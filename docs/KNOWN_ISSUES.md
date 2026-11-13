@@ -185,7 +185,7 @@ Ideas that build on what kr already has and that k3s does not offer. None is pla
 11. **aarch64 path is only partly exercised**
     Cross-built binaries run under qemu-user (`tools/test/aarch64.sh`); `kr ctr`/kubelet/apiserver paths (namespaces, cgroups, clone3, mounts) do not work there and need a real aarch64 host. No CI job yet.
 53. **Binary size** — *watch*
-    The single binary (server, agent, runtime, TLS/crypto, CRDs, webhooks, aggregation, protobuf tables) is 3.10 MB on x86_64 (measured 2026-11-01; was 2.87 MB on 2026-10-27, and 2.32 MB on aarch64 then; it was ~1.8 MB when the 2 MB agent budget in PLAN.md was set, which is now exceeded). Measure before adding large features; avoid `{:?}` on large types, and keep `opt-level = "z"` + LTO + strip.
+    The single binary (server, agent, runtime, TLS/crypto, CRDs, webhooks, aggregation, protobuf tables) is 4.54 MB on x86_64 (measured 2026-11-13, after seccomp, the layered store, image GC, nft datapaths and the zstd decoder; it was 3.10 MB on 2026-11-01; was 2.87 MB on 2026-10-27, and 2.32 MB on aarch64 then; it was ~1.8 MB when the 2 MB agent budget in PLAN.md was set, which is now exceeded). Measure before adding large features; avoid `{:?}` on large types, and keep `opt-level = "z"` + LTO + strip.
 60. **P-256 scalar multiplication is slow** — *watch*
     Now a constant-time fixed 4-bit window (masked table scan): ~0.5 ms sign, ~0.95 ms verify (was 0.75 / 1.4 ms), dudect |t| 0.4. Fast enough for the API server's handshake rate so far; revisit if that changes.
 97. **HA (kr-raft, ADR-026) design limits**
