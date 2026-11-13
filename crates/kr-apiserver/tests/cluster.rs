@@ -149,10 +149,20 @@ fn three_servers_replicate_and_fail_over() {
                 break;
             }
         }
-        let li = l.expect("a leader is elected");
+        let mut li = l.expect("a leader is elected");
 
-        // A write on the leader commits and replicates with the same resourceVersion.
-        let (code, cm) = write(&srvs[li], "POST", "/api/v1/namespaces/default/configmaps", r#"{"metadata":{"name":"a"},"data":{"k":"v"}}"#).await;
+        // A write on the leader commits and replicates with the same resourceVersion. A freshly
+        // elected leader can still step down (a slower node's election wins), so retry on the
+        // current leader for a while before failing.
+        let (mut code, mut cm) = (0, Value::Null);
+        for _ in 0..50 {
+            (code, cm) = write(&srvs[li], "POST", "/api/v1/namespaces/default/configmaps", r#"{"metadata":{"name":"a"},"data":{"k":"v"}}"#).await;
+            if code == 201 {
+                break;
+            }
+            sleep(100).await;
+            li = leader(&srvs).unwrap_or(li);
+        }
         assert_eq!(code, 201, "{cm:?}");
         let want_rv = rv(&cm);
         for _ in 0..50 {

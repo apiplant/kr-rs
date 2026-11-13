@@ -4,7 +4,11 @@ use kr_apiserver::api::ApiServer;
 use kr_apiserver::audit::{begin, finish, Auditor, Policy};
 use kr_net::http1::server::{Body, Request, Response, UpgradedConn};
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::task::{Context, Poll};
+
+// The runtime is single-threaded (ADR-005): the tests of this file must not run in parallel.
+static LOCK: Mutex<()> = Mutex::new(());
 
 fn rng(b: &mut [u8]) {
     kr_sys::getrandom(b)
@@ -33,6 +37,7 @@ fn request(path: &str, hdr: &[(&str, &str)]) -> Request {
 
 #[test]
 fn healthz_carries_an_audit_id_even_when_not_audited() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let api = Rc::new(ApiServer::new(kr_store::Store::in_memory(), || 1_700_000_000, rng, "127.0.0.1".into()).unwrap());
     let r = kr_rt::exec::block_on({
         let api = api.clone();
@@ -49,6 +54,7 @@ fn healthz_carries_an_audit_id_even_when_not_audited() {
 
 #[test]
 fn upgraded_connection_records_response_complete_when_it_closes() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = format!("{}/audit-upgrade-{}", env!("CARGO_TARGET_TMPDIR"), std::process::id());
     let path = format!("{dir}/audit.log");
     let api = Rc::new(ApiServer::new(kr_store::Store::in_memory(), || 1_700_000_000, rng, "127.0.0.1".into()).unwrap());

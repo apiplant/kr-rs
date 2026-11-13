@@ -287,7 +287,7 @@ mod tests {
             {"names":["socket"],"action":"SCMP_ACT_ERRNO","args":[{"index":0,"value":16,"op":"SCMP_CMP_EQ"}]},
             {"names":["personality"],"action":"SCMP_ACT_ERRNO","args":[{"index":0,"value":0,"op":"SCMP_CMP_NE"},{"index":0,"value":8,"op":"SCMP_CMP_NE"}]},
             {"names":["clone"],"action":"SCMP_ACT_ERRNO","args":[{"index":0,"value":268435456,"valueTwo":268435456,"op":"SCMP_CMP_MASKED_EQ"}]},
-            {"names":["dup2"],"action":"SCMP_ACT_ERRNO","args":[{"index":1,"value":10,"op":"SCMP_CMP_GE"}]},
+            {"names":["fcntl"],"action":"SCMP_ACT_ERRNO","args":[{"index":1,"value":10,"op":"SCMP_CMP_GE"}]},
             {"names":["dup3"],"action":"SCMP_ACT_ERRNO","args":[{"index":1,"value":10,"op":"SCMP_CMP_LT"}]}
         ]}"#;
         let p = compile(prof, &[]).unwrap();
@@ -299,8 +299,8 @@ mod tests {
         assert_eq!(run(&p, n("personality"), [5, 0, 0, 0, 0, 0]), eperm(), "both conditions hold (5 is neither 0 nor 8): refused");
         assert_eq!(run(&p, n("clone"), [0x1000_0011, 0, 0, 0, 0, 0]), eperm());
         assert_eq!(run(&p, n("clone"), [0x0000_0011, 0, 0, 0, 0, 0]), ALLOW);
-        assert_eq!(run(&p, n("dup2"), [0, 10, 0, 0, 0, 0]), eperm());
-        assert_eq!(run(&p, n("dup2"), [0, 9, 0, 0, 0, 0]), ALLOW);
+        assert_eq!(run(&p, n("fcntl"), [0, 10, 0, 0, 0, 0]), eperm());
+        assert_eq!(run(&p, n("fcntl"), [0, 9, 0, 0, 0, 0]), ALLOW);
         assert_eq!(run(&p, n("dup3"), [0, 9, 0, 0, 0, 0]), eperm());
         assert_eq!(run(&p, n("dup3"), [0, 10, 0, 0, 0, 0]), ALLOW);
     }

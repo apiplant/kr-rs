@@ -558,7 +558,8 @@ mod tests {
         assert_eq!(run_one(&fail, &st, None, None), Err(Fail::Exit(3)));
         let missing = Hook { path: b"/nonexistent/hook".to_vec(), ..Default::default() };
         assert_eq!(run_one(&missing, &st, None, None), Err(Fail::Exit(127)));
-        let slow = Hook { path: b"/bin/sleep".to_vec(), args: alloc::vec![b"sleep".to_vec(), b"30".to_vec()], timeout: 1, ..Default::default() };
+        // Through /bin/sh like the hooks above: /bin/sleep is not a plain binary on every host.
+        let slow = Hook { path: b"/bin/sh".to_vec(), args: alloc::vec![b"sh".to_vec(), b"-c".to_vec(), b"exec sleep 30".to_vec()], timeout: 1, ..Default::default() };
         assert_eq!(run_one(&slow, &st, None, None), Err(Fail::TimedOut));
     }
 

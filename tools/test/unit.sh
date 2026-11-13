@@ -11,7 +11,7 @@ for c in "${crates[@]}"; do
   out=$(/usr/bin/timeout 900 cargo test -q -p "$c" 2>&1); rc=$?
   passed=$(grep -oE '[0-9]+ passed' <<<"$out" | awk '{s+=$1} END{print s+0}')
   if [ $rc -ne 0 ]; then
-    fail=1; echo "FAIL $c (exit $rc, $passed passed before failing)"; grep -E 'panicked|FAILED|overflow|error(\[|:)' <<<"$out" | head -5 | sed 's/^/     /'
+    fail=1; echo "FAIL $c (exit $rc, $passed passed before failing)"; grep -E -A2 'panicked|FAILED|overflow|error(\[|:)' <<<"$out" | grep -v '^--$' | head -12 | sed 's/^/     /'
   else
     echo "ok   $c ($passed passed)"
   fi
