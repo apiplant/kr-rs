@@ -36,6 +36,10 @@ process exits the kernel kills its pods, and a new binary cannot save them. For 
 
 Every later upgrade can skip the drain.
 
+## CA rotation and older agents
+
+`kr pki rotate --ca ...` reaches agents through `/kr/ca-bundle`. An agent from a release that does not follow that endpoint keeps trusting only the old CA: copy the server's `pki/ca.pem` to the agent's `pki/ca.pem` after `prepare` and restart it, or upgrade the agent first.
+
 ## What is not preserved
 
 * A running `kubectl exec` / `attach` session ends with the old process (reconnect; `attach -i`

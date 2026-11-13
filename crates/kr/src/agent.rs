@@ -154,34 +154,34 @@ async fn track_ca(remote: Remote, pki_dir: String, name: String, ip: [u8; 16], s
         if x509::pem_decode_all(bundle, "CERTIFICATE").map_or(true, |v| v.is_empty()) {
             continue;
         }
-        if bundle.trim() == cur.trim() {
-            // After `--ca activate` the signing CA leads the bundle: a node certificate from the
-            // other CA is renewed now rather than at 2/3 of its lifetime, so `--ca finish` can follow.
-            if read("node.pem").is_some_and(|n| !signed_by_first(bundle, &n)) {
-                match renew(&remote, &pki_dir, &name, ip).await.and_then(|()| serving_config(&pki_dir)) {
-                    Ok(cfg) => {
-                        *serving.borrow_mut() = cfg;
-                        print(b"kr agent: node certificates renewed with the new CA\n");
-                    }
-                    Err(e) => eprint(format!("kr agent: renewing with the new CA failed (retrying): {e}\n").as_bytes()),
-                }
+        if bundle.trim() != cur.trim() {
+            let tmp = "ca.pem.new";
+            let _ = fs::unlinkat(fs::AT_FDCWD, &pki::path(&pki_dir, tmp), 0);
+            if pki::write_new(&pki::path(&pki_dir, tmp), bundle.as_bytes(), 0o644).is_err() || fs::renameat2(fs::AT_FDCWD, &pki::path(&pki_dir, tmp), fs::AT_FDCWD, &pki::path(&pki_dir, "ca.pem"), 0).is_err() {
+                continue;
             }
-            continue;
+            let (Some(chain), Some(key)) = (read("node.pem"), read("node.key")) else { continue };
+            if let Err(e) = remote.set_roots(bundle, &chain, &key) {
+                eprint(format!("kr agent: new CA bundle: {}\n", e.message).as_bytes());
+                continue;
+            }
+            if let Ok(cfg) = serving_config(&pki_dir) {
+                *serving.borrow_mut() = cfg;
+            }
+            print(b"kr agent: the cluster CA bundle changed; trusting the new one\n");
         }
-        let tmp = "ca.pem.new";
-        let _ = fs::unlinkat(fs::AT_FDCWD, &pki::path(&pki_dir, tmp), 0);
-        if pki::write_new(&pki::path(&pki_dir, tmp), bundle.as_bytes(), 0o644).is_err() || fs::renameat2(fs::AT_FDCWD, &pki::path(&pki_dir, tmp), fs::AT_FDCWD, &pki::path(&pki_dir, "ca.pem"), 0).is_err() {
-            continue;
+        // After `--ca activate` the signing CA leads the bundle: a node certificate from the
+        // other CA is renewed now (in the same pass that trusted the bundle) rather than at 2/3
+        // of its lifetime, so `--ca finish` can follow.
+        if read("node.pem").is_some_and(|n| !signed_by_first(bundle, &n)) {
+            match renew(&remote, &pki_dir, &name, ip).await.and_then(|()| serving_config(&pki_dir)) {
+                Ok(cfg) => {
+                    *serving.borrow_mut() = cfg;
+                    print(b"kr agent: node certificates renewed with the new CA\n");
+                }
+                Err(e) => eprint(format!("kr agent: renewing with the new CA failed (retrying): {e}\n").as_bytes()),
+            }
         }
-        let (Some(chain), Some(key)) = (read("node.pem"), read("node.key")) else { continue };
-        if let Err(e) = remote.set_roots(bundle, &chain, &key) {
-            eprint(format!("kr agent: new CA bundle: {}\n", e.message).as_bytes());
-            continue;
-        }
-        if let Ok(cfg) = serving_config(&pki_dir) {
-            *serving.borrow_mut() = cfg;
-        }
-        print(b"kr agent: the cluster CA bundle changed; trusting the new one\n");
     }
 }
 
@@ -341,11 +341,17 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
         Ok(v) => v,
         Err(e) => return fail(&e),
     };
-    let cfg = kr_kubelet::Config { labels, taints, external_ip: crate::install::external_ip(), disabled, node_name: name.clone(), root: String::from(store.root()), network: ns::getuid() == 0, cgroups: cgroups_available(), node_ip: ip, vxlan: !matches!(kr_runtime::store::env_var("KR_NET_BACKEND").as_deref(), Some("host-gw" | "wireguard")), wireguard: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() == Some("wireguard"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env(), control_plane: false };
+    let cfg = kr_kubelet::Config { labels, taints, external_ip: crate::install::external_ip(), disabled, node_name: name.clone(), root: String::from(store.root()), network: ns::getuid() == 0, cgroups: cgroups_available(), node_ip: ip, vxlan: !matches!(kr_runtime::store::env_var("KR_NET_BACKEND").as_deref(), Some("host-gw" | "wireguard")), wireguard: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() == Some("wireguard"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env(), control_plane: false, embedded_registry: false };
     let rotation = (remote.clone(), pki_dir.clone(), name.clone(), ip, tls.clone());
     let tracker = remote.clone();
     let (ca_remote, ca_dir, ca_name, ca_tls) = (remote.clone(), pki_dir.clone(), name.clone(), tls.clone());
     let kubelet = kr_kubelet::Kubelet::new(remote, cfg, store);
+    // Embedded registry mirror (#322): serves with the node's serving certificate (it requires a
+    // client certificate of the cluster CA), pulls from peers with the node certificate.
+    {
+        let f = |n: &str| Some(format!("{pki_dir}/{n}"));
+        kubelet.set_mirror(tls.clone(), kr_runtime::registries::TlsCfg { ca_file: f("ca.pem"), cert_file: f("node.pem"), key_file: f("node.key"), insecure: false });
+    }
     print(format!("kr agent: node {name} ({}) -> {server}\n", kr_net::tcp::fmt_ip16(ip)).as_bytes());
     kr_rt::exec::block_on(async move {
         let proxy: Rc<dyn kr_apiserver::api::NodeProxy> = Rc::new(kr_kubelet::stream::Proxy(kubelet.clone()));

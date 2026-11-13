@@ -343,6 +343,24 @@ pub fn escape_ref(s: &str) -> String {
     o
 }
 
+/// Inverse of [`escape_ref`].
+pub fn unescape_ref(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut o = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let h = core::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+            o.push(u8::from_str_radix(h, 16).ok()?);
+            i += 3;
+        } else {
+            o.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(o).ok()
+}
+
 fn valid_container_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -690,6 +708,14 @@ impl Store {
         } else {
             None
         }
+    }
+
+    /// Every stored reference (canonical form) with its image id.
+    pub fn list_refs(&self) -> Vec<(String, ImageId)> {
+        let Ok(dir) = cpath(&self.join("refs")) else { return Vec::new() };
+        let Ok(fd) = fs::openat(AT_FDCWD, &dir, fs::O_RDONLY | fs::O_DIRECTORY | fs::O_CLOEXEC, 0) else { return Vec::new() };
+        let names: Vec<String> = fs::read_dir(&fd).filter_map(|e| e.ok()).filter_map(|e| String::from_utf8(e.name).ok()).filter(|n| !n.starts_with('.')).collect();
+        names.into_iter().filter_map(|n| { let r = unescape_ref(&n)?; let id = self.resolve_ref(&r)?; Some((r, id)) }).collect()
     }
 
     /// Looks up a pulled image: `(id, config, NUL-terminated rootfs path)`.

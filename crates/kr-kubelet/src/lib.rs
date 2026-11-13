@@ -20,6 +20,7 @@ extern crate std;
 pub mod evict;
 pub mod imagegc;
 pub mod node;
+pub mod mirror;
 mod adopt;
 pub mod cni;
 mod csi;
@@ -87,6 +88,9 @@ pub struct Config {
     pub external_ip: Option<[u8; 16]>,
     /// Components turned off with `--disable` (only `coredns` matters here; ADR-060).
     pub disabled: kr_apiserver::components::Disabled,
+    /// `kr server --embedded-registry`: turn the embedded registry mirror on for the cluster
+    /// (agents follow; [`mirror`]).
+    pub embedded_registry: bool,
 }
 
 fn now() -> i64 {
@@ -312,6 +316,8 @@ pub struct Kubelet<C: Client> {
     survive: Cell<bool>,
     /// NetworkPolicy controller state (ADR-049): pods announce their IP before their containers start.
     netpol: Rc<netpol::Ctl>,
+    /// The embedded registry mirror, when the node has the identities for it ([`Kubelet::set_mirror`]).
+    mirror: RefCell<Option<Rc<mirror::Mirror>>>,
     /// Probe results by (namespace, pod, container, probe type, success), for `/metrics/probes`.
     probe_counts: RefCell<BTreeMap<(String, String, String, &'static str, bool), u64>>,
     started_s: i64,
@@ -340,10 +346,16 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     pub fn new(c: C, cfg: Config, store: Store) -> Rc<Self> {
         let devices = deviceplugin::Plugins::new(&deviceplugin::default_dir(&cfg.root));
         let csi = csi::Csi::new(&cfg.node_name);
-        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), starting: RefCell::new(alloc::collections::BTreeSet::new()), notify: Notify::default(), devices, csi, vol_cache: RefCell::new(BTreeMap::new()), vol_abnormal: RefCell::new(alloc::collections::BTreeSet::new()), fs_cache: RefCell::new(BTreeMap::new()), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()), adopted: Cell::new((0, 0)), survive: Cell::new(false), netpol: Rc::new(netpol::Ctl::default()), probe_counts: RefCell::new(BTreeMap::new()), started_s: now_ms() as i64 / 1000 })
+        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), starting: RefCell::new(alloc::collections::BTreeSet::new()), notify: Notify::default(), devices, csi, vol_cache: RefCell::new(BTreeMap::new()), vol_abnormal: RefCell::new(alloc::collections::BTreeSet::new()), fs_cache: RefCell::new(BTreeMap::new()), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()), adopted: Cell::new((0, 0)), survive: Cell::new(false), netpol: Rc::new(netpol::Ctl::default()), mirror: RefCell::new(None), probe_counts: RefCell::new(BTreeMap::new()), started_s: now_ms() as i64 / 1000 })
     }
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
+    /// Gives the kubelet what the embedded registry mirror needs (call before [`Kubelet::run`]):
+    /// a serving identity requiring cluster client certificates, and a client identity.
+    pub fn set_mirror(&self, server_tls: Rc<RefCell<Rc<kr_crypto::tls::ServerConfig>>>, client: kr_runtime::registries::TlsCfg) {
+        *self.mirror.borrow_mut() = Some(mirror::Mirror::new(server_tls, client));
+    }
+
     pub async fn run(self: Rc<Self>) {
         if self.cfg.vxlan && self.cfg.network {
             // Before any sandbox: pod interfaces get the tunnel MTU (uplink - VXLAN overhead).
@@ -467,6 +479,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             let me = self.clone();
             kr_rt::exec::spawn(async move { me.route_loop().await });
             kr_rt::exec::spawn(netpol::run(self.c.clone(), self.cfg.node_name.clone(), self.netpol.clone()));
+        }
+        if let Some(m) = self.mirror.borrow().clone() {
+            kr_rt::exec::spawn(m.run(self.c.clone(), self.cfg.node_name.clone(), self.cfg.root.clone(), self.cfg.embedded_registry));
         }
         let hb = self.clone();
         kr_rt::exec::spawn(async move { node::heartbeat_loop(&hb.c, &hb.cfg, &hb.devices).await });
@@ -2078,7 +2093,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     fn start_pull(self: &Rc<Self>, key: String, image: String, creds: Vec<Cred>) {
         let me = self.clone();
         kr_rt::exec::spawn(async move {
-            let r = kr_runtime::pull::pull_auth(&me.store, &image, &creds).await;
+            let peers = me.mirror.borrow().as_ref().and_then(|m| m.peers(&me.cfg.node_name, &image));
+            let r = match peers {
+                Some(p) => kr_runtime::pull::pull_peers(&me.store, &image, &creds, &p).await,
+                None => kr_runtime::pull::pull_auth(&me.store, &image, &creds).await,
+            };
             let mut pulls = me.pulls.borrow_mut();
             match r {
                 Ok(_) => {

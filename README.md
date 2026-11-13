@@ -103,6 +103,7 @@ More keys (flag or config key; each sets the `KR_*` variable shown, the flag win
 | `image-gc-high-threshold`, `image-gc-low-threshold`, `image-minimum-gc-age` | `KR_IMAGE_GC_HIGH`, `_LOW`, `_MIN_AGE` | percent, percent, `2m` / seconds |
 | `node-eviction-rate`, `secondary-node-eviction-rate`, `unhealthy-zone-threshold`, `large-cluster-size-threshold` | `KR_NODE_EVICTION_RATE`, `KR_SECONDARY_NODE_EVICTION_RATE`, `KR_UNHEALTHY_ZONE_THRESHOLD`, `KR_LARGE_CLUSTER_SIZE_THRESHOLD` | numbers, as for kube-controller-manager |
 | `private-registry` | `KR_REGISTRIES_YAML` | path of a k3s-format `registries.yaml` |
+| `embedded-registry` | | server only, boolean: nodes share pulled images peer to peer (port 5001) for the registries under `mirrors:` in `registries.yaml`; agents follow (ADR-067) |
 | `kubelet-root-dir` | `KR_KUBELET_DIR` | default `/var/lib/kubelet` |
 | `data-dir`, `server`, `token`, `token-file` | (`--data`, `--server`, `--token`, `--token-file`; `KR_TOKEN`) | as in k3s; `data-dir` is an alias of `data` |
 | `disable-network-policy`, `disable-helm-controller` | `KR_DISABLE` | boolean config keys, same as `disable: [...]` |
@@ -159,6 +160,8 @@ Numbers will vary with hardware; the commands to reproduce them are in `tools/te
 ## Features
 
 **Control plane**
+- Embedded registry mirror like k3s (`--embedded-registry`): nodes pull images from each other before the registry, so an image is downloaded once per cluster and pulls keep working while the registry is down
+- Certificate and key rotation without restarts: `kr pki rotate` (leaf certificates, `--service-account-key`, `--ca prepare|activate|finish`) is picked up by the running servers; agents follow the CA bundle and renew by themselves
 - Helm controller: `HelmChart` / `HelmChartConfig` (`helm.cattle.io/v1`) like k3s, run as a `rancher/klipper-helm` Job (`--helm-job-image` to change the image, `--disable helm-controller` to turn off); drop HelmChart YAML into `<data dir>/manifests`, which also deletes what a removed file created
 - Kubernetes API v1.37: core, apps, batch, autoscaling, policy, networking, storage, RBAC, certificates, coordination, discovery, flowcontrol, scheduling, resource (DRA), events and more, served as JSON and protobuf, with watches, chunked lists, Tables and aggregated discovery
 - Embedded datastore (append-only log with MVCC revisions, compaction, optional Raft replication for 3 or more servers) instead of etcd

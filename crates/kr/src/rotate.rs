@@ -1,6 +1,6 @@
 //! `kr pki rotate` / `kr certificate rotate`: issues the leaf certificates of a server again
 //! (ADR-043). The CA and (unless asked) the service-account key stay. Run it on the server's
-//! machine, then restart `kr server`: pods keep running (ADR-036).
+//! machine; a running server reloads the files (`keysync::watch_pki`), no restart.
 //!
 //! Replaced: `pki/apiserver.*` (serving certificate), `pki/kubelet-client.*`, `pki/admin.*` with
 //! `admin.kubeconfig`, and in HA `pki/server.*` (Raft transport). The old files are moved to
@@ -18,27 +18,25 @@ use kr_rt::{eprint, print, Args};
 use kr_sys::fs;
 
 const USAGE: &[u8] = b"usage: kr pki rotate [--data DIR] [--port PORT (default: the server's)] [--service-account-key] [--ca prepare|activate|finish [--yes]|sync]
-  Issues the API server serving certificate, the server and admin client certificates and
-  admin.kubeconfig again (same names and addresses, new keys, 365 days). Restart `kr server` after.
+  Run on a server's machine while it runs: the server reloads changed files within a few seconds
+  (no restart, pods untouched). A stopped server picks them up when it starts.
+  Without --ca: issues the API server serving certificate, the server and admin client certificates
+  and admin.kubeconfig again (same names and addresses, new keys, 365 days).
   --service-account-key  also replace pki/sa.key. The old key is kept in pki/sa-old.pem, so tokens
-                         issued so far keep verifying until you delete that file and restart; new
-                         tokens are signed with the new key. In HA the keys reach every server through
-                         the Raft log in two steps (every server verifies with the new key before any
-                         signs with it) and take effect without a restart.
-  --ca prepare           creates a new CA and puts both in ca.pem (old first, signing unchanged). Single
-                         server: stop it first, then restart. HA: run it on a running server; ca.pem is
-                         replicated and every server trusts the bundle at once (no restart). Running
-                         agents fetch the bundle within a minute (an agent from an older release needs
-                         ca.pem copied).
+                         issued so far keep verifying until you delete that file; new tokens are signed
+                         with the new key. In HA the keys reach every server through the Raft log in two
+                         steps (every server verifies with the new key before any signs with it).
+  --ca prepare           creates a new CA and puts both in ca.pem (old first, signing unchanged); every
+                         server trusts the bundle (HA: replicated). Running agents fetch it within a
+                         minute (an agent too old to follow /kr/ca-bundle needs ca.pem copied).
   --ca activate          signs with the new CA from now on: re-issues the server certificates and
                          admin.kubeconfig and updates node-token and server-token. Old client certificates
                          stay valid. HA: run it on the same server as prepare; ca.pem, ca.key and the
-                         tokens are replicated and every server issues its own certificates again and
-                         uses them (no restart). Single server: restart. Agents renew their certificates
-                         with the new CA within about a minute.
+                         tokens are replicated and every server issues its own certificates again.
+                         Agents renew their certificates with the new CA within about a minute.
   --ca finish            drops the old CA from ca.pem once every agent serves a certificate of the new CA
-                         (checked by connecting to each agent's kubelet; --yes skips the check). HA:
-                         replicated, no restart; single server: restart. Agents fetch the new ca.pem.
+                         (checked by connecting to each agent's kubelet; --yes skips the check). Agents
+                         fetch the new ca.pem within a minute.
   --ca sync              HA: replicates the current CA files again (after a failed replication).
 ";
 
@@ -213,7 +211,7 @@ fn rotate_ca(data: &str, port: Option<u16>, phase: &str, yes: bool) -> Result<()
             let old = read_text(&ca_pem)?;
             put(&ca_pem, &format!("{old}{new_cert}"), 0o644)?;
             replicate_current(data, port, &["pki/ca.pem"])?;
-            print(format!("prepared: pki/ca.pem now holds the old and the new CA (the old one still signs).\n1. running agents fetch the bundle from /kr/ca-bundle within a minute and trust it (copy {ca_pem} to pki/ca.pem of agents from an older release); a single server restarts now, HA servers trust the bundle at once (no restart)\n2. when every node trusts the bundle (its pki/ca.pem has two certificates), run `kr pki rotate --ca activate`\n").as_bytes());
+            print(format!("prepared: pki/ca.pem now holds the old and the new CA (the old one still signs).\n1. running agents fetch the bundle from /kr/ca-bundle within a minute and trust it (copy {ca_pem} to pki/ca.pem of agents from an older release); the servers trust the bundle within a few seconds (no restart)\n2. when every node trusts the bundle (its pki/ca.pem has two certificates), run `kr pki rotate --ca activate`\n").as_bytes());
         }
         "sync" => {
             replicate_current(data, port, &["pki/ca.pem", "pki/ca.key", "node-token", "server-token"])?;
@@ -252,11 +250,7 @@ fn rotate_ca(data: &str, port: Option<u16>, phase: &str, yes: bool) -> Result<()
             }
             run(data, port, false)?;
             replicate_current(data, port, &["pki/ca.pem", "pki/ca.key", "node-token", "server-token"])?;
-            print(if exists(&format!("{data}/raft")) {
-                b"activated: the new CA signs from now on; every server issued its certificates again and uses them (no restart). Agents renew theirs within about a minute; then run `kr pki rotate --ca finish` (it checks every agent first).\n".as_slice()
-            } else {
-                b"activated: the new CA signs from now on; restart the server. Agents renew their certificates within about a minute of the restart; then run `kr pki rotate --ca finish` (it checks every agent first).\n".as_slice()
-            });
+            print(b"activated: the new CA signs from now on; the servers use their new certificates within a few seconds (no restart). Agents renew theirs within about a minute; then run `kr pki rotate --ca finish` (it checks every agent first).\n");
         }
         _ => {
             if !exists(&old_pem) {
@@ -276,7 +270,7 @@ fn rotate_ca(data: &str, port: Option<u16>, phase: &str, yes: bool) -> Result<()
             for (f, name) in [(&old_pem, "ca.pem"), (&old_key, "ca.key")] {
                 fs::renameat2(fs::AT_FDCWD, &cstr(f), fs::AT_FDCWD, &cstr(&format!("{aside}/{name}")), 0).map_err(|e| format!("move {f}: errno {}", e.0))?;
             }
-            let next = if exists(&format!("{data}/raft")) { "Every server uses it now; agents fetch it within a minute" } else { "Restart the server; agents fetch it within a minute of that" };
+            let next = "The servers use it within a few seconds; agents fetch it within a minute";
             print(format!("finished: pki/ca.pem holds only the new CA (the old CA and key are in {aside}). {next}.\n").as_bytes());
         }
     }
@@ -354,9 +348,9 @@ fn run(data: &str, port: Option<u16>, sa: bool) -> Result<(), String> {
         pki::write_new(&cstr(&tmp), &text, 0o600).map_err(|e| format!("cannot write pki/sa-old.pem ({e}); the old key is in {aside}"))?;
         fs::renameat2(fs::AT_FDCWD, &cstr(&tmp), fs::AT_FDCWD, &cstr(&path), 0).map_err(|e| format!("cannot write pki/sa-old.pem (errno {}); the old key is in {aside}", e.0))?;
     }
-    print(format!("rotated {} files; the old ones are in {aside}\nrestart `kr server` to serve the new certificate; admin.kubeconfig was written again ({data}/admin.kubeconfig)\n", moved.len()).as_bytes());
+    print(format!("rotated {} files; the old ones are in {aside}\nthe running server serves the new certificate within a few seconds; admin.kubeconfig was written again ({data}/admin.kubeconfig)\n", moved.len()).as_bytes());
     if sa && ha {
-        print(b"HA: the new service-account key and the earlier ones were replicated; every server signs with the new key and still verifies the old ones, no restart needed for that.\n");
+        print(b"HA: the new service-account key and the earlier ones were replicated; every server signs with the new key and still verifies the old ones.\n");
     }
     Ok(())
 }

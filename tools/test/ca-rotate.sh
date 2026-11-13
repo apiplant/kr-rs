@@ -1,6 +1,6 @@
 #!/bin/bash
 # Cluster CA rotation (#156): prepare, activate, finish on a rootless single server.
-#   tools/test/ca-rotate.sh [path/to/kr]     (needs kubectl, openssl; uses port 17451)
+#   [KR_CA_LIVE=1] tools/test/ca-rotate.sh [path/to/kr]     (needs kubectl, openssl; uses port 17451)
 set -uo pipefail
 KR=${1:-$(cd "$(dirname "$0")/../.." && pwd)/target/debug/kr}
 W=$(mktemp -d); trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$W"' EXIT
@@ -12,6 +12,11 @@ start() { KR_ROOT=$A $KR server --port 17451 >"$W/s.log" 2>&1 & P1=$!; wait_api;
 stop() { kill "$P1"; wait "$P1" 2>/dev/null || true; sleep 1; }
 ncerts() { grep -c "BEGIN CERTIFICATE" "$1"; }
 start
+# KR_CA_LIVE=1: the same steps on the running server (it reloads the files; no restart).
+if [ -n "${KR_CA_LIVE:-}" ]; then
+  stop() { :; }
+  start() { sleep 6; kill -0 "$P1" || { echo "FAIL server exited"; fail=1; }; }
+fi
 cp "$A/server/admin.kubeconfig" "$W/old.kubeconfig"
 OLDHASH=$(openssl x509 -in "$P/ca.pem" -outform DER | sha256sum | cut -d' ' -f1)
 check "node-token pins the old CA" "$(cut -c4-67 "$A/server/node-token")" "$OLDHASH"
@@ -34,7 +39,8 @@ check "activate: the new admin kubeconfig works" "$(works "$A/server/admin.kubec
 check "activate: the old client certificate is still accepted with the bundle" "$(works "$W/mid.kubeconfig")" yes
 check "activate: a client that only trusts the old CA no longer verifies the server" "$(works "$W/old.kubeconfig")" no
 stop
-KR_ROOT=$A $KR pki rotate --ca finish >/dev/null 2>&1 && { echo "FAIL finish without --yes"; fail=1; }
+# Stopped: finish cannot check the agents and refuses without --yes. Live with no agents: nothing to wait for.
+[ -z "${KR_CA_LIVE:-}" ] && { KR_ROOT=$A $KR pki rotate --ca finish >/dev/null 2>&1 && { echo "FAIL finish without --yes"; fail=1; }; }
 KR_ROOT=$A $KR pki rotate --ca finish --yes >/dev/null || fail=1
 check "finish: only the new CA remains" "$(ncerts "$P/ca.pem")" 1
 start

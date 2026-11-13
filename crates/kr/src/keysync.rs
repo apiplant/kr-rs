@@ -230,3 +230,58 @@ pub fn wait_acked(data: &str, server: &str, gen: u64, secs: u64) -> Result<(), S
         kr_rt::exec::block_on(kr_rt::exec::sleep(1000));
     }
 }
+
+/// Every server (single or HA): reloads what `kr pki rotate` changed on disk while the server
+/// runs, so no step of a rotation needs a restart. Checked every 2 s by content digest: the CA
+/// (node certificate signing, `/kr/ca-bundle`, pods' ca.crt), the service-account keys and every
+/// TLS configuration (listeners, Raft, kubelet client).
+pub async fn watch_pki(api: Rc<kr_apiserver::api::ApiServer>, data: String, tls: Rc<server::TlsReload>) {
+    let sum = |files: &[&str]| -> [u8; 32] {
+        let mut all = Vec::new();
+        for f in files {
+            all.extend(read(&data, f).unwrap_or_default().into_bytes());
+            all.push(0);
+        }
+        kr_crypto::sha2::sha256(&all)
+    };
+    const CA: [&str; 2] = ["pki/ca.pem", "pki/ca.key"];
+    const SA: [&str; 3] = ["pki/sa.key", "pki/sa-old.pem", "pki/ca.pem"];
+    let (mut ca, mut sa) = (sum(&CA), sum(&SA));
+    // A rotation writes several files in a row (a certificate, then its key): act only on a
+    // state that held for a whole tick, never on a half-written one.
+    let mut prev = (ca, sa, tls.digest());
+    loop {
+        kr_rt::exec::sleep(2000).await;
+        let now = (sum(&CA), sum(&SA), tls.digest());
+        let stable = now == prev;
+        prev = now;
+        if !stable {
+            continue;
+        }
+        let (ca2, sa2, _) = now;
+        if ca2 != ca {
+            match pki::load_ca(&format!("{data}/pki")) {
+                Ok((name, key, der)) => {
+                    api.set_ca(name, key, der);
+                    ca = ca2;
+                }
+                Err(e) => eprint(format!("kr server: reloading the CA: {e}; will retry\n").as_bytes()),
+            }
+        }
+        if sa2 != sa {
+            match load_signer(&data) {
+                Ok((signer, secret, ca_pem)) => {
+                    kr_net::tls::set_ticket_secret(crate::server::ticket_secret(&secret));
+                    api.reload_service_accounts(signer, ca_pem);
+                    sa = sa2;
+                }
+                Err(e) => eprint(format!("kr server: reloading the service-account keys: {e}; will retry\n").as_bytes()),
+            }
+        }
+        match tls.reload_if_changed() {
+            Ok(true) => print(b"kr server: certificates changed on disk; now serving and trusting the new ones (no restart)\n"),
+            Ok(false) => {}
+            Err(e) => eprint(format!("kr server: reloading certificates: {e}; will retry\n").as_bytes()),
+        }
+    }
+}

@@ -9,7 +9,7 @@
 # docker volumes kr-cache-<name>. Other test scripts pick the mirrors up automatically via `env`.
 set -euo pipefail
 
-UPSTREAMS=("k8s registry.k8s.io https://registry.k8s.io" "docker docker.io https://registry-1.docker.io")
+UPSTREAMS=("k8s registry.k8s.io https://registry.k8s.io" "docker docker.io https://registry-1.docker.io" "quay quay.io https://quay.io")
 
 NET=${2:-bridge}
 ip_of() { docker inspect -f "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}" "$1" 2>/dev/null; }

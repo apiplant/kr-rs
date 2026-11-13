@@ -1,15 +1,20 @@
 #!/bin/bash
-# The kernel (nftables) Service datapath and NetworkPolicy on a real multi-node cluster with the
-# built-in bridge (#133, #205): server krp1 + agents krp2, krp3 in throwaway privileged containers
-# (dev only). Checks ClusterIP, DNS name and NodePort across nodes, NetworkPolicy (deny, podSelector,
-# ipBlock with except, named port) through ClusterIPs, then a `kr server` restart keeps it all.
-#   tools/test/nft-cluster.sh [down]       (needs target/release/kr)
+# The kernel (nftables) Service datapath on a real multi-node cluster (#133, #205): server krp1 +
+# agents krp2, krp3 in throwaway privileged containers (dev only). Checks ClusterIP, DNS name and
+# NodePort across nodes, NetworkPolicy (deny, podSelector, ipBlock with except, named port) through
+# ClusterIPs, then a `kr server` restart keeps it all.
+#   tools/test/nft-cluster.sh [down]       (needs target/release/kr) - kr's built-in bridge
+#   KR_TEST_CNI=calico tools/test/nft-cluster.sh   - Calico (tigera operator, VXLAN, pool
+#       10.244.0.0/16) as an external CNI with KR_PROXY=nft; Calico enforces the policies.
 set -uo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 NODES="krp1 krp2 krp3"
 docker rm -f $NODES >/dev/null 2>&1 || true
 [ "${1:-up}" = down ] && exit 0
 docker network create krnet >/dev/null 2>&1 || true
+CNI=${KR_TEST_CNI:-}
+ENV=""
+[ "$CNI" = calico ] && ENV="KR_PROXY=nft KR_CNI_CONF_DIR=/etc/cni/net.d KR_CNI_BIN_DIR=/opt/cni/bin"
 K="docker exec -i -e KUBECONFIG=/var/tmp/srv/admin.kubeconfig krp1 kubectl"
 MIRRORS=$("$REPO/tools/test/registry-cache.sh" env krnet)
 FAIL=0
@@ -17,19 +22,33 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; FAIL=1; fi; }
 for n in $NODES; do
   docker run -d --name $n --hostname $n --network krnet --privileged --tmpfs /store:exec,size=2g \
     -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" \
-    archlinux:base-devel sleep infinity >/dev/null
+    -v /lib/modules:/lib/modules:ro archlinux:base-devel sleep infinity >/dev/null
+  docker exec $n mkdir -p /etc/cni/net.d /opt/cni/bin
 done
-start_server() { docker exec -d krp1 sh -c "echo \$\$ > /tmp/srv.pid; KR_REGISTRY_MIRRORS=$MIRRORS KR_ROOT=/store exec /krbin/kr server --data /var/tmp/srv >> /tmp/srv.log 2>&1"; }
+start_server() { docker exec -d krp1 sh -c "echo \$\$ > /tmp/srv.pid; KR_REGISTRY_MIRRORS=$MIRRORS $ENV KR_ROOT=/store exec /krbin/kr server --data /var/tmp/srv >> /tmp/srv.log 2>&1"; }
 start_server
 for _ in $(seq 60); do $K get --raw /healthz >/dev/null 2>&1 && break; sleep 1; done
 TOKEN=$(docker exec krp1 cat /var/tmp/srv/node-token)
 IP1=$(docker inspect -f '{{.NetworkSettings.Networks.krnet.IPAddress}}' krp1)
 for n in krp2 krp3; do
   docker exec $n sh -c "umask 077; echo '$TOKEN' > /root/kr-token"
-  docker exec -d $n sh -c "KR_REGISTRY_MIRRORS=$MIRRORS KR_ROOT=/store /krbin/kr agent --server https://$IP1:6443 --token-file /root/kr-token > /tmp/agent.log 2>&1"
+  docker exec -d $n sh -c "KR_REGISTRY_MIRRORS=$MIRRORS $ENV KR_ROOT=/store /krbin/kr agent --server https://$IP1:6443 --token-file /root/kr-token > /tmp/agent.log 2>&1"
 done
 for _ in $(seq 90); do [ "$($K get nodes --no-headers 2>/dev/null | grep -c ' Ready')" = 3 ] && break; sleep 1; done
 $K get nodes
+if [ "$CNI" = calico ]; then
+  helm template calico-crds projectcalico/crd.projectcalico.org.v1 | $K apply --server-side -f - >/dev/null
+  $K create namespace tigera-operator >/dev/null
+  helm template calico projectcalico/tigera-operator -n tigera-operator --no-hooks \
+    --set installation.calicoNetwork.bgp=Disabled \
+    --set 'installation.calicoNetwork.ipPools[0].cidr=10.244.0.0/16' \
+    --set 'installation.calicoNetwork.ipPools[0].encapsulation=VXLAN' \
+    --set 'installation.calicoNetwork.ipPools[0].natOutgoing=Enabled' \
+    --set 'installation.calicoNetwork.ipPools[0].nodeSelector=all()' | $K apply --server-side -n tigera-operator -f - >/dev/null
+  for _ in $(seq 120); do [ "$($K get ds -n calico-system calico-node -o jsonpath='{.status.numberReady}' 2>/dev/null)" = 3 ] && break; sleep 5; done
+  check "calico-node Ready on all nodes" "[ \"\$($K get ds -n calico-system calico-node -o jsonpath='{.status.numberReady}')\" = 3 ]"
+  [ $FAIL = 0 ] || { $K get pods -A -o wide; echo "FAILED (Calico not up; left running)"; exit 1; }
+fi
 check "krp1: nftables datapath" "docker exec krp1 grep -q 'nftables datapath' /tmp/srv.log"
 for n in krp2 krp3; do check "$n: nftables datapath" "docker exec $n grep -q 'nftables datapath' /tmp/agent.log"; done
 

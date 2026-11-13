@@ -22,7 +22,7 @@ use kr_fmt::json::Value;
 pub const DEFAULT_PATH: &str = "/etc/kr/config.yaml";
 
 /// Flags that take no value: `true` emits the bare flag, `false` nothing.
-const BOOL_FLAGS: &[&str] = &["cluster-init", "snapshot-s3", "snapshot-s3-insecure", "snapshot-s3-skip-ssl-verify"];
+const BOOL_FLAGS: &[&str] = &["cluster-init", "embedded-registry", "snapshot-s3", "snapshot-s3-insecure", "snapshot-s3-skip-ssl-verify"];
 
 /// `disable-<name>: true` keys that k3s has as boolean flags.
 const DISABLE_BOOLS: &[&str] = &["network-policy", "helm-controller"];

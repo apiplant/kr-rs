@@ -75,6 +75,47 @@ pub async fn pull_auth(store: &Store, image_ref: &str, creds: &[Cred]) -> Result
     pull_full(store, image_ref, creds, &Limits::default()).await
 }
 
+/// Other nodes of the cluster that serve their image store (the embedded registry mirror,
+/// `kr-kubelet/src/mirror.rs`): tried before any registry for the registries it covers.
+#[derive(Clone, Debug, Default)]
+pub struct Peers {
+    /// `host:port` (IPv6 in brackets), best first.
+    pub hosts: Vec<String>,
+    /// Cluster CA and this node's client certificate (mutual TLS between nodes).
+    pub tls: TlsCfg,
+}
+
+/// The base path under which a peer serves the `/v2/` API of upstream `registry`.
+pub fn peer_base(registry: &str) -> String {
+    format!("/kr/ns/{registry}")
+}
+
+/// Whether a reference may be taken from a peer: pinned by digest, or a tag other than `latest`
+/// (a peer's `latest` may be older than the registry's, as in k3s).
+pub fn peer_eligible(r: &Reference) -> bool {
+    r.digest.is_some() || r.tag.as_deref().is_some_and(|t| t != "latest")
+}
+
+/// [`pull_auth`] trying `peers` first.
+pub async fn pull_peers(store: &Store, image_ref: &str, creds: &[Cred], peers: &Peers) -> Result<ImageId> {
+    if let Some(id) = store.resolve_ref(image_ref).filter(|id| store.has_image(id)) {
+        return Ok(id);
+    }
+    let upstream = Reference::parse(image_ref)?;
+    if peer_eligible(&upstream) {
+        for host in &peers.hosts {
+            let Ok(mut reg) = registry(Some(&peers.tls)) else { break };
+            reg.set_base_path(&peer_base(&upstream.registry));
+            let r = Reference { registry: host.clone(), ..upstream.clone() };
+            let Ok(image) = reg.resolve(&r).await else { continue };
+            if let Ok(id) = finish(store, reg, r, image, image_ref, &Limits::default()).await {
+                return Ok(id);
+            }
+        }
+    }
+    pull_full(store, image_ref, creds, &Limits::default()).await
+}
+
 async fn pull_full(store: &Store, image_ref: &str, creds: &[Cred], limits: &Limits) -> Result<ImageId> {
     if let Some(id) = store.resolve_ref(image_ref) {
         if store.has_image(&id) {

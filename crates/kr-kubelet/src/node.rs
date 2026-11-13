@@ -33,6 +33,11 @@ pub(crate) fn memory_available_ki() -> Option<u64> {
     read(b"/proc/meminfo\0").lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|v| v.split_whitespace().next()?.parse().ok())
 }
 
+/// The node's architecture as Kubernetes names it.
+pub fn arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" }
+}
+
 fn status(cfg: &Config, dp: &crate::deviceplugin::Plugins) -> String {
     let (mut ext_cap, mut ext_alloc) = (String::new(), String::new());
     for (k, cap, healthy) in dp.node_resources() {
@@ -52,8 +57,10 @@ fn status(cfg: &Config, dp: &crate::deviceplugin::Plugins) -> String {
 {{"type":"DiskPressure","status":"False","reason":"KubeletHasNoDiskPressure","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}},
 {{"type":"PIDPressure","status":"False","reason":"KubeletHasSufficientPID","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}}],
 "addresses":[{{"type":"InternalIP","address":"{ip}"}}{ip6}{ext},{{"type":"Hostname","address":"{name}"}}],
+"images":{images},
 "nodeInfo":{{"kubeletVersion":"v1.37.0-kr","kubeProxyVersion":"v1.37.0-kr","containerRuntimeVersion":"kr://0.0.1","kernelVersion":"{kernel}","osImage":"kr","operatingSystem":"linux","architecture":"{arch}","machineID":"","systemUUID":"","bootID":""}}}}"#,
         name = cfg.node_name,
+        images = kr_runtime::store::Store::open(Some(&cfg.root)).map(|st| json::to_string(&crate::mirror::status_images(&st))).unwrap_or_else(|_| String::from("[]")),
         ip6 = kr_apiserver::api::host_ip6().filter(|a| *a != cfg.node_ip).map(|a| alloc::format!(r#",{{"type":"InternalIP","address":"{}"}}"#, kr_net::tcp::ipv6_string(a))).unwrap_or_default(),
         ext = cfg.external_ip.map(|a| alloc::format!(r#",{{"type":"ExternalIP","address":"{}"}}"#, kr_net::tcp::fmt_ip16(a))).unwrap_or_default(),
         kernel = kernel.trim(),

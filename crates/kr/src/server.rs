@@ -363,6 +363,14 @@ fn api_tls(pki_dir: &str) -> Result<Rc<ServerConfig>, String> {
     Ok(Rc::new(ServerConfig { cert_chain: chain, key, client_auth: ClientAuth::Optional(ca), alpn: alloc::vec![b"http/1.1".to_vec()] }))
 }
 
+/// The embedded registry mirror's TLS configuration on a server.
+fn mirror_tls(pki_dir: &str) -> Result<Rc<ServerConfig>, String> {
+    let a = api_tls(pki_dir)?;
+    let ca = load_pem(pki_dir, "ca.pem", "CERTIFICATE")?;
+    let key = x509::private_key_from_pkcs8(&load_pem(pki_dir, "apiserver.key", "PRIVATE KEY")?.pop().ok_or("apiserver.key empty")?).map_err(|_| "apiserver.key unsupported")?;
+    Ok(Rc::new(ServerConfig { cert_chain: a.cert_chain.clone(), key, client_auth: ClientAuth::Required(ca), alpn: alloc::vec![b"http/1.1".to_vec()] }))
+}
+
 /// The client identity for reaching agents' kubelets.
 fn kubelet_client_tls(pki_dir: &str) -> Result<Rc<kr_crypto::tls::ClientConfig>, String> {
     let chain = load_pem(pki_dir, "kubelet-client.pem", "CERTIFICATE")?;
@@ -381,14 +389,15 @@ pub(crate) struct TlsReload {
     api: Slot<ServerConfig>,
     kubelet: Slot<kr_crypto::tls::ClientConfig>,
     raft: Option<(Slot<ServerConfig>, Rc<kr_apiserver::cluster::Cluster>)>,
+    mirror: Option<Slot<ServerConfig>>,
     /// Digest of the PKI files the loaded configurations were built from.
     loaded: core::cell::RefCell<[u8; 32]>,
 }
 
 impl TlsReload {
-    fn digest(&self) -> [u8; 32] {
+    pub(crate) fn digest(&self) -> [u8; 32] {
         let mut all = Vec::new();
-        for f in ["ca.pem", "apiserver.pem", "server.pem", "kubelet-client.pem"] {
+        for f in ["ca.pem", "apiserver.pem", "apiserver.key", "server.pem", "server.key", "kubelet-client.pem", "kubelet-client.key"] {
             all.extend(fs::read_file(&pki::path(&self.pki_dir, f), 1 << 20).unwrap_or_default());
             all.push(0);
         }
@@ -397,11 +406,12 @@ impl TlsReload {
 
     /// [`TlsReload::reload`] when the files changed since the last load (a key-sync record
     /// carries every file, so most generations change nothing here).
-    pub(crate) fn reload_if_changed(&self) -> Result<(), String> {
+    /// Ok(true) when it reloaded.
+    pub(crate) fn reload_if_changed(&self) -> Result<bool, String> {
         if *self.loaded.borrow() == self.digest() {
-            return Ok(());
+            return Ok(false);
         }
-        self.reload()
+        self.reload().map(|()| true)
     }
 
     pub(crate) fn reload(&self) -> Result<(), String> {
@@ -412,7 +422,14 @@ impl TlsReload {
             Some(_) => Some(server_tls(&self.pki_dir)?),
             None => None,
         };
+        let mirror = match &self.mirror {
+            Some(_) => Some(mirror_tls(&self.pki_dir)?),
+            None => None,
+        };
         *self.api.borrow_mut() = api;
+        if let (Some(slot), Some(m)) = (&self.mirror, mirror) {
+            *slot.borrow_mut() = m;
+        }
         *self.kubelet.borrow_mut() = kubelet;
         if let (Some((slot, c)), Some((srv, cli))) = (&self.raft, raft) {
             *slot.borrow_mut() = srv;
@@ -524,6 +541,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
     let (mut join_url, mut token, mut token_file): (Option<String>, Option<String>, Option<String>) = (None, None, None);
     let mut inst = crate::install::Install::default();
     let mut helm_image: Option<String> = None;
+    let mut embedded_registry = false;
     while let Some(a) = args.next() {
         // `--flag=value` and `--flag value` are both accepted.
         let (a, inline) = match a.iter().position(|&c| c == b'=') {
@@ -531,7 +549,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
             _ => (a, None),
         };
         // Switches take no value (so the next argument stays a flag); `--flag=false` still works.
-        let switch = a == b"--cluster-init" || crate::snapshot::is_s3_bool_flag(a, "--snapshot-s3");
+        let switch = a == b"--cluster-init" || a == b"--embedded-registry" || crate::snapshot::is_s3_bool_flag(a, "--snapshot-s3");
         let v = if switch { inline } else { inline.or_else(|| args.next()) }.and_then(|v| core::str::from_utf8(v).ok());
         if let Some(val) = v {
             if inst.take(a, val) {
@@ -550,6 +568,11 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
                     return fail(&format!("unexpected argument {v}"));
                 }
             }
+            (b"--embedded-registry", v) => match v {
+                None | Some("true") => embedded_registry = true,
+                Some("false") => embedded_registry = false,
+                Some(v) => return fail(&format!("--embedded-registry: unexpected value {v}")),
+            },
             (b"--server", Some(v)) => join_url = Some(String::from(v.trim_end_matches('/'))),
             (b"--token", Some(v)) => {
                 eprint(b"kr server: warning: --token exposes the server token to local users via the process list; use --token-file or KR_TOKEN\n");
@@ -594,7 +617,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
                 Ok(Err(e)) => return fail(&e),
                 _ => return fail(&format!("unknown or incomplete flag {}", String::from_utf8_lossy(f))),
             },
-            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h [--snapshot-keep 5] [--snapshot-s3 --snapshot-s3-bucket B [--snapshot-s3-endpoint HOST:PORT] [--snapshot-s3-folder DIR] [--snapshot-s3-region R] [--snapshot-s3-access-key K --snapshot-s3-secret-key S] [--snapshot-s3-insecure] [--snapshot-s3-endpoint-ca FILE] [--snapshot-s3-skip-ssl-verify]]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--audit-log-maxage DAYS] [--audit-log-format json|legacy] [--audit-webhook-config-file KUBECONFIG [--audit-webhook-mode batch|blocking|blocking-strict] [--audit-webhook-batch-max-size N] [--audit-webhook-batch-max-wait 30s] [--audit-webhook-batch-buffer-size N] [--audit-webhook-initial-backoff 10s]] [--pod-security-config FILE] [--config FILE] [--tls-san NAME]... [--node-name NAME] [--node-label K=V]... [--node-taint K=V:EFFECT]... [--node-ip IP] [--node-external-ip IP] [--disable COMPONENT]... [--helm-job-image IMAGE] [--cluster-cidr CIDR] [--service-cidr CIDR] [--cluster-domain NAME] [--flannel-backend vxlan|host-gw|wireguard-native] [--proxy-mode userspace|nftables] [--max-pods N] [--private-registry FILE] (more keys: README, configuration file)"),
+            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h [--snapshot-keep 5] [--snapshot-s3 --snapshot-s3-bucket B [--snapshot-s3-endpoint HOST:PORT] [--snapshot-s3-folder DIR] [--snapshot-s3-region R] [--snapshot-s3-access-key K --snapshot-s3-secret-key S] [--snapshot-s3-insecure] [--snapshot-s3-endpoint-ca FILE] [--snapshot-s3-skip-ssl-verify]]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--audit-log-maxage DAYS] [--audit-log-format json|legacy] [--audit-webhook-config-file KUBECONFIG [--audit-webhook-mode batch|blocking|blocking-strict] [--audit-webhook-batch-max-size N] [--audit-webhook-batch-max-wait 30s] [--audit-webhook-batch-buffer-size N] [--audit-webhook-initial-backoff 10s]] [--pod-security-config FILE] [--config FILE] [--tls-san NAME]... [--node-name NAME] [--node-label K=V]... [--node-taint K=V:EFFECT]... [--node-ip IP] [--node-external-ip IP] [--disable COMPONENT]... [--helm-job-image IMAGE] [--embedded-registry] [--cluster-cidr CIDR] [--service-cidr CIDR] [--cluster-domain NAME] [--flannel-backend vxlan|host-gw|wireguard-native] [--proxy-mode userspace|nftables] [--max-pods N] [--private-registry FILE] (more keys: README, configuration file)"),
         }
     }
     if let Err(e) = crate::install::publish(&inst) {
@@ -767,8 +790,17 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
         return fail(&e.message);
     }
     print(format!("kr server: listening on https://0.0.0.0:{port}\nkr server: export KUBECONFIG={data}/admin.kubeconfig\n").as_bytes());
-    let kubelet = match start_kubelet(&api, disabled) {
-        Ok(k) => Some(k),
+    // The embedded registry mirror (#322) serves with the API serving certificate (it has the
+    // node's addresses) and requires a client certificate of the cluster CA.
+    let mirror_slot: Option<Slot<ServerConfig>> = mirror_tls(&pki_dir).ok().map(|c| Rc::new(core::cell::RefCell::new(c)));
+    let kubelet = match start_kubelet(&api, disabled, embedded_registry) {
+        Ok(k) => {
+            if let Some(slot) = &mirror_slot {
+                let f = |n: &str| Some(format!("{pki_dir}/{n}"));
+                k.set_mirror(slot.clone(), kr_runtime::registries::TlsCfg { ca_file: f("ca.pem"), cert_file: f("kubelet-client.pem"), key_file: f("kubelet-client.key"), insecure: false });
+            }
+            Some(k)
+        }
         Err(e) => {
             eprint(format!("kr server: kubelet disabled: {e}\n").as_bytes());
             None
@@ -783,7 +815,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
     };
     let api_slot: Slot<ServerConfig> = Rc::new(core::cell::RefCell::new(tls));
     let raft_slot: Option<Slot<ServerConfig>> = ha_tasks.as_ref().map(|(_, _, srv, _)| Rc::new(core::cell::RefCell::new(srv.clone())));
-    let reload = Rc::new(TlsReload { pki_dir: pki_dir.clone(), api: api_slot.clone(), kubelet: kubelet_client.clone(), raft: raft_slot.clone().zip(ha_tasks.as_ref().map(|t| t.0.clone())), loaded: core::cell::RefCell::new([0; 32]) });
+    let reload = Rc::new(TlsReload { pki_dir: pki_dir.clone(), api: api_slot.clone(), kubelet: kubelet_client.clone(), raft: raft_slot.clone().zip(ha_tasks.as_ref().map(|t| t.0.clone())), mirror: mirror_slot.clone(), loaded: core::cell::RefCell::new([0; 32]) });
     *reload.loaded.borrow_mut() = reload.digest();
     let api_for_proxy = api.clone();
     let snapshot_data = data.clone();
@@ -823,6 +855,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
                 kr_rt::exec::spawn(kr_controllers::manifests::run(manifest_client, manifest_dir));
             }
         }
+        kr_rt::exec::spawn(crate::keysync::watch_pki(api.clone(), data_for_sync.clone(), reload.clone()));
         if let Some(every) = snap_every {
             kr_rt::exec::spawn(crate::snapshot::schedule(snapshot_data, every, snap_keep, snap_s3));
         }
@@ -869,14 +902,14 @@ pub fn cgroups_available() -> bool {
 }
 
 /// The node agent embedded in the server (single-node mode).
-fn start_kubelet(api: &Rc<kr_apiserver::api::ApiServer>, disabled: kr_apiserver::components::Disabled) -> Result<Rc<kr_kubelet::Kubelet<kr_apiserver::client::InProcess>>, String> {
+fn start_kubelet(api: &Rc<kr_apiserver::api::ApiServer>, disabled: kr_apiserver::components::Disabled, embedded_registry: bool) -> Result<Rc<kr_kubelet::Kubelet<kr_apiserver::client::InProcess>>, String> {
     let store = kr_runtime::store::Store::open(None).map_err(|_| String::from("cannot open the image store"))?;
     crate::ctr_import::import_startup(&store, None);
     let name = node_name();
     let cgroups = cgroups_available();
     let node_ip = primary_addr();
     let (labels, taints) = crate::install::node_settings()?;
-    let cfg = kr_kubelet::Config { labels, taints, external_ip: crate::install::external_ip(), disabled, node_name: name, root: String::from(store.root()), network: ns::getuid() == 0, cgroups, node_ip, vxlan: !matches!(kr_runtime::store::env_var("KR_NET_BACKEND").as_deref(), Some("host-gw" | "wireguard")), wireguard: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() == Some("wireguard"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env(), control_plane: true };
+    let cfg = kr_kubelet::Config { labels, taints, external_ip: crate::install::external_ip(), disabled, node_name: name, root: String::from(store.root()), network: ns::getuid() == 0, cgroups, node_ip, vxlan: !matches!(kr_runtime::store::env_var("KR_NET_BACKEND").as_deref(), Some("host-gw" | "wireguard")), wireguard: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() == Some("wireguard"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env(), control_plane: true, embedded_registry };
     let client = kr_apiserver::client::InProcess::new(api.clone(), "kubelet");
     Ok(kr_kubelet::Kubelet::new(client, cfg, store))
 }
