@@ -47,6 +47,27 @@ const SETTINGS: &[(&str, &str, Translate)] = &[
     ("large-cluster-size-threshold", "KR_LARGE_CLUSTER_SIZE_THRESHOLD", uint),
     ("private-registry", "KR_REGISTRIES_YAML", plain),
     ("kubelet-root-dir", "KR_KUBELET_DIR", plain),
+    // API server authentication, authorization and admission (#362), kube-apiserver names.
+    ("authentication-config", "KR_AUTHENTICATION_CONFIG", plain),
+    ("oidc-issuer-url", "KR_OIDC_ISSUER_URL", plain),
+    ("oidc-client-id", "KR_OIDC_CLIENT_ID", plain),
+    ("oidc-username-claim", "KR_OIDC_USERNAME_CLAIM", plain),
+    ("oidc-username-prefix", "KR_OIDC_USERNAME_PREFIX", plain),
+    ("oidc-groups-claim", "KR_OIDC_GROUPS_CLAIM", plain),
+    ("oidc-groups-prefix", "KR_OIDC_GROUPS_PREFIX", plain),
+    ("oidc-required-claim", "KR_OIDC_REQUIRED_CLAIM", plain),
+    ("oidc-ca-file", "KR_OIDC_CA_FILE", plain),
+    ("authentication-token-webhook-config-file", "KR_AUTHN_WEBHOOK_CONFIG", plain),
+    ("authentication-token-webhook-cache-ttl", "KR_AUTHN_WEBHOOK_CACHE_TTL", duration_secs),
+    ("authentication-token-webhook-version", "KR_AUTHN_WEBHOOK_VERSION", plain),
+    ("authorization-config", "KR_AUTHORIZATION_CONFIG", plain),
+    ("authorization-mode", "KR_AUTHORIZATION_MODE", plain),
+    ("authorization-webhook-config-file", "KR_AUTHZ_WEBHOOK_CONFIG", plain),
+    ("authorization-webhook-cache-authorized-ttl", "KR_AUTHZ_WEBHOOK_AUTHORIZED_TTL", duration_secs),
+    ("authorization-webhook-cache-unauthorized-ttl", "KR_AUTHZ_WEBHOOK_UNAUTHORIZED_TTL", duration_secs),
+    ("authorization-webhook-version", "KR_AUTHZ_WEBHOOK_VERSION", plain),
+    ("enable-admission-plugins", "KR_ADMISSION_PLUGINS", plain),
+    ("admission-control-config-file", "KR_ADMISSION_CONFIG", plain),
 ];
 
 fn plain(v: &str) -> Result<Option<String>, String> {
@@ -94,14 +115,36 @@ fn eviction_hard(v: &str) -> Result<Option<String>, String> {
 
 /// `120`, `90s`, `2m`, `1h` as seconds.
 fn duration_secs(v: &str) -> Result<Option<String>, String> {
-    let v = v.trim();
-    let (n, mul) = match v.as_bytes().last() {
-        Some(b's') => (&v[..v.len() - 1], 1),
-        Some(b'm') => (&v[..v.len() - 1], 60),
-        Some(b'h') => (&v[..v.len() - 1], 3600),
-        _ => (v, 1),
-    };
-    n.parse::<u64>().map(|n| Some((n * mul).to_string())).map_err(|_| alloc::format!("{v:?} is not a duration"))
+    let t = v.trim();
+    let bad = || alloc::format!("{v:?} is not a duration");
+    if let Ok(n) = t.parse::<u64>() {
+        return Ok(Some(n.to_string()));
+    }
+    // `90s`, `2m`, `1h30m`, `5m0s` (Go durations without fractions).
+    let (mut total, mut num) = (0u64, 0u64);
+    let mut digits = false;
+    for c in t.chars() {
+        if let Some(d) = c.to_digit(10) {
+            num = num.checked_mul(10).and_then(|n| n.checked_add(d as u64)).ok_or_else(bad)?;
+            digits = true;
+            continue;
+        }
+        let mul = match c {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            _ => return Err(bad()),
+        };
+        if !digits {
+            return Err(bad());
+        }
+        total += num * mul;
+        (num, digits) = (0, false);
+    }
+    if digits || t.is_empty() {
+        return Err(bad());
+    }
+    Ok(Some(total.to_string()))
 }
 
 /// Removes `--config FILE` / `--config=FILE` from `argv`; returns the path (explicit: the file
@@ -295,6 +338,15 @@ impl Install {
             b"--node-ip" | b"-i" => self.node_ip = Some(value.to_string()),
             b"--node-external-ip" => self.node_external_ip = Some(value.to_string()),
             b"--disable" => self.disable.push(value.to_string()),
+            // k3s pass-through: `kube-apiserver-arg: [oidc-issuer-url=...]` for the settings above.
+            b"--kube-apiserver-arg" => {
+                let (k, v) = value.trim_start_matches("--").split_once('=').unwrap_or((value, ""));
+                let flag = alloc::format!("--{k}");
+                let known = SETTINGS.iter().skip_while(|(n, _, _)| *n != "authentication-config").any(|(n, _, _)| *n == k);
+                if !known || !self.take(flag.as_bytes(), v) {
+                    self.errors.push(alloc::format!("kube-apiserver-arg: unsupported argument {k:?}"));
+                }
+            }
             _ => {
                 let Some((_, var, f)) = SETTINGS.iter().find(|(n, _, _)| flag.strip_prefix(b"--") == Some(n.as_bytes())) else { return false };
                 match f(value) {
@@ -462,6 +514,19 @@ mod tests {
         let mut i = Install::default();
         i.take(b"--max-pods", "50");
         assert!(i.vars().contains(&("KR_MAX_PODS", "50".into())));
+        assert_eq!(ok("--authorization-webhook-cache-authorized-ttl", "5m0s"), [("KR_AUTHZ_WEBHOOK_AUTHORIZED_TTL", "300".to_string())]);
+        assert_eq!(ok("--authentication-token-webhook-cache-ttl", "1h30m"), [("KR_AUTHN_WEBHOOK_CACHE_TTL", "5400".to_string())]);
+        assert!(!setting("--authentication-token-webhook-cache-ttl", "5x").1.is_empty());
+        // k3s pass-through of kube-apiserver arguments kr knows.
+        let mut i = Install::default();
+        i.take(b"--kube-apiserver-arg", "oidc-issuer-url=https://idp");
+        i.take(b"--kube-apiserver-arg", "--enable-admission-plugins=AlwaysPullImages");
+        assert!(i.errors.is_empty(), "{:?}", i.errors);
+        assert!(i.vars().contains(&("KR_OIDC_ISSUER_URL", "https://idp".into())));
+        assert!(i.vars().contains(&("KR_ADMISSION_PLUGINS", "AlwaysPullImages".into())));
+        i.take(b"--kube-apiserver-arg", "max-pods=3");
+        i.take(b"--kube-apiserver-arg", "feature-gates=X=true");
+        assert_eq!(i.errors.len(), 2);
     }
 
     #[test]
