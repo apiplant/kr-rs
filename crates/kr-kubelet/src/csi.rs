@@ -74,28 +74,31 @@ fn decode_plugin_info(b: &[u8]) -> Result<(String, String, String), ()> {
     Ok((t, n, e))
 }
 
-/// `NodeGetInfoResponse` -> (node id, topology segment keys, max volumes per node).
-fn decode_node_info(b: &[u8]) -> Result<(String, Vec<String>, u64), ()> {
-    let (mut id, mut keys, mut max) = (String::new(), Vec::new(), 0);
+/// `NodeGetInfoResponse` -> (node id, accessible topology segments as (key, value), max volumes).
+fn decode_node_info(b: &[u8]) -> Result<(String, Vec<(String, String)>, u64), ()> {
+    let (mut id, mut segs, mut max) = (String::new(), Vec::new(), 0);
     walk(b, |k, f| match k {
         1 => id = f.as_str().unwrap_or("").to_string(),
         2 => max = f.as_varint().unwrap_or(0),
         3 => {
+            // Topology { map<string, string> segments = 1 }: each entry is { key = 1, value = 2 }.
             let _ = walk(f.as_bytes().unwrap_or(&[]), |k, f| {
                 if k == 1 {
-                    let _ = walk(f.as_bytes().unwrap_or(&[]), |k, f| {
-                        if k == 1 {
-                            keys.push(f.as_str().unwrap_or("").to_string());
-                        }
+                    let (mut key, mut val) = (String::new(), String::new());
+                    let _ = walk(f.as_bytes().unwrap_or(&[]), |k, f| match k {
+                        1 => key = f.as_str().unwrap_or("").to_string(),
+                        2 => val = f.as_str().unwrap_or("").to_string(),
+                        _ => {}
                     });
+                    segs.push((key, val));
                 }
             });
         }
         _ => {}
     })?;
-    keys.sort();
-    keys.dedup();
-    Ok((id, keys, max))
+    segs.sort();
+    segs.dedup_by(|a, b| a.0 == b.0);
+    Ok((id, segs, max))
 }
 
 /// `NodeGetCapabilitiesResponse` -> the `NodeServiceCapability.RPC.Type` values offered
@@ -181,7 +184,8 @@ fn bytes_of(v: Option<&Value>) -> Option<u64> {
 struct Driver {
     endpoint: String,
     node_id: String,
-    topology_keys: Vec<String>,
+    /// `NodeGetInfo.accessible_topology` segments: keys go to CSINode, key=value to Node labels.
+    topology: Vec<(String, String)>,
     stage: bool,
     stats: bool,
     expand: bool,
@@ -369,7 +373,7 @@ impl Csi {
         let endpoint = if ep.is_empty() { sock.to_string() } else { ep };
         let ec = Client::connect_unix(endpoint.as_bytes()).await.map_err(|_| format!("cannot connect to {endpoint}"))?;
         let b = ec.unary(NODE_INFO, &[], FAST_MS).await.map_err(|s| format!("NodeGetInfo: {} ({})", s.message, s.code))?;
-        let (node_id, topology_keys, max_volumes) = decode_node_info(&b).map_err(|()| "malformed NodeGetInfoResponse".to_string())?;
+        let (node_id, topology, max_volumes) = decode_node_info(&b).map_err(|()| "malformed NodeGetInfoResponse".to_string())?;
         if node_id.is_empty() {
             return Err("NodeGetInfo returned no node_id".to_string());
         }
@@ -378,7 +382,7 @@ impl Csi {
         let (stage, stats, expand) = (caps.contains(&1), caps.contains(&2), caps.contains(&3));
         self.notify(sock, true, "").await;
         kr_rt::eprint(format!("kubelet: CSI driver {name} registered (node id {node_id}, stage {stage}, stats {stats}, expand {expand}, max volumes {max_volumes})\n").as_bytes());
-        Ok(Some((name, Driver { endpoint, node_id, topology_keys, stage, stats, expand, max_volumes, reg_sock: sock.to_string(), reg_inode: ino })))
+        Ok(Some((name, Driver { endpoint, node_id, topology, stage, stats, expand, max_volumes, reg_sock: sock.to_string(), reg_inode: ino })))
     }
 
     /// Rewrites the CSINode object and the node-id annotation. True on success.
@@ -387,7 +391,7 @@ impl Csi {
         let Ok(n) = c.get(&format!("/api/v1/nodes/{node}")).await else { return false };
         let uid = n.pointer(&["metadata", "uid"]).and_then(Value::as_str).unwrap_or("");
         let drivers: Vec<(String, Driver)> = self.drivers.borrow().iter().map(|(k, d)| (k.clone(), d.clone())).collect();
-        let list: Vec<String> = drivers.iter().map(|(k, d)| format!(r#"{{"name":{},"nodeID":{},"topologyKeys":[{}]{}}}"#, q(k), q(&d.node_id), d.topology_keys.iter().map(|t| q(t)).collect::<Vec<_>>().join(","), if d.max_volumes > 0 { format!(r#","allocatable":{{"count":{}}}"#, d.max_volumes) } else { String::new() })).collect();
+        let list: Vec<String> = drivers.iter().map(|(k, d)| format!(r#"{{"name":{},"nodeID":{},"topologyKeys":[{}]{}}}"#, q(k), q(&d.node_id), d.topology.iter().map(|(t, _)| q(t)).collect::<Vec<_>>().join(","), if d.max_volumes > 0 { format!(r#","allocatable":{{"count":{}}}"#, d.max_volumes) } else { String::new() })).collect();
         let body = format!(r#"{{"apiVersion":"storage.k8s.io/v1","kind":"CSINode","metadata":{{"name":{nq},"ownerReferences":[{{"apiVersion":"v1","kind":"Node","name":{nq},"uid":{}}}]}},"spec":{{"drivers":[{}]}}}}"#, q(uid), list.join(","), nq = q(node));
         let Ok(mut obj) = json::parse(body.as_bytes()) else { return false };
         let path = format!("/apis/storage.k8s.io/v1/csinodes/{node}");
@@ -407,7 +411,11 @@ impl Csi {
         }
         let ids = format!("{{{}}}", drivers.iter().map(|(k, d)| format!("{}:{}", q(k), q(&d.node_id))).collect::<Vec<_>>().join(","));
         let val = if drivers.is_empty() { "null".to_string() } else { q(&ids) };
-        let Ok(p) = json::parse(format!(r#"{{"metadata":{{"annotations":{{"{NODEID_ANNOTATION}":{val}}}}}}}"#).as_bytes()) else { return false };
+        // As the upstream kubelet: the driver's topology segments become Node labels (the external
+        // provisioner and the scheduler match on them), added and never removed.
+        let labels: Vec<String> = drivers.iter().flat_map(|(_, d)| d.topology.iter()).filter(|(k, _)| !k.is_empty()).map(|(k, v)| format!("{}:{}", q(k), q(v))).collect();
+        let labels = if labels.is_empty() { String::new() } else { format!(r#","labels":{{{}}}"#, labels.join(",")) };
+        let Ok(p) = json::parse(format!(r#"{{"metadata":{{"annotations":{{"{NODEID_ANNOTATION}":{val}}}{labels}}}}}"#).as_bytes()) else { return false };
         c.patch(&format!("/api/v1/nodes/{node}"), "application/merge-patch+json", &p).await.is_ok()
     }
 
@@ -484,7 +492,9 @@ impl Csi {
             staging = format!("{parent}/globalmount");
             let key = (driver.clone(), handle.clone());
             if !self.staged.borrow().contains(&key) {
-                kr_runtime::store::mkdir_p(&parent, 0o750).map_err(|_| format!("cannot create {parent}"))?;
+                // The CO creates staging_target_path itself (CSI spec; the upstream kubelet does):
+                // drivers whose NodeStageVolume does nothing (csi-driver-host-path) stat it later.
+                kr_runtime::store::mkdir_p(&staging, 0o750).map_err(|_| format!("cannot create {staging}"))?;
                 let secrets = Self::secrets(c, pv, "nodeStageSecretRef").await?;
                 let mut w = Writer::new();
                 w.string(1, &handle);
@@ -670,7 +680,7 @@ impl Csi {
                     b.insert(key, (n, now + Self::backoff_ms(n)));
                     n
                 };
-                let cond = format!(r#"{{"type":"NodeResizeError","status":"True","lastTransitionTime":{},"reason":"NodeExpandFailed","message":{}}}"#, q(&kr_apiserver::object::rfc3339(now as i64 / 1000)), q(&e));
+                let cond = format!(r#"{{"type":"NodeResizeError","status":"True","lastTransitionTime":{},"reason":"NodeExpandFailed","message":{}}}"#, q(&kr_apiserver::object::rfc3339(kr_sys::clock_gettime(0).map(|t| t.tv_sec).unwrap_or(0))), q(&e));
                 let mut all = others(&["NodeResizeError"]);
                 all.push(cond);
                 if let Ok(p) = json::parse(format!(r#"{{"status":{{"conditions":[{}]}}}}"#, all.join(",")).as_bytes()) {
@@ -1044,13 +1054,15 @@ pub(crate) mod tests {
             let csi = c2;
             assert!(csi.tick().await);
             let d = csi.driver("fake.csi").unwrap();
-            assert_eq!((d.node_id.as_str(), d.stage, d.topology_keys.as_slice()), ("node-id-1", true, &["topology.fake/zone".to_string()][..]));
+            assert_eq!((d.node_id.as_str(), d.stage, d.topology.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>().as_slice()), ("node-id-1", true, &["topology.fake/zone".to_string()][..]));
             assert!(!csi.tick().await);
             assert!(csi.sync_csinode(&fake).await);
             let log = fake.log.borrow().clone();
             assert_eq!(log[0].0, "create");
             assert!(log[0].2.contains(r#""nodeID":"node-id-1""#) && log[0].2.contains("nuid") && log[0].2.contains("topology.fake/zone"), "{}", log[0].2);
             assert!(log[1].2.contains("csi.volume.kubernetes.io/nodeid") && log[1].2.contains("node-id-1"));
+            // The topology segment becomes a Node label (the provisioner matches nodes on it).
+            assert!(log[1].2.contains(r#""labels":{"topology.fake/zone":"z1"}"#), "{}", log[1].2);
 
             // Not attached yet.
             let e = csi.mount_pv(&fake, &pod("u1"), &pv(), false).await.unwrap_err();
