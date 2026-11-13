@@ -21,6 +21,8 @@ pub struct Signer {
     key: p256::SecretKey,
     pub_key: [u8; 65],
     kid: String,
+    /// Public keys of earlier signing keys: tokens signed with them still verify (rotation overlap).
+    old: Vec<([u8; 65], String)>,
 }
 
 /// Verified token contents.
@@ -50,7 +52,17 @@ impl Signer {
         let pub_key = key.public_key();
         // kid: base64url(SHA-256 of the public key), like upstream's key-id derivation.
         let kid = b64(&sha256(&pub_key));
-        Signer { key, pub_key, kid }
+        Signer { key, pub_key, kid, old: Vec::new() }
+    }
+
+    /// Accepts tokens signed by `key` as well (an earlier signing key kept for the overlap after a
+    /// rotation); it never signs.
+    pub fn add_verify_key(&mut self, key: &p256::SecretKey) {
+        let pk = key.public_key();
+        let kid = b64(&sha256(&pk));
+        if kid != self.kid && !self.old.iter().any(|(_, k)| *k == kid) {
+            self.old.push((pk, kid));
+        }
     }
 
     pub fn kid(&self) -> &str {
@@ -108,7 +120,10 @@ impl Signer {
             return None;
         }
         let digest = sha256(alloc::format!("{h}.{c}").as_bytes());
-        if !p256::verify_digest(&self.pub_key, &digest, sig[..32].try_into().ok()?, sig[32..].try_into().ok()?) {
+        // The key named by `kid` (the current one, or an earlier one kept for the overlap).
+        let kid = header.get("kid").and_then(Value::as_str).unwrap_or("");
+        let key = if kid == self.kid || kid.is_empty() { &self.pub_key } else { &self.old.iter().find(|(_, k)| k == kid)?.0 };
+        if !p256::verify_digest(key, &digest, sig[..32].try_into().ok()?, sig[32..].try_into().ok()?) {
             return None;
         }
         let claims = json::parse(&unb64(c)?).ok()?;
@@ -141,18 +156,33 @@ impl Signer {
 
     /// JWKS document for service-account issuer discovery.
     pub fn jwks(&self) -> String {
-        alloc::format!(
-            r#"{{"keys":[{{"use":"sig","kty":"EC","kid":"{}","crv":"P-256","alg":"ES256","x":"{}","y":"{}"}}]}}"#,
-            self.kid,
-            b64(&self.pub_key[1..33]),
-            b64(&self.pub_key[33..])
-        )
+        let one = |pk: &[u8; 65], kid: &str| alloc::format!(r#"{{"use":"sig","kty":"EC","kid":"{kid}","crv":"P-256","alg":"ES256","x":"{}","y":"{}"}}"#, b64(&pk[1..33]), b64(&pk[33..]));
+        let mut keys = alloc::vec![one(&self.pub_key, &self.kid)];
+        keys.extend(self.old.iter().map(|(pk, kid)| one(pk, kid)));
+        alloc::format!(r#"{{"keys":[{}]}}"#, keys.join(","))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokens_of_an_earlier_key_verify_while_it_is_kept() {
+        let old_key = p256::SecretKey::from_bytes(&[3; 32]).unwrap();
+        let aud = alloc::vec![String::from(ISSUER)];
+        let old_token = Signer::new(p256::SecretKey::from_bytes(&[3; 32]).unwrap()).issue("d", "sa", "uid-1", None, &aud, 1_000, 3600);
+        let mut rotated = Signer::new(p256::SecretKey::from_bytes(&[4; 32]).unwrap());
+        assert!(rotated.verify(&old_token, 1_100).is_none(), "an unknown key is refused");
+        rotated.add_verify_key(&old_key);
+        assert_eq!(rotated.verify(&old_token, 1_100).unwrap().sa_name, "sa");
+        let fresh = rotated.issue("d", "sa", "uid-1", None, &aud, 1_000, 3600);
+        assert!(rotated.verify(&fresh, 1_100).is_some());
+        assert_eq!(rotated.jwks().matches("\"kid\"").count(), 2, "both keys are published");
+        let mut forged = old_token.clone();
+        forged.replace_range(forged.len() - 4.., "AAAA");
+        assert!(rotated.verify(&forged, 1_100).is_none());
+    }
 
     #[test]
     fn issue_verify_and_tamper() {

@@ -592,3 +592,6 @@
 
 305. **NetworkPolicy did not filter traffic to the node itself** — *fixed for egress* (part of #201)
     The policy table has an `input` base chain beside `forward`: replies, ND, and Service addresses stay open, and a pod with an egress policy is judged by the same chain for packets addressed to the node. Real-kernel check: pod A with an egress policy reaches pod B but not the node's own address.
+
+306. **Rotating the service-account key invalidated every token** — *fixed for one server* (part of #177)
+    The signer can hold verify-only keys: `kr pki rotate --service-account-key` appends the old `sa.key` to `pki/sa-old.pem` (0600, part of `kr snapshot`), the server loads it, tokens signed by an old key verify (the header `kid` picks the key) and the JWKS publishes all keys. New tokens use the new key. Unit test `tokens_of_an_earlier_key_verify_while_it_is_kept`; end to end `tools/test/sa-rotate.sh`.

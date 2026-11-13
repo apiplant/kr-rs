@@ -542,7 +542,16 @@ pub fn main(mut args: Args) -> i32 {
         // holds (ADR-051): a restart or another server still opens the tickets.
         kr_net::tls::set_ticket_secret(ticket_secret(&key.to_bytes()));
         let ca_pem = fs::read_file(&pki::path(&pki_dir, "ca.pem"), 1 << 20).ok().and_then(|b| String::from_utf8(b).ok()).ok_or("cannot read ca.pem")?;
-        api.set_service_accounts(kr_apiserver::tokens::Signer::new(key), ca_pem).map_err(|e| e.message)
+        let mut signer = kr_apiserver::tokens::Signer::new(key);
+        // Keys kept by `kr pki rotate --service-account-key`: their tokens verify until the file is removed.
+        if let Ok(text) = fs::read_file(&pki::path(&pki_dir, "sa-old.pem"), 1 << 20) {
+            for der in x509::pem_decode_all(&String::from_utf8_lossy(&text), "PRIVATE KEY").unwrap_or_default() {
+                if let Ok(x509::SigningKey::P256(k)) = x509::private_key_from_pkcs8(&der) {
+                    signer.add_verify_key(&k);
+                }
+            }
+        }
+        api.set_service_accounts(signer, ca_pem).map_err(|e| e.message)
     };
     if let Err(e) = sa_setup() {
         return fail(&e);

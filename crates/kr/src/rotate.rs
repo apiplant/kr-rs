@@ -16,8 +16,9 @@ use kr_sys::fs;
 const USAGE: &[u8] = b"usage: kr pki rotate [--data DIR] [--port 6443] [--service-account-key] [--ca]
   Issues the API server serving certificate, the server and admin client certificates and
   admin.kubeconfig again (same names and addresses, new keys, 365 days). Restart `kr server` after.
-  --service-account-key  also replace pki/sa.key (single server only; every token issued so far stops
-                         verifying and pods get new ones when the kubelet refreshes them)
+  --service-account-key  also replace pki/sa.key (single server only). The old key is kept in
+                         pki/sa-old.pem, so tokens issued so far keep verifying until you delete that
+                         file and restart; new tokens are signed with the new key
   --ca                   not implemented: see docs/KNOWN_ISSUES.md (CA rotation)
 ";
 
@@ -122,6 +123,18 @@ fn run(data: &str, port: Option<u16>, sa: bool) -> Result<(), String> {
             let _ = fs::renameat2(fs::AT_FDCWD, &cstr(to), fs::AT_FDCWD, &cstr(from), 0);
         }
         return Err(format!("{e} (nothing was changed)"));
+    }
+    if sa {
+        // Keep the old signing key as a verify-only key (the overlap k3s's rotate-ca also offers).
+        let old = fs::read_file(&cstr(&format!("{aside}/sa.key")), 1 << 16).map_err(|e| format!("read the old sa.key: errno {}", e.0))?;
+        let path = format!("{pki_dir}/sa-old.pem");
+        let mut text = fs::read_file(&cstr(&path), 1 << 20).unwrap_or_default();
+        text.extend_from_slice(&old);
+        // A temporary file with mode 0600, then renamed over the old list.
+        let tmp = format!("{path}.new");
+        let _ = fs::unlinkat(fs::AT_FDCWD, &cstr(&tmp), 0);
+        pki::write_new(&cstr(&tmp), &text, 0o600).map_err(|e| format!("cannot write pki/sa-old.pem ({e}); the old key is in {aside}"))?;
+        fs::renameat2(fs::AT_FDCWD, &cstr(&tmp), fs::AT_FDCWD, &cstr(&path), 0).map_err(|e| format!("cannot write pki/sa-old.pem (errno {}); the old key is in {aside}", e.0))?;
     }
     print(format!("rotated {} files; the old ones are in {aside}\nrestart `kr server` to serve the new certificate; admin.kubeconfig was written again ({data}/admin.kubeconfig)\n", moved.len()).as_bytes());
     Ok(())

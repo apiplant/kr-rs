@@ -24,7 +24,7 @@ const USAGE: &[u8] = b"usage:
 ";
 const PREFIX: &str = "kr-snapshot/";
 /// (path relative to the data dir, mode, required)
-const KEYS: [(&str, u32, bool); 6] = [("pki/ca.pem", 0o644, true), ("pki/ca.key", 0o600, true), ("pki/sa.key", 0o600, true), ("node-token", 0o600, false), ("server-token", 0o600, false), ("encryption-config.json", 0o600, false)];
+const KEYS: [(&str, u32, bool); 7] = [("pki/ca.pem", 0o644, true), ("pki/ca.key", 0o600, true), ("pki/sa.key", 0o600, true), ("pki/sa-old.pem", 0o600, false), ("node-token", 0o600, false), ("server-token", 0o600, false), ("encryption-config.json", 0o600, false)];
 /// State a restore replaces (and `--force` moves aside).
 const STATE: [&str; 9] = ["db", "raft", "pki", "server-id", "node-token", "server-token", "admin.kubeconfig", "db.imported", "encryption-config.json"];
 const LIMIT: usize = 1 << 31;
