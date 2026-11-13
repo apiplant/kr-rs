@@ -47,6 +47,8 @@ const SETTINGS: &[(&str, &str, Translate)] = &[
     ("large-cluster-size-threshold", "KR_LARGE_CLUSTER_SIZE_THRESHOLD", uint),
     ("private-registry", "KR_REGISTRIES_YAML", plain),
     ("kubelet-root-dir", "KR_KUBELET_DIR", plain),
+    ("image-credential-provider-config", "KR_CREDENTIAL_PROVIDER_CONFIG", plain),
+    ("image-credential-provider-bin-dir", "KR_CREDENTIAL_PROVIDER_BIN_DIR", plain),
 ];
 
 fn plain(v: &str) -> Result<Option<String>, String> {
