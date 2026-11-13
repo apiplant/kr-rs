@@ -933,3 +933,92 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(b.bytes()[28..32].try_into().unwrap()), 2);
     }
 }
+
+const RTM_GETADDR: u16 = 22;
+
+/// Parses one `ifaddrmsg`: (interface index, address as 16 bytes, IPv4-mapped for IPv4) for
+/// addresses of global scope.
+fn parse_addr(m: &[u8]) -> Option<(i32, [u8; 16])> {
+    if m.len() < 8 || m[3] != 0 {
+        return None; // not RT_SCOPE_UNIVERSE: loopback, link-local
+    }
+    let (family, index) = (m[0], i32::from_ne_bytes(m[4..8].try_into().ok()?));
+    let (mut local, mut address) = (None, None);
+    let mut o = 8;
+    while o + 4 <= m.len() {
+        let l = u16::from_ne_bytes([m[o], m[o + 1]]) as usize;
+        let t = u16::from_ne_bytes([m[o + 2], m[o + 3]]) & 0x3fff;
+        if l < 4 || o + l > m.len() {
+            break;
+        }
+        let v = &m[o + 4..o + l];
+        let a = match (family, v.len()) {
+            (AF_INET, 4) => Some(kr_sys::map4([v[0], v[1], v[2], v[3]])),
+            (AF_INET6, 16) => v.try_into().ok(),
+            _ => None,
+        };
+        match t {
+            IFA_LOCAL => local = a,
+            IFA_ADDRESS => address = a,
+            _ => {}
+        }
+        o += align4(l);
+    }
+    // IFA_LOCAL is the interface's own address (IFA_ADDRESS is the peer on point-to-point links).
+    Some((index, local.or(address)?))
+}
+
+impl Netlink {
+    /// The host's addresses of global scope, IPv4 and IPv6: (interface index, address).
+    pub fn addrs(&self) -> Result<Vec<(i32, [u8; 16])>, Errno> {
+        let mut b = NlBuf::new();
+        b.begin(RTM_GETADDR, NLM_F_DUMP);
+        b.raw(&[0, 0, 0, 0, 0, 0, 0, 0]); // ifaddrmsg, AF_UNSPEC: both families
+        b.end();
+        let mut out = Vec::new();
+        for m in self.request(&b)? {
+            if m.len() < 16 || u16::from_ne_bytes([m[4], m[5]]) != RTM_NEWADDR {
+                continue;
+            }
+            if let Some(a) = parse_addr(&m[16..]) {
+                out.push(a);
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod addr_tests {
+    use super::*;
+
+    fn attr(t: u16, v: &[u8]) -> Vec<u8> {
+        let mut a = ((4 + v.len()) as u16).to_ne_bytes().to_vec();
+        a.extend_from_slice(&t.to_ne_bytes());
+        a.extend_from_slice(v);
+        while a.len() % 4 != 0 {
+            a.push(0);
+        }
+        a
+    }
+
+    #[test]
+    fn global_addresses_prefer_ifa_local() {
+        // ifaddrmsg: AF_INET, /24, flags 0, scope universe, index 3; a point-to-point peer in IFA_ADDRESS.
+        let mut m = alloc::vec![AF_INET, 24, 0, 0];
+        m.extend_from_slice(&3i32.to_ne_bytes());
+        m.extend(attr(IFA_ADDRESS, &[10, 0, 0, 2]));
+        m.extend(attr(IFA_LOCAL, &[10, 0, 0, 1]));
+        assert_eq!(parse_addr(&m), Some((3, kr_sys::map4([10, 0, 0, 1]))));
+        // Host scope (loopback) and link scope are skipped.
+        let mut lo = alloc::vec![AF_INET, 8, 0, 254];
+        lo.extend_from_slice(&1i32.to_ne_bytes());
+        lo.extend(attr(IFA_LOCAL, &[127, 0, 0, 1]));
+        assert_eq!(parse_addr(&lo), None);
+        let mut v6 = alloc::vec![AF_INET6, 64, 0, 0];
+        v6.extend_from_slice(&2i32.to_ne_bytes());
+        let a6 = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7];
+        v6.extend(attr(IFA_ADDRESS, &a6));
+        assert_eq!(parse_addr(&v6), Some((2, a6)));
+    }
+}

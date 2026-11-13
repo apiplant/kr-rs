@@ -4,12 +4,12 @@
 # `kr server` with a pod, both with KR_POD_FAMILIES=MODE. A network namespace with fd01::2 and
 # 10.99.0.2 plays the outside world. Checks the addresses the workloads have (and lack), egress
 # over each family, name lookup through the forwarder and cluster DNS.
-# Needs docker, kubectl, target/release/kr and the archlinux:base-devel image (network for the alpine pull).
+# Needs docker, kubectl, target/release/kr and the ${KR_TEST_IMAGE:-archlinux:base-devel} image (network for the alpine pull).
 set -u
 MODE=${1:?usage: rootless-families.sh 4|6|4,6}
 cd "$(dirname "$0")/../.."
 KR=${KR:-$PWD/target/release/kr}
-docker run --rm --privileged -e MODE="$MODE" -v "$KR:/kr:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" archlinux:base-devel bash -c '
+docker run --rm --privileged -e MODE="$MODE" -v "$KR:/kr:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" ${KR_TEST_IMAGE:-archlinux:base-devel} bash -c '
 set -u
 V4=0; V6=0; case $MODE in *4*) V4=1;; esac; case $MODE in *6*) V6=1;; esac
 useradd -m u && echo u:100000:65536 > /etc/subuid && echo u:100000:65536 > /etc/subgid

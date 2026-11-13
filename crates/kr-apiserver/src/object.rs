@@ -454,6 +454,18 @@ impl Selector {
         })
     }
 
+    /// The `key=value` (and `key==value`, `key in (value)`) terms: every match has these labels.
+    pub fn eq_terms(&self) -> Vec<(&str, &str)> {
+        self.0
+            .iter()
+            .filter_map(|r| match r {
+                Req::Eq(k, v) => Some((k.as_str(), v.as_str())),
+                Req::In(k, vs) if vs.len() == 1 => Some((k.as_str(), vs[0].as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Matches an object's metadata.labels.
     pub fn matches(&self, o: &Value) -> bool {
         let labels = o.pointer(&["metadata", "labels"]);
@@ -501,6 +513,11 @@ fn absent(raw: &[u8], s: &str) -> bool {
 pub struct FieldSelector(Vec<(Vec<String>, bool, String)>);
 
 impl FieldSelector {
+    /// The value of a positive `path=value` term, when there is one.
+    pub fn eq_value(&self, path: &[&str]) -> Option<&str> {
+        self.0.iter().find(|(p, neg, _)| !*neg && p.len() == path.len() && p.iter().zip(path).all(|(a, b)| a == b)).map(|(_, _, v)| v.as_str())
+    }
+
     pub fn parse(s: &str) -> Result<FieldSelector, ApiError> {
         Self::parse_for(s, &[]).map(|(b, _)| b)
     }

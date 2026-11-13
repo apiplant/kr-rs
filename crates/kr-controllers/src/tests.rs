@@ -160,7 +160,8 @@ async fn kubelet(c: InProcess) {
 }
 
 pub(crate) async fn wait_until<Fut: Future<Output = bool>>(what: &str, mut f: impl FnMut() -> Fut) {
-    for _ in 0..800 {
+    // 30 s: generous for a loaded single-CPU machine (the arm64 CI host), instant when it works.
+    for _ in 0..3000 {
         if f().await {
             return;
         }

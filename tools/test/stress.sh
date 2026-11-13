@@ -18,7 +18,7 @@ running() { [ "$(k -n apps get pods "${@:2}" --no-headers 2>/dev/null | grep -c 
 "$REPO/tools/test/two-node.sh" up >/dev/null
 docker rm -f kr3 >/dev/null 2>&1
 docker run -d --name kr3 --hostname kr3 --network krnet --privileged --tmpfs /store:exec,size=${KR_STORE_SIZE:-2g} \
-  -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" archlinux:base-devel sleep infinity >/dev/null
+  -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" ${KR_TEST_IMAGE:-archlinux:base-devel} sleep infinity >/dev/null
 IP1=$(docker inspect -f '{{.NetworkSettings.Networks.krnet.IPAddress}}' kr1)
 docker exec kr3 sh -c "umask 077; echo '$(docker exec kr1 cat /var/tmp/srv/node-token)' > /root/kr-token"
 docker exec -d kr3 sh -c "KR_REGISTRY_MIRRORS=$("$REPO/tools/test/registry-cache.sh" env krnet) KR_ROOT=/store /krbin/kr agent --server https://$IP1:6443 --token-file /root/kr-token > /tmp/agent.log 2>&1"

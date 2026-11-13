@@ -20,7 +20,7 @@ waitfor() { for _ in $(seq "$2"); do eval "$1" && return 0; sleep 2; done; retur
 for n in $N; do
   docker run -d --name $n --hostname $n --network krnet --privileged --tmpfs /store:exec,size=2g \
     -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" \
-    archlinux:base-devel sleep infinity >/dev/null
+    ${KR_TEST_IMAGE:-archlinux:base-devel} sleep infinity >/dev/null
 done
 docker exec -d krm1 sh -c "KR_REGISTRY_MIRRORS=$MIRRORS KR_ROOT=/store exec /krbin/kr server --embedded-registry --data /var/tmp/srv > /tmp/srv.log 2>&1"
 waitfor "$K get --raw /healthz >/dev/null 2>&1" 30

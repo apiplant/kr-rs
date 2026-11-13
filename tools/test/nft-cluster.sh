@@ -22,7 +22,7 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; FAIL=1; fi; }
 for n in $NODES; do
   docker run -d --name $n --hostname $n --network krnet --privileged --tmpfs /store:exec,size=2g \
     -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" \
-    -v /lib/modules:/lib/modules:ro archlinux:base-devel sleep infinity >/dev/null
+    -v /lib/modules:/lib/modules:ro ${KR_TEST_IMAGE:-archlinux:base-devel} sleep infinity >/dev/null
   docker exec $n mkdir -p /etc/cni/net.d /opt/cni/bin
 done
 start_server() { docker exec -d krp1 sh -c "echo \$\$ > /tmp/srv.pid; KR_REGISTRY_MIRRORS=$MIRRORS $ENV KR_ROOT=/store exec /krbin/kr server --data /var/tmp/srv >> /tmp/srv.log 2>&1"; }
@@ -137,6 +137,51 @@ np '[{ports: [{port: 9999}]}]'
 check "other port only: blocked" "never 'get client http://$CIP'"
 $K delete networkpolicy web >/dev/null
 check "policy removed: allowed again" "eventually 'get client http://$CIP'"
+
+# Egress (#205): policies on the client side.
+WEB_IP=$($K get pod web -o jsonpath='{.status.podIP}')
+nc_ok() { $K exec client -- nc -z -w 3 "$1" "$2" >/dev/null 2>&1; }
+egress() { cat <<Y | $K apply -f - >/dev/null
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: out}
+spec:
+  podSelector: {matchLabels: {role: client}}
+  policyTypes: [Egress]
+  egress: $1
+Y
+}
+egress '[]'
+check "egress deny-all: client cannot reach web through the ClusterIP" "never 'get client http://$CIP'"
+check "egress deny-all: nor the API server" "never 'nc_ok 10.96.0.1 443'"
+egress '[{to: [{podSelector: {matchLabels: {app: web}}}], ports: [{port: 8080}]}]'
+check "egress podSelector+port: web reachable through the ClusterIP" "eventually 'get client http://$CIP'"
+check "egress podSelector+port: the API server still blocked" "never 'nc_ok 10.96.0.1 443'"
+egress "[{to: [{ipBlock: {cidr: $WEB_IP/32}}]}]"
+check "egress ipBlock: web pod IP reachable" "eventually 'nc_ok $WEB_IP 8080'"
+check "egress ipBlock: the API server blocked" "never 'nc_ok 10.96.0.1 443'"
+$K delete networkpolicy out >/dev/null
+check "egress policy removed: the API server reachable again" "eventually 'nc_ok 10.96.0.1 443'"
+
+# IPv6 peers (#205), when the pods have IPv6 addresses (kr gives pods both families by default).
+WEB6=$($K get pod web -o jsonpath='{.status.podIPs[1].ip}')
+CLIENT6=$($K get pod client -o jsonpath='{.status.podIPs[1].ip}')
+if [ -n "$WEB6" ] && [ -n "$CLIENT6" ]; then
+  get6() { $K exec "$1" -- wget -q -T 3 -O - "http://[$WEB6]:8080" 2>/dev/null | grep -q hello; }
+  check "IPv6: client -> web pod across nodes" "eventually 'get6 client'"
+  np '[]'
+  check "IPv6: ingress deny-all blocks IPv6 too" "never 'get6 client'"
+  np "[{from: [{ipBlock: {cidr: $CLIENT6/128}}]}]"
+  check "IPv6: ipBlock /128 of the client allows it" "eventually 'get6 client'"
+  check "IPv6: ... and not another pod" "never 'get6 other'"
+  np "[{from: [{podSelector: {matchLabels: {role: client}}}]}]"
+  check "IPv6: podSelector peers match the IPv6 address too" "eventually 'get6 client'"
+  $K delete networkpolicy web >/dev/null
+  # Rules are kept while the API is unreachable: the deletion must be in effect before the restart test.
+  check "IPv6: policy removed: another pod allowed again" "eventually 'get6 other'"
+else
+  echo "skip IPv6 peers: pods have no IPv6 address here"
+fi
 
 # Server restart: the datapath must keep working while it is down and after it is back.
 # Only the main process is killed: pod shims are detached copies with the same command line,

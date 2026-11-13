@@ -90,6 +90,30 @@ pub(crate) fn primary_addr() -> [u8; 16] {
     kr_sys::ns::route_source_any(kr_runtime::store::env_var("KR_PREFER_IPV6").is_some_and(|v| !v.is_empty() && v != "0"))
 }
 
+/// The host's global addresses that clients may use to reach this server: every interface except
+/// kr's own (pod bridge, overlays: their addresses are not how anyone reaches the API) and
+/// container interfaces. Joins over any network of a multi-homed host work (k3s's listener
+/// adds the address a client used; kr puts them all in the certificate).
+pub(crate) fn host_addrs() -> Vec<[u8; 16]> {
+    let names: Vec<(i32, String)> = fs::openat(fs::AT_FDCWD, b"/sys/class/net\0", fs::O_RDONLY | fs::O_DIRECTORY | kr_sys::O_CLOEXEC, 0)
+        .map(|fd| {
+            fs::read_dir(&fd)
+                .filter_map(|e| e.ok())
+                .filter_map(|e| String::from_utf8(e.name).ok())
+                .filter_map(|n| {
+                    let idx = fs::read_file(&pki::path(&format!("/sys/class/net/{n}"), "ifindex"), 64).ok()?;
+                    Some((core::str::from_utf8(&idx).ok()?.trim().parse().ok()?, n))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let ours = |i: i32| names.iter().find(|(x, _)| *x == i).is_some_and(|(_, n)| n.starts_with("kr") || n.starts_with("veth") || n.starts_with("cali") || n.starts_with("vxlan") || n.starts_with("flannel") || n.starts_with("cni"));
+    let mut out: Vec<[u8; 16]> = kr_net::netlink::Netlink::route().and_then(|nl| nl.addrs()).unwrap_or_default().into_iter().filter(|(i, _)| !ours(*i)).map(|(_, a)| a).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn drop_if_ip_changed(pki_dir: &str, file: &str, ip: [u8; 16], adv_check: bool) {
     let Ok(b) = fs::read_file(&pki::path(pki_dir, &format!("{file}.pem")), 1 << 20) else { return };
     let Some(der) = core::str::from_utf8(&b).ok().and_then(|p| x509::pem_decode_all(p, "CERTIFICATE").ok()).and_then(|mut v| (!v.is_empty()).then(|| v.remove(0))) else { return };
@@ -119,6 +143,9 @@ pub(crate) fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
     let routable = adv != kr_sys::map4([127, 0, 0, 1]);
     for file in ["apiserver", "server", "kubelet-client"] {
         drop_if_ip_changed(&pki_dir, file, adv, routable && file != "kubelet-client");
+    }
+    for a in host_addrs() {
+        drop_if_ip_changed(&pki_dir, "apiserver", a, true);
     }
     // --tls-san: the certificate is issued again when the set of names changed (ADR-060).
     let mut sans = crate::install::tls_sans();
@@ -161,6 +188,11 @@ pub(crate) fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
         if let Some(h6) = kr_apiserver::api::host_ip6() {
             ips.push(h6.to_vec());
         }
+        for a in host_addrs() {
+            ips.push(kr_net::tcp::ip_bytes16(a));
+        }
+        ips.sort();
+        ips.dedup();
         for san in &sans {
             match kr_net::tcp::parse_ip16(san) {
                 Some(ip) => ips.push(kr_net::tcp::ip_bytes16(ip)),

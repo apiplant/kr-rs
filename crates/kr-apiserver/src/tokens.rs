@@ -23,7 +23,16 @@ pub struct Signer {
     kid: String,
     /// Public keys of earlier signing keys: tokens signed with them still verify (rotation overlap).
     old: Vec<([u8; 65], String)>,
+    /// Tokens whose signature already verified: SHA-256 of the token -> (claims, nbf). A P-256
+    /// verification costs about 0.5 ms and every request of a pod carries its token, so this is
+    /// what keeps in-cluster clients cheap (kube-apiserver caches token authentication too). The
+    /// time window is checked on every use, revocation by the caller; a key rotation builds a new
+    /// Signer, which starts empty.
+    cache: core::cell::RefCell<alloc::collections::BTreeMap<[u8; 32], (Claims, i64)>>,
 }
+
+/// Verified tokens kept at most (about 300 bytes each).
+const CACHE_MAX: usize = 4096;
 
 /// Verified token contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +61,7 @@ impl Signer {
         let pub_key = key.public_key();
         // kid: base64url(SHA-256 of the public key), like upstream's key-id derivation.
         let kid = b64(&sha256(&pub_key));
-        Signer { key, pub_key, kid, old: Vec::new() }
+        Signer { key, pub_key, kid, old: Vec::new(), cache: core::cell::RefCell::new(alloc::collections::BTreeMap::new()) }
     }
 
     /// Accepts tokens signed by `key` as well (an earlier signing key kept for the overlap after a
@@ -63,6 +72,7 @@ impl Signer {
         if kid != self.kid && !self.old.iter().any(|(_, k)| *k == kid) {
             self.old.push((pk, kid));
         }
+        self.cache.borrow_mut().clear();
     }
 
     pub fn kid(&self) -> &str {
@@ -106,6 +116,24 @@ impl Signer {
     /// Verifies signature and time window; returns the claims (existence checks are the
     /// caller's, since they need the store).
     pub fn verify(&self, token: &str, now: i64) -> Option<Claims> {
+        let id = sha256(token.as_bytes());
+        if let Some((c, nbf)) = self.cache.borrow().get(&id) {
+            // 60 s leeway for clock skew, as upstream (and as below).
+            return (now <= c.exp + 60 && now + 60 >= *nbf).then(|| c.clone());
+        }
+        let (c, nbf) = self.verify_uncached(token, now)?;
+        let mut cache = self.cache.borrow_mut();
+        if cache.len() >= CACHE_MAX {
+            cache.retain(|_, (c, _)| now <= c.exp + 60);
+            if cache.len() >= CACHE_MAX {
+                cache.clear();
+            }
+        }
+        cache.insert(id, (c.clone(), nbf));
+        Some(c)
+    }
+
+    fn verify_uncached(&self, token: &str, now: i64) -> Option<(Claims, i64)> {
         let mut parts = token.split('.');
         let (h, c, s) = (parts.next()?, parts.next()?, parts.next()?);
         if parts.next().is_some() || token.len() > 16 * 1024 {
@@ -143,7 +171,7 @@ impl Signer {
             _ => return None,
         };
         let pod = k8s.get("pod").map(|p| (p.get("name").and_then(Value::as_str).unwrap_or("").to_string(), p.get("uid").and_then(Value::as_str).unwrap_or("").to_string()));
-        Some(Claims {
+        Some((Claims {
             namespace: k8s.get("namespace")?.as_str()?.to_string(),
             sa_name: k8s.pointer(&["serviceaccount", "name"])?.as_str()?.to_string(),
             sa_uid: k8s.pointer(&["serviceaccount", "uid"])?.as_str()?.to_string(),
@@ -151,7 +179,7 @@ impl Signer {
             audiences,
             exp,
             jti: claims.get("jti").and_then(Value::as_str).unwrap_or("").to_string(),
-        })
+        }, nbf))
     }
 
     /// JWKS document for service-account issuer discovery.
@@ -203,5 +231,20 @@ mod tests {
         // Another key's token is refused.
         let other = Signer::new(p256::SecretKey::from_bytes(&[8; 32]).unwrap());
         assert!(s.verify(&other.issue("default", "bot", "uid-1", None, &aud, 1_800_000_000, 3600), 1_800_000_100).is_none());
+    }
+
+    #[test]
+    fn cached_tokens_keep_their_time_window_and_the_cache_is_bounded() {
+        let s = Signer::new(p256::SecretKey::from_bytes(&[5; 32]).unwrap());
+        let aud = alloc::vec![String::from(ISSUER)];
+        let t = s.issue("d", "sa", "u", None, &aud, 10_000, 3600);
+        assert!(s.verify(&t, 10_100).is_some());
+        assert!(s.verify(&t, 10_000 - 61).is_none(), "not yet valid, though cached");
+        assert!(s.verify(&t, 10_000 + 3600 + 61).is_none(), "expired, though cached");
+        assert!(s.verify(&t, 10_100).is_some());
+        for i in 0..(CACHE_MAX + 10) {
+            assert!(s.verify(&s.issue("d", "sa", "u", None, &aud, i as i64, 3600), i as i64).is_some());
+        }
+        assert!(s.cache.borrow().len() <= CACHE_MAX);
     }
 }

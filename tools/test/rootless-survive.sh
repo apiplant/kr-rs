@@ -2,14 +2,14 @@
 # Rootless pods survive a crash of the agent (ADR-036): server kr1 (root) + rootless agent kr2.
 # Pods keep their processes, IPs, outbound connectivity (the egress helper) and terminal logs
 # while the agent is down; a container that ends meanwhile keeps its real exit status.
-# Needs docker, kubectl, target/release/kr, archlinux:base-devel.
+# Needs docker, kubectl, target/release/kr, ${KR_TEST_IMAGE:-archlinux:base-devel}.
 set -u
 cd "$(dirname "$0")/../.."
 REPO=$PWD
 docker rm -f kr1 kr2 >/dev/null 2>&1; docker network create krnet >/dev/null 2>&1 || true
 for n in kr1 kr2; do
   docker run -d --name $n --hostname $n --network krnet --privileged --tmpfs /store:exec,size=2g \
-    -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" archlinux:base-devel sleep infinity >/dev/null
+    -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" ${KR_TEST_IMAGE:-archlinux:base-devel} sleep infinity >/dev/null
 done
 KC="docker exec -i -e KUBECONFIG=/var/tmp/srv/admin.kubeconfig kr1 kubectl"
 MIRRORS=$(tools/test/registry-cache.sh env krnet)

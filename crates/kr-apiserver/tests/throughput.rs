@@ -56,3 +56,59 @@ fn one_core() {
         assert_eq!(call(&api, "DELETE", &format!("/api/v1/namespaces/default/pods/p{i}"), c, ""), 200);
     });
 }
+
+/// The kubelet's query: every node lists `pods?fieldSelector=spec.nodeName=<node>` about once a
+/// second, so with N nodes and P pods the API server does N lists over P pods each second.
+#[test]
+#[ignore]
+fn node_pod_lists() {
+    let api = ApiServer::new(kr_store::Store::in_memory(), || 1_700_000_000, rng, "127.0.0.1".into()).unwrap();
+    let key = kr_crypto::p256::SecretKey::from_bytes(&[7; 32]).unwrap();
+    api.set_service_accounts(kr_apiserver::tokens::Signer::new(key), "CA".into()).unwrap();
+    let c = "application/json";
+    let (pods, nodes) = (5000, 100);
+    for i in 0..pods {
+        let pod = format!(r#"{{"metadata":{{"name":"p{i}","namespace":"ns{}","labels":{{"app":"a{}"}}}},"spec":{{"nodeName":"n{}","containers":[{{"name":"c","image":"x"}}]}}}}"#, i % 20, i % 50, i % nodes);
+        if i < 20 {
+            let ns = format!(r#"{{"metadata":{{"name":"ns{i}"}}}}"#);
+            call(&api, "POST", "/api/v1/namespaces", c, &ns);
+        }
+        assert_eq!(call(&api, "POST", &format!("/api/v1/namespaces/ns{}/pods", i % 20), c, &pod), 201);
+    }
+    let user = || Some(User { name: "admin".into(), groups: vec!["system:masters".into()] });
+    rate("list pods, fieldSelector nodeName (50)", 500, |i| {
+        let q = format!("fieldSelector=spec.nodeName%3Dn{}", i % nodes);
+        let req = Req { method: "GET", path: "/api/v1/pods", query: &q, content_type: Some(c), accept: None, body: b"", user: user(), bearer: None, headers: &[], authz_verb: None };
+        match api.handle(&req) {
+            Reply::Json(200, b) => assert_eq!(b.matches("\"nodeName\":").count(), pods / nodes, "{q}"),
+            _ => panic!("list failed"),
+        }
+    });
+    rate("list pods, labelSelector (100 hits)", 200, |i| {
+        let q = format!("labelSelector=app%3Da{}", i % 50);
+        let req = Req { method: "GET", path: "/api/v1/pods", query: &q, content_type: Some(c), accept: None, body: b"", user: user(), bearer: None, headers: &[], authz_verb: None };
+        assert!(matches!(api.handle(&req), Reply::Json(200, _)));
+    });
+}
+
+/// Requests authenticated with a ServiceAccount token (every pod's API client).
+#[test]
+#[ignore]
+fn sa_token_requests() {
+    let api = ApiServer::new(kr_store::Store::in_memory(), || 1_700_000_000, rng, "127.0.0.1".into()).unwrap();
+    let key = kr_crypto::p256::SecretKey::from_bytes(&[7; 32]).unwrap();
+    api.set_service_accounts(kr_apiserver::tokens::Signer::new(key), "CA".into()).unwrap();
+    let c = "application/json";
+    call(&api, "POST", "/api/v1/namespaces/default/pods", c, r#"{"metadata":{"name":"p"},"spec":{"containers":[{"name":"c","image":"x"}]}}"#);
+    let admin = || Some(User { name: "admin".into(), groups: vec!["system:masters".into()] });
+    let req = Req { method: "POST", path: "/api/v1/namespaces/default/serviceaccounts/default/token", query: "", content_type: Some(c), accept: None, body: br#"{"spec":{"audiences":["https://kubernetes.default.svc"]}}"#, user: admin(), bearer: None, headers: &[], authz_verb: None };
+    let tok = match api.handle(&req) {
+        Reply::Json(201, b) => kr_fmt::json::parse_str(&b).unwrap().pointer(&["status", "token"]).and_then(|t| t.as_str()).unwrap().to_string(),
+        _ => panic!("token"),
+    };
+    rate("get pod with a ServiceAccount token", 2000, |_| {
+        let req = Req { method: "GET", path: "/api/v1/namespaces/default/pods/p", query: "", content_type: Some(c), accept: None, body: b"", user: None, bearer: Some(&tok), headers: &[], authz_verb: None };
+        // The default ServiceAccount has no RBAC for pods: authenticated, then 403 (authentication is the cost here).
+        assert!(matches!(api.handle(&req), Reply::Json(403, _) | Reply::Json(200, _)));
+    });
+}

@@ -2,11 +2,11 @@
 # Rootless IPv6 egress (ADR-030/031) in a throwaway privileged container: a non-root user runs
 # `kr ctr run`; a network namespace with fd01::2 plays the outside world. Checks that the container
 # has its IPv6 address, fetches over IPv6, pings and sees `traceroute` end at the target.
-# Needs docker, target/release/kr and the archlinux:base-devel image (network for the alpine pull).
+# Needs docker, target/release/kr and the ${KR_TEST_IMAGE:-archlinux:base-devel} image (network for the alpine pull).
 set -u
 cd "$(dirname "$0")/../.."
 KR=${KR:-$PWD/target/release/kr}
-docker run --rm --privileged -v "$KR:/kr:ro" archlinux:base-devel sh -c '
+docker run --rm --privileged -v "$KR:/kr:ro" ${KR_TEST_IMAGE:-archlinux:base-devel} sh -c '
 set -u
 useradd -m u && echo u:100000:65536 > /etc/subuid && echo u:100000:65536 > /etc/subgid
 mkdir -p /home/u/kr && mount -t tmpfs -o size=2g,exec tmpfs /home/u/kr && chown u /home/u/kr

@@ -702,3 +702,70 @@ fn codec_labels_count_the_stored_form_of_live_keys() {
     let s = Store::open_with(&dir, Some(StdRc::new(Tagged))).unwrap();
     assert_eq!(s.codec_labels(), vec![(String::from("sealed"), 2)]);
 }
+
+fn node_of(v: &[u8]) -> Vec<String> {
+    core::str::from_utf8(v).ok().and_then(|s| s.strip_prefix("node=")).map(|n| n.split(',').map(String::from).collect()).unwrap_or_default()
+}
+
+#[test]
+fn index_follows_every_change_and_lists_in_key_order() {
+    let dir = tmpdir("index");
+    let mut s = Store::open_with(&dir, None).unwrap();
+    s.add_index("node", "/pods/", node_of);
+    for (k, n) in [("/pods/b/2", "n1"), ("/pods/a/1", "n1"), ("/pods/a/3", "n2"), ("/other/x", "n1")] {
+        s.create(k, v(&format!("node={n}"))).unwrap();
+    }
+    let keys = |s: &Store, val: &str, prefix: &str, after: Option<&str>, limit: usize| s.list_indexed("node", val, prefix, after, limit).map(|(l, more)| (l.iter().map(|kv| kv.key.to_string()).collect::<Vec<_>>(), more));
+    assert_eq!(keys(&s, "n1", "/pods/", None, 0), Some((vec!["/pods/a/1".to_string(), "/pods/b/2".to_string()], false)));
+    assert_eq!(keys(&s, "n1", "/pods/a/", None, 0), Some((vec!["/pods/a/1".to_string()], false)), "namespaced prefix");
+    assert_eq!(keys(&s, "n1", "/pods/", None, 1), Some((vec!["/pods/a/1".to_string()], true)), "limit");
+    assert_eq!(keys(&s, "n1", "/pods/", Some("/pods/a/1"), 0), Some((vec!["/pods/b/2".to_string()], false)), "continue");
+    assert_eq!(keys(&s, "n1", "/other/", None, 0), None, "no index there");
+    // Moves between values, deletes, and values that stop being indexed.
+    s.update("/pods/a/1", v("node=n2"), None).unwrap();
+    s.delete("/pods/b/2", None).unwrap();
+    s.update("/pods/a/3", v("unscheduled"), None).unwrap();
+    assert_eq!(keys(&s, "n1", "/pods/", None, 0), Some((vec![], false)));
+    assert_eq!(keys(&s, "n2", "/pods/", None, 0), Some((vec!["/pods/a/1".to_string()], false)));
+    // Reopening replays the log: an index added afterwards is built from it.
+    s.sync().unwrap();
+    drop(s);
+    let mut s = Store::open_with(&dir, None).unwrap();
+    s.add_index("node", "/pods/", node_of);
+    assert_eq!(keys(&s, "n2", "/pods/", None, 0), Some((vec!["/pods/a/1".to_string()], false)));
+    // Restore from an image rebuilds it.
+    let img = s.image();
+    s.create("/pods/z/9", v("node=n2")).unwrap();
+    s.restore(&img).unwrap();
+    assert_eq!(keys(&s, "n2", "/pods/", None, 0), Some((vec!["/pods/a/1".to_string()], false)));
+}
+
+#[test]
+fn index_follows_replicated_records() {
+    let mut leader = Store::replicated();
+    let mut follower = Store::replicated();
+    follower.add_index("node", "/pods/", node_of);
+    leader.create("/pods/a", v("node=n1")).unwrap();
+    leader.update("/pods/a", v("node=n2"), None).unwrap();
+    leader.create("/pods/b", v("node=n2")).unwrap();
+    leader.delete("/pods/b", None).unwrap();
+    follower.apply_records(&leader.take_records()).unwrap();
+    let got = follower.list_indexed("node", "n2", "/pods/", None, 0).unwrap().0;
+    assert_eq!(got.iter().map(|k| &*k.key).collect::<Vec<_>>(), ["/pods/a"]);
+    assert!(follower.list_indexed("node", "n1", "/pods/", None, 0).unwrap().0.is_empty());
+}
+
+#[test]
+fn index_with_several_values_per_key() {
+    let mut s = Store::in_memory();
+    s.add_index("node", "/pods/", node_of);
+    s.create("/pods/a", v("node=x,y")).unwrap();
+    s.create("/pods/b", v("node=y")).unwrap();
+    let names = |val: &str, s: &Store| s.list_indexed("node", val, "/pods/", None, 0).unwrap().0.iter().map(|k| k.key.to_string()).collect::<Vec<_>>();
+    assert_eq!(names("y", &s), ["/pods/a", "/pods/b"]);
+    assert_eq!(names("x", &s), ["/pods/a"]);
+    assert_eq!(s.index_count("node", "y"), Some(2));
+    s.update("/pods/a", v("node=x"), None).unwrap();
+    assert_eq!(names("y", &s), ["/pods/b"]);
+    assert_eq!(s.index_count("node", "x"), Some(1));
+}

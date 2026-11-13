@@ -44,8 +44,9 @@ fn receiver(codes: Vec<u16>) -> (u16, mpsc::Receiver<(String, String)>) {
             }
             let code = codes[n.min(codes.len() - 1)];
             n += 1;
-            let _ = s.write_all(format!("HTTP/1.1 {code} X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").as_bytes());
+            // Recorded before answering: once the client has the answer, the test may count.
             let _ = tx.send((head, String::from_utf8_lossy(&body).to_string()));
+            let _ = s.write_all(format!("HTTP/1.1 {code} X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").as_bytes());
         }
     });
     (port, rx)

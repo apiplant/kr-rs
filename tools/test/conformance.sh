@@ -27,7 +27,7 @@ ensure() {
     -v "$REPO/target/release:/krbin:ro" \
     -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" \
     -v "$(command -v sonobuoy):/usr/local/bin/sonobuoy:ro" \
-    archlinux:base-devel sleep infinity >/dev/null
+    ${KR_TEST_IMAGE:-archlinux:base-devel} sleep infinity >/dev/null
 }
 
 restart_kr() {

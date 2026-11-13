@@ -257,6 +257,11 @@ impl Query {
     }
 }
 
+/// Store index of pods by `spec.nodeName` ([`kr_store::Store::add_index`]).
+pub const POD_NODE_INDEX: &str = "pods.spec.nodeName";
+/// Store index of pods by label, as `key=value`.
+pub const POD_LABEL_INDEX: &str = "pods.metadata.labels";
+
 /// A parsed resource URL.
 pub(crate) struct Route {
     pub(crate) res: &'static Resource,
@@ -304,6 +309,11 @@ impl ApiServer {
             store.create(&key, json::to_string(&o).into_bytes()).map_err(|e| store_err(e, "Namespace", name))?;
         }
         store.sync().map_err(|_| ApiError::new(500, "InternalError", "storage sync failed"))?;
+        // Every kubelet lists its pods by `spec.nodeName` about once a second (#210).
+        let pods = resources::find("", "v1", "pods").unwrap().prefix();
+        store.add_index(POD_NODE_INDEX, &pods, |b| json::string_at(b, &["spec", "nodeName"]).into_iter().collect());
+        // Controllers list pods by label (endpoints, daemonsets, statefulsets, jobs, HPA).
+        store.add_index(POD_LABEL_INDEX, &pods, |b| json::strings_under(b, &["metadata", "labels"]).into_iter().map(|(k, v)| alloc::format!("{k}={v}")).collect());
         let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), enc_reload: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), oa_cache: RefCell::new(alloc::collections::BTreeMap::new()), parsed: RefCell::new(ParseCache::default()), defer_lists: core::cell::Cell::new(false), list_job: RefCell::new(None), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), agg_http: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default(), disabled: Default::default() };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
@@ -949,11 +959,11 @@ impl ApiServer {
             return Err("invalid audience");
         }
         // Revocation: the ServiceAccount (and a bound pod) must still exist with the same uid.
-        let store = self.store.borrow();
+        // The uid straight from the stored bytes (no parse: this runs on every pod's request).
         let uid_of = |plural: &str, name: &str| -> Option<String> {
             let r = resources::find("", "v1", plural)?;
-            let kv = store.get(&r.key(Some(&c.namespace), name))?;
-            json::parse(&kv.value).ok()?.pointer(&["metadata", "uid"]).and_then(Value::as_str).map(String::from)
+            let kv = self.store.borrow().get(&r.key(Some(&c.namespace), name))?;
+            json::string_at(&kv.value, &["metadata", "uid"])
         };
         if uid_of("serviceaccounts", &c.sa_name).as_deref() != Some(c.sa_uid.as_str()) {
             return Err("service account no longer exists");
@@ -1817,6 +1827,19 @@ impl ApiServer {
     fn list(&self, req: &Req, rt: &Route, q: &Query) -> R<Reply> {
         let ls = Selector::parse(q.get("labelSelector").unwrap_or(""))?;
         let fs = self.field_selectors(rt, q)?.0;
+        // Pods: visit only the keys of one indexed term (the full selectors still apply): the
+        // node of `spec.nodeName=<n>`, else the rarest `key=value` term of the label selector.
+        let by_node: Option<(&str, String)> = if rt.res.plural == "pods" && rt.res.group.is_empty() {
+            match fs.eq_value(&["spec", "nodeName"]).filter(|n| !n.is_empty()) {
+                Some(n) => Some((POD_NODE_INDEX, String::from(n))),
+                None => {
+                    let store = self.store.borrow();
+                    ls.eq_terms().into_iter().map(|(k, v)| alloc::format!("{k}={v}")).min_by_key(|t| store.index_count(POD_LABEL_INDEX, t).unwrap_or(usize::MAX)).map(|t| (POD_LABEL_INDEX, t))
+                }
+            }
+        } else {
+            None
+        };
         let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(0);
         let prefix = self.list_prefix(rt);
         // Continue token: base64url("<rev>:<issued>:<last key>"). Pages report the first page's
@@ -1852,7 +1875,10 @@ impl ApiServer {
         // Fetch in pages so selectors can filter without returning short pages early.
         loop {
             let want = if limit == 0 { 0 } else { (limit - items.len()).max(1) * 2 };
-            let (page, has_more) = store.list(&prefix, cursor.as_deref(), want);
+            let (page, has_more) = match &by_node {
+                Some((ix, n)) => store.list_indexed(ix, n, &prefix, cursor.as_deref(), want).unwrap_or_else(|| store.list(&prefix, cursor.as_deref(), want)),
+                None => store.list(&prefix, cursor.as_deref(), want),
+            };
             for kv in &page {
                 cursor = Some(kv.key.to_string());
                 if !ls.is_empty() || !fs.is_empty() {
@@ -1872,7 +1898,10 @@ impl ApiServer {
             }
             if limit != 0 && items.len() == limit {
                 more = has_more || page.last().map(|k| &*k.key) != cursor.as_deref();
-                more = more || store.list(&prefix, cursor.as_deref(), 1).0.len() == 1;
+                more = more || match &by_node {
+                    Some((ix, n)) => store.list_indexed(ix, n, &prefix, cursor.as_deref(), 1).map_or_else(|| store.list(&prefix, cursor.as_deref(), 1).0.len() == 1, |l| l.0.len() == 1),
+                    None => store.list(&prefix, cursor.as_deref(), 1).0.len() == 1,
+                };
                 break;
             }
             if !has_more {

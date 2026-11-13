@@ -830,3 +830,181 @@ pub fn write_str(s: &str, out: &mut String) {
     }
     out.push('"');
 }
+
+// ---- raw path scanning (no tree, no validation of skipped parts) ----
+//
+// For documents this crate wrote (stored objects): subtrees off the path are skipped by counting
+// brackets outside strings, which is several times faster than tokenizing them. Malformed input
+// gives `None`/empty, never a panic.
+
+fn ws(b: &[u8], mut i: usize) -> usize {
+    while matches!(b.get(i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        i += 1;
+    }
+    i
+}
+
+/// End (exclusive) of the string starting at `b[i] == '"'`, and whether it has escapes.
+fn str_end(b: &[u8], i: usize) -> Option<(usize, bool)> {
+    let mut j = i + 1;
+    let mut esc = false;
+    loop {
+        match b.get(j)? {
+            b'"' => return Some((j + 1, esc)),
+            b'\\' => {
+                esc = true;
+                j += 2;
+            }
+            _ => j += 1,
+        }
+    }
+}
+
+/// The value of the string literal `b[i..end]` (quotes included).
+fn str_val(b: &[u8], i: usize, end: usize, esc: bool) -> Option<String> {
+    if !esc {
+        return core::str::from_utf8(&b[i + 1..end - 1]).ok().map(String::from);
+    }
+    match parse(&b[i..end]).ok()? {
+        Value::String(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// End of the value starting at `b[i]` (after whitespace).
+fn value_end(b: &[u8], i: usize) -> Option<usize> {
+    match *b.get(i)? {
+        b'"' => str_end(b, i).map(|(e, _)| e),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut j = i;
+            loop {
+                match *b.get(j)? {
+                    b'"' => {
+                        j = str_end(b, j)?.0;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
+        _ => {
+            let mut j = i;
+            while !matches!(b.get(j), None | Some(b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')) {
+                j += 1;
+            }
+            (j > i).then_some(j)
+        }
+    }
+}
+
+/// Members of the object starting at `b[i] == '{'`: calls `f(key, value_start)` for each; `f`
+/// returns `Some(x)` to stop with `x`. Returns `Ok(None)` at the end of the object.
+fn members<T>(b: &[u8], i: usize, mut f: impl FnMut(&str, usize) -> Option<T>) -> Option<Option<T>> {
+    if b.get(i) != Some(&b'{') {
+        return None;
+    }
+    let mut j = ws(b, i + 1);
+    if b.get(j) == Some(&b'}') {
+        return Some(None);
+    }
+    loop {
+        if b.get(j) != Some(&b'"') {
+            return None;
+        }
+        let (kend, kesc) = str_end(b, j)?;
+        let key = str_val(b, j, kend, kesc)?;
+        j = ws(b, kend);
+        if b.get(j) != Some(&b':') {
+            return None;
+        }
+        let v = ws(b, j + 1);
+        if let Some(x) = f(&key, v) {
+            return Some(Some(x));
+        }
+        j = ws(b, value_end(b, v)?);
+        match b.get(j)? {
+            b',' => j = ws(b, j + 1),
+            b'}' => return Some(None),
+            _ => return None,
+        }
+    }
+}
+
+/// Start of the value at `path` (object keys from the root).
+fn find_path(src: &[u8], path: &[&str]) -> Option<usize> {
+    let mut at = ws(src, 0);
+    for key in path {
+        at = members(src, at, |k, v| (k == *key).then_some(v))??;
+    }
+    Some(at)
+}
+
+/// The string at `path` (object keys from the root) of the JSON document `src`. `None` when the
+/// path is missing, leads through a non-object, or ends at a non-string. Used to index stored
+/// objects by a field (e.g. a pod's `spec.nodeName`). The first occurrence of a key counts.
+pub fn string_at(src: &[u8], path: &[&str]) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let v = find_path(src, path)?;
+    if src.get(v) != Some(&b'"') {
+        return None;
+    }
+    let (end, esc) = str_end(src, v)?;
+    str_val(src, v, end, esc)
+}
+
+/// The string members of the object at `path` (e.g. `metadata.labels`); non-string members are
+/// skipped. Empty when the path is missing or not an object.
+pub fn strings_under(src: &[u8], path: &[&str]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(at) = find_path(src, path) else { return out };
+    let r = members(src, at, |k, v| {
+        if src.get(v) == Some(&b'"') {
+            let (end, esc) = str_end(src, v)?;
+            out.push((String::from(k), str_val(src, v, end, esc)?));
+        }
+        None::<()>
+    });
+    if r.is_none() {
+        out.clear();
+    }
+    out
+}
+
+#[cfg(test)]
+mod string_at_tests {
+    use super::string_at;
+
+    #[test]
+    fn finds_the_value_on_the_path_only() {
+        let doc = br#"{"metadata":{"name":"p","annotations":{"nodeName":"decoy"},"x":[{"spec":{"nodeName":"no"}}]},"status":{"nodeName":"no"},"spec":{"containers":[{"nodeName":"no"}],"nodeName":"n7","z":1}}"#;
+        assert_eq!(string_at(doc, &["spec", "nodeName"]).as_deref(), Some("n7"));
+        assert_eq!(string_at(doc, &["metadata", "name"]).as_deref(), Some("p"));
+        assert_eq!(string_at(br#"{"spec":{"containers":[]}}"#, &["spec", "nodeName"]), None);
+        assert_eq!(string_at(br#"{"spec":{"nodeName":5}}"#, &["spec", "nodeName"]), None);
+        assert_eq!(string_at(br#"{"spec":"x"}"#, &["spec", "nodeName"]), None);
+        assert_eq!(string_at(br#"{"spec":{"nodeName":"ab"}}"#, &["spec", "nodeName"]).as_deref(), Some("ab"));
+        assert_eq!(string_at(b"[1]", &["spec"]), None);
+        assert_eq!(string_at(br#"{"spec":{"nodeName":"#, &["spec", "nodeName"]), None);
+    }
+
+    #[test]
+    fn strings_under_a_path() {
+        use super::strings_under;
+        let doc = br#"{"spec":{"labels":{"no":"x"}},"metadata":{"name":"p","labels":{"app":"web","n":5,"o":{"a":"b"},"tier":"fe"}}}"#;
+        let got = strings_under(doc, &["metadata", "labels"]);
+        assert_eq!(got, [("app".into(), "web".into()), ("tier".into(), "fe".into())]);
+        assert!(strings_under(br#"{"metadata":{}}"#, &["metadata", "labels"]).is_empty());
+        assert!(strings_under(br#"{"metadata":{"labels":{"a":"#, &["metadata", "labels"]).is_empty());
+    }
+}

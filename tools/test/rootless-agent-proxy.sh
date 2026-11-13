@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Pod proxy to a pod on a rootless agent (the API server on another node cannot route to the pod
 # network; it tunnels through the agent's kubelet). Server kr1 (root) + rootless agent kr2.
-# Needs docker, kubectl, target/release/kr, archlinux:base-devel.
+# Needs docker, kubectl, target/release/kr, ${KR_TEST_IMAGE:-archlinux:base-devel}.
 set -u
 cd "$(dirname "$0")/../.."
 REPO=$PWD
 docker rm -f kr1 kr2 >/dev/null 2>&1; docker network create krnet >/dev/null 2>&1 || true
 for n in kr1 kr2; do
   docker run -d --name $n --hostname $n --network krnet --privileged --tmpfs /store:exec,size=2g \
-    -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" archlinux:base-devel sleep infinity >/dev/null
+    -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" ${KR_TEST_IMAGE:-archlinux:base-devel} sleep infinity >/dev/null
 done
 KC="docker exec -e KUBECONFIG=/var/tmp/srv/admin.kubeconfig kr1 kubectl"
 docker exec -d kr1 sh -c "KR_REGISTRY_MIRRORS=$(tools/test/registry-cache.sh env krnet) KR_ROOT=/store /krbin/kr server --data /var/tmp/srv > /tmp/srv.log 2>&1"

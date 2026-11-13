@@ -34,7 +34,7 @@ up() {
   for n in $SERVERS kra1; do
     docker run -d --name $n --hostname $n --network krha --privileged --tmpfs /store:exec,size=2g \
       -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" \
-      archlinux:base-devel sleep infinity >/dev/null
+      ${KR_TEST_IMAGE:-archlinux:base-devel} sleep infinity >/dev/null
     if [ -n "${KR_HA_V6:-}" ]; then
       a=$(ip "$n"); a=${a#[}; a=${a%]}
       docker exec "$n" sh -c "sysctl -qw net.ipv6.conf.eth0.disable_ipv6=0; ip -6 addr add ${a#}/64 dev eth0 nodad; ip -6 route add default dev eth0 metric 1024"
@@ -145,7 +145,7 @@ import_() {
   for n in krs1 krs2; do
     docker run -d --name $n --hostname $n --network krha --privileged --tmpfs /store:exec,size=2g \
       -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" \
-      archlinux:base-devel sleep infinity >/dev/null
+      ${KR_TEST_IMAGE:-archlinux:base-devel} sleep infinity >/dev/null
   done
   start krs1; wait_api krs1
   k krs1 create configmap legacy --from-literal=a=b >/dev/null

@@ -15,7 +15,7 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; FAIL=1; fi; }
 for n in $NODES; do
   docker run -d --name $n --hostname $n --network krnet --privileged --tmpfs /store:exec,size=2g \
     -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" \
-    archlinux:base-devel sleep infinity >/dev/null
+    ${KR_TEST_IMAGE:-archlinux:base-devel} sleep infinity >/dev/null
   docker exec $n sh -c 'command -v bridge >/dev/null || pacman -Sy --noconfirm iproute2 >/dev/null 2>&1'
 done
 docker exec -d kr1 sh -c "KR_REGISTRY_MIRRORS=$("$REPO/tools/test/registry-cache.sh" env krnet) ${KR_SERVER_ENV:-} KR_ROOT=/store /krbin/kr server --data /var/tmp/srv > /tmp/srv.log 2>&1"
@@ -34,7 +34,7 @@ fdb_of() { docker exec "$1" bridge fdb show dev kr.vxlan 2>/dev/null | grep ' ds
 wait_fdb() { for _ in $(seq 40); do [ "$(fdb_of "$1" | wc -l)" = "$2" ] && return 0; sleep 1; done; return 0; }
 dump() { for n in "$@"; do echo "--- $n"; docker exec $n sh -c 'bridge fdb show dev kr.vxlan; ip neigh show dev kr.vxlan; ip route | grep kr.vxlan'; done; }
 nroutes() { docker exec "$1" ip route | grep -c 'dev kr.vxlan.*onlink' || true; }
-narp() { docker exec "$1" ip neigh show dev kr.vxlan | grep -c PERMANENT || true; }
+narp() { docker exec "$1" ip -4 neigh show dev kr.vxlan | grep -c PERMANENT || true; }
 
 for n in $NODES; do wait_fdb $n 2; done
 dump $NODES

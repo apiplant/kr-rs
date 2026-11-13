@@ -14,7 +14,7 @@ for n in kr1 kr2; do
   docker run -d --name $n --hostname $n --network krnet --privileged --tmpfs /store:exec,size=${KR_STORE_SIZE:-2g} \
     -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" \
     ${KR_SONOBUOY:+-v "$(command -v sonobuoy):/usr/local/bin/sonobuoy:ro"} \
-    archlinux:base-devel sleep infinity >/dev/null
+    ${KR_TEST_IMAGE:-archlinux:base-devel} sleep infinity >/dev/null
 done
 # KR_HOST_V6=1: give the nodes a global IPv6 address on the shared network, so they report an
 # IPv6 InternalIP and the kubernetes Service becomes dual stack (host-gw v6 routes etc.).
@@ -25,14 +25,16 @@ if [ -n "${KR_V6_UNDERLAY:-}" ]; then
   KR_HOST_V6=1; KR_SERVER_ENV="KR_PREFER_IPV6=1 ${KR_SERVER_ENV:-}"; KR_AGENT_ENV="KR_PREFER_IPV6=1 ${KR_AGENT_ENV:-}"
 fi
 if [ -n "${KR_HOST_V6:-}" ]; then
-  i=1; for n in kr1 kr2; do docker exec $n sh -c "sysctl -qw net.ipv6.conf.eth0.disable_ipv6=0; ip -6 addr add fd05::$i/64 dev eth0 nodad; ip -6 route add default dev eth0 metric 1024"; i=$((i+1)); done
+  # KR_V6_BASE (default 0): offset of the host part, for a container network that already has an
+  # IPv6 subnet fd05::/64 of its own (podman: gateway ::1, containers from ::2; KR_V6_BASE=100).
+  i=$((${KR_V6_BASE:-0} + 1)); for n in kr1 kr2; do docker exec $n sh -c "sysctl -qw net.ipv6.conf.eth0.disable_ipv6=0; ip -6 addr add fd05::$i/64 dev eth0 nodad; ip -6 route add default dev eth0 metric 1024"; i=$((i+1)); done
 fi
 docker exec -d kr1 sh -c "KR_REGISTRY_MIRRORS=$("$REPO/tools/test/registry-cache.sh" env krnet) ${KR_SERVER_ENV:-} KR_ROOT=/store /krbin/kr server --data /var/tmp/srv > /tmp/srv.log 2>&1"
 # node-token is written before the API listens: wait for the API itself.
 for _ in $(seq 60); do docker exec -e KUBECONFIG=/var/tmp/srv/admin.kubeconfig kr1 kubectl get --raw /healthz >/dev/null 2>&1 && break; sleep 1; done
 TOKEN=$(docker exec kr1 cat /var/tmp/srv/node-token)
 IP1=$(docker inspect -f '{{.NetworkSettings.Networks.krnet.IPAddress}}' kr1)
-[ -n "${KR_V6_UNDERLAY:-}" ] && IP1="[fd05::1]"
+[ -n "${KR_V6_UNDERLAY:-}" ] && IP1="[fd05::$((${KR_V6_BASE:-0} + 1))]"
 docker exec kr2 sh -c "umask 077; echo '$TOKEN' > /root/kr-token"
 docker exec -d kr2 sh -c "KR_REGISTRY_MIRRORS=$("$REPO/tools/test/registry-cache.sh" env krnet) ${KR_AGENT_ENV:-} KR_ROOT=/store /krbin/kr agent --server https://$IP1:6443 --token-file /root/kr-token > /tmp/agent.log 2>&1"
 for _ in $(seq 60); do

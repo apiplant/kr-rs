@@ -157,6 +157,10 @@ fn values_data(chart: &Value, cfgobj: Option<&Value>) -> Value {
     if !spec_str(chart, "valuesContent").is_empty() {
         d.set("values-01_HelmChart.yaml", s(spec_str(chart, "valuesContent")));
     }
+    // klipper-helm reads `repoCA` as /config/ca-file.pem (this ConfigMap is mounted at /config).
+    if !spec_str(chart, "repoCA").is_empty() {
+        d.set("ca-file.pem", s(spec_str(chart, "repoCA")));
+    }
     if let Some(c) = cfgobj.filter(|c| !str_at(c, &["spec", "valuesContent"]).is_empty()) {
         d.set("values-02_HelmChartConfig.yaml", s(str_at(c, &["spec", "valuesContent"])));
     }
@@ -173,7 +177,17 @@ pub fn build_job(chart: &Value, cfgobj: Option<&Value>, action: &str, default_im
     let image = image_of(chart, default_image);
     let target = Some(spec_str(chart, "targetNamespace")).filter(|t| !t.is_empty()).unwrap_or(ns);
     let has_content = !spec_str(chart, "chartContent").is_empty();
-    let chart_ref = if has_content { alloc::format!("/chart/{name}.tgz") } else { spec_str(chart, "chart").to_string() };
+    // With `repo`, klipper-helm adds the repository under the part of CHART before the `/` and
+    // installs CHART, so a bare chart name becomes `<release>/<chart>` (as k3s's controller does);
+    // `alias/chart` and URLs are passed as given.
+    let bare = spec_str(chart, "chart");
+    let chart_ref = if has_content {
+        alloc::format!("/chart/{name}.tgz")
+    } else if !spec_str(chart, "repo").is_empty() && !bare.contains('/') {
+        alloc::format!("{name}/{bare}")
+    } else {
+        bare.to_string()
+    };
     let mut args = alloc::vec![s(action)];
     if action == "install" {
         if spec_bool(chart, "createNamespace") {
@@ -198,6 +212,9 @@ pub fn build_job(chart: &Value, cfgobj: Option<&Value>, action: &str, default_im
         pair("REPO", spec_str(chart, "repo")),
         pair("HELM_DRIVER", "secret"),
         pair("CHART_NAMESPACE", ns),
+        // helm itself takes the release namespace from HELM_NAMESPACE: klipper-helm's install,
+        // upgrade and delete pass no --namespace (only its `helm ls` uses TARGET_NAMESPACE).
+        pair("HELM_NAMESPACE", target),
         pair("CHART", &chart_ref),
         pair("HELM_VERSION", spec_str(chart, "helmVersion")),
         pair("TARGET_NAMESPACE", target),
@@ -223,11 +240,11 @@ pub fn build_job(chart: &Value, cfgobj: Option<&Value>, action: &str, default_im
         mounts.push(obj(alloc::vec![("name", s("auth")), ("mountPath", s("/auth")), ("readOnly", Value::Bool(true))]));
         volumes.push(obj(alloc::vec![("name", s("auth")), ("secret", obj(alloc::vec![("secretName", s(auth))]))]));
     }
-    let ca_cm = Some(str_at(chart, &["spec", "repoCAConfigMap", "name"])).filter(|n| !n.is_empty()).map(String::from).or_else(|| (!spec_str(chart, "repoCA").is_empty()).then(|| alloc::format!("chart-cas-{name}")));
-    if let Some(cm) = ca_cm {
-        mounts.push(obj(alloc::vec![("name", s("ca")), ("mountPath", s("/ca-file")), ("readOnly", Value::Bool(true))]));
-        volumes.push(obj(alloc::vec![("name", s("ca")), ("configMap", obj(alloc::vec![("name", s(&cm))]))]));
-        env.push(pair("REPO_CA_FILE", "/ca-file/ca.crt"));
+    // `repoCAConfigMap`: every file of /ca-files is appended to helm's --ca-file by klipper-helm
+    // (`repoCA` itself travels in the values ConfigMap as /config/ca-file.pem).
+    if let Some(cm) = Some(str_at(chart, &["spec", "repoCAConfigMap", "name"])).filter(|n| !n.is_empty()) {
+        mounts.push(obj(alloc::vec![("name", s("ca")), ("mountPath", s("/ca-files")), ("readOnly", Value::Bool(true))]));
+        volumes.push(obj(alloc::vec![("name", s("ca")), ("configMap", obj(alloc::vec![("name", s(cm))]))]));
     }
     let mut container = obj(alloc::vec![("name", s("helm")), ("image", s(image)), ("imagePullPolicy", s("IfNotPresent")), ("args", arr(args)), ("env", arr(env)), ("volumeMounts", arr(mounts))]);
     if let Some(sc) = chart.pointer(&["spec", "securityContext"]).filter(|v| v.as_object().is_some()) {
@@ -351,9 +368,8 @@ async fn ensure_support<C: Client>(c: &C, chart: &Value, cfgobj: Option<&Value>)
     create_if_absent(c, "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings", &crb).await?;
     let cms = api_path("", "v1", Some(ns), "configmaps");
     upsert_data(c, &cms, "ConfigMap", ns, &alloc::format!("chart-values-{name}"), Some(values_data(chart, cfgobj)), chart).await?;
-    let ca = spec_str(chart, "repoCA");
-    let ca_data = (!ca.is_empty()).then(|| obj(alloc::vec![("ca.crt", s(ca))]));
-    upsert_data(c, &cms, "ConfigMap", ns, &alloc::format!("chart-cas-{name}"), ca_data, chart).await?;
+    // An earlier release kept `repoCA` in its own ConfigMap: remove it.
+    upsert_data(c, &cms, "ConfigMap", ns, &alloc::format!("chart-cas-{name}"), None, chart).await?;
     let content = spec_str(chart, "chartContent");
     let content_data = (!content.is_empty()).then(|| obj(alloc::vec![(&*alloc::format!("{name}.tgz"), s(content))]));
     upsert_data(c, &api_path("", "v1", Some(ns), "secrets"), "Secret", ns, &alloc::format!("chart-content-{name}"), content_data, chart).await
@@ -405,6 +421,12 @@ pub async fn reconcile<C: Client>(c: &C, cfg: &Config, default_image: &str, key:
             None => {
                 create_if_absent(c, &jobs_coll, &build_job(&chart, cfgobj.as_ref(), "delete", default_image)).await?;
                 Ok(Some(2000))
+            }
+            // The chart changed while being deleted (e.g. its jobImage was fixed after a failing
+            // uninstall): replace the Job, as for installs.
+            Some(job) if !job_done(&job) && str_at(&job, &["metadata", "annotations", HASH_ANN]) != config_hash(&chart, cfgobj.as_ref(), image_of(&chart, default_image)) => {
+                delete_ok(c, &delete_path).await?;
+                Ok(Some(500))
             }
             Some(job) if job_done(&job) => {
                 delete_ok(c, &delete_path).await?;
@@ -467,10 +489,11 @@ mod tests {
         let env = c.get("env").and_then(Value::as_array).unwrap();
         let e = |n: &str| env.iter().find(|x| str_at(x, &["name"]) == n).map(|x| str_at(x, &["value"]).to_string());
         assert_eq!(e("NAME").as_deref(), Some("traefik"));
-        assert_eq!(e("CHART").as_deref(), Some("traefik"));
+        assert_eq!(e("CHART").as_deref(), Some("traefik/traefik"), "repo charts are addressed through the repo alias");
         assert_eq!(e("REPO").as_deref(), Some("https://traefik.github.io/charts"));
         assert_eq!(e("VERSION").as_deref(), Some("30.1.0"));
         assert_eq!(e("TARGET_NAMESPACE").as_deref(), Some("ingress"));
+        assert_eq!(e("HELM_NAMESPACE").as_deref(), Some("ingress"), "helm installs into the target namespace");
         assert_eq!(e("CHART_NAMESPACE").as_deref(), Some("kube-system"));
         assert_eq!(e("HELM_DRIVER").as_deref(), Some("secret"));
         assert_eq!(job.pointer(&["spec", "template", "spec", "hostNetwork"]).and_then(Value::as_bool), Some(true));
@@ -491,7 +514,12 @@ mod tests {
         let env = c.get("env").and_then(Value::as_array).unwrap();
         assert!(env.iter().any(|x| str_at(x, &["name"]) == "CHART" && str_at(x, &["value"]) == "/chart/x.tgz"));
         let vols: Vec<&str> = pod.get("volumes").and_then(Value::as_array).unwrap().iter().map(|x| str_at(x, &["name"])).collect();
-        assert_eq!(vols, ["values", "content", "auth", "ca"]);
+        assert_eq!(vols, ["values", "content", "auth"], "repoCA goes into the values ConfigMap");
+        assert_eq!(str_at(&values_data(&ch, None), &["ca-file.pem"]), "PEM");
+        ch.entry_object("spec").set("repoCAConfigMap", v(r#"{"name":"cas"}"#));
+        let job = build_job(&ch, None, "install", DEFAULT_IMAGE);
+        let c = &job.pointer(&["spec", "template", "spec", "containers"]).and_then(Value::as_array).unwrap()[0];
+        assert!(c.get("volumeMounts").and_then(Value::as_array).unwrap().iter().any(|m| str_at(m, &["mountPath"]) == "/ca-files"));
     }
 
     #[test]

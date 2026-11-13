@@ -42,6 +42,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod index;
 pub mod bundle;
 pub mod wal;
 pub mod watch;
@@ -159,6 +160,8 @@ pub struct Store {
     /// Approximate size of a snapshot of the live data.
     live_bytes: u64,
     codec: Option<Rc<dyn Codec>>,
+    /// Secondary indexes ([`Store::add_index`]).
+    indexes: Vec<index::Index>,
     /// [`Codec::label`] of the latest stored form of each covered key (stale entries for
     /// deleted keys are skipped when counting).
     labels: core::cell::RefCell<BTreeMap<String, String>>,
@@ -211,6 +214,7 @@ impl Store {
             held: VecDeque::new(),
             live_bytes: 0,
             codec: None,
+            indexes: Vec::new(),
             labels: core::cell::RefCell::new(BTreeMap::new()),
         }
     }
@@ -401,6 +405,7 @@ impl Store {
         fresh.codec = self.codec.clone();
         fresh.load_snapshot(image)?;
         self.map = core::mem::take(&mut fresh.map);
+        self.rebuild_indexes();
         self.live_bytes = fresh.live_bytes;
         self.rev = fresh.rev;
         self.history.clear();
@@ -545,6 +550,9 @@ impl Store {
 
     fn raw_put(&mut self, key: &str, val: &[u8], create_rev: u64, mod_rev: u64) {
         let k: Rc<str> = Rc::from(key);
+        for ix in &mut self.indexes {
+            ix.put(&k, val);
+        }
         let kv = Kv { key: k.clone(), value: Rc::from(val), create_rev, mod_rev };
         self.live_bytes += Self::kv_size(key, val);
         if let Some(old) = self.map.insert(k, kv) {
@@ -553,6 +561,9 @@ impl Store {
     }
 
     fn raw_delete(&mut self, key: &str) {
+        for ix in &mut self.indexes {
+            ix.remove(key);
+        }
         if let Some(old) = self.map.remove(key) {
             self.live_bytes -= Self::kv_size(&old.key, &old.value);
         }
@@ -614,6 +625,43 @@ impl Store {
             }
         }
         (out, it.next().is_some())
+    }
+
+    /// Indexes the keys under `prefix` by `extract`ed value (see [`index`]); replaces an index of
+    /// the same name. Built from the current data and kept up to date from then on.
+    pub fn add_index(&mut self, name: &'static str, prefix: &str, extract: index::Extract) {
+        self.indexes.retain(|i| i.name != name);
+        self.indexes.push(index::Index::new(name, prefix, extract));
+        self.rebuild_indexes();
+    }
+
+    fn rebuild_indexes(&mut self) {
+        for ix in &mut self.indexes {
+            ix.clear();
+            for (k, kv) in &self.map {
+                ix.put(k, &kv.value);
+            }
+        }
+    }
+
+    /// [`Store::list`] of the keys under `prefix` whose index `name` has `value`. `None` when no
+    /// such index covers `prefix` (then list and filter instead).
+    pub fn list_indexed(&self, name: &str, value: &str, prefix: &str, start_after: Option<&str>, limit: usize) -> Option<(Vec<Kv>, bool)> {
+        let ix = self.indexes.iter().find(|i| i.name == name && i.covers(prefix))?;
+        let mut it = ix.keys(value, prefix, start_after).filter_map(|k| self.map.get(k));
+        let mut out = Vec::new();
+        while limit == 0 || out.len() < limit {
+            match it.next() {
+                Some(kv) => out.push(kv.clone()),
+                None => return Some((out, false)),
+            }
+        }
+        Some((out, it.next().is_some()))
+    }
+
+    /// Keys with `value` in index `name` (any prefix); `None` without such an index.
+    pub fn index_count(&self, name: &str, value: &str) -> Option<usize> {
+        self.indexes.iter().find(|i| i.name == name).map(|i| i.count(value))
     }
 
     pub fn count(&self, prefix: &str) -> usize {
@@ -694,6 +742,9 @@ impl Store {
         let kv = Kv { key: key.clone(), value: value.clone(), create_rev, mod_rev: rev };
         match kind {
             EventKind::Put => {
+                for ix in &mut self.indexes {
+                    ix.put(&key, &value);
+                }
                 self.live_bytes += Self::kv_size(&key, &value);
                 if let Some(old) = self.map.insert(key, kv.clone()) {
                     self.live_bytes -= Self::kv_size(&old.key, &old.value);
