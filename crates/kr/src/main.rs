@@ -36,10 +36,18 @@ static LINGERING: AtomicUsize = AtomicUsize::new(0);
 
 #[no_mangle]
 fn kr_main(mut args: Args) -> i32 {
+    // no_main: nothing ignores SIGPIPE for us (Rust's std main would). A hook or plugin that exits
+    // before reading what we write must give EPIPE, not kill the server. Reset on every exec.
+    let _ = kr_sys::ns::sigaction_simple(kr_sys::ns::SIGPIPE, true);
     let _argv0 = args.next();
     match args.next() {
         // Pod sandbox holder: no allocation, no output, just wait for a signal.
-        Some(b"pause") => kr_sys::ns::pause_loop(),
+        // As pid 1 of a shared pod pid namespace (shareProcessNamespace) it inherits the orphans:
+        // SIGCHLD ignored makes the kernel reap them.
+        Some(b"pause") => {
+            let _ = kr_sys::ns::sigaction_simple(17, true);
+            kr_sys::ns::pause_loop()
+        }
         // Rootless pod egress (ADR-031) in a process of its own, so pods keep their outbound
         // connectivity while the kubelet restarts. The TUN device is descriptor 3.
         // Container shim (parent of one container): kr shim PID EXIT-FILE MASTER-FD TTY-LOG CG-PARENT CG-ID IO-FD IO-SOCKET

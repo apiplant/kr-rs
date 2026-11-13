@@ -672,7 +672,7 @@ impl Store {
             return Ok(flat);
         }
         let keys = self.image_layers(id).ok_or(Error::Image("image has no rootfs and no layers"))?;
-        Ok(keys.iter().rev().map(|k| self.layer_path(k)).collect::<Vec<_>>().join(":"))
+        Ok(top_first_unique(&keys).iter().map(|k| self.layer_path(k)).collect::<Vec<_>>().join(":"))
     }
 
     pub fn image_config(&self, id: &ImageId) -> Result<ImageConfig> {
@@ -764,5 +764,32 @@ impl Store {
         let dir = cpath(&self.join("containers"))?;
         let fd = fs::openat(AT_FDCWD, &dir, fs::O_PATH | fs::O_DIRECTORY | fs::O_CLOEXEC, 0).ctx("open containers")?;
         fs::remove_all(fd.raw(), &cpath(id)?).ctx("remove container")
+    }
+}
+
+/// Layer keys (bottom first, as stored) in overlay order, top first, each key once. An image may
+/// repeat a layer (identical diffs have the same digest); overlayfs refuses a directory listed
+/// twice with ELOOP. Keeping only the topmost copy is the same tree: that copy already covers
+/// every path the lower one adds or removes.
+fn top_first_unique(keys: &[String]) -> Vec<&String> {
+    let mut out: Vec<&String> = Vec::with_capacity(keys.len());
+    for k in keys.iter().rev() {
+        if !out.contains(&k) {
+            out.push(k);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod layer_order_tests {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn repeated_layer_listed_once_topmost() {
+        let keys: Vec<String> = ["a", "e", "b", "e", "c"].iter().map(|s| String::from(*s)).collect();
+        let got: Vec<&str> = super::top_first_unique(&keys).iter().map(|s| s.as_str()).collect();
+        assert_eq!(got, ["c", "e", "b", "a"]);
     }
 }

@@ -31,6 +31,7 @@ mod n {
     pub const SETRESGID: usize = 119;
     pub const SETGROUPS: usize = 116;
     pub const RT_SIGPROCMASK: usize = 14;
+    pub const RT_SIGACTION: usize = 13;
     pub const SIGNALFD4: usize = 289;
     pub const WAITID: usize = 247;
     pub const SETNS: usize = 308;
@@ -66,6 +67,7 @@ mod n {
     pub const SETRESGID: usize = 149;
     pub const SETGROUPS: usize = 159;
     pub const RT_SIGPROCMASK: usize = 135;
+    pub const RT_SIGACTION: usize = 134;
     pub const SIGNALFD4: usize = 74;
     pub const WAITID: usize = 95;
     pub const SETNS: usize = 268;
@@ -174,6 +176,23 @@ pub fn exit_code(status: i32) -> i32 {
     }
 }
 
+pub const SIGPIPE: i32 = 13;
+
+/// Sets the disposition of `sig` to SIG_DFL (`ignore == false`) or SIG_IGN.
+pub fn sigaction_simple(sig: i32, ignore: bool) -> Result<()> {
+    // struct kernel_sigaction { handler, flags, restorer, mask } (same layout on x86_64 and arm64).
+    let act: [usize; 4] = [ignore as usize, 0, 0, 0];
+    // SAFETY: act is a valid kernel_sigaction; old action pointer is NULL; sigsetsize 8.
+    check(unsafe { syscall4(n::RT_SIGACTION, sig as usize, act.as_ptr() as usize, 0, 8) }).map(|_| ())
+}
+
+/// kr ignores SIGPIPE (a write to a pipe or socket whose reader is gone fails with EPIPE instead
+/// of killing the server); ignored dispositions survive execve, so every exec restores the default
+/// first: containers, hooks and helpers start with the usual SIGPIPE behaviour.
+fn sigpipe_default() {
+    let _ = sigaction_simple(SIGPIPE, false);
+}
+
 /// `argv` and `envp` must be NULL-terminated arrays of NUL-terminated strings.
 pub fn execve(path: &[u8], argv: &[*const u8], envp: &[*const u8]) -> Errno {
     if argv.last() != Some(&core::ptr::null()) || envp.last() != Some(&core::ptr::null()) {
@@ -183,6 +202,7 @@ pub fn execve(path: &[u8], argv: &[*const u8], envp: &[*const u8]) -> Errno {
         Ok(p) => p,
         Err(e) => return e,
     };
+    sigpipe_default();
     // SAFETY: all three pointers reference NUL/NULL-terminated data owned by the caller; execve only
     // returns on failure.
     let r = unsafe { syscall3(n::EXECVE, p, argv.as_ptr() as usize, envp.as_ptr() as usize) };
@@ -194,6 +214,7 @@ pub fn execveat_fd(fd: i32, argv: &[*const u8], envp: &[*const u8]) -> Errno {
     if argv.last() != Some(&core::ptr::null()) || envp.last() != Some(&core::ptr::null()) {
         return Errno(22);
     }
+    sigpipe_default();
     #[cfg(target_arch = "x86_64")]
     const EXECVEAT: usize = 322;
     #[cfg(target_arch = "aarch64")]
@@ -1072,5 +1093,25 @@ pub fn spawn_fsync_helper() -> Result<(Fd, Fd)> {
             core::mem::forget(resp_w);
             Ok((req_w, resp_r))
         }
+    }
+}
+
+#[cfg(test)]
+mod sigpipe_tests {
+    use super::*;
+
+    #[test]
+    fn ignored_sigpipe_gives_epipe_and_exec_restores_default() {
+        sigaction_simple(SIGPIPE, true).unwrap();
+        let (r, w) = crate::pipe2(0).unwrap();
+        drop(r);
+        assert_eq!(crate::write(w.raw(), b"x"), Err(Errno(32)));
+        drop(w);
+        sigpipe_default();
+        let mut old = [0usize; 4];
+        // SAFETY: NULL new action; old receives a kernel_sigaction.
+        check(unsafe { syscall4(n::RT_SIGACTION, SIGPIPE as usize, 0, old.as_mut_ptr() as usize, 8) }).unwrap();
+        assert_eq!(old[0], 0, "SIG_DFL after the exec-time reset");
+        sigaction_simple(SIGPIPE, true).unwrap();
     }
 }

@@ -135,6 +135,24 @@ mod term_tests {
     }
 }
 
+/// `hostIPC` and `shareProcessNamespace` (ignored with `hostPID`, which wins) as sandbox namespaces.
+pub fn sandbox_ns(pod: &Value) -> container::SandboxNs {
+    let flag = |k: &str| pod.pointer(&["spec", k]).and_then(Value::as_bool) == Some(true);
+    container::SandboxNs { host_ipc: flag("hostIPC"), pid: flag("shareProcessNamespace") && !flag("hostPID") }
+}
+
+/// The pid namespace of the pod's containers: `hostPID`, then `shareProcessNamespace`.
+pub fn pid_mode(pod: &Value) -> container::PidMode {
+    let flag = |k: &str| pod.pointer(&["spec", k]).and_then(Value::as_bool) == Some(true);
+    if flag("hostPID") {
+        container::PidMode::Host
+    } else if flag("shareProcessNamespace") {
+        container::PidMode::Pod
+    } else {
+        container::PidMode::Container
+    }
+}
+
 pub fn find_container<'a>(pod: &'a Value, name: &str) -> Option<&'a Value> {
     ["initContainers", "containers", "ephemeralContainers"]
         .iter()
@@ -1195,6 +1213,10 @@ pub async fn build<C: Client>(c: &C, pod: &Value, ctr: &Value, img: &ImageConfig
         Mount { source: alloc::format!("{pod_dir}/etc-hosts").into_bytes(), sub_path: None, target: b"/etc/hosts".to_vec(), readonly: false, prop: container::Prop::Private },
         Mount { source: alloc::format!("{pod_dir}/resolv.conf").into_bytes(), sub_path: None, target: b"/etc/resolv.conf".to_vec(), readonly: false, prop: container::Prop::Private },
     ];
+    // hostIPC: POSIX shared memory too, as containerd does (the host's /dev/shm, not a tmpfs).
+    if sandbox_ns(pod).host_ipc {
+        mounts.push(Mount { source: b"/dev/shm".to_vec(), sub_path: None, target: b"/dev/shm".to_vec(), readonly: false, prop: container::Prop::Private });
+    }
     for vm in ctr.get("volumeMounts").and_then(Value::as_array).unwrap_or(&[]) {
         let name = vm.get("name").and_then(Value::as_str).unwrap_or("");
         let target = vm.get("mountPath").and_then(Value::as_str).unwrap_or("");
@@ -1562,5 +1584,27 @@ mod block_volume_tests {
             assert_eq!(pvc_source(&fake, &csi, &pod, "ns", "app-scratch", false, true, true).await.unwrap(), "/dev/null");
             assert!(pvc_source(&fake, &csi, &pod, "ns", "app-other", false, true, true).await.unwrap_err().contains("was not created for the pod"));
         });
+    }
+}
+
+#[cfg(test)]
+mod host_namespace_tests {
+    use super::*;
+    use kr_runtime::container::{PidMode, SandboxNs};
+
+    fn pod(spec: &str) -> Value {
+        kr_fmt::json::parse_str(&alloc::format!(r#"{{"spec":{spec}}}"#)).unwrap()
+    }
+
+    #[test]
+    fn pid_and_ipc_modes_from_the_pod_spec() {
+        assert_eq!(pid_mode(&pod("{}")), PidMode::Container);
+        assert_eq!(pid_mode(&pod(r#"{"shareProcessNamespace":true}"#)), PidMode::Pod);
+        assert_eq!(pid_mode(&pod(r#"{"hostPID":true}"#)), PidMode::Host);
+        // hostPID wins: no pod pid namespace is created for it.
+        assert_eq!(pid_mode(&pod(r#"{"hostPID":true,"shareProcessNamespace":true}"#)), PidMode::Host);
+        assert_eq!(sandbox_ns(&pod(r#"{"hostPID":true,"shareProcessNamespace":true}"#)), SandboxNs { host_ipc: false, pid: false });
+        assert_eq!(sandbox_ns(&pod(r#"{"shareProcessNamespace":true,"hostIPC":true}"#)), SandboxNs { host_ipc: true, pid: true });
+        assert_eq!(sandbox_ns(&pod(r#"{"hostIPC":false}"#)), SandboxNs::default());
     }
 }

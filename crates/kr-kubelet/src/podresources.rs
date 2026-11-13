@@ -1,4 +1,5 @@
-//! The kubelet's `PodResources` gRPC API (v1: `List`, `GetAllocatableResources`, `Get`) on
+//! The kubelet's `PodResources` gRPC API (v1: `List`, `GetAllocatableResources`, `Get`; v1alpha1
+//! `List`) on
 //! `<kubelet dir>/pod-resources/kubelet.sock`, for tools that map devices to pods (the DCGM
 //! exporter, monitoring agents). Devices come from the device plugin allocations (ADR-038); CPU
 //! and memory lists are always empty (kr has no CPU or memory manager).
@@ -15,6 +16,9 @@ use kr_rt::exec::{spawn, Async};
 const LIST: &str = "/v1.PodResourcesLister/List";
 const ALLOCATABLE: &str = "/v1.PodResourcesLister/GetAllocatableResources";
 const GET: &str = "/v1.PodResourcesLister/Get";
+/// v1alpha1 `List` (still what the DCGM exporter calls): the same messages and field numbers as
+/// v1's, which only adds fields (topology, cpu_ids, memory) that a v1alpha1 decoder skips.
+const LIST_V1ALPHA1: &str = "/v1alpha1.PodResourcesLister/List";
 const NOT_FOUND: u32 = 5;
 
 /// A pod on this node, as far as the API needs it.
@@ -119,7 +123,7 @@ pub fn start(dp: &Rc<Plugins>, pods: Rc<dyn Fn() -> Vec<PodInfo>>) -> bool {
             let (dp, pods) = (dp.clone(), pods.clone());
             async move {
                 let body = match m.as_str() {
-                    LIST => Some(encode_list(&pods(), &dp)),
+                    LIST | LIST_V1ALPHA1 => Some(encode_list(&pods(), &dp)),
                     ALLOCATABLE => Some(encode_allocatable(&dp)),
                     GET => match encode_get(&pods(), &req, &dp) {
                         Some(b) => Some(b),

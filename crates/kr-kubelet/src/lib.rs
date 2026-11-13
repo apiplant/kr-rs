@@ -424,7 +424,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             } else {
                 // The old pod network is gone (or never existed): pods that used it cannot live on.
                 self.kill_recorded(&[]);
-                match container::start_sandbox(b"kr-pod-network", b"", &self.maps, None, true) {
+                match container::start_sandbox(b"kr-pod-network", b"", &self.maps, None, true, Default::default()) {
                     Ok(infra) => {
                         // ip_forward + bridge inside the infra namespaces; egress is set up
                         // separately and optional.
@@ -1662,10 +1662,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         } else {
             spec::pod_hostname(pod)
         };
+        let sns = spec::sandbox_ns(pod);
         let started = match self.infra.borrow().as_ref() {
-            _ if host_net => container::start_host_sandbox(uid.as_bytes(), hostname.as_bytes(), &self.maps, userns),
-            Some(infra) => container::start_sandbox_in(infra, uid.as_bytes(), hostname.as_bytes(), &self.maps, net, userns),
-            None => container::start_sandbox(uid.as_bytes(), hostname.as_bytes(), &self.maps, net, userns),
+            _ if host_net => container::start_host_sandbox(uid.as_bytes(), hostname.as_bytes(), &self.maps, userns, sns),
+            Some(infra) => container::start_sandbox_in(infra, uid.as_bytes(), hostname.as_bytes(), &self.maps, net, userns, sns),
+            None => container::start_sandbox(uid.as_bytes(), hostname.as_bytes(), &self.maps, net, userns, sns),
         };
         let sb = match started {
             Ok(s) => s,
@@ -1931,6 +1932,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             sandbox: p.sandbox.as_ref(),
             mounts: &built.mounts,
             hooks: &built.hooks,
+            pid_mode: spec::pid_mode(pod),
             log_fd: log.as_ref().map(|f| f.raw()),
             stdin_fd: stdin_read.map(|f| f.raw()),
             tty_fd: tty_pair.as_ref().map(|(_, sl)| sl.raw()),

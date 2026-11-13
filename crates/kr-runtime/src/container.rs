@@ -98,6 +98,30 @@ pub struct RunSpec<'a> {
     pub userns: bool,
     /// OCI lifecycle hooks (CDI `hooks`); see `crate::hooks`. Use `hooks::NONE` for none.
     pub hooks: &'a crate::hooks::Hooks,
+    /// Which pid namespace a sandboxed container runs in (`hostPID`, `shareProcessNamespace`).
+    pub pid_mode: PidMode,
+}
+
+/// The pid namespace of a container in a pod.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PidMode {
+    /// Its own (the container's process is pid 1).
+    #[default]
+    Container,
+    /// The pod's (`shareProcessNamespace`): the sandbox's `pause` is pid 1 and reaps orphans;
+    /// the sandbox must have been started with `SandboxNs::pid`.
+    Pod,
+    /// The host's (`hostPID`): the kubelet's own pid namespace.
+    Host,
+}
+
+/// Namespaces a pod sandbox does or does not get, besides the network one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SandboxNs {
+    /// `hostIPC`: no IPC namespace of its own; containers share the host's SysV IPC.
+    pub host_ipc: bool,
+    /// `shareProcessNamespace`: a pid namespace for the pod, with `pause` as its pid 1.
+    pub pid: bool,
 }
 
 /// Mount propagation of a volume (`volumeMounts[].mountPropagation`).
@@ -369,24 +393,24 @@ impl Sandbox {
 }
 
 /// Starts a pod sandbox. `net` (root only) attaches it to the bridge with that address.
-pub fn start_sandbox(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>, userns: bool) -> Result<Sandbox, RunError> {
-    sandbox_inner(id, hostname, maps, net, false, false, userns).map(|(pid, pidfd)| Sandbox { pid, pidfd: pidfd.expect("pidfd without CLONE_PARENT"), host_net: false, userns })
+pub fn start_sandbox(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>, userns: bool, sns: SandboxNs) -> Result<Sandbox, RunError> {
+    sandbox_inner(id, hostname, maps, net, false, false, userns, sns).map(|(pid, pidfd)| Sandbox { pid, pidfd: pidfd.expect("pidfd without CLONE_PARENT"), host_net: false, userns })
 }
 
 /// Starts a hostNetwork pod sandbox: like `start_sandbox` but without a network namespace, so
 /// the pod's processes share the caller's (the host's, or the rootless user's own).
-pub fn start_host_sandbox(id: &[u8], hostname: &[u8], maps: &IdMaps, userns: bool) -> Result<Sandbox, RunError> {
-    sandbox_inner(id, hostname, maps, None, false, true, userns).map(|(pid, pidfd)| Sandbox { pid, pidfd: pidfd.expect("pidfd without CLONE_PARENT"), host_net: true, userns })
+pub fn start_host_sandbox(id: &[u8], hostname: &[u8], maps: &IdMaps, userns: bool, sns: SandboxNs) -> Result<Sandbox, RunError> {
+    sandbox_inner(id, hostname, maps, None, false, true, userns, sns).map(|(pid, pidfd)| Sandbox { pid, pidfd: pidfd.expect("pidfd without CLONE_PARENT"), host_net: true, userns })
 }
 
 /// Starts a pod sandbox whose user and network namespaces are children of `parent`'s (the
 /// rootless pod network): a helper joins `parent`, creates the sandbox as kr's child
 /// (CLONE_PARENT), writes the nested maps and plugs it into the bridge living there.
-pub fn start_sandbox_in(parent: &Sandbox, id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>, userns: bool) -> Result<Sandbox, RunError> {
+pub fn start_sandbox_in(parent: &Sandbox, id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>, userns: bool, sns: SandboxNs) -> Result<Sandbox, RunError> {
     let nested = maps.nested();
     let (pid_r, pid_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     let helper_flags = if userns { ns::CLONE_NEWUSER | ns::CLONE_NEWNET } else { ns::CLONE_NEWNET };
-    let helper = fork_into(&parent.pidfd, helper_flags, None, move || match sandbox_inner(id, hostname, &nested, net, true, false, userns) {
+    let helper = fork_into(&parent.pidfd, helper_flags, None, move || match sandbox_inner(id, hostname, &nested, net, true, false, userns, sns) {
         Ok((pid, _)) => {
             let _ = kr_sys::write(pid_w.raw(), &(pid as u32).to_le_bytes());
             0
@@ -437,13 +461,16 @@ fn init_exe_fd() {
 
 /// Shared sandbox start. With `clone_parent` the sandbox becomes the caller's parent's child
 /// (used from a helper inside the pod-network namespaces) and no pidfd is returned.
-fn sandbox_inner(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>, clone_parent: bool, host_net: bool, userns: bool) -> Result<(i32, Option<Fd>), RunError> {
+#[allow(clippy::too_many_arguments)]
+fn sandbox_inner(id: &[u8], hostname: &[u8], maps: &IdMaps, net: Option<NetConfig>, clone_parent: bool, host_net: bool, userns: bool, sns: SandboxNs) -> Result<(i32, Option<Fd>), RunError> {
     init_exe_fd();
     let (go_r, go_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     let (rep_r, rep_w) = kr_sys::pipe2(kr_sys::O_CLOEXEC).map_err(err("pipe"))?;
     let (uid, gid) = (ns::getuid(), ns::getgid());
     let mut pidfd: i32 = -1;
-    let mut flags = ns::CLONE_NEWUTS | ns::CLONE_NEWIPC;
+    let mut flags = ns::CLONE_NEWUTS;
+    if !sns.host_ipc { flags |= ns::CLONE_NEWIPC; }
+    if sns.pid { flags |= ns::CLONE_NEWPID; }
     if userns { flags |= ns::CLONE_NEWUSER; }
     let mut args = CloneArgs { flags, ..Default::default() };
     if !host_net {
@@ -1187,10 +1214,16 @@ fn start_in_sandbox(spec: &RunSpec, sb: &Sandbox, cgroup: Option<Cgroup>, rootle
         drop(pid_r);
         let mut setns_flags = if sb.host_net { ns::CLONE_NEWUTS | ns::CLONE_NEWIPC } else { ns::CLONE_NEWNET | ns::CLONE_NEWUTS | ns::CLONE_NEWIPC };
         if sb.userns { setns_flags |= ns::CLONE_NEWUSER; }
+        // Pod: our children are born in pause's pid namespace (setns(CLONE_NEWPID) only changes
+        // the namespace of later children).
+        if spec.pid_mode == PidMode::Pod { setns_flags |= ns::CLONE_NEWPID; }
         if let Err(e) = ns::setns(&sb.pidfd, setns_flags) {
             report_exit(&rep_w, 24, e);
         }
-        let mut args = CloneArgs { flags: ns::CLONE_NEWNS | ns::CLONE_NEWPID | ns::CLONE_PARENT, ..Default::default() };
+        let mut args = CloneArgs { flags: ns::CLONE_NEWNS | ns::CLONE_PARENT, ..Default::default() };
+        if spec.pid_mode == PidMode::Container {
+            args.flags |= ns::CLONE_NEWPID;
+        }
         if cgroup.is_none() {
             args.flags |= ns::CLONE_NEWCGROUP;
         }
