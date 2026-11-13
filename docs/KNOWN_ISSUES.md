@@ -7,22 +7,18 @@ Goal order: **(A) parity with k3s** (needed to call kr production ready) → **(
 # A. Parity with k3s (blocks "production ready")
 Ordered by impact. Size: S days, M a week or two, L more.
 
-Every earlier parity item is closed (RESOLVED 342-345, 358). Found in the re-audit of 2026-11-14 (flags, configuration keys and subcommands compared with k3s):
+Every earlier parity item is closed (RESOLVED 342-345, 358). Found in the re-audit of 2026-11-14 (functionality compared with k3s; kr's own flag names are fine and kubectl is not bundled):
 
-361. **k3s configuration keys kr rejects** — *S*
-    Every key `kr_runtime::config` cannot translate is a start error (ADR-060), so a k3s `config.yaml` with any of these stops kr from starting: `write-kubeconfig`, `write-kubeconfig-mode` (in most k3s install guides), `bind-address`, `advertise-address`, `https-listen-port` (kr: `--port`), `cluster-dns`, `service-node-port-range`, `resolv-conf`, `system-default-registry`, `agent-token`, `default-local-storage-path`, `flannel-iface`, `selinux`, `protect-kernel-defaults`, `egress-selector-mode`, `with-node-id`, and the `etcd-snapshot-*` family (`-schedule-cron`, `-retention`, `-dir`, `-compress`; kr has `--snapshot-interval`/`--snapshot-keep`, no cron). Map each to a kr setting, or accept it with a logged "no effect" where kr has nothing to configure (egress selector); add cron schedules.
-362. **Component arguments, OIDC and webhook authentication/authorization** — *M*
-    k3s passes `kube-apiserver-arg`, `kubelet-arg`, `kube-controller-manager-arg`, `kube-scheduler-arg`, `kube-proxy-arg` through; kr has no such keys (ADR-060). The common uses have no kr equivalent: OIDC login (`oidc-issuer-url`, `oidc-client-id`, claims; or `--authentication-config` AuthenticationConfiguration with JWT authenticators), webhook token authentication, `--authorization-config`/webhook authorization, and opt-in admission plugins (`AlwaysPullImages`, `EventRateLimit`, `PodNodeSelector`). Needs JWT verification against a JWKS (RS256/ES256; kr-crypto has both), claim mapping, and a translation table for the pass-through keys that matter (unknown ones fail as today).
+361. **Server and node settings k3s offers and kr lacks** — *S*
+    Functionality, not key names: the admin kubeconfig's file mode and an extra copy path; the API listen address and the address advertised to agents and other servers; the cluster DNS Service IP; the NodePort range; the node `resolv.conf` handed to pods; a default registry prefix for system images; cron-scheduled snapshots with a snapshot directory (kr has an interval and a keep count).
+362. **OIDC and webhook authentication/authorization, optional admission plugins** — *M*
+    k3s users reach these through component arguments; kr has none of them: OIDC login (`oidc-issuer-url`, `oidc-client-id`, claims; or `--authentication-config` AuthenticationConfiguration with JWT authenticators), webhook token authentication, `--authorization-config`/webhook authorization, and opt-in admission plugins (`AlwaysPullImages`, `EventRateLimit`, `PodNodeSelector`). Needs JWT verification against a JWKS (RS256/ES256; kr-crypto has both), claim mapping.
 363. **Kubelet resource managers and graceful node shutdown** — *M*
     No CPU manager (`static` policy: exclusive cores for Guaranteed pods with integer CPU), memory manager, topology manager, and no graceful node shutdown (`shutdownGracePeriod`: a systemd inhibitor lock, pods terminated in priority order before poweroff). Users enable these with `kubelet-arg` in k3s; latency-sensitive and GPU workloads rely on the CPU/topology managers.
 364. **Kubelet image credential provider plugins** — *S*
     `--image-credential-provider-config`/`-bin-dir` (k3s flags; ECR, GCR/Artifact Registry and ACR plugins exec'd per image with a `CredentialProviderRequest`). kr pulls only with `registries.yaml` credentials and pull secrets, so nodes on a cloud cannot pull from the cloud's private registry with the node identity.
 365. **`kr token` lacks list, delete, generate and rotate** — *S*
     Only `kr token create` exists. k3s: `token list`/`delete`/`generate` for bootstrap tokens and `token rotate` for the server token (with `--new-token`), which agents and other servers must then use.
-366. **No bundled `kubectl` (`k3s kubectl`)** — *M*
-    k3s ships kubectl, crictl and ctr in its binary and points `kubectl` at its kubeconfig. kr has `kr ctr` only; users need a separate kubectl. A full kubectl is large; a subset (get/describe/apply/delete/logs/exec) would weigh on the binary-size budget (#53). Decide: bundle a subset, or document a download of upstream kubectl in the installer.
-
-
 # B. Verification backlog (code exists, not run on real systems)
 Each is a test run, not new code, unless the run finds a bug. Left: what needs hardware, credentials or a host decision.
 
