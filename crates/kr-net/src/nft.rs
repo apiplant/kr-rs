@@ -33,6 +33,7 @@ const NFTA_CHAIN_TYPE: u16 = 7; // NFTA_CHAIN_TYPE
 const NFTA_HOOK_HOOKNUM: u16 = 1; // NFTA_HOOK_HOOKNUM
 const NFTA_HOOK_PRIORITY: u16 = 2; // NFTA_HOOK_PRIORITY
 const NF_INET_FORWARD: u32 = 2; // NF_INET_FORWARD
+const NF_INET_LOCAL_IN: u32 = 1; // NF_INET_LOCAL_IN / NF_BR_LOCAL_IN
 const NF_INET_POST_ROUTING: u32 = 4; // NF_INET_POST_ROUTING
 
 const NFTA_RULE_TABLE: u16 = 1; // NFTA_RULE_TABLE
@@ -485,6 +486,9 @@ fn netpol_batch(fam: PolFam, chains: &[NpChain]) -> NlBuf {
     b.end();
     new_table(&mut b, f, t, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
     new_chain(&mut b, f, t, b"forward", b"filter", NF_INET_FORWARD, 0);
+    // Packets that end on this node (a pod talking to the node's own addresses) pass the `input`
+    // hook, not `forward`; pods' egress policy applies there too (as kube-router's INPUT chain).
+    new_chain(&mut b, f, t, b"input", b"filter", NF_INET_LOCAL_IN, 0);
     for c in chains {
         // a regular chain (no hook)
         msg(&mut b, NFT_MSG_NEWCHAIN, NLM_F_ACK | NLM_F_CREATE, f, 0);
@@ -512,6 +516,38 @@ fn netpol_batch(fam: PolFam, chains: &[NpChain]) -> NlBuf {
         cmp(b, NFT_CMP_LTE, &[137]);
         verdict_accept(b);
     });
+    // The same two accepts for the input hook, and Service addresses the node serves itself (the
+    // userspace proxy and the built-in DNS listen on ClusterIPs, so the destination is a Service
+    // address, not an endpoint: it cannot be judged against peers) stay open.
+    rule(&mut b, f, t, b"input", |b| {
+        expr_begin(b, b"ct");
+        b.attr_u32_be(NFTA_CT_DREG, NFT_REG_1);
+        b.attr_u32_be(NFTA_CT_KEY, NFT_CT_STATE);
+        expr_end(b);
+        bitwise_and(b, &CT_ESTABLISHED_RELATED.to_ne_bytes());
+        cmp(b, NFT_CMP_NEQ, &[0u8; 4]);
+        verdict_accept(b);
+    });
+    rule(&mut b, f, t, b"input", |b| {
+        family_guard(b, fam, true);
+        meta(b, NFT_META_L4PROTO);
+        cmp(b, NFT_CMP_EQ, &[58]);
+        payload(b, NFT_PAYLOAD_TRANSPORT_HEADER, 0, 1);
+        cmp(b, NFT_CMP_GTE, &[133]);
+        cmp(b, NFT_CMP_LTE, &[137]);
+        verdict_accept(b);
+    });
+    let (svc4, plen4) = crate::cidr::service_cidr();
+    rule(&mut b, f, t, b"input", |b| {
+        family_guard(b, fam, false);
+        addr_match(b, 16, &svc4, plen4);
+        verdict_accept(b);
+    });
+    rule(&mut b, f, t, b"input", |b| {
+        family_guard(b, fam, true);
+        addr_match(b, 24, &[0xfd, 0, 0, 0x96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 112);
+        verdict_accept(b);
+    });
     // Ingress chains first, then egress chains: a packet must pass both ("return" = allowed
     // here, the base chain goes on).
     for ingress in [true, false] {
@@ -526,6 +562,15 @@ fn netpol_batch(fam: PolFam, chains: &[NpChain]) -> NlBuf {
         }
     }
     let mut set_id = 0u32;
+    for c in chains.iter().filter(|c| !c.ingress) {
+        let v6 = c.ip.len() == 16;
+        let (src, _) = offsets(v6);
+        rule(&mut b, f, t, b"input", |b| {
+            family_guard(b, fam, v6);
+            addr_match(b, src, &c.ip, (c.ip.len() * 8) as u8);
+            verdict(b, NFT_JUMP, Some(c.name.as_bytes()));
+        });
+    }
     for c in chains {
         let v6 = c.ip.len() == 16;
         let (src, dst) = offsets(v6);
@@ -726,22 +771,22 @@ mod tests {
             let t = |x: u16| (NFNL_SUBSYS_NFTABLES << 8) | x;
             let types: Vec<u16> = m.iter().map(|x| x.0).collect();
             // begin, newtable, deltable, newtable, base chain, pod chain, ct, nd, jump, 2+1 allows + drop, end
-            let mut want = alloc::vec![0x10, t(0), t(2), t(0), t(3), t(3)];
-            want.extend([t(6); 7]);
+            let mut want = alloc::vec![0x10, t(0), t(2), t(0), t(3), t(3), t(3)];
+            want.extend([t(6); 11]); // ct, nd, input: ct, nd, 2 service ranges; jump, 3 allows, drop
             want.push(0x11);
             assert_eq!(types, want);
             let fam_byte = if fam == PolFam::Bridge { 7 } else { 1 };
             assert_eq!(m[4].2[16], fam_byte);
-            assert!(contains(m[8].2, b"i4_0\0")); // jump target
-            assert!(contains(m[8].2, &NFT_JUMP.to_be_bytes()));
-            assert!(contains(m[8].2, &[10, 88, 0, 5]));
+            assert!(contains(m[13].2, b"i4_0\0")); // jump target
+            assert!(contains(m[13].2, &NFT_JUMP.to_be_bytes()));
+            assert!(contains(m[13].2, &[10, 88, 0, 5]));
             // allow 1 / port 80: masked peer, port 80 BE; allow 1 / udp range; allow 2 = any
-            assert!(contains(m[9].2, &[255, 255, 0, 0]));
-            assert!(contains(m[9].2, &80u16.to_be_bytes()));
-            assert!(contains(m[10].2, &53u16.to_be_bytes()) && contains(m[10].2, &60u16.to_be_bytes()));
-            assert!(contains(m[10].2, &NFT_CMP_GTE.to_be_bytes()));
-            assert!(contains(m[11].2, &NFT_RETURN.to_be_bytes()) && !contains(m[11].2, b"payload"));
-            assert!(contains(m[12].2, b"immediate"));
+            assert!(contains(m[14].2, &[255, 255, 0, 0]));
+            assert!(contains(m[14].2, &80u16.to_be_bytes()));
+            assert!(contains(m[15].2, &53u16.to_be_bytes()) && contains(m[15].2, &60u16.to_be_bytes()));
+            assert!(contains(m[15].2, &NFT_CMP_GTE.to_be_bytes()));
+            assert!(contains(m[16].2, &NFT_RETURN.to_be_bytes()) && !contains(m[16].2, b"payload"));
+            assert!(contains(m[17].2, b"immediate"));
         }
     }
 

@@ -589,3 +589,6 @@
 
 304. **`registries.yaml` `configs` had no `*` default; a removed encrypted resource looked unreadable** — *fixed / not a bug* (#175, #193)
     A `*` key under `configs` is now the credentials and TLS default for every registry without its own entry (the `*` mirror existed; k3s supports both). For #193 the documented hazard does not exist: the encryption codec decides by the stored value's `k8s:enc:` prefix, not by the resource list, so ciphertext of a resource later removed from `encryption-config.json` still decrypts as long as its key is present (`a_resource_removed_from_the_list_still_reads_back`); the codec is only absent when the config file is gone, which is the `disable` flow.
+
+305. **NetworkPolicy did not filter traffic to the node itself** — *fixed for egress* (part of #201)
+    The policy table has an `input` base chain beside `forward`: replies, ND, and Service addresses stay open, and a pod with an egress policy is judged by the same chain for packets addressed to the node. Real-kernel check: pod A with an egress policy reaches pod B but not the node's own address.

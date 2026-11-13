@@ -109,7 +109,12 @@ check "policy with a set of peers: a member on another port is dropped" "$(clien
 check "the peers are in a set" "$(nft list set inet kr-netpol i4_0-s1 2>&1 | grep -c "10.88.9.1")" "1"
 scenario pol-deny-all
 check "policy: default deny drops everyone" "$(client 10.88.1.2 9090 1)" "error TimeoutError"
+python3 /tmp/srv.py H 7000 & SH=$!
+sleep 0.3
+check "the node itself is reachable from a pod without a policy" "$(client 10.88.0.1 7000 1 | cut -d" " -f1)" "H"
 scenario pol-egress
+check "policy: egress to an address of the node itself is dropped (INPUT hook, #201)" "$(client 10.88.0.1 7000 1)" "error TimeoutError"
+kill $SH 2>/dev/null
 check "policy: egress to the allowed peer works" "$(client 10.88.1.2 9090 1 | cut -d" " -f1)" "B"
 check "policy: egress to another pod is dropped" "$(client 10.88.2.2 9090 1)" "error TimeoutError"
 nft delete table inet kr-netpol 2>/dev/null
