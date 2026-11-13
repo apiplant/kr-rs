@@ -83,6 +83,44 @@ fn issue(dir: &str, file: &str, ca: &(Name, x509::SigningKey, Vec<u8>), subject:
 /// changed), so that it is issued again with the new address.
 /// The node's primary address: IPv4 if the host has a route out, else IPv6 (`KR_PREFER_IPV6=1`
 /// picks IPv6 even on a dual-stack host: how the IPv6 underlay is tested).
+/// The address agents, other servers and pods use to reach this server: `KR_ADVERTISE_ADDRESS`
+/// (e.g. a NAT or load-balancer address), else the node's primary address.
+pub(crate) fn advertise_addr() -> [u8; 16] {
+    kr_runtime::store::env_var("KR_ADVERTISE_ADDRESS").and_then(|a| kr_net::tcp::parse_ip16(a.trim())).unwrap_or_else(primary_addr)
+}
+
+/// The IPv4 address the API listens on (`KR_BIND_ADDRESS`, default all).
+pub(crate) fn bind_addr() -> [u8; 4] {
+    kr_runtime::store::env_var("KR_BIND_ADDRESS").and_then(|a| kr_net::tcp::parse_ip16(a.trim())).and_then(kr_sys::unmap4).unwrap_or([0, 0, 0, 0])
+}
+
+/// After `admin.kubeconfig` exists: applies `KR_KUBECONFIG_MODE` to it and writes the copy
+/// `KR_KUBECONFIG_COPY` (same mode, default 0600), replaced at every start.
+fn publish_kubeconfig(data: &str) -> Result<(), String> {
+    let chmod = |p: &[u8], m: u32| fs::openat(fs::AT_FDCWD, p, fs::O_RDONLY | fs::O_CLOEXEC, 0).and_then(|fd| fs::fchmod(fd.raw(), m));
+    let mode = kr_runtime::store::env_var("KR_KUBECONFIG_MODE").and_then(|m| u32::from_str_radix(m.trim(), 8).ok());
+    let src = pki::path(data, "admin.kubeconfig");
+    if let Some(m) = mode {
+        chmod(&src, m).map_err(|e| format!("chmod admin.kubeconfig: errno {}", e.0))?;
+    }
+    if let Some(dst) = kr_runtime::store::env_var("KR_KUBECONFIG_COPY").filter(|d| !d.is_empty()) {
+        let text = fs::read_file(&src, 1 << 20).map_err(|e| format!("read admin.kubeconfig: errno {}", e.0))?;
+        if let Some(parent) = dst.rsplit_once('/').map(|(p, _)| p).filter(|p| !p.is_empty()) {
+            mkdir_p(parent)?;
+        }
+        let mut t = format!("{dst}.kr-tmp").into_bytes();
+        t.push(0);
+        let mut d = dst.clone().into_bytes();
+        d.push(0);
+        let _ = fs::unlinkat(fs::AT_FDCWD, &t, 0);
+        let m = mode.unwrap_or(0o600);
+        pki::write_new(&t, &text, m)?;
+        chmod(&t, m).map_err(|e| format!("chmod {dst}: errno {}", e.0))?; // umask may have narrowed it
+        fs::renameat2(fs::AT_FDCWD, &t, fs::AT_FDCWD, &d, 0).map_err(|e| format!("write {dst}: errno {}", e.0))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn primary_addr() -> [u8; 16] {
     if let Some(ip) = crate::install::node_ip() {
         return ip;
@@ -139,7 +177,7 @@ fn drop_if_ip_changed(pki_dir: &str, file: &str, ip: [u8; 16], adv_check: bool) 
 pub(crate) fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
     let pki_dir = format!("{data}/pki");
     mkdir_p(&pki_dir)?;
-    let adv = primary_addr();
+    let adv = advertise_addr();
     let routable = adv != kr_sys::map4([127, 0, 0, 1]);
     for file in ["apiserver", "server", "kubelet-client"] {
         drop_if_ip_changed(&pki_dir, file, adv, routable && file != "kubelet-client");
@@ -151,6 +189,9 @@ pub(crate) fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
     let mut sans = crate::install::tls_sans();
     if let Some(e) = crate::install::external_ip() {
         sans.push(kr_net::tcp::fmt_ip16(e));
+    }
+    if kr_runtime::store::env_var("KR_ADVERTISE_ADDRESS").is_some() {
+        sans.push(kr_net::tcp::fmt_ip16(advertise_addr()));
     }
     sans.sort();
     sans.dedup();
@@ -238,15 +279,17 @@ pub(crate) fn bootstrap(data: &str, port: u16, ha: bool) -> Result<(), String> {
         issue(&pki_dir, "admin", &ca, name, false, true, Vec::new(), Vec::new())?;
         let read = |f: &str| fs::read_file(&pki::path(&pki_dir, f), 1 << 20).map_err(|e| format!("read {f}: errno {}", e.0));
         let b64 = |v: Vec<u8>| kr_fmt::base64::encode(&v);
+        let b = bind_addr();
+        let host = if b == [0, 0, 0, 0] { String::from("127.0.0.1") } else { format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]) };
         let kubeconfig = format!(
-            "apiVersion: v1\nkind: Config\nclusters:\n- name: kr\n  cluster:\n    server: https://127.0.0.1:{port}\n    certificate-authority-data: {}\nusers:\n- name: kr-admin\n  user:\n    client-certificate-data: {}\n    client-key-data: {}\ncontexts:\n- name: kr\n  context:\n    cluster: kr\n    user: kr-admin\ncurrent-context: kr\n",
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: kr\n  cluster:\n    server: https://{host}:{port}\n    certificate-authority-data: {}\nusers:\n- name: kr-admin\n  user:\n    client-certificate-data: {}\n    client-key-data: {}\ncontexts:\n- name: kr\n  context:\n    cluster: kr\n    user: kr-admin\ncurrent-context: kr\n",
             b64(read("ca.pem")?),
             b64(read("admin.pem")?),
             b64(read("admin.key")?)
         );
         pki::write_new(&pki::path(data, "admin.kubeconfig"), kubeconfig.as_bytes(), 0o600)?;
     }
-    Ok(())
+    publish_kubeconfig(data)
 }
 
 pub fn load_pem(dir: &str, file: &str, label: &str) -> Result<Vec<Vec<u8>>, String> {
@@ -565,6 +608,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
     }
     let (mut port, mut data, mut cluster_init) = (6443u16, None, false);
     let (mut snap_every, mut snap_keep) = (None::<u64>, 5usize);
+    let (mut snap_cron, mut snap_dir) = (None::<kr_runtime::cron::Cron>, None::<String>);
     let mut s3_opts = crate::snapshot::S3Opts::default();
     let mut enc_on = true;
     let (mut audit_policy, mut audit_path, mut audit_max, mut audit_backup, mut psa_config) = (None::<String>, None::<String>, 100u64, 5usize, None::<String>);
@@ -620,6 +664,11 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
                 "off" => enc_on = false,
                 _ => return fail("--secrets-encryption takes on or off"),
             },
+            (b"--snapshot-cron", Some(v)) => match kr_runtime::cron::Cron::parse(v) {
+                Ok(c) => snap_cron = Some(c),
+                Err(e) => return fail(&format!("--snapshot-cron: {e}")),
+            },
+            (b"--snapshot-dir", Some(v)) => snap_dir = Some(String::from(v.trim_end_matches('/'))),
             (b"--snapshot-keep", Some(v)) => match v.parse::<usize>() {
                 Ok(n) if n > 0 => snap_keep = n,
                 _ => return fail("bad --snapshot-keep"),
@@ -649,10 +698,13 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
                 Ok(Err(e)) => return fail(&e),
                 _ => return fail(&format!("unknown or incomplete flag {}", String::from_utf8_lossy(f))),
             },
-            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h [--snapshot-keep 5] [--snapshot-s3 --snapshot-s3-bucket B [--snapshot-s3-endpoint HOST:PORT] [--snapshot-s3-folder DIR] [--snapshot-s3-region R] [--snapshot-s3-access-key K --snapshot-s3-secret-key S] [--snapshot-s3-insecure] [--snapshot-s3-endpoint-ca FILE] [--snapshot-s3-skip-ssl-verify]]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--audit-log-maxage DAYS] [--audit-log-format json|legacy] [--audit-webhook-config-file KUBECONFIG [--audit-webhook-mode batch|blocking|blocking-strict] [--audit-webhook-batch-max-size N] [--audit-webhook-batch-max-wait 30s] [--audit-webhook-batch-buffer-size N] [--audit-webhook-initial-backoff 10s]] [--pod-security-config FILE] [--config FILE] [--tls-san NAME]... [--node-name NAME] [--node-label K=V]... [--node-taint K=V:EFFECT]... [--node-ip IP] [--node-external-ip IP] [--disable COMPONENT]... [--helm-job-image IMAGE] [--embedded-registry] [--cluster-cidr CIDR] [--service-cidr CIDR] [--cluster-domain NAME] [--flannel-backend vxlan|host-gw|wireguard-native] [--proxy-mode userspace|nftables] [--max-pods N] [--private-registry FILE] (more keys: README, configuration file)"),
+            _ => return fail("usage: kr server [--port 6443] [--data DIR] [--cluster-init | --server https://HOST:6443 [--token-file FILE | --token TOKEN]] [--snapshot-interval 6h | --snapshot-cron 'M H DOM MON DOW' [--snapshot-keep 5] [--snapshot-dir DIR] [--snapshot-s3 --snapshot-s3-bucket B [--snapshot-s3-endpoint HOST:PORT] [--snapshot-s3-folder DIR] [--snapshot-s3-region R] [--snapshot-s3-access-key K --snapshot-s3-secret-key S] [--snapshot-s3-insecure] [--snapshot-s3-endpoint-ca FILE] [--snapshot-s3-skip-ssl-verify]]] [--secrets-encryption on|off] [--audit-policy-file FILE] [--audit-log-path FILE|-|off] [--audit-log-maxsize MB] [--audit-log-maxbackup N] [--audit-log-maxage DAYS] [--audit-log-format json|legacy] [--audit-webhook-config-file KUBECONFIG [--audit-webhook-mode batch|blocking|blocking-strict] [--audit-webhook-batch-max-size N] [--audit-webhook-batch-max-wait 30s] [--audit-webhook-batch-buffer-size N] [--audit-webhook-initial-backoff 10s]] [--pod-security-config FILE] [--config FILE] [--tls-san NAME]... [--node-name NAME] [--node-label K=V]... [--node-taint K=V:EFFECT]... [--node-ip IP] [--node-external-ip IP] [--disable COMPONENT]... [--helm-job-image IMAGE] [--embedded-registry] [--cluster-cidr CIDR] [--service-cidr CIDR] [--cluster-domain NAME] [--flannel-backend vxlan|host-gw|wireguard-native] [--proxy-mode userspace|nftables] [--max-pods N] [--private-registry FILE] (more keys: README, configuration file)"),
         }
     }
     if let Err(e) = crate::install::publish(&inst) {
+        return fail(&e);
+    }
+    if let Err(e) = crate::init_cidrs() {
         return fail(&e);
     }
     let disabled = crate::install::disabled().unwrap_or_default();
@@ -660,8 +712,11 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
         Ok(v) => v,
         Err(e) => return fail(&e),
     };
-    if snap_s3.is_some() && snap_every.is_none() {
-        return fail("--snapshot-s3 uploads the scheduled snapshots: set --snapshot-interval too (or use `kr snapshot save --s3`)");
+    if snap_every.is_some() && snap_cron.is_some() {
+        return fail("--snapshot-interval and --snapshot-cron are alternatives: set one");
+    }
+    if snap_s3.is_some() && snap_every.is_none() && snap_cron.is_none() {
+        return fail("--snapshot-s3 uploads the scheduled snapshots: set --snapshot-interval or --snapshot-cron too (or use `kr snapshot save --s3`)");
     }
     let data = data.unwrap_or_else(data_dir);
     if cluster_init && join_url.is_some() {
@@ -707,7 +762,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
         }
     }
     // The address pods, agents and other servers use to reach this API server.
-    let advertise = primary_addr();
+    let advertise = advertise_addr();
     // An existing single-server datastore: imported on --cluster-init, never thrown away by a join.
     let import_db = ha && raft_fresh && exists(&pki::path(&format!("{data}/db"), "log"));
     if import_db && join_url.is_some() {
@@ -821,7 +876,9 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
     if let Err(e) = api.ensure_builtin_services(advertise, port) {
         return fail(&e.message);
     }
-    print(format!("kr server: listening on https://0.0.0.0:{port}\nkr server: export KUBECONFIG={data}/admin.kubeconfig\n").as_bytes());
+    let b = bind_addr();
+    print(format!("kr server: listening on https://{}.{}.{}.{}:{port}\n", b[0], b[1], b[2], b[3]).as_bytes());
+    print(format!("kr server: export KUBECONFIG={data}/admin.kubeconfig\n").as_bytes());
     // The embedded registry mirror (#322) serves with the API serving certificate (it has the
     // node's addresses) and requires a client certificate of the cluster CA.
     let mirror_slot: Option<Slot<ServerConfig>> = mirror_tls(&pki_dir).ok().map(|c| Rc::new(core::cell::RefCell::new(c)));
@@ -861,7 +918,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
             }
             kr_apiserver::audit::spawn_flusher(a);
         }
-        let cfg = kr_controllers::Config { now: pki::now, evict: kr_controllers::nodelifecycle::Limits::from_lookup(kr_runtime::store::env_var), disabled, helm_image: helm_image.clone().or_else(|| kr_runtime::store::env_var("KR_HELM_JOB_IMAGE").filter(|v| !v.is_empty())).map(|i| &*alloc::boxed::Box::leak(i.into_boxed_str())), ..kr_controllers::Config::default() };
+        let cfg = kr_controllers::Config { now: pki::now, evict: kr_controllers::nodelifecycle::Limits::from_lookup(kr_runtime::store::env_var), disabled, helm_image: helm_image.clone().or_else(|| kr_runtime::store::env_var("KR_HELM_JOB_IMAGE").filter(|v| !v.is_empty())).or_else(|| kr_runtime::store::env_var("KR_SYSTEM_DEFAULT_REGISTRY").filter(|r| !r.is_empty()).map(|r| format!("{r}/{}", kr_controllers::helm::DEFAULT_IMAGE))).map(|i| &*alloc::boxed::Box::leak(i.into_boxed_str())), ..kr_controllers::Config::default() };
         // The CSR approver/signer issues with the cluster CA (absent: it does not run).
         let csr_ca = pki::load_ca(&pki_dir).ok().map(|(name, key, _)| Rc::new(kr_controllers::csr::CaSigner { name, key, rng }));
         match ha_tasks {
@@ -888,8 +945,13 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
             }
         }
         kr_rt::exec::spawn(crate::keysync::watch_pki(api.clone(), data_for_sync.clone(), reload.clone()));
-        if let Some(every) = snap_every {
-            kr_rt::exec::spawn(crate::snapshot::schedule(snapshot_data, every, snap_keep, snap_s3));
+        let when = match (snap_every, snap_cron) {
+            (Some(every), _) => Some(crate::snapshot::When::Every(every)),
+            (_, Some(c)) => Some(crate::snapshot::When::Cron(c)),
+            _ => None,
+        };
+        if let Some(when) = when {
+            kr_rt::exec::spawn(crate::snapshot::schedule(snapshot_data, when, snap_dir, snap_keep, snap_s3));
         }
         let local: Option<Rc<dyn kr_apiserver::api::NodeProxy>> = kubelet.as_ref().map(|k| Rc::new(kr_kubelet::stream::Proxy(k.clone())) as Rc<dyn kr_apiserver::api::NodeProxy>);
         let local_dial: Option<Rc<dyn kr_apiserver::podproxy::PodDialer>> = kubelet.as_ref().map(|k| Rc::new(kr_kubelet::stream::Proxy(k.clone())) as Rc<dyn kr_apiserver::podproxy::PodDialer>);
@@ -902,7 +964,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
         if let Some(k) = kubelet {
             kr_rt::exec::spawn(k.run());
         }
-        kr_apiserver::server::run_reloadable(api, [0, 0, 0, 0], port, api_slot).await
+        kr_apiserver::server::run_reloadable(api, bind_addr(), port, api_slot).await
     }) {
         Ok(()) => 0,
         Err(e) => fail(&format!("listener failed: {e:?} (is port {port} already in use?)")),

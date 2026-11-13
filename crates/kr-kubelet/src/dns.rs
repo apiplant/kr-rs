@@ -14,9 +14,10 @@ use kr_net::dnsserver::{self, EndpointRecord, PortRecord, ServiceRecord, Zone};
 use kr_net::tcp::{IpAddr, SocketAddr};
 use kr_rt::exec::Async;
 
-/// The `kube-dns` Service's IPv4 ClusterIP: the Service network's `.0.10`.
+/// The `kube-dns` Service's IPv4 ClusterIP: the Service network's `.0.10` unless
+/// `KR_CLUSTER_DNS` names another address ([`kr_net::cidr::dns_ip`]).
 pub fn dns_ip() -> [u8; 4] {
-    kr_net::cidr::service_ip(0, 10)
+    kr_net::cidr::dns_ip()
 }
 /// The `kube-dns` Service's IPv6 ClusterIP (`fd00:96::a`).
 pub const DNS_IP6: [u8; 16] = [0xfd, 0, 0, 0x96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a];

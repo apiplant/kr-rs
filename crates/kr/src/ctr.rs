@@ -324,7 +324,7 @@ fn resolv_conf(rootless: bool) -> String {
         }
         return format!("nameserver {}.{}.{}.{}\n", network::EGRESS_DNS[0], network::EGRESS_DNS[1], network::EGRESS_DNS[2], network::EGRESS_DNS[3]);
     }
-    let host = String::from_utf8(kr_sys::fs::read_file(b"/etc/resolv.conf\0", 16384).unwrap_or_default()).unwrap_or_default();
+    let host = String::from_utf8(kr_sys::fs::read_file(&kr_net::dns::resolv_conf_path(), 16384).unwrap_or_default()).unwrap_or_default();
     let mut out: String = host.lines().filter(|l| l.trim().strip_prefix("nameserver").map(|a| !a.trim().starts_with("127.") && a.trim() != "::1" && (fam.v4 || a.contains(':'))).unwrap_or(false)).map(|l| format!("{l}\n")).collect();
     if out.is_empty() {
         out.push_str(if fam.v4 { "nameserver 1.1.1.1\n" } else { "nameserver 2606:4700:4700::1111\n" });

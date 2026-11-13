@@ -279,6 +279,9 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
     if let Err(e) = crate::install::publish(&inst) {
         return fail(&e);
     }
+    if let Err(e) = crate::init_cidrs() {
+        return fail(&e);
+    }
     let disabled = crate::install::disabled().unwrap_or_default();
     let Some(server) = server.map(|s| String::from(s.trim_end_matches('/'))) else { return fail("--server is required") };
     let data = data.unwrap_or_else(data_dir);

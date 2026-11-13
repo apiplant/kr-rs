@@ -19,7 +19,7 @@ const MAX_PENDING: usize = 256 << 10;
 
 /// The host's first nameserver, either family (what `EGRESS_DNS` / `EGRESS_DNS6` are forwarded to).
 fn host_dns() -> Addr {
-    let text = kr_sys::fs::read_file(b"/etc/resolv.conf\0", 16384).unwrap_or_default();
+    let text = kr_sys::fs::read_file(&kr_net::dns::resolv_conf_path(), 16384).unwrap_or_default();
     core::str::from_utf8(&text)
         .unwrap_or("")
         .lines()

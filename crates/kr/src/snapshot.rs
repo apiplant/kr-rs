@@ -509,10 +509,31 @@ pub fn parse_duration(s: &str) -> Option<u64> {
 
 /// Writes `<data>/snapshots/kr-snapshot-<unix time>.tar` every `interval_s` seconds and keeps
 /// the newest `keep`; with `s3` the same archive is uploaded and the bucket folder pruned alike.
-pub async fn schedule(data: String, interval_s: u64, keep: usize, s3: Option<S3Settings>) {
-    let dir = format!("{data}/snapshots");
+/// When scheduled snapshots are taken.
+pub enum When {
+    /// Every this many seconds after the start.
+    Every(u64),
+    /// At the times a cron expression matches (UTC).
+    Cron(kr_runtime::cron::Cron),
+}
+
+pub async fn schedule(data: String, when: When, dir: Option<String>, keep: usize, s3: Option<S3Settings>) {
+    let dir = dir.unwrap_or_else(|| format!("{data}/snapshots"));
     loop {
-        kr_rt::exec::sleep(interval_s.saturating_mul(1000)).await;
+        let wait_s = match &when {
+            When::Every(s) => *s,
+            When::Cron(c) => {
+                let now = pki::now();
+                match c.next_after(now) {
+                    Some(t) => (t - now) as u64,
+                    None => {
+                        eprint(b"kr server: --snapshot-cron never matches a date; no scheduled snapshots\n");
+                        return;
+                    }
+                }
+            }
+        };
+        kr_rt::exec::sleep(wait_s.saturating_mul(1000)).await;
         let name = snapshot_name(pki::now());
         let f = format!("{dir}/{name}");
         // Reading the datastore, replaying it, building and writing the archive is all disk
@@ -587,3 +608,4 @@ fn prune(dir: &str, keep: usize) {
         let _ = fs::unlinkat(fd.raw(), &c, 0);
     }
 }
+

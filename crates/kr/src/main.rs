@@ -137,10 +137,21 @@ fn kr_main(mut args: Args) -> i32 {
 }
 
 /// `KR_POD_CIDR` / `KR_SERVICE_CIDR` (see `kr_net::cidr`): the same on the server and every agent.
-fn init_cidrs() -> Result<(), alloc::string::String> {
+/// Applies the network settings; again after `install::publish`, whose flags and config keys
+/// override the environment.
+pub(crate) fn init_cidrs() -> Result<(), alloc::string::String> {
     let pod = kr_runtime::store::env_var("KR_POD_CIDR");
     let svc = kr_runtime::store::env_var("KR_SERVICE_CIDR");
-    kr_net::cidr::init(pod.as_deref(), svc.as_deref())
+    kr_net::cidr::init(pod.as_deref(), svc.as_deref())?;
+    if let Some(r) = kr_runtime::store::env_var("KR_RESOLV_CONF").filter(|r| !r.is_empty()) {
+        if kr_sys::fs::read_file(&{ let mut p = r.as_bytes().to_vec(); p.push(0); p }, 64 * 1024).is_err() {
+            return Err(alloc::format!("KR_RESOLV_CONF: cannot read {r}"));
+        }
+        kr_net::dns::set_resolv_conf(&r);
+    }
+    let dns = kr_runtime::store::env_var("KR_CLUSTER_DNS");
+    let ports = kr_runtime::store::env_var("KR_NODE_PORT_RANGE");
+    kr_net::cidr::init_services(dns.as_deref(), ports.as_deref())
 }
 
 fn bad_config(msg: &str) -> i32 {

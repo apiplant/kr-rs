@@ -3026,7 +3026,14 @@ impl ApiServer {
             let old_ports: Vec<Value> = old_spec.and_then(|s| s.get("ports")).and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default();
             if let Some(Value::Array(ports)) = spec.get_mut("ports") {
                 for p in ports.iter_mut() {
-                    if p.get("nodePort").and_then(Value::as_u64).is_some() {
+                    if let Some(n) = p.get("nodePort").and_then(Value::as_u64) {
+                        // As upstream: an explicit NodePort must lie in the range (a kept one may not,
+                        // after the range changed).
+                        let (lo, hi) = kr_net::cidr::node_port_range();
+                        let kept = old_ports.iter().any(|op| op.get("nodePort").and_then(Value::as_u64) == Some(n));
+                        if !kept && (n < lo as u64 || n > hi as u64) {
+                            return Err(ApiError::new(422, "Invalid", &alloc::format!("spec.ports.nodePort: Invalid value: {n}: provided port is not in the valid range. The range of valid ports is {lo}-{hi}")));
+                        }
                         continue;
                     }
                     // Keep the previous allocation for the same port on updates.
@@ -3034,7 +3041,8 @@ impl ApiServer {
                     let np = match prev {
                         Some(n) => n as u16,
                         None => {
-                            let n = (30000u16..=32767).find(|n| !used.contains(n)).ok_or_else(|| ApiError::new(422, "Invalid", "no free NodePorts"))?;
+                            let (lo, hi) = kr_net::cidr::node_port_range();
+                            let n = (lo..=hi).find(|n| !used.contains(n)).ok_or_else(|| ApiError::new(422, "Invalid", "no free NodePorts"))?;
                             used.push(n);
                             n
                         }
@@ -3375,7 +3383,10 @@ impl ApiServer {
         } else {
             String::from(dns)
         };
-        self.bootstrap_object(svc, Some("kube-system"), "kube-dns", "Service", &with_net(dns));
+        // The DNS address may be moved inside the Service network (KR_CLUSTER_DNS).
+        let d = kr_net::cidr::dns_ip();
+        let dns = with_net(dns).replace(&alloc::format!("\"{}.{}.0.10\"", sp[0], sp[1]), &alloc::format!("\"{}.{}.{}.{}\"", d[0], d[1], d[2], d[3]));
+        self.bootstrap_object(svc, Some("kube-system"), "kube-dns", "Service", &dns);
         self.sync()
     }
 

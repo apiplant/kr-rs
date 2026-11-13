@@ -5,6 +5,7 @@
 //! on the server and on every agent. Set once at start-up by [`init`].
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 const DEFAULT_POD: [u8; 2] = [10, 88];
@@ -67,6 +68,63 @@ pub fn parse16(s: &str) -> Result<[u8; 2], String> {
     Ok([o[0], o[1]])
 }
 
+// The cluster DNS address `A.B.hi.lo` as 0x10000 | hi << 8 | lo (0: `.0.10`).
+static DNS: AtomicU32 = AtomicU32::new(0);
+// The NodePort range as low << 16 | high (0: 30000-32767).
+static NODE_PORTS: AtomicU32 = AtomicU32::new(0);
+
+/// The `kube-dns` Service's IPv4 ClusterIP, which pods use as their nameserver.
+pub fn dns_ip() -> [u8; 4] {
+    match DNS.load(Ordering::Relaxed) {
+        0 => service_ip(0, 10),
+        x => service_ip((x >> 8) as u8, x as u8),
+    }
+}
+
+/// NodePorts are allocated from this inclusive range (default 30000-32767).
+pub fn node_port_range() -> (u16, u16) {
+    match NODE_PORTS.load(Ordering::Relaxed) {
+        0 => (30000, 32767),
+        x => ((x >> 16) as u16, x as u16),
+    }
+}
+
+/// Applies `KR_CLUSTER_DNS` (an address of the Service network, not `.0.0`, `.0.1` or the
+/// broadcast) and `KR_NODE_PORT_RANGE` (`LOW-HIGH`). Call after [`init`].
+pub fn init_services(dns: Option<&str>, node_ports: Option<&str>) -> Result<(), String> {
+    let (d, n) = parse_services(dns, node_ports, service_prefix())?;
+    if let Some(d) = d {
+        DNS.store(0x10000 | (d[0] as u32) << 8 | d[1] as u32, Ordering::Relaxed);
+    }
+    if let Some((a, b)) = n {
+        NODE_PORTS.store((a as u32) << 16 | b as u32, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Validates [`init_services`]' settings against the Service network `prefix`: the DNS
+/// address's last two octets and the NodePort range.
+fn parse_services(dns: Option<&str>, node_ports: Option<&str>, p: [u8; 2]) -> Result<(Option<[u8; 2]>, Option<(u16, u16)>), String> {
+    let mut out = (None, None);
+    if let Some(d) = dns {
+        let o: Vec<u8> = d.trim().split('.').filter_map(|x| x.parse().ok()).collect();
+        if o.len() != 4 || o[..2] != p || (o[2] == 0 && o[3] <= 1) || (o[2] == 255 && o[3] == 255) {
+            return Err(alloc::format!("KR_CLUSTER_DNS: {d:?} must be an address of the Service network {}.{}.0.0/16 other than .0.0, .0.1 and .255.255", p[0], p[1]));
+        }
+        out.0 = Some([o[2], o[3]]);
+    }
+    if let Some(r) = node_ports {
+        let bad = || alloc::format!("KR_NODE_PORT_RANGE: {r:?} is not LOW-HIGH");
+        let (a, b) = r.trim().split_once('-').ok_or_else(bad)?;
+        let (a, b): (u16, u16) = (a.trim().parse().map_err(|_| bad())?, b.trim().parse().map_err(|_| bad())?);
+        if a == 0 || a > b {
+            return Err(bad());
+        }
+        out.1 = Some((a, b));
+    }
+    Ok(out)
+}
+
 /// Applies `KR_POD_CIDR` / `KR_SERVICE_CIDR` (None = default). Both must differ.
 pub fn init(pod: Option<&str>, service: Option<&str>) -> Result<(), String> {
     let p = pod.map(|s| parse16(s).map_err(|e| alloc::format!("KR_POD_CIDR: {e}"))).transpose()?.unwrap_or(DEFAULT_POD);
@@ -101,5 +159,20 @@ mod tests {
         assert_eq!((pod_cidr(), service_ip(0, 10)), (([10, 42, 0, 0], 16), [10, 43, 0, 10]));
         assert!(init(None, None).is_ok());
         assert_eq!(pod_prefix(), [10, 88]);
+    }
+}
+
+#[cfg(test)]
+mod services_tests {
+    use super::*;
+
+    #[test]
+    fn dns_and_node_ports() {
+        let p = [10, 96];
+        assert!(parse_services(Some("10.97.0.53"), None, p).is_err(), "outside the Service network");
+        assert!(parse_services(Some("10.96.0.1"), None, p).is_err(), "the kubernetes Service");
+        assert!(parse_services(None, Some("5-1"), p).is_err());
+        assert!(parse_services(None, Some("0-1"), p).is_err());
+        assert_eq!(parse_services(Some("10.96.3.53"), Some("20000-20010"), p), Ok((Some([3, 53]), Some((20000, 20010)))));
     }
 }

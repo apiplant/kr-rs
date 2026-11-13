@@ -47,7 +47,64 @@ const SETTINGS: &[(&str, &str, Translate)] = &[
     ("large-cluster-size-threshold", "KR_LARGE_CLUSTER_SIZE_THRESHOLD", uint),
     ("private-registry", "KR_REGISTRIES_YAML", plain),
     ("kubelet-root-dir", "KR_KUBELET_DIR", plain),
+    ("kubeconfig-mode", "KR_KUBECONFIG_MODE", octal_mode),
+    ("kubeconfig-copy", "KR_KUBECONFIG_COPY", plain),
+    ("bind-address", "KR_BIND_ADDRESS", ipv4_addr),
+    ("advertise-address", "KR_ADVERTISE_ADDRESS", ip_addr),
+    ("cluster-dns", "KR_CLUSTER_DNS", ipv4_addr),
+    ("service-node-port-range", "KR_NODE_PORT_RANGE", port_range),
+    ("resolv-conf", "KR_RESOLV_CONF", plain),
+    ("system-default-registry", "KR_SYSTEM_DEFAULT_REGISTRY", registry_prefix),
 ];
+
+/// `644`, `0644` or `0o644`; at most 0o777.
+fn octal_mode(v: &str) -> Result<Option<String>, String> {
+    let t = v.trim().trim_start_matches("0o");
+    match u32::from_str_radix(t, 8) {
+        Ok(m) if m <= 0o777 => Ok(Some(alloc::format!("{m:o}"))),
+        _ => Err(alloc::format!("{v:?} is not a file mode (e.g. 0644)")),
+    }
+}
+
+fn ipv4_addr(v: &str) -> Result<Option<String>, String> {
+    let t = v.trim();
+    let parts: Vec<&str> = t.split('.').collect();
+    if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
+        Ok(Some(t.to_string()))
+    } else {
+        Err(alloc::format!("{v:?} is not an IPv4 address"))
+    }
+}
+
+fn ip_addr(v: &str) -> Result<Option<String>, String> {
+    let t = v.trim();
+    if t.contains(':') {
+        if t.chars().all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.') {
+            return Ok(Some(t.to_string()));
+        }
+        return Err(alloc::format!("{v:?} is not an IP address"));
+    }
+    ipv4_addr(t)
+}
+
+/// `LOW-HIGH` (inclusive), both in 1..=65535, LOW <= HIGH.
+fn port_range(v: &str) -> Result<Option<String>, String> {
+    let bad = || alloc::format!("{v:?} is not a port range (e.g. 30000-32767)");
+    let (a, b) = v.trim().split_once('-').ok_or_else(bad)?;
+    match (a.trim().parse::<u16>(), b.trim().parse::<u16>()) {
+        (Ok(a), Ok(b)) if a >= 1 && a <= b => Ok(Some(alloc::format!("{a}-{b}"))),
+        _ => Err(bad()),
+    }
+}
+
+/// A registry host (optionally with a port and path), without a scheme or trailing slash.
+fn registry_prefix(v: &str) -> Result<Option<String>, String> {
+    let t = v.trim().trim_end_matches('/');
+    if t.is_empty() || t.contains("://") || t.contains(char::is_whitespace) {
+        return Err(alloc::format!("{v:?} is not a registry (e.g. registry.example.com:5000)"));
+    }
+    Ok(Some(t.to_string()))
+}
 
 fn plain(v: &str) -> Result<Option<String>, String> {
     Ok(Some(v.to_string()))
@@ -468,5 +525,24 @@ mod tests {
     fn config_aliases() {
         let a = run(&[], &[(DEFAULT_PATH, "data-dir: /d\ndisable-network-policy: true\ndisable-helm-controller: false\nflannel-backend: wireguard-native\n")], None).unwrap();
         assert_eq!(a, s(&["--data", "/d", "--disable", "network-policy", "--flannel-backend", "wireguard-native"]));
+    }
+}
+
+#[cfg(test)]
+mod settings_361_tests {
+    use super::*;
+
+    #[test]
+    fn translations() {
+        assert_eq!(octal_mode("0644").unwrap().as_deref(), Some("644"));
+        assert_eq!(octal_mode("600").unwrap().as_deref(), Some("600"));
+        assert!(octal_mode("0999").is_err() && octal_mode("1777").is_err());
+        assert_eq!(ipv4_addr("10.0.0.5").unwrap().as_deref(), Some("10.0.0.5"));
+        assert!(ipv4_addr("10.0.0").is_err() && ipv4_addr("::1").is_err());
+        assert_eq!(ip_addr("fd00::5").unwrap().as_deref(), Some("fd00::5"));
+        assert_eq!(port_range("20000-22767").unwrap().as_deref(), Some("20000-22767"));
+        assert!(port_range("3-2").is_err() && port_range("0-10").is_err() && port_range("30000").is_err());
+        assert_eq!(registry_prefix("reg.example.com:5000/").unwrap().as_deref(), Some("reg.example.com:5000"));
+        assert!(registry_prefix("https://reg").is_err());
     }
 }

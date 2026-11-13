@@ -75,7 +75,7 @@ impl Config {
     }
 
     pub fn system() -> Config {
-        match sys::open_read(b"/etc/resolv.conf\0") {
+        match sys::open_read(&resolv_conf_path()) {
             Ok(fd) => {
                 let mut data = Vec::new();
                 let mut buf = [0u8; 4096];
@@ -436,5 +436,32 @@ mod tests {
         let d = Config::parse("search lan\n");
         assert_eq!(d.candidates("registry-1.docker.io")[0], "registry-1.docker.io");
         assert!(!valid_name("a..b") && !valid_name("bad name") && valid_name("k8s-rs.io"));
+    }
+}
+
+static RESOLV: core::sync::atomic::AtomicPtr<alloc::vec::Vec<u8>> = core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// The host resolver configuration (NUL-terminated path): `/etc/resolv.conf` unless
+/// [`set_resolv_conf`] chose another file (`KR_RESOLV_CONF`, e.g. systemd-resolved's
+/// `/run/systemd/resolve/resolv.conf` when `/etc/resolv.conf` points at a loopback stub). Used for
+/// upstream forwarding and for pods with `dnsPolicy: Default`.
+pub fn resolv_conf_path() -> alloc::vec::Vec<u8> {
+    let p = RESOLV.load(core::sync::atomic::Ordering::Acquire);
+    if p.is_null() {
+        return b"/etc/resolv.conf\0".to_vec();
+    }
+    // SAFETY: set once from a leaked Box and never freed.
+    unsafe { (*p).clone() }
+}
+
+/// Sets the file [`resolv_conf_path`] returns; call once at start-up.
+pub fn set_resolv_conf(path: &str) {
+    let mut v = path.as_bytes().to_vec();
+    v.push(0);
+    let b = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(v));
+    let old = RESOLV.swap(b, core::sync::atomic::Ordering::AcqRel);
+    if !old.is_null() {
+        // SAFETY: allocated by a previous call; nobody keeps references (callers clone).
+        drop(unsafe { alloc::boxed::Box::from_raw(old) });
     }
 }

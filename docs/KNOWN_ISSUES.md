@@ -9,8 +9,6 @@ Ordered by impact. Size: S days, M a week or two, L more.
 
 Every earlier parity item is closed (RESOLVED 342-345, 358). Found in the re-audit of 2026-11-14 (functionality compared with k3s; kr's own flag names are fine and kubectl is not bundled):
 
-361. **Server and node settings k3s offers and kr lacks** — *S*
-    Functionality, not key names: the admin kubeconfig's file mode and an extra copy path; the API listen address and the address advertised to agents and other servers; the cluster DNS Service IP; the NodePort range; the node `resolv.conf` handed to pods; a default registry prefix for system images; cron-scheduled snapshots with a snapshot directory (kr has an interval and a keep count).
 362. **OIDC and webhook authentication/authorization, optional admission plugins** — *M*
     k3s users reach these through component arguments; kr has none of them: OIDC login (`oidc-issuer-url`, `oidc-client-id`, claims; or `--authentication-config` AuthenticationConfiguration with JWT authenticators), webhook token authentication, `--authorization-config`/webhook authorization, and opt-in admission plugins (`AlwaysPullImages`, `EventRateLimit`, `PodNodeSelector`). Needs JWT verification against a JWKS (RS256/ES256; kr-crypto has both), claim mapping.
 363. **Kubelet resource managers and graceful node shutdown** — *M*

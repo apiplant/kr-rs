@@ -170,7 +170,7 @@ pub fn pod_hostname(pod: &Value) -> String {
 /// the host's (127.0.0.53, 127.0.0.1) is replaced by the egress forwarder, which reaches it from
 /// the host namespace.
 fn host_resolv_conf(rootless_pod: bool, fam: kr_net::tcp::Families) -> String {
-    let text = String::from_utf8(kr_sys::fs::read_file(b"/etc/resolv.conf\0", 64 * 1024).unwrap_or_default()).unwrap_or_default();
+    let text = String::from_utf8(kr_sys::fs::read_file(&kr_net::dns::resolv_conf_path(), 64 * 1024).unwrap_or_default()).unwrap_or_default();
     if !rootless_pod && fam.v4 {
         return text;
     }
