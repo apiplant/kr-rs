@@ -9,8 +9,6 @@ Ordered by impact. Size: S days, M a week or two, L more.
 
 Every earlier parity item is closed (RESOLVED 342-345, 358). Found in the re-audit of 2026-11-14 (functionality compared with k3s; kr's own flag names are fine and kubectl is not bundled):
 
-362. **OIDC and webhook authentication/authorization, optional admission plugins** — *M*
-    k3s users reach these through component arguments; kr has none of them: OIDC login (`oidc-issuer-url`, `oidc-client-id`, claims; or `--authentication-config` AuthenticationConfiguration with JWT authenticators), webhook token authentication, `--authorization-config`/webhook authorization, and opt-in admission plugins (`AlwaysPullImages`, `EventRateLimit`, `PodNodeSelector`). Needs JWT verification against a JWKS (RS256/ES256; kr-crypto has both), claim mapping.
 363. **Kubelet resource managers and graceful node shutdown** — *M*
     No CPU manager (`static` policy: exclusive cores for Guaranteed pods with integer CPU), memory manager, topology manager, and no graceful node shutdown (`shutdownGracePeriod`: a systemd inhibitor lock, pods terminated in priority order before poweroff). Users enable these with `kubelet-arg` in k3s; latency-sensitive and GPU workloads rely on the CPU/topology managers.
 # B. Verification backlog (code exists, not run on real systems)
