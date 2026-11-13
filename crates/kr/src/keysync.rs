@@ -247,6 +247,9 @@ pub async fn watch_pki(api: Rc<kr_apiserver::api::ApiServer>, data: String, tls:
     const CA: [&str; 2] = ["pki/ca.pem", "pki/ca.key"];
     const SA: [&str; 3] = ["pki/sa.key", "pki/sa-old.pem", "pki/ca.pem"];
     let (mut ca, mut sa) = (sum(&CA), sum(&SA));
+    // `kr token rotate` replaces node-token (also through key sync on the other servers): the
+    // running server must use the new id and secret, or bootstrap_all would restore the old Secret.
+    let mut node = sum(&["node-token"]);
     // A rotation writes several files in a row (a certificate, then its key): act only on a
     // state that held for a whole tick, never on a half-written one.
     let mut prev = (ca, sa, tls.digest());
@@ -259,6 +262,15 @@ pub async fn watch_pki(api: Rc<kr_apiserver::api::ApiServer>, data: String, tls:
             continue;
         }
         let (ca2, sa2, _) = now;
+        let node2 = sum(&["node-token"]);
+        if node2 != node {
+            let t = read(&data, "node-token").unwrap_or_default();
+            if let Some((id, secret)) = t.trim().split_once("::").and_then(|(_, r)| r.split_once('.')) {
+                let _ = api.ensure_bootstrap_token(id, secret);
+                print(b"kr server: join token changed on disk; now using the new one\n");
+            }
+            node = node2;
+        }
         if ca2 != ca {
             match pki::load_ca(&format!("{data}/pki")) {
                 Ok((name, key, der)) => {
