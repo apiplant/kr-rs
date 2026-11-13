@@ -15,6 +15,9 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; FAIL=1; fi; }
 waitfor() { for _ in $(seq "$2"); do eval "$1" && return 0; sleep 3; done; return 1; }
 docker run -d --init --name krcsi --hostname krcsi --network krnet --privileged --tmpfs /store:exec,size=3g \
   -v "$REPO/target/release:/krbin:ro" ${KR_TEST_IMAGE:-archlinux:base-devel} sleep infinity >/dev/null
+# A privileged container's /dev is a snapshot: loop devices the host creates later (losetup -f in
+# the driver for Block claims) have no node in it. Make the first 64.
+docker exec krcsi sh -c 'for i in $(seq 0 63); do [ -e /dev/loop$i ] || mknod -m 660 /dev/loop$i b 7 $i; done'
 # The plugin mounts volumes back into /var/lib/kubelet (Bidirectional): it must be a shared mount.
 docker exec krcsi sh -c 'mkdir -p /var/lib/kubelet && mount --bind /var/lib/kubelet /var/lib/kubelet && mount --make-rshared /var/lib/kubelet'
 docker exec -d krcsi sh -c "KR_REGISTRY_MIRRORS=$MIRRORS KR_ROOT=/store exec /krbin/kr server --data /var/tmp/srv > /tmp/srv.log 2>&1"
