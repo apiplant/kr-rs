@@ -20,18 +20,18 @@ export function DocsArchitecture() {
           head={["Crate", "Role"]}
           rows={[
             ["kr-sys", "Raw syscalls for x86_64 and aarch64, namespaces, cgroups, netlink primitives."],
-            ["kr-rt", "Process start-up, allocator, and a single-threaded epoll executor for async/await."],
+            ["kr-rt", "Process start-up, allocator, a single-threaded epoll executor for async/await, and worker processes for CPU-bound work."],
             ["kr-fmt", "JSON, a YAML subset, protobuf wire format, base64, quantities."],
-            ["kr-crypto", "SHA-2, HMAC, X25519, Ed25519, ECDSA P-256, RSA verification, AES-GCM, ChaCha20-Poly1305, X.509, TLS 1.3 client and server."],
-            ["kr-net", "TCP, HTTP/1.1 client and server, WebSocket, SPDY, DNS server, netlink, nftables."],
-            ["kr-archive", "gzip and tar for image layers."],
-            ["kr-store", "The embedded MVCC datastore with watch."],
+            ["kr-crypto", "SHA-2, HMAC, X25519, Ed25519, ECDSA P-256, RSA, AES-GCM, ChaCha20-Poly1305, X.509, TLS 1.3 client and server with session resumption, TLS 1.2 client (opt-in)."],
+            ["kr-net", "TCP, HTTP/1.1 client and server, HTTP/2 with HPACK, gRPC (unary and streaming, client and server), WebSocket, SPDY, DNS client and server, OCI registry client, S3 client (SigV4), netlink (incl. WireGuard), nftables, userspace NAT for rootless pods."],
+            ["kr-archive", "gzip (inflate), zstd and tar for image layers."],
+            ["kr-store", "The embedded MVCC datastore with write-ahead log, watch and snapshots."],
             ["kr-raft", "Raft for replicated servers."],
-            ["kr-apiserver", "REST, discovery, authn/authz, admission, CRDs, webhooks, aggregation."],
-            ["kr-controllers", "The built-in controllers and the scheduler."],
-            ["kr-runtime", "OCI image store, container runtime, pod network."],
-            ["kr-kubelet", "Pod lifecycle, probes, volumes, node status, service proxy."],
-            ["kr", "The binary: server, agent, ctr, token, pki."],
+            ["kr-apiserver", "REST (JSON and protobuf), discovery, OpenAPI, authn/authz (RBAC, node authorizer), admission (incl. Pod Security, quota, CEL validating policies), CRDs with conversion, server-side apply, webhooks, aggregation, API priority and fairness, audit (log and webhook), encryption at rest, metrics, Raft cluster join and forwarding."],
+            ["kr-controllers", "Built-in controllers (workloads, GC, namespaces, nodes, HPA, PVC and attach/detach, CSR signing, quota, service LB, storage version migration), the Helm controller, the manifests directory, the scheduler."],
+            ["kr-runtime", "OCI image pull and store, container runtime with seccomp, AppArmor/SELinux, device cgroup filter and OCI hooks, image GC, pod network."],
+            ["kr-kubelet", "Pod lifecycle, probes (incl. gRPC), volumes and CSI, device plugins, pod resources API, eviction, stats, exec/attach/port-forward, CNI, network policy, egress, DNS, service proxy (userspace and nftables), adoption of running pods."],
+            ["kr", "The binary: server, agent, ctr, token, pki/certificate, snapshot, secrets-encrypt."],
           ]}
         />
       </Section>

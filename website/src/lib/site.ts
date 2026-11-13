@@ -24,11 +24,11 @@ export const SITE = {
   hero: { pre: "Kubernetes in ", accent: "one 5 MB binary", post: "." },
   lead: "API server, datastore, scheduler, controllers, kubelet, container runtime, pod network, service proxy and cluster DNS in a single static executable. Written in Rust with no libc and no third-party crates. Runs unmodified kubectl and standard workloads.",
   heroNote:
-    "Passes the Kubernetes v1.37 conformance suite: 460 of 460 specs on two nodes. The server idles at 7 MB of RAM and the node is Ready in under a second.",
+    "Passes the Kubernetes v1.37 conformance suite: 460 of 460 specs on two nodes. The server idles at 13 MB of RAM and a server and agent are Ready in about 2 seconds.",
   stats: [
-    { value: "4.9 MB", label: "static binary, x86_64" },
-    { value: "7.4 MB", label: "server RSS, idle" },
-    { value: "< 1 s", label: "start to node Ready" },
+    { value: "5.0 MB", label: "static binary, x86_64" },
+    { value: "13.3 MB", label: "server RSS, idle" },
+    { value: "~2 s", label: "start to nodes Ready" },
     { value: "460 / 460", label: "conformance specs" },
   ] as Stat[],
   terminal: {
@@ -114,14 +114,14 @@ web-6bd98c9549-mdhpr   1/1     Running   0          12s   10.88.1.3   kr2`,
   tableTitle: "Small, measured",
   tableLead: "One 32-core x86_64 machine, each node in a privileged Docker container, images cached.",
   table: [
-    ["Binary, stripped (x86_64)", "2.87 MB"],
+    ["Binary, stripped (x86_64)", "4.98 MB"],
     ["Third-party crates", "0"],
-    ["kr server idle, no pods", "7.4 MB RSS"],
-    ["kr server, 100 pods", "19.8 MB RSS"],
-    ["kr agent idle", "3.2 MB RSS"],
-    ["kr agent, 100 pods", "9.0 MB RSS"],
-    ["100-pod Deployment, all Running", "about 2 s"],
-    ["GET /version, new TLS 1.3 connection", "p50 4.0 ms"],
+    ["kr server idle, no pods", "13.3 MB RSS"],
+    ["kr server, 100 pods", "28.4 MB RSS"],
+    ["kr agent idle", "5.3 MB RSS"],
+    ["kr agent, 100 pods", "15.5 MB RSS"],
+    ["100-pod Deployment, all Running", "about 8.6 s"],
+    ["GET /version, new TLS 1.3 connection", "p50 1.9 ms"],
   ] as [string, string][],
   cargo: `git clone https://github.com/apiplant/kr-rs && cd kr-rs
 cargo build --release        # needs a Rust nightly toolchain

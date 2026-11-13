@@ -6,7 +6,7 @@ export function DocsOverview() {
     <DocsLayout>
       <H1>Documentation</H1>
       <Lead>
-        <IC>kr</IC> is a Kubernetes distribution in a single static binary of about 4.9 MB, written in Rust with no
+        <IC>kr</IC> is a Kubernetes distribution in a single static binary of about 5.0 MB, written in Rust with no
         libc and no third-party crates. It is the API server, datastore, scheduler, controllers, kubelet, container
         runtime, pod network, service proxy and cluster DNS in one executable.
       </Lead>
@@ -19,7 +19,7 @@ export function DocsOverview() {
             The v1.37 conformance suite passes: 460 of 460 specs on a two-node cluster, 458 of 460 on one node (the
             other two need a second node). See <a class="text-accent hover:text-accent-dim" href="/docs/conformance">Conformance</a>.
           </LI>
-          <LI>Idle memory in single-digit megabytes, and a node that is Ready in under a second.</LI>
+          <LI>Idle memory of about 13 MB for the server and 5 MB for an agent, and nodes that are Ready in about 2 seconds.</LI>
           <LI>Multi-node clusters over VXLAN or host routes, and Raft-replicated servers for high availability.</LI>
           <LI>Pods that keep running while <IC>kr</IC> is restarted, crashes, or is replaced by a newer binary.</LI>
         </UL>
