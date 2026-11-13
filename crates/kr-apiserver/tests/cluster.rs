@@ -213,9 +213,19 @@ fn three_servers_replicate_and_fail_over() {
                 break;
             }
         }
-        let ni = nl.expect("a new leader is elected after the old one died");
-        let (code, _) = write(&srvs[ni], "POST", "/api/v1/namespaces/default/configmaps", r#"{"metadata":{"name":"c"}}"#).await;
-        assert_eq!(code, 201);
+        let mut ni = nl.expect("a new leader is elected after the old one died");
+        // As above, a fresh leader can still lose leadership (or not yet serve writes): retry
+        // on whichever live server currently leads.
+        let (mut code, mut v) = (0, Value::Null);
+        for _ in 0..50 {
+            (code, v) = write(&srvs[ni], "POST", "/api/v1/namespaces/default/configmaps", r#"{"metadata":{"name":"c"}}"#).await;
+            if code == 201 {
+                break;
+            }
+            sleep(100).await;
+            ni = srvs.iter().position(|s| s.id != dead && s.cluster.is_leader()).unwrap_or(ni);
+        }
+        assert_eq!(code, 201, "{v:?}");
         sleep(500).await;
         let other = srvs.iter().position(|s| s.id != dead && s.id != srvs[ni].id).unwrap();
         assert_eq!(get(&srvs[other], "/api/v1/namespaces/default/configmaps/c").0, 200);
