@@ -121,6 +121,11 @@ impl From<Errno> for Error {
 pub trait Codec {
     fn encode(&self, key: &str, value: &[u8]) -> Option<Vec<u8>>;
     fn decode(&self, key: &str, value: &[u8]) -> Result<Option<Vec<u8>>, ()>;
+    /// For keys the codec covers: a name for how `stored` (an encoded or plaintext value) is
+    /// kept, e.g. the encryption key's name or "plaintext". Feeds [`Store::codec_labels`].
+    fn label(&self, _key: &str, _stored: &[u8]) -> Option<String> {
+        None
+    }
 }
 
 struct Persist {
@@ -154,6 +159,9 @@ pub struct Store {
     /// Approximate size of a snapshot of the live data.
     live_bytes: u64,
     codec: Option<Rc<dyn Codec>>,
+    /// [`Codec::label`] of the latest stored form of each covered key (stale entries for
+    /// deleted keys are skipped when counting).
+    labels: core::cell::RefCell<BTreeMap<String, String>>,
 }
 
 fn path(name: &str) -> Vec<u8> {
@@ -203,6 +211,7 @@ impl Store {
             held: VecDeque::new(),
             live_bytes: 0,
             codec: None,
+            labels: core::cell::RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -213,13 +222,40 @@ impl Store {
     }
 
     fn enc<'a>(&self, key: &str, v: &'a [u8]) -> alloc::borrow::Cow<'a, [u8]> {
-        match self.codec.as_ref().and_then(|c| c.encode(key, v)) {
+        let out = match self.codec.as_ref().and_then(|c| c.encode(key, v)) {
             Some(e) => alloc::borrow::Cow::Owned(e),
             None => alloc::borrow::Cow::Borrowed(v),
+        };
+        self.note_label(key, &out);
+        out
+    }
+
+    fn note_label(&self, key: &str, stored: &[u8]) {
+        if let Some(l) = self.codec.as_ref().and_then(|c| c.label(key, stored)) {
+            let mut m = self.labels.borrow_mut();
+            if m.get(key).map(String::as_str) != Some(l.as_str()) {
+                m.insert(String::from(key), l);
+            }
         }
     }
 
+    /// How many live covered values are stored in each form ([`Codec::label`]), as of the
+    /// last write, load or snapshot of each.
+    pub fn codec_labels(&self) -> Vec<(String, usize)> {
+        let mut m = self.labels.borrow_mut();
+        m.retain(|k, _| self.get(k).is_some());
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for l in m.values() {
+            match out.iter_mut().find(|(x, _)| x == l) {
+                Some(e) => e.1 += 1,
+                None => out.push((l.clone(), 1)),
+            }
+        }
+        out
+    }
+
     fn dec<'a>(&self, key: &str, v: &'a [u8]) -> Result<alloc::borrow::Cow<'a, [u8]>, Error> {
+        self.note_label(key, v);
         match &self.codec {
             None => Ok(alloc::borrow::Cow::Borrowed(v)),
             Some(c) => match c.decode(key, v) {

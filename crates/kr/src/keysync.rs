@@ -95,37 +95,46 @@ fn my_ack(data: &str, gen: u64) -> Ack {
 }
 
 /// Applies a record: files first, then what can reload without a restart.
-fn apply(api: &kr_apiserver::api::ApiServer, data: &str, rec: &kr_apiserver::cluster::keysync::Record) -> Result<(), String> {
+fn apply(api: &kr_apiserver::api::ApiServer, data: &str, rec: &kr_apiserver::cluster::keysync::Record, tls: &server::TlsReload) -> Result<(), String> {
     let changed = write_files(data, &rec.files)?;
     let touched = |f: &str| rec.file(f).is_some();
     // Reading before writing: the encryption config goes first, so the codec can read the keys.
     if touched(kr_apiserver::encrypt::FILE) {
         api.reload_encryption().map_err(|e| format!("encryption reload: {e}"))?;
     }
-    if touched("pki/sa.key") || touched("pki/sa-old.pem") {
+    // By record, not by file change: on the server where the CLI ran the files are already
+    // on disk, but the running process still has the old ones loaded.
+    let ca_changed = touched("pki/ca.key") || touched("pki/ca.pem");
+    // The CA bundle also feeds /kr/ca-bundle (agents follow it) and the pods' ca.crt.
+    if touched("pki/sa.key") || touched("pki/sa-old.pem") || ca_changed {
         let (signer, secret, ca_pem) = load_signer(data)?;
         kr_net::tls::set_ticket_secret(crate::server::ticket_secret(&secret));
         api.reload_service_accounts(signer, ca_pem);
     }
-    if changed.iter().any(|f| f == "pki/ca.key" || f == "pki/ca.pem") {
+    if ca_changed {
         if let Ok((name, key, der)) = pki::load_ca(&format!("{data}/pki")) {
             api.set_ca(name, key, der);
         }
+        // The listeners and outbound connections trust the new bundle at once.
+        tls.reload_if_changed().map_err(|e| format!("TLS reload: {e}"))?;
     }
     if !changed.is_empty() {
-        print(format!("kr server: key sync generation {} applied ({}); {}\n", rec.gen, changed.join(", "), if changed.iter().any(|f| f.starts_with("pki/ca")) { "restart this server to trust and use the new CA" } else { "no restart needed" }).as_bytes());
+        print(format!("kr server: key sync generation {} applied ({}); no restart needed\n", rec.gen, changed.join(", ")).as_bytes());
     }
     Ok(())
 }
 
-fn reissue_pending(data: &str, port: u16) {
+fn reissue_pending(data: &str, port: u16, tls: &server::TlsReload) {
     if read(data, REISSUE_MARKER).is_none() {
         return;
     }
     match rotate::reissue(data, port) {
         Ok(()) => {
             let _ = fs::unlinkat(fs::AT_FDCWD, &cstr(&format!("{data}/{REISSUE_MARKER}")), 0);
-            print(b"kr server: certificates issued again with the new CA; restart this server to use them\n");
+            match tls.reload() {
+                Ok(()) => print(b"kr server: certificates issued again with the new CA and in use (no restart needed)\n"),
+                Err(e) => eprint(format!("kr server: certificates issued again with the new CA, but loading them failed: {e}; restart this server\n").as_bytes()),
+            }
         }
         Err(e) => eprint(format!("kr server: re-issuing the certificates failed: {e}; will retry\n").as_bytes()),
     }
@@ -141,7 +150,7 @@ async fn send_ack(data: &str, port: u16, ack: &Ack) -> Result<(), String> {
 }
 
 /// The applier: every second, apply a newer record and acknowledge it.
-pub async fn run(c: Rc<Cluster>, api: Rc<kr_apiserver::api::ApiServer>, data: String, port: u16) {
+pub async fn run(c: Rc<Cluster>, api: Rc<kr_apiserver::api::ApiServer>, data: String, port: u16, tls: Rc<server::TlsReload>) {
     let mut acked: u64 = 0;
     loop {
         kr_rt::exec::sleep(1000).await;
@@ -150,7 +159,7 @@ pub async fn run(c: Rc<Cluster>, api: Rc<kr_apiserver::api::ApiServer>, data: St
         let mut local: u64 = read(&data, "keysync-gen").and_then(|t| t.trim().parse().ok()).unwrap_or(0);
         if gen > local {
             match c.keysync_record(&api, &secret) {
-                Some(Ok(rec)) => match apply(&api, &data, &rec) {
+                Some(Ok(rec)) => match apply(&api, &data, &rec, &tls) {
                     Ok(()) => {
                         let _ = put_file(&data, "keysync-gen", &format!("{}\n", rec.gen), 0o600);
                         local = rec.gen;
@@ -171,7 +180,7 @@ pub async fn run(c: Rc<Cluster>, api: Rc<kr_apiserver::api::ApiServer>, data: St
                 None => {}
             }
         }
-        reissue_pending(&data, port);
+        reissue_pending(&data, port, &tls);
         if local > 0 && acked < local {
             match send_ack(&data, port, &my_ack(&data, local)).await {
                 Ok(()) => acked = local,

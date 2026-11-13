@@ -205,7 +205,8 @@ impl Cluster {
                 ])
             })
             .collect();
-        obj(alloc::vec![("gen", Value::from(gen as i64)), ("voters", Value::Array(voters.into_iter().map(|v| Value::from(v as i64)).collect())), ("servers", Value::Array(servers))])
+        let stored = api.store.borrow().codec_labels().into_iter().map(|(l, n)| obj(alloc::vec![("key", Value::from(l.as_str())), ("objects", Value::from(n as i64))])).collect();
+        obj(alloc::vec![("gen", Value::from(gen as i64)), ("stored", Value::Array(stored)), ("voters", Value::Array(voters.into_iter().map(|v| Value::from(v as i64)).collect())), ("servers", Value::Array(servers))])
     }
 
     /// Publishes the next generation of the key-sync record: the previous files with the

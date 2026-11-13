@@ -93,13 +93,14 @@ async fn read_exact<T: Transport>(s: &mut T, buf: &mut [u8]) -> bool {
 }
 
 /// Accepts peers on `listener` and feeds their messages into `inbox`.
-pub async fn serve(listener: Async<Fd>, tls: Rc<ServerConfig>, me: NodeId, inbox: Rc<Inbox>) {
+/// `tls` is reloadable: each new connection uses the current configuration.
+pub async fn serve(listener: Async<Fd>, tls: Rc<RefCell<Rc<ServerConfig>>>, me: NodeId, inbox: Rc<Inbox>) {
     loop {
         let Ok(sock) = listener.accept().await else {
             sleep(50).await;
             continue;
         };
-        let (tls, inbox) = (tls.clone(), inbox.clone());
+        let (tls, inbox) = (tls.borrow().clone(), inbox.clone());
         spawn(async move {
             let Ok(Ok(mut s)) = timeout(10_000, TlsStream::accept(sock, tls)).await else { return };
             let Some(from) = s.connection().peer_certificates().first().and_then(|c| peer_id(c)) else { return };
@@ -147,6 +148,10 @@ impl Peer {
         let addr = Rc::new(RefCell::new(addr));
         let task = spawn(sender(queue.clone(), wake.clone(), addr.clone(), tls));
         Peer { queue, wake, addr, _task: task }
+    }
+
+    pub fn addr(&self) -> ([u8; 16], u16) {
+        *self.addr.borrow()
     }
 
     /// A changed address takes effect at once: the open connection is dropped (one to a dead

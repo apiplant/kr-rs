@@ -144,14 +144,28 @@ async fn rotate(remote: Remote, pki_dir: String, name: String, ip: [u8; 16], ser
 /// Follows a CA rotation (`kr pki rotate --ca`): the cluster publishes its CA bundle at
 /// `/kr/ca-bundle`; when it differs from `pki/ca.pem` the agent stores it and trusts it from the
 /// next connection on (and for the clients of its kubelet API), so no file has to be copied by hand.
-async fn track_ca(remote: Remote, pki_dir: String, serving: Rc<core::cell::RefCell<Rc<kr_crypto::tls::ServerConfig>>>) {
+async fn track_ca(remote: Remote, pki_dir: String, name: String, ip: [u8; 16], serving: Rc<core::cell::RefCell<Rc<kr_crypto::tls::ServerConfig>>>) {
     loop {
         kr_rt::exec::sleep(60_000).await;
         let Ok(doc) = remote.get("/kr/ca-bundle").await else { continue };
         let Some(bundle) = doc.get("caBundle").and_then(kr_fmt::json::Value::as_str) else { continue };
         let read = |f: &str| fs::read_file(&pki::path(&pki_dir, f), 1 << 20).ok().and_then(|b| String::from_utf8(b).ok());
         let Some(cur) = read("ca.pem") else { continue };
-        if bundle.trim() == cur.trim() || x509::pem_decode_all(bundle, "CERTIFICATE").map_or(true, |v| v.is_empty()) {
+        if x509::pem_decode_all(bundle, "CERTIFICATE").map_or(true, |v| v.is_empty()) {
+            continue;
+        }
+        if bundle.trim() == cur.trim() {
+            // After `--ca activate` the signing CA leads the bundle: a node certificate from the
+            // other CA is renewed now rather than at 2/3 of its lifetime, so `--ca finish` can follow.
+            if read("node.pem").is_some_and(|n| !signed_by_first(bundle, &n)) {
+                match renew(&remote, &pki_dir, &name, ip).await.and_then(|()| serving_config(&pki_dir)) {
+                    Ok(cfg) => {
+                        *serving.borrow_mut() = cfg;
+                        print(b"kr agent: node certificates renewed with the new CA\n");
+                    }
+                    Err(e) => eprint(format!("kr agent: renewing with the new CA failed (retrying): {e}\n").as_bytes()),
+                }
+            }
             continue;
         }
         let tmp = "ca.pem.new";
@@ -169,6 +183,14 @@ async fn track_ca(remote: Remote, pki_dir: String, serving: Rc<core::cell::RefCe
         }
         print(b"kr agent: the cluster CA bundle changed; trusting the new one\n");
     }
+}
+
+/// True when the first certificate of `node_pem` was signed by the first CA of `bundle`.
+pub(crate) fn signed_by_first(bundle: &str, node_pem: &str) -> bool {
+    let (Ok(cas), Ok(leaf)) = (x509::pem_decode_all(bundle, "CERTIFICATE"), x509::pem_decode_all(node_pem, "CERTIFICATE")) else { return true };
+    let (Some(ca), Some(leaf)) = (cas.first(), leaf.first()) else { return true };
+    let (Ok(ca), Ok(leaf)) = (x509::Certificate::parse(ca), x509::Certificate::parse(leaf)) else { return true };
+    ca.public_key.as_ref().map_or(true, |k| leaf.signed_by(k))
 }
 
 async fn renew(remote: &Remote, pki_dir: &str, name: &str, ip: [u8; 16]) -> Result<(), String> {
@@ -322,7 +344,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
     let cfg = kr_kubelet::Config { labels, taints, external_ip: crate::install::external_ip(), disabled, node_name: name.clone(), root: String::from(store.root()), network: ns::getuid() == 0, cgroups: cgroups_available(), node_ip: ip, vxlan: !matches!(kr_runtime::store::env_var("KR_NET_BACKEND").as_deref(), Some("host-gw" | "wireguard")), wireguard: kr_runtime::store::env_var("KR_NET_BACKEND").as_deref() == Some("wireguard"), eviction_memory_bytes: kr_kubelet::evict::threshold_from_env(), control_plane: false };
     let rotation = (remote.clone(), pki_dir.clone(), name.clone(), ip, tls.clone());
     let tracker = remote.clone();
-    let (ca_remote, ca_dir, ca_tls) = (remote.clone(), pki_dir.clone(), tls.clone());
+    let (ca_remote, ca_dir, ca_name, ca_tls) = (remote.clone(), pki_dir.clone(), name.clone(), tls.clone());
     let kubelet = kr_kubelet::Kubelet::new(remote, cfg, store);
     print(format!("kr agent: node {name} ({}) -> {server}\n", kr_net::tcp::fmt_ip16(ip)).as_bytes());
     kr_rt::exec::block_on(async move {
@@ -331,7 +353,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
         let (r, d, n, ip, s) = rotation;
         kr_rt::exec::spawn(rotate(r, d, n, ip, s));
         kr_rt::exec::spawn(track_servers(tracker, servers_file));
-        kr_rt::exec::spawn(track_ca(ca_remote, ca_dir, ca_tls));
+        kr_rt::exec::spawn(track_ca(ca_remote, ca_dir, ca_name, ip, ca_tls));
         kubelet.run().await;
     });
     0

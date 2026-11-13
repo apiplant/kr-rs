@@ -20,13 +20,13 @@ fn fail(msg: &str) -> i32 {
     1
 }
 
-const USAGE: &str = "usage: kr token create [--ttl DURATION (default 24h, 0 = never)] [--data DIR] [--server https://127.0.0.1:6443]";
+const USAGE: &str = "usage: kr token create [--ttl DURATION (default 24h, 0 = never)] [--data DIR] [--server URL (default: this machine's server)]";
 
 pub fn main(mut args: Args) -> i32 {
     if args.next() != Some(b"create".as_slice()) {
         return fail(USAGE);
     }
-    let (mut ttl, mut data, mut server) = (86400i64, crate::server::data_dir(), String::from("https://127.0.0.1:6443"));
+    let (mut ttl, mut data, mut server) = (86400i64, crate::server::data_dir(), None::<String>);
     while let Some(a) = args.next() {
         let Some(v) = args.next().and_then(|v| core::str::from_utf8(v).ok()) else { return fail(USAGE) };
         match a {
@@ -35,10 +35,11 @@ pub fn main(mut args: Args) -> i32 {
                 _ => return fail("--ttl: expected a duration like 30m or 24h"),
             },
             b"--data" => data = String::from(v),
-            b"--server" => server = String::from(v.trim_end_matches('/')),
+            b"--server" => server = Some(String::from(v.trim_end_matches('/'))),
             _ => return fail(USAGE),
         }
     }
+    let server = server.unwrap_or_else(|| crate::server::local_url(&data));
     let read = |f: &str| fs::read_file(&pki::path(&format!("{data}/pki"), f), 1 << 20).ok().and_then(|b| String::from_utf8(b).ok());
     let (Some(ca_pem), Some(chain), Some(key)) = (read("ca.pem"), read("admin.pem"), read("admin.key")) else { return fail("cannot read the server's admin credentials (run on the server, or pass --data)") };
     let Some(ca_der) = x509::pem_decode_all(&ca_pem, "CERTIFICATE").ok().and_then(|v| v.into_iter().next()) else { return fail("bad ca.pem") };

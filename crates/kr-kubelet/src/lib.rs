@@ -497,7 +497,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     /// and frees their IPs.
     async fn sweep_unclaimed(&self) {
         kr_rt::exec::phase("sweep: devices");
-        let live: Vec<String> = self.pods.borrow().keys().cloned().collect();
+        // Pods whose sandbox task is still starting (and adopting) count too: they are not in
+        // `pods` yet, and sweeping them would kill what they are about to adopt. With the
+        // in-process API (the server's kubelet) the first sync returns before those tasks run.
+        let mut live: Vec<String> = self.pods.borrow().keys().cloned().collect();
+        live.extend(self.starting.borrow().iter().filter(|u| !live.contains(u)).cloned().collect::<Vec<_>>());
         self.devices.retain_pods(&live);
         for u in self.csi.pod_uids().into_iter().filter(|u| !live.contains(u)) {
             let csi = self.csi.clone();
@@ -517,6 +521,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         self.remove_unclaimed_dirs(&live).await;
         kr_rt::exec::yield_if_long(5).await;
         kr_rt::exec::phase("sweep: ipam gc");
+        // Adoption happens in the pods' start tasks: count once they are done (bounded).
+        let t0 = now_ms();
+        while !self.starting.borrow().is_empty() && now_ms() - t0 < 30_000 {
+            kr_rt::exec::sleep(200).await;
+        }
         let (pods, ctrs) = self.adopted.get();
         kr_rt::eprint(alloc::format!("kubelet: adopted {pods} pods ({ctrs} running containers) left by the previous run\n").as_bytes());
         network::gc(alloc::format!("{}/ipam", self.cfg.root).as_bytes(), |owner| if is_pod_uid(owner) { live.iter().any(|u| u.as_bytes() == owner) } else { network::owner_alive(owner) != Some(false) });
@@ -1433,8 +1442,12 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         };
         let _ = kr_sys::fs::unlinkat(kr_sys::ns::AT_FDCWD, path.as_bytes(), 0);
         let rec = core::str::from_utf8(&raw).ok().and_then(adopt::decode);
-        let adopted = rec.and_then(|(sb, ctrs)| self.adopt_pod(uid, pod, rt, sb, ctrs));
-        if adopted.is_none() {
+        let adopted = match rec {
+            Some((sb, ctrs)) => self.adopt_pod(uid, pod, rt, sb, ctrs),
+            None => Err("unreadable record"),
+        };
+        if let Err(why) = adopted {
+            kr_rt::eprint(alloc::format!("kubelet: pod {}/{} not adopted ({why}); starting it again\n", pod.pointer(&["metadata", "namespace"]).and_then(Value::as_str).unwrap_or(""), pod.pointer(&["metadata", "name"]).and_then(Value::as_str).unwrap_or("")).as_bytes());
             if self.cfg.cgroups {
                 kr_runtime::cgroup::kill_pod(uid);
             }
@@ -1448,8 +1461,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
     }
 
-    fn adopt_pod(self: &Rc<Self>, uid: &str, pod: &Value, rt: &mut PodRt, sb: adopt::Sb, recs: Vec<adopt::Ctr>) -> Option<()> {
-        let sandbox = Sandbox::adopt_with_userns(sb.pid, sb.start, sb.host_net, sb.userns)?;
+    fn adopt_pod(self: &Rc<Self>, uid: &str, pod: &Value, rt: &mut PodRt, sb: adopt::Sb, recs: Vec<adopt::Ctr>) -> Result<(), &'static str> {
+        let sandbox = Sandbox::adopt_with_userns(sb.pid, sb.start, sb.host_net, sb.userns).ok_or("the sandbox process is gone")?;
         let pn = self.podnet.get();
         let fam = self.fam.get();
         let net = sb.ip.filter(|_| !sb.host_net).map(|ip| NetConfig::with(ip, &pn, fam));
@@ -1458,11 +1471,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let cni = cni::is_enabled() && !sb.host_net;
         if !sb.host_net && !cni {
             // The pod keeps its IP; its lease must exist so nobody else gets it.
-            let ip = sb.ip?;
-            rt.lease = Some(Lease::adopt(alloc::format!("{}/ipam", self.cfg.root).as_bytes(), uid.as_bytes(), ip)?);
+            let ip = sb.ip.ok_or("the record has no IPv4 address")?;
+            rt.lease = Some(Lease::adopt(alloc::format!("{}/ipam", self.cfg.root).as_bytes(), uid.as_bytes(), ip).ok_or("its IP lease cannot be taken over")?);
         }
         if cni && sb.ip.is_none() && sb.ip6.is_none() {
-            return None; // a record from before CNI pods were adoptable: start the pod again
+            return Err("a record from before CNI pods were adoptable"); // start the pod again
         }
         rt.ip = if sb.host_net { kr_sys::unmap4(self.cfg.node_ip) } else { sb.ip.filter(|_| fam.v4 || cni) };
         rt.ip6 = if sb.host_net { Some(self.cfg.node_ip).filter(|a| kr_sys::unmap4(*a).is_none()) } else if cni { sb.ip6 } else { net.and_then(|n| n.ip6) };
@@ -1558,7 +1571,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         // view of them: they run again (what an init container must tolerate anyway).
         let (p, c) = self.adopted.get();
         self.adopted.set((p + 1, c + rt.ctrs.iter().filter(|c| matches!(c.state, CState::Running { .. })).count() as u32));
-        Some(())
+        Ok(())
     }
 
     /// Prepares local bookkeeping for a newly seen pod.

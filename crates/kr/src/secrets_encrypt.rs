@@ -218,6 +218,15 @@ fn cluster_status(data: &str, server: &str) -> String {
         ));
     }
     s.push_str("  (servers that never applied a generation do not appear; old ciphertext stays in the Raft log until the next snapshot)\n");
+    if let Some(stored) = st.get("stored").and_then(Value::as_array) {
+        s.push_str("stored objects (cluster, as last written or snapshotted):\n");
+        if stored.is_empty() {
+            s.push_str("  none\n");
+        }
+        for e in stored {
+            s.push_str(&format!("  {}: {}\n", e.get("key").and_then(Value::as_str).unwrap_or("?"), e.get("objects").and_then(Value::as_u64).unwrap_or(0)));
+        }
+    }
     s
 }
 
@@ -228,7 +237,7 @@ fn ns_exists(p: &str) -> bool {
 pub fn main(mut args: Args) -> i32 {
     let Some(cmd) = args.next().map(|c| c.to_vec()) else { return fail(USAGE) };
     let mut data = server::data_dir();
-    let (mut online, mut server_url) = (false, String::from("https://127.0.0.1:6443"));
+    let (mut online, mut server_url) = (false, None::<String>);
     while let Some(a) = args.next() {
         if a == b"--online" {
             online = true;
@@ -236,10 +245,11 @@ pub fn main(mut args: Args) -> i32 {
         }
         match (a, args.next().and_then(|v| core::str::from_utf8(v).ok())) {
             (b"--data", Some(d)) => data = String::from(d),
-            (b"--server", Some(u)) => server_url = String::from(u.trim_end_matches('/')),
+            (b"--server", Some(u)) => server_url = Some(String::from(u.trim_end_matches('/'))),
             _ => return fail(USAGE),
         }
     }
+    let server_url = server_url.unwrap_or_else(|| server::local_url(&data));
     let run = || -> Result<(), String> {
         let need = || read_config(&data)?.ok_or_else(|| format!("no {data}/{FILE}: start `kr server` once to create it"));
         match cmd.as_slice() {

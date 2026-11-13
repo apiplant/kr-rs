@@ -173,8 +173,10 @@ pub fn bootstrap_roles() -> Vec<(&'static str, String)> {
         (
             "system:node",
             alloc::format!(
-                "[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]",
+                "[{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}]",
                 rule(&[""], &["pods", "services", "endpoints", "namespaces"], READ),
+                // The kubelet's NetworkPolicy controller (netpol.rs) on agents.
+                rule(&["networking.k8s.io"], &["networkpolicies"], READ),
                 rule(&[""], &["pods"], &["delete"]),
                 rule(&[""], &["pods/status", "nodes/status"], &["get", "patch", "update"]),
                 rule(&[""], &["nodes"], &["get", "list", "watch", "create", "patch", "update"]),

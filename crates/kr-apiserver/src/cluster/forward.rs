@@ -105,7 +105,7 @@ impl Cluster {
     fn http(&self) -> Rc<Http<TlsConnector>> {
         self.forwarder
             .borrow_mut()
-            .get_or_insert_with(|| Rc::new(Http::with_connector(TlsConnector::new(SystemResolver::system(), self.tls.clone()), HttpConfig { max_redirects: 0, user_agent: "kr-server".to_string(), ..HttpConfig::default() })))
+            .get_or_insert_with(|| Rc::new(Http::with_connector(TlsConnector::new(SystemResolver::system(), self.tls.borrow().clone()), HttpConfig { max_redirects: 0, user_agent: "kr-server".to_string(), ..HttpConfig::default() })))
             .clone()
     }
 

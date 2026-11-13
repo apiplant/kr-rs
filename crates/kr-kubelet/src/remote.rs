@@ -31,7 +31,8 @@ pub struct Router {
     pub local_node: String,
     pub local: Option<Rc<dyn NodeProxy>>,
     /// roots = cluster CA, client_cert = kube-apiserver-kubelet-client.
-    pub tls: Rc<ClientConfig>,
+    /// Reloadable: a CA step swaps it without a restart.
+    pub tls: Rc<core::cell::RefCell<Rc<ClientConfig>>>,
     /// Dials pods of this node that sit in a private network.
     pub local_dial: Option<Rc<dyn kr_apiserver::podproxy::PodDialer>>,
 }
@@ -40,7 +41,7 @@ fn header<'a>(h: &'a [(String, String)], name: &str) -> Option<&'a str> {
     h.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
 }
 
-pub(crate) async fn connect(tls: Rc<ClientConfig>, ip: [u8; 16]) -> Option<TlsStream<kr_rt::exec::Async<kr_sys::Fd>>> {
+pub async fn connect(tls: Rc<ClientConfig>, ip: [u8; 16]) -> Option<TlsStream<kr_rt::exec::Async<kr_sys::Fd>>> {
     let sock = kr_net::tcp::connect_addr(kr_net::tcp::SocketAddr { ip: kr_net::tcp::ip_addr16(ip), port: KUBELET_PORT }, 5000).await.ok()?;
     let name = kr_net::tcp::fmt_ip16(ip);
     kr_rt::exec::timeout(5000, TlsStream::connect(sock, tls, &name)).await.ok()?.ok()
@@ -114,7 +115,7 @@ impl NodeProxy for Router {
         }
         let ip = node_ip.ok_or_else(|| ApiError::new(503, "ServiceUnavailable", alloc::format!("node {node} has no InternalIP")))?;
         let target = if query.is_empty() { alloc::format!("/pods/{ns}/{pod}/{sub}") } else { alloc::format!("/pods/{ns}/{pod}/{sub}?{query}") };
-        let tls = self.tls.clone();
+        let tls = self.tls.borrow().clone();
         // SPDY/3.1 (client-go remotecommand / spdystream): pass the upgrade through to the node.
         if header(headers, "upgrade").is_some_and(|u| u.split(',').any(|t| t.trim().eq_ignore_ascii_case("SPDY/3.1"))) {
             let protos: Vec<String> = headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("x-stream-protocol-version")).flat_map(|(_, v)| v.split(',')).map(|t| t.trim().to_string()).collect();
@@ -357,7 +358,7 @@ impl kr_apiserver::podproxy::PodDialer for Router {
         match &t.pod {
             Some(w) if w.node != self.local_node => {
                 let Some(node_ip) = w.node_ip.filter(|_| w.private_net) else { return Box::pin(async { None }) };
-                let (tls, ns, pod) = (self.tls.clone(), w.namespace.clone(), w.name.clone());
+                let (tls, ns, pod) = (self.tls.borrow().clone(), w.namespace.clone(), w.name.clone());
                 Box::pin(async move {
                     let mut conn = connect(tls, node_ip).await?;
                     let req = alloc::format!("GET /pods/{ns}/{pod}/tunnel?port={port} HTTP/1.1\r\nHost: {}\r\nUpgrade: kr-tunnel\r\nConnection: Upgrade\r\n\r\n", kr_net::tcp::url_host(node_ip));

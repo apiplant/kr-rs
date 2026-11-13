@@ -86,7 +86,7 @@ pub struct Cluster {
     peers: RefCell<BTreeMap<NodeId, Peer>>,
     /// Addresses known before they are replicated (founding members, the leader we joined).
     seeds: RefCell<BTreeMap<NodeId, ServerAddr>>,
-    tls: Rc<ClientConfig>,
+    tls: RefCell<Rc<ClientConfig>>,
     pub inbox: Rc<Inbox>,
     fsync: Committer,
     /// Last committed (applied) Raft index and store revision.
@@ -113,6 +113,18 @@ pub struct Cluster {
 }
 
 impl Cluster {
+    /// Swaps the TLS identity and trust for outbound server-to-server connections (after a CA
+    /// step or re-issued certificates): peer connections and the forwarder are rebuilt.
+    pub fn set_client_tls(&self, tls: Rc<ClientConfig>) {
+        *self.tls.borrow_mut() = tls.clone();
+        *self.forwarder.borrow_mut() = None;
+        let mut peers = self.peers.borrow_mut();
+        let addrs: Vec<(NodeId, ([u8; 16], u16))> = peers.iter().map(|(id, p)| (*id, p.addr())).collect();
+        for (id, a) in addrs {
+            peers.insert(id, Peer::new(a, tls.clone()));
+        }
+    }
+
     /// Opens the node's Raft state in `dir`. `voters` is the initial membership for a brand
     /// new cluster (just `[id]` for the first server), empty for a server joining one.
     pub fn open(api: &ApiServer, id: NodeId, dir: &str, voters: Vec<NodeId>, tls: Rc<ClientConfig>, seed: u64) -> Result<Rc<Cluster>, String> {
@@ -131,7 +143,7 @@ impl Cluster {
             storage: RefCell::new(storage),
             peers: RefCell::new(BTreeMap::new()),
             seeds: RefCell::new(BTreeMap::new()),
-            tls,
+            tls: RefCell::new(tls),
             inbox: Rc::default(),
             fsync: Committer::new(),
             waiting: RefCell::new(BTreeMap::new()),
@@ -387,7 +399,7 @@ impl Cluster {
             match peers.get(&id) {
                 Some(p) => p.set_addr((a.ip, a.raft_port)),
                 None => {
-                    peers.insert(id, Peer::new((a.ip, a.raft_port), self.tls.clone()));
+                    peers.insert(id, Peer::new((a.ip, a.raft_port), self.tls.borrow().clone()));
                 }
             }
         }

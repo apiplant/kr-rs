@@ -131,7 +131,7 @@ fn three_servers_replicate_and_fail_over() {
             }
             api.set_cluster(cluster.clone());
             let api_tls = Rc::new(ServerConfig { cert_chain: srv_tls.cert_chain.clone(), key: key(10 + id as u8), client_auth: ClientAuth::Optional(vec![ca.clone()]), alpn: vec![b"http/1.1".to_vec()] });
-            let t1 = spawn(transport::serve(l, srv_tls, id, cluster.inbox.clone()));
+            let t1 = spawn(transport::serve(l, Rc::new(core::cell::RefCell::new(srv_tls)), id, cluster.inbox.clone()));
             let t2 = spawn(cluster.clone().run(api.clone()));
             let (al, _) = api_listeners[i].take().unwrap();
             let a2 = api.clone();
@@ -252,7 +252,7 @@ fn three_servers_replicate_and_fail_over() {
             }
         }
         api.set_cluster(cluster.clone());
-        let t1 = spawn(transport::serve(l, srv_tls, dead, cluster.inbox.clone()));
+        let t1 = spawn(transport::serve(l, Rc::new(core::cell::RefCell::new(srv_tls)), dead, cluster.inbox.clone()));
         let t2 = spawn(cluster.clone().run(api.clone()));
         let back = Srv { id: dead, api, cluster, tasks: vec![t1, t2] };
         for _ in 0..100 {

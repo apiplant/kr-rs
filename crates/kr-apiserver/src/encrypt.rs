@@ -157,6 +157,16 @@ impl Encryptor {
 }
 
 impl Codec for Encryptor {
+    fn label(&self, key: &str, stored: &[u8]) -> Option<String> {
+        if !self.covers(key) {
+            return None;
+        }
+        Some(match stored.strip_prefix(PREFIX.as_bytes()) {
+            Some(r) => String::from_utf8_lossy(&r[..r.iter().position(|b| *b == b':').unwrap_or(0)]).into_owned(),
+            None => String::from("plaintext"),
+        })
+    }
+
     fn encode(&self, key: &str, value: &[u8]) -> Option<Vec<u8>> {
         if self.identity_first || !self.covers(key) {
             return None;
@@ -276,6 +286,18 @@ mod tests {
         assert!(e.decode(SK, &c[..30]).is_err());
         assert!(e.decode(SK, b"k8s:enc:aesgcm:v1:nokey:0123456789012345678901234567890123456789").is_err());
         assert_eq!(e.decode(SK, b"{\"plain\":1}").unwrap(), None, "plaintext fallback");
+    }
+
+    #[test]
+    fn label_names_the_stored_form_of_covered_keys() {
+        let e = Encryptor::new(&Config::generate(rng, 1), rng);
+        let c = e.encode(SK, b"v").unwrap();
+        assert_eq!(e.label(SK, &c).as_deref(), Some("key1"));
+        assert_eq!(e.label(SK, b"{\"plain\":1}").as_deref(), Some("plaintext"));
+        // Not covered: no label, encrypted or not.
+        let cm = "/registry/core/configmaps/default/c";
+        assert_eq!(e.label(cm, b"x"), None);
+        assert_eq!(e.label(cm, b"k8s:enc:aesgcm:v1:key1:01234567890123456789012345678901"), None);
     }
 
     #[test]

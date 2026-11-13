@@ -35,6 +35,18 @@ pub fn data_dir() -> String {
     format!("{}/.local/share/kr/server", env("HOME").unwrap_or_else(|| "/tmp".into()))
 }
 
+/// The port the server in `data` listens on: `--port` as recorded at its last start
+/// (`<data>/port`), else the one in `admin.kubeconfig`, else 6443.
+pub fn local_port(data: &str) -> u16 {
+    let read = |f: &str| fs::read_file(&pki::path(data, f), 1 << 20).ok().and_then(|b| String::from_utf8(b).ok());
+    read("port").and_then(|t| t.trim().parse().ok()).or_else(|| read("admin.kubeconfig").and_then(|t| crate::rotate::kubeconfig_port(&t))).unwrap_or(6443)
+}
+
+/// `https://127.0.0.1:<local_port>`.
+pub fn local_url(data: &str) -> String {
+    format!("https://127.0.0.1:{}", local_port(data))
+}
+
 pub fn mkdir_p(dir: &str) -> Result<(), String> {
     let mut cur = String::new();
     for part in dir.split('/').filter(|p| !p.is_empty()) {
@@ -341,6 +353,76 @@ async fn become_voter(c: Rc<kr_apiserver::cluster::Cluster>, server: String, pki
     }
 }
 
+/// The API server's TLS configuration. The CA travels in the chain so joining agents can pin it by hash.
+fn api_tls(pki_dir: &str) -> Result<Rc<ServerConfig>, String> {
+    let mut chain = load_pem(pki_dir, "apiserver.pem", "CERTIFICATE")?;
+    chain.extend(load_pem(pki_dir, "ca.pem", "CERTIFICATE")?);
+    let key_der = load_pem(pki_dir, "apiserver.key", "PRIVATE KEY")?.pop().ok_or("apiserver.key empty")?;
+    let key = x509::private_key_from_pkcs8(&key_der).map_err(|_| "apiserver.key unsupported")?;
+    let ca = load_pem(pki_dir, "ca.pem", "CERTIFICATE")?;
+    Ok(Rc::new(ServerConfig { cert_chain: chain, key, client_auth: ClientAuth::Optional(ca), alpn: alloc::vec![b"http/1.1".to_vec()] }))
+}
+
+/// The client identity for reaching agents' kubelets.
+fn kubelet_client_tls(pki_dir: &str) -> Result<Rc<kr_crypto::tls::ClientConfig>, String> {
+    let chain = load_pem(pki_dir, "kubelet-client.pem", "CERTIFICATE")?;
+    let key = x509::private_key_from_pkcs8(&load_pem(pki_dir, "kubelet-client.key", "PRIVATE KEY")?.pop().ok_or("empty key")?).map_err(|_| "bad kubelet-client key")?;
+    let roots = load_pem(pki_dir, "ca.pem", "CERTIFICATE")?;
+    Ok(Rc::new(kr_crypto::tls::ClientConfig { roots, pinned_ca: None, client_cert: Some((chain, key)), alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false }))
+}
+
+type Slot<T> = Rc<core::cell::RefCell<Rc<T>>>;
+
+/// Every TLS configuration of a running server that depends on the PKI files. After a key-sync
+/// CA step or re-issued certificates, [`TlsReload::reload`] swaps them in: new connections
+/// use the new trust and certificates, so no restart is needed (#189).
+pub(crate) struct TlsReload {
+    pki_dir: String,
+    api: Slot<ServerConfig>,
+    kubelet: Slot<kr_crypto::tls::ClientConfig>,
+    raft: Option<(Slot<ServerConfig>, Rc<kr_apiserver::cluster::Cluster>)>,
+    /// Digest of the PKI files the loaded configurations were built from.
+    loaded: core::cell::RefCell<[u8; 32]>,
+}
+
+impl TlsReload {
+    fn digest(&self) -> [u8; 32] {
+        let mut all = Vec::new();
+        for f in ["ca.pem", "apiserver.pem", "server.pem", "kubelet-client.pem"] {
+            all.extend(fs::read_file(&pki::path(&self.pki_dir, f), 1 << 20).unwrap_or_default());
+            all.push(0);
+        }
+        kr_crypto::sha2::sha256(&all)
+    }
+
+    /// [`TlsReload::reload`] when the files changed since the last load (a key-sync record
+    /// carries every file, so most generations change nothing here).
+    pub(crate) fn reload_if_changed(&self) -> Result<(), String> {
+        if *self.loaded.borrow() == self.digest() {
+            return Ok(());
+        }
+        self.reload()
+    }
+
+    pub(crate) fn reload(&self) -> Result<(), String> {
+        let d = self.digest();
+        let api = api_tls(&self.pki_dir)?;
+        let kubelet = kubelet_client_tls(&self.pki_dir)?;
+        let raft = match &self.raft {
+            Some(_) => Some(server_tls(&self.pki_dir)?),
+            None => None,
+        };
+        *self.api.borrow_mut() = api;
+        *self.kubelet.borrow_mut() = kubelet;
+        if let (Some((slot, c)), Some((srv, cli))) = (&self.raft, raft) {
+            *slot.borrow_mut() = srv;
+            c.set_client_tls(cli);
+        }
+        *self.loaded.borrow_mut() = d;
+        Ok(())
+    }
+}
+
 /// TLS configurations for the Raft listener and for outbound server-to-server connections.
 fn server_tls(pki_dir: &str) -> Result<(Rc<ServerConfig>, Rc<kr_crypto::tls::ClientConfig>), String> {
     let chain = load_pem(pki_dir, "server.pem", "CERTIFICATE")?;
@@ -561,6 +643,14 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
     if let Err(e) = mkdir_p(&data).and_then(|_| bootstrap(&data, port, ha)) {
         return fail(&e);
     }
+    // For the CLI on this machine (`kr pki rotate`, `kr secrets-encrypt`, `kr token`).
+    {
+        let (path, tmp) = (pki::path(&data, "port"), pki::path(&data, "port.new"));
+        let _ = fs::unlinkat(fs::AT_FDCWD, &tmp, 0);
+        if pki::write_new(&tmp, format!("{port}\n").as_bytes(), 0o644).is_ok() {
+            let _ = fs::renameat2(fs::AT_FDCWD, &tmp, fs::AT_FDCWD, &path, 0);
+        }
+    }
     // The address pods, agents and other servers use to reach this API server.
     let advertise = primary_addr();
     // An existing single-server datastore: imported on --cluster-init, never thrown away by a join.
@@ -569,13 +659,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
         return fail("this server already has a single-server datastore; it can found a cluster (--cluster-init) but not join one");
     }
     let setup = || -> Result<(Rc<ServerConfig>, kr_store::Store), String> {
-        // The CA travels in the chain so joining agents can pin it by hash.
-        let mut chain = load_pem(&pki_dir, "apiserver.pem", "CERTIFICATE")?;
-        chain.extend(load_pem(&pki_dir, "ca.pem", "CERTIFICATE")?);
-        let key_der = load_pem(&pki_dir, "apiserver.key", "PRIVATE KEY")?.pop().ok_or("apiserver.key empty")?;
-        let key = x509::private_key_from_pkcs8(&key_der).map_err(|_| "apiserver.key unsupported")?;
-        let ca = load_pem(&pki_dir, "ca.pem", "CERTIFICATE")?;
-        let tls = Rc::new(ServerConfig { cert_chain: chain, key, client_auth: ClientAuth::Optional(ca), alpn: alloc::vec![b"http/1.1".to_vec()] });
+        let tls = api_tls(&pki_dir)?;
         // A joining server gets the cluster's encryption config in the join flow, never its own.
         let codec = crate::secrets_encrypt::load(&data, enc_on, join_url.is_none())?;
         let store = if ha {
@@ -693,15 +777,14 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
     let controllers = kr_apiserver::client::InProcess::new(api.clone(), "controller-manager");
     let local_node = node_name();
     // TLS identity for reaching agents' kubelets.
-    let kubelet_client = match (|| -> Result<Rc<kr_crypto::tls::ClientConfig>, String> {
-        let chain = load_pem(&pki_dir, "kubelet-client.pem", "CERTIFICATE")?;
-        let key = x509::private_key_from_pkcs8(&load_pem(&pki_dir, "kubelet-client.key", "PRIVATE KEY")?.pop().ok_or("empty key")?).map_err(|_| "bad kubelet-client key")?;
-        let roots = load_pem(&pki_dir, "ca.pem", "CERTIFICATE")?;
-        Ok(Rc::new(kr_crypto::tls::ClientConfig { roots, pinned_ca: None, client_cert: Some((chain, key)), alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false }))
-    })() {
-        Ok(c) => c,
+    let kubelet_client: Slot<kr_crypto::tls::ClientConfig> = match kubelet_client_tls(&pki_dir) {
+        Ok(c) => Rc::new(core::cell::RefCell::new(c)),
         Err(e) => return fail(&e),
     };
+    let api_slot: Slot<ServerConfig> = Rc::new(core::cell::RefCell::new(tls));
+    let raft_slot: Option<Slot<ServerConfig>> = ha_tasks.as_ref().map(|(_, _, srv, _)| Rc::new(core::cell::RefCell::new(srv.clone())));
+    let reload = Rc::new(TlsReload { pki_dir: pki_dir.clone(), api: api_slot.clone(), kubelet: kubelet_client.clone(), raft: raft_slot.clone().zip(ha_tasks.as_ref().map(|t| t.0.clone())), loaded: core::cell::RefCell::new([0; 32]) });
+    *reload.loaded.borrow_mut() = reload.digest();
     let api_for_proxy = api.clone();
     let snapshot_data = data.clone();
     let data_for_sync = data.clone();
@@ -718,14 +801,15 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
         // The CSR approver/signer issues with the cluster CA (absent: it does not run).
         let csr_ca = pki::load_ca(&pki_dir).ok().map(|(name, key, _)| Rc::new(kr_controllers::csr::CaSigner { name, key, rng }));
         match ha_tasks {
-            Some((c, l, srv_tls, id)) => {
+            Some((c, l, _, id)) => {
+                let srv_tls = raft_slot.clone().expect("HA has a Raft TLS slot");
                 if let Ok(l6) = kr_net::http1::server::listen6(kr_apiserver::cluster::transport::PORT, 64) {
                     kr_rt::exec::spawn(kr_apiserver::cluster::transport::serve(l6, srv_tls.clone(), id, c.inbox.clone()));
                 }
                 kr_rt::exec::spawn(kr_apiserver::cluster::transport::serve(l, srv_tls, id, c.inbox.clone()));
                 kr_rt::exec::spawn_priority(c.clone().run(api.clone()));
                 kr_rt::exec::spawn(c.clone().keep_registered(api.clone()));
-                kr_rt::exec::spawn(crate::keysync::run(c.clone(), api.clone(), data_for_sync.clone(), port));
+                kr_rt::exec::spawn(crate::keysync::run(c.clone(), api.clone(), data_for_sync.clone(), port, reload.clone()));
                 if let Some(url) = join_url {
                     let me = kr_apiserver::cluster::ServerAddr { ip: advertise, raft_port: kr_apiserver::cluster::transport::PORT, api_port: port };
                     kr_rt::exec::spawn(become_voter(c.clone(), url, pki_dir.clone(), me));
@@ -753,7 +837,7 @@ pub fn main(mut args: crate::install::Argv) -> i32 {
         if let Some(k) = kubelet {
             kr_rt::exec::spawn(k.run());
         }
-        kr_apiserver::server::run(api, [0, 0, 0, 0], port, tls).await
+        kr_apiserver::server::run_reloadable(api, [0, 0, 0, 0], port, api_slot).await
     }) {
         Ok(()) => 0,
         Err(e) => fail(&format!("listener failed: {e:?} (is port {port} already in use?)")),

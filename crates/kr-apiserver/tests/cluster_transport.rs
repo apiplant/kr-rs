@@ -71,7 +71,7 @@ fn transport_delivers_and_authenticates() {
         let l = listen([127, 0, 0, 1], 0, 16).unwrap();
         let port = local_addr(&l).unwrap().1;
         let inbox: Rc<Inbox> = Rc::default();
-        spawn(transport::serve(l, s2.srv.clone(), 2, inbox.clone()));
+        spawn(transport::serve(l, Rc::new(core::cell::RefCell::new(s2.srv.clone())), 2, inbox.clone()));
 
         // 1 -> 2: delivered.
         let p = Peer::new((kr_sys::map4([127, 0, 0, 1]), port), s1.cli.clone());

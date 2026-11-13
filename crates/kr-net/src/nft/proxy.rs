@@ -6,7 +6,9 @@
 //! the connection keeps its client address: NetworkPolicy sees the real client, source IPs reach
 //! the backends, and established connections survive a kubelet restart (conntrack holds the NAT).
 //! Only traffic that would not find its way back is masqueraded (clients outside the pod network
-//! reaching a NodePort, a pod reaching itself through a Service).
+//! reaching a NodePort, a pod reaching itself through a Service, and everything the host itself
+//! sends to a Service (only connections kr itself translated): its source is picked from the local Service-CIDR route and no remote
+//! endpoint could reply to it, so it is masqueraded like kube-proxy does).
 //!
 //! Layout: chain `services` holds one rule per frontend and jumps to the service's chain;
 //! a service chain picks an endpoint with `numgen random` (rule `j` of `K` fires with probability
@@ -19,6 +21,10 @@ use super::*;
 pub const PROXY_TABLE: &[u8] = b"kr-proxy";
 /// The packet mark that asks the `postrouting` chain to masquerade.
 pub const MASQ_MARK: u32 = 0x4000;
+/// Set on a packet that one of kr's endpoint rules translated (just before its DNAT). The host
+/// masquerade rule requires it, so DNAT done by others (Docker's embedded DNS, published ports,
+/// other tools) is never masqueraded by kr.
+pub const SVC_MARK: u32 = 0x2000;
 
 const NFT_META_MARK: u32 = 3; // NFT_META_MARK
 const NFT_MSG_DELCHAIN: u16 = 5; // NFT_MSG_DELCHAIN
@@ -28,6 +34,11 @@ const NFT_REG_2: u32 = 2; // NFT_REG_2
 const NF_INET_PRE_ROUTING: u32 = 0; // NF_INET_PRE_ROUTING
 const NF_INET_LOCAL_OUT: u32 = 3; // NF_INET_LOCAL_OUT
 const NFPROTO_INET: u8 = 1; // NFPROTO_INET
+const NFTA_CT_DREG: u16 = 1; // NFTA_CT_DREG
+const NFTA_CT_KEY: u16 = 2; // NFTA_CT_KEY
+const NFT_CT_STATUS: u32 = 2; // NFT_CT_STATUS (enum nft_ct_keys)
+/// `IPS_DST_NAT`: the connection's destination was translated.
+const IPS_DST_NAT: u32 = 1 << 5;
 const NFTA_NAT_TYPE: u16 = 1; // NFTA_NAT_TYPE
 const NFTA_NAT_FAMILY: u16 = 2; // NFTA_NAT_FAMILY
 const NFTA_NAT_REG_ADDR_MIN: u16 = 3; // NFTA_NAT_REG_ADDR_MIN
@@ -215,18 +226,37 @@ fn policy_of(f: &Frontend) -> Policy {
 
 /// `mark = mark | MASQ_MARK`.
 fn set_masq_mark(b: &mut NlBuf) {
+    set_mark_bit(b, MASQ_MARK);
+}
+
+/// `mark = mark | bit`.
+fn set_mark_bit(b: &mut NlBuf, bit: u32) {
     meta(b, NFT_META_MARK);
     expr_begin(b, b"bitwise");
     b.attr_u32_be(NFTA_BITWISE_SREG, NFT_REG_1);
     b.attr_u32_be(NFTA_BITWISE_DREG, NFT_REG_1);
     b.attr_u32_be(NFTA_BITWISE_LEN, 4);
-    data_value(b, NFTA_BITWISE_MASK, &(!MASQ_MARK).to_ne_bytes());
-    data_value(b, NFTA_BITWISE_XOR, &MASQ_MARK.to_ne_bytes());
+    data_value(b, NFTA_BITWISE_MASK, &(!bit).to_ne_bytes());
+    data_value(b, NFTA_BITWISE_XOR, &bit.to_ne_bytes());
     expr_end(b);
     expr_begin(b, b"meta");
     b.attr_u32_be(NFTA_META_KEY, NFT_META_MARK);
     b.attr_u32_be(NFTA_META_SREG, NFT_REG_1);
     expr_end(b);
+}
+
+/// True when the connection's destination was translated: a host packet that matched a Service
+/// rule in this traversal (the NAT takes effect in the same hook). Used after `services` returns
+/// in the `output` chain, so only host traffic that reached a real endpoint is masqueraded;
+/// forwarded pod traffic (NATed in `prerouting`, client address kept for NetworkPolicy and the
+/// backend) never passes here, and the built-in DNS (no rule) is untouched.
+fn ct_status_dnat(b: &mut NlBuf) {
+    expr_begin(b, b"ct");
+    b.attr_u32_be(NFTA_CT_KEY, NFT_CT_STATUS);
+    b.attr_u32_be(NFTA_CT_DREG, NFT_REG_1);
+    expr_end(b);
+    bitwise_and(b, &IPS_DST_NAT.to_ne_bytes());
+    cmp(b, NFT_CMP_EQ, &IPS_DST_NAT.to_ne_bytes());
 }
 
 /// Picks one of `targets` (chain names) uniformly, or by client address.
@@ -309,6 +339,21 @@ fn reset(nl: &Netlink) -> Result<(), Errno> {
     chain(&mut b, "services", None);
     add_rule(&mut b, "prerouting", |b| jump(b, "services"));
     add_rule(&mut b, "output", |b| jump(b, "services"));
+    // Host traffic that reached a real endpoint is masqueraded: the routing picks its source from
+    // the local Service-CIDR route (the ClusterIP itself), which a remote endpoint cannot reply to.
+    // Its own chain (a filter chain runs after the nat chain, when `ct status dnat` is set; in the
+    // nat chain itself the next rule would not see it yet). Only the first packet of a connection
+    // is evaluated by the nat `postrouting` chain, so marked reply packets change nothing.
+    chain(&mut b, "hostmasq", Some((b"filter", NF_INET_LOCAL_OUT, 10)));
+    // Only kr's own translations (SVC_MARK, set by the endpoint rules) count: other DNAT on the
+    // host (Docker's DNS at 127.0.0.11, published ports, ...) is left alone.
+    add_rule(&mut b, "hostmasq", |b| {
+        ct_status_dnat(b);
+        meta(b, NFT_META_MARK);
+        bitwise_and(b, &SVC_MARK.to_ne_bytes());
+        cmp(b, NFT_CMP_NEQ, &[0u8; 4]);
+        set_masq_mark(b);
+    });
     // Connections that asked for it are masqueraded when they leave.
     add_rule(&mut b, "postrouting", |b| {
         meta(b, NFT_META_MARK);
@@ -346,7 +391,10 @@ fn emit_service(b: &mut NlBuf, g: u32, i: usize, s: &Svc, m: &Model) {
             cmp(b, NFT_CMP_EQ, &a);
             set_masq_mark(b);
         });
-        add_rule(b, &eps[j], |b| dnat(b, be, v6));
+        add_rule(b, &eps[j], |b| {
+            set_mark_bit(b, SVC_MARK);
+            dnat(b, be, v6);
+        });
     }
     let name = alloc::format!("g{g}s{i}");
     chain(b, &name, None);

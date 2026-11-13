@@ -563,7 +563,7 @@ impl kr_apiserver::metrics::Scraper for crate::remote::Router {
                 }
             });
         }
-        let tls = self.tls.clone();
+        let tls = self.tls.borrow().clone();
         Box::pin(async move {
             let ip = ip?;
             let mut t = crate::remote::connect(tls, ip).await?;

@@ -257,6 +257,11 @@ fn respond(reply: Reply) -> Response {
 
 /// Serves the API on `addr:port` until the listener fails.
 pub async fn run(api: Rc<ApiServer>, addr: [u8; 4], port: u16, tls: Rc<kr_crypto::tls::ServerConfig>) -> kr_net::Result<()> {
+    run_reloadable(api, addr, port, Rc::new(core::cell::RefCell::new(tls))).await
+}
+
+/// [`run`] with a TLS configuration that can be swapped while serving (CA rotation).
+pub async fn run_reloadable(api: Rc<ApiServer>, addr: [u8; 4], port: u16, tls: Rc<core::cell::RefCell<Rc<kr_crypto::tls::ServerConfig>>>) -> kr_net::Result<()> {
     // Writes by in-process components (controllers, the server's kubelet) are not awaited by
     // any HTTP request: flush them every second. Compaction is checked every minute.
     let a = api.clone();
@@ -303,18 +308,22 @@ pub async fn run(api: Rc<ApiServer>, addr: [u8; 4], port: u16, tls: Rc<kr_crypto
         if let Ok(l6) = server::listen6(port, 4096) {
             let (api, tls) = (api.clone(), tls.clone());
             kr_rt::exec::spawn(async move {
-                let _ = serve(api, l6, tls).await;
+                let _ = serve_slot(api, l6, tls).await;
             });
         }
     }
-    serve(api, listener, tls).await
+    serve_slot(api, listener, tls).await
 }
 
 /// Serves the API on an already bound listener (no background flushing; see [`run`]).
 pub async fn serve(api: Rc<ApiServer>, listener: kr_rt::exec::Async<kr_sys::Fd>, tls: Rc<kr_crypto::tls::ServerConfig>) -> kr_net::Result<()> {
+    serve_slot(api, listener, Rc::new(core::cell::RefCell::new(tls))).await
+}
+
+async fn serve_slot(api: Rc<ApiServer>, listener: kr_rt::exec::Async<kr_sys::Fd>, tls: Rc<core::cell::RefCell<Rc<kr_crypto::tls::ServerConfig>>>) -> kr_net::Result<()> {
     // Parallel clients keep hundreds of idle connections; one over the cap is closed unanswered
     // (the client sees EOF), so the cap sits well above any realistic client count.
-    let cfg = Rc::new(ServerConfig { tls: Some(tls), idle_timeout_ms: 300_000, max_connections: 32_768, ..ServerConfig::default() });
+    let cfg = Rc::new(ServerConfig { tls_slot: Some(tls), idle_timeout_ms: 300_000, max_connections: 32_768, ..ServerConfig::default() });
     let handler = move |req: Request| -> HandlerFuture {
         let api = api.clone();
         Box::pin(async move { handle(&api, req).await })

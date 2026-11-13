@@ -669,3 +669,36 @@ fn image_restore_roundtrip_closes_watchers() {
     assert!(b.take_records().is_empty());
     assert!(matches!(b.watch("/", 3), Err(Error::Compacted { .. })));
 }
+
+struct Tagged;
+
+impl Codec for Tagged {
+    fn encode(&self, _key: &str, value: &[u8]) -> Option<Vec<u8>> {
+        Some(value.to_vec())
+    }
+    fn decode(&self, _key: &str, value: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+        Ok(Some(value.to_vec()))
+    }
+    fn label(&self, key: &str, _stored: &[u8]) -> Option<String> {
+        Some(String::from(if key.starts_with("/s") { "sealed" } else { "clear" }))
+    }
+}
+
+#[test]
+fn codec_labels_count_the_stored_form_of_live_keys() {
+    let dir = tmpdir("labels");
+    let mut s = Store::open_with(&dir, Some(StdRc::new(Tagged))).unwrap();
+    s.create("/s/a", v("1")).unwrap();
+    s.create("/s/b", v("2")).unwrap();
+    s.create("/c/c", v("3")).unwrap();
+    assert_eq!(s.codec_labels(), vec![(String::from("clear"), 1), (String::from("sealed"), 2)]);
+    // Deleted keys drop out; a changed label replaces the old one.
+    s.delete("/c/c", None).unwrap();
+    s.update("/s/a", v("11"), None).unwrap();
+    assert_eq!(s.codec_labels(), vec![(String::from("sealed"), 2)]);
+    s.sync().unwrap();
+    // Reopening re-labels from the stored values (dec).
+    drop(s);
+    let s = Store::open_with(&dir, Some(StdRc::new(Tagged))).unwrap();
+    assert_eq!(s.codec_labels(), vec![(String::from("sealed"), 2)]);
+}

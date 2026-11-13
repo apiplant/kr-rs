@@ -2,7 +2,7 @@
 # HA cluster test (ADR-026): servers krs1..krs3 (Raft) + agent kra1 in throwaway privileged
 # containers (dev only). Checks joining, replication, write forwarding from followers,
 # leader failover after kill -9, restart catch-up and server removal.
-#   tools/test/ha.sh [up|test|import|ipchange|down]   (default: up + test; leaves the cluster running)
+#   tools/test/ha.sh [up|test|import|ipchange|keysync|carotate|down]   (default: up + test; leaves the cluster running)
 #   import: a single-server install converted with --cluster-init, a second server joins
 #           (InstallSnapshot), then the first restarts and must reach its peer (2 voters).
 #   ipchange: krs3 moves to another IP and restarts (new certificates, re-registered address).
@@ -30,7 +30,7 @@ down() {
 
 up() {
   down
-  docker network create --subnet 172.30.0.0/24 krha >/dev/null
+  docker network create --subnet 172.30.0.0/24 krha >/dev/null 2>&1 || docker network inspect krha >/dev/null  # cache containers may hold it
   for n in $SERVERS kra1; do
     docker run -d --name $n --hostname $n --network krha --privileged --tmpfs /store:exec,size=2g \
       -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" \
@@ -141,7 +141,7 @@ test_() {
 
 import_() {
   down
-  docker network create --subnet 172.30.0.0/24 krha >/dev/null
+  docker network create --subnet 172.30.0.0/24 krha >/dev/null 2>&1 || docker network inspect krha >/dev/null  # cache containers may hold it
   for n in krs1 krs2; do
     docker run -d --name $n --hostname $n --network krha --privileged --tmpfs /store:exec,size=2g \
       -v "$REPO/target/release:/krbin:ro" -v "$(command -v kubectl):/usr/local/bin/kubectl:ro" \
@@ -212,8 +212,44 @@ keysync_() {
   echo "PASS (keysync)"
 }
 
+# CA rotation in HA without restarting anything (#189): prepare, activate and finish on krs1;
+# every server and the agent follow through the Raft log and /kr/ca-bundle. finish runs without
+# --yes, so it must see the agent serving a certificate of the new CA.
+carotate_() {
+  local kr="docker exec -e KR_ROOT=/store krs1 /krbin/kr"
+  k krs1 run ca-probe --image=busybox --overrides='{"spec":{"nodeName":"kra1"}}' -- sh -c 'while true; do echo alive; sleep 5; done' >/dev/null
+  for _ in $(seq 60); do k krs1 logs ca-probe 2>/dev/null | grep -q alive && break; sleep 2; done
+  k krs1 logs ca-probe | grep -q alive || fail "probe pod not running"
+  $kr pki rotate --ca prepare --data /var/tmp/srv || fail "prepare"
+  for _ in $(seq 90); do docker exec kra1 grep -q "trusting the new one" /tmp/agent.log && break; sleep 2; done
+  docker exec kra1 grep -q "trusting the new one" /tmp/agent.log || fail "agent did not fetch the bundle"
+  $kr pki rotate --ca activate --data /var/tmp/srv || fail "activate"
+  for n in krs2 krs3; do  # krs1 issued its own in the CLI and reloads through the applier
+    for _ in $(seq 30); do docker exec $n grep -q "certificates issued again with the new CA and in use" /tmp/srv.log && break; sleep 1; done
+    docker exec $n grep -q "certificates issued again with the new CA and in use" /tmp/srv.log || fail "$n did not reload its certificates"
+  done
+  for _ in $(seq 90); do docker exec kra1 grep -q "renewed with the new CA" /tmp/agent.log && break; sleep 2; done
+  docker exec kra1 grep -q "renewed with the new CA" /tmp/agent.log || fail "agent did not renew"
+  $kr pki rotate --ca finish --data /var/tmp/srv || fail "finish (without --yes) refused"
+  sleep 5
+  for n in $SERVERS; do
+    k $n get nodes >/dev/null || fail "API on $n with the new CA"
+    [ "$(docker exec $n grep -c 'BEGIN CERT' /var/tmp/srv/pki/ca.pem)" = 1 ] || fail "$n still has two CAs"
+  done
+  # Servers to agent (kubelet client) and the Raft transport with the new CA only.
+  k krs2 logs ca-probe --tail=1 | grep -q alive || fail "logs through the kubelet after finish"
+  k krs3 create configmap after-ca >/dev/null || fail "write after finish"
+  for _ in $(seq 20); do k krs1 get configmap after-ca >/dev/null 2>&1 && break; sleep 1; done
+  k krs1 get configmap after-ca >/dev/null || fail "replication after finish"
+  [ "$(k krs1 get nodes --no-headers | grep -c ' Ready')" = 4 ] || fail "nodes not Ready after finish"
+  for n in $SERVERS; do [ "$(docker exec $n pgrep -c -f 'kr server')" -ge 1 ] || fail "$n server exited"; done
+  $kr secrets-encrypt status --data /var/tmp/srv | grep -A5 "stored objects (cluster" || true
+  echo "PASS (carotate)"
+}
+
 case "${1:-all}" in
   keysync) keysync_ ;;
+  carotate) carotate_ ;;
   up) up ;;
   test) test_ ;;
   import) import_ ;;

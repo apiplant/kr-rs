@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use kr_rt::{eprint, print, Args};
 use kr_sys::fs;
 
-const USAGE: &[u8] = b"usage: kr pki rotate [--data DIR] [--port 6443] [--service-account-key] [--ca prepare|activate|finish [--yes]]
+const USAGE: &[u8] = b"usage: kr pki rotate [--data DIR] [--port PORT (default: the server's)] [--service-account-key] [--ca prepare|activate|finish [--yes]|sync]
   Issues the API server serving certificate, the server and admin client certificates and
   admin.kubeconfig again (same names and addresses, new keys, 365 days). Restart `kr server` after.
   --service-account-key  also replace pki/sa.key. The old key is kept in pki/sa-old.pem, so tokens
@@ -27,17 +27,18 @@ const USAGE: &[u8] = b"usage: kr pki rotate [--data DIR] [--port 6443] [--servic
                          signs with it) and take effect without a restart.
   --ca prepare           creates a new CA and puts both in ca.pem (old first, signing unchanged). Single
                          server: stop it first, then restart. HA: run it on a running server; ca.pem is
-                         replicated, then restart every server one at a time so each trusts the bundle
-                         before you activate. Running agents fetch the bundle from a server within a
-                         minute (an agent from an older release needs ca.pem copied).
+                         replicated and every server trusts the bundle at once (no restart). Running
+                         agents fetch the bundle within a minute (an agent from an older release needs
+                         ca.pem copied).
   --ca activate          signs with the new CA from now on: re-issues the server certificates and
                          admin.kubeconfig and updates node-token and server-token. Old client certificates
                          stay valid. HA: run it on the same server as prepare; ca.pem, ca.key and the
-                         tokens are replicated and every server issues its own certificates again.
-                         Restart (one at a time); nodes renew their certificates with the new CA.
-  --ca finish --yes      drops the old CA from ca.pem once every node certificate was renewed
-                         (a node certificate of the old CA stops working); copy ca.pem to the agents.
-                         HA: replicated, then restart the servers.
+                         tokens are replicated and every server issues its own certificates again and
+                         uses them (no restart). Single server: restart. Agents renew their certificates
+                         with the new CA within about a minute.
+  --ca finish            drops the old CA from ca.pem once every agent serves a certificate of the new CA
+                         (checked by connecting to each agent's kubelet; --yes skips the check). HA:
+                         replicated, no restart; single server: restart. Agents fetch the new ca.pem.
   --ca sync              HA: replicates the current CA files again (after a failed replication).
 ";
 
@@ -127,7 +128,41 @@ fn certs_of(pem: &str) -> Result<Vec<Vec<u8>>, String> {
 }
 
 fn port_of(data: &str, port: Option<u16>) -> u16 {
-    port.or_else(|| fs::read_file(&cstr(&format!("{data}/admin.kubeconfig")), 1 << 20).ok().and_then(|b| kubeconfig_port(&String::from_utf8_lossy(&b)))).unwrap_or(6443)
+    port.unwrap_or_else(|| server::local_port(data))
+}
+
+/// Agents whose kubelet does not yet present a certificate of `new_ca` (checked by a TLS
+/// handshake that trusts only the new CA, with the server's kubelet-client identity, which
+/// `--ca activate` issued from the new CA). Servers are skipped: their kubelet runs in process
+/// and their certificates were issued again at activate.
+fn agents_not_renewed(data: &str, port: Option<u16>, new_ca: &[u8]) -> Result<Vec<String>, String> {
+    use kr_apiserver::client::Client;
+    use kr_crypto::x509;
+    use kr_fmt::json::Value;
+    let remote = crate::secrets_encrypt::admin_remote(data, &format!("https://127.0.0.1:{}", port_of(data, port)))?;
+    let pki_dir = format!("{data}/pki");
+    let chain = server::load_pem(&pki_dir, "kubelet-client.pem", "CERTIFICATE")?;
+    let key = x509::private_key_from_pkcs8(&server::load_pem(&pki_dir, "kubelet-client.key", "PRIVATE KEY")?.pop().ok_or("kubelet-client.key empty")?).map_err(|_| "bad kubelet-client.key")?;
+    let tls = alloc::rc::Rc::new(kr_crypto::tls::ClientConfig { roots: alloc::vec![new_ca.to_vec()], pinned_ca: None, client_cert: Some((chain, key)), alpn: alloc::vec![b"http/1.1".to_vec()], tls12: false });
+    kr_rt::exec::block_on(async move {
+        let list = remote.get("/api/v1/nodes").await.map_err(|e| format!("listing nodes: {} {}", e.code, e.message))?;
+        let mut behind = Vec::new();
+        for n in list.get("items").and_then(Value::as_array).map(|a| a.to_vec()).unwrap_or_default() {
+            let name = n.pointer(&["metadata", "name"]).and_then(Value::as_str).map(String::from).unwrap_or_default();
+            if n.pointer(&["metadata", "labels", "node-role.kubernetes.io/control-plane"]).is_some() {
+                continue;
+            }
+            let ip = n.pointer(&["status", "addresses"]).and_then(Value::as_array).and_then(|a| a.iter().find(|x| x.get("type").and_then(Value::as_str) == Some("InternalIP")).and_then(|x| x.get("address")).and_then(Value::as_str)).and_then(kr_net::tcp::parse_ip16);
+            let ok = match ip {
+                Some(ip) => kr_kubelet::remote::connect(tls.clone(), ip).await.is_some(),
+                None => false,
+            };
+            if !ok {
+                behind.push(name);
+            }
+        }
+        Ok(behind)
+    })
 }
 
 /// HA only: publishes `files` through the running server and waits until every voter applied
@@ -178,7 +213,7 @@ fn rotate_ca(data: &str, port: Option<u16>, phase: &str, yes: bool) -> Result<()
             let old = read_text(&ca_pem)?;
             put(&ca_pem, &format!("{old}{new_cert}"), 0o644)?;
             replicate_current(data, port, &["pki/ca.pem"])?;
-            print(format!("prepared: pki/ca.pem now holds the old and the new CA (the old one still signs).\n1. restart the server (HA: every server, one at a time); running agents fetch the bundle from /kr/ca-bundle within a minute and trust it (copy {ca_pem} to pki/ca.pem of agents from an older release and restart them)\n2. when every node trusts the bundle (its pki/ca.pem has two certificates), run `kr pki rotate --ca activate`\n").as_bytes());
+            print(format!("prepared: pki/ca.pem now holds the old and the new CA (the old one still signs).\n1. running agents fetch the bundle from /kr/ca-bundle within a minute and trust it (copy {ca_pem} to pki/ca.pem of agents from an older release); a single server restarts now, HA servers trust the bundle at once (no restart)\n2. when every node trusts the bundle (its pki/ca.pem has two certificates), run `kr pki rotate --ca activate`\n").as_bytes());
         }
         "sync" => {
             replicate_current(data, port, &["pki/ca.pem", "pki/ca.key", "node-token", "server-token"])?;
@@ -217,16 +252,23 @@ fn rotate_ca(data: &str, port: Option<u16>, phase: &str, yes: bool) -> Result<()
             }
             run(data, port, false)?;
             replicate_current(data, port, &["pki/ca.pem", "pki/ca.key", "node-token", "server-token"])?;
-            print(b"activated: the new CA signs from now on; restart the server. Nodes keep their old certificates until they renew (the server still trusts the old CA); run `kr pki rotate --ca finish --yes` after every node certificate was renewed.\n");
+            print(if exists(&format!("{data}/raft")) {
+                b"activated: the new CA signs from now on; every server issued its certificates again and uses them (no restart). Agents renew theirs within about a minute; then run `kr pki rotate --ca finish` (it checks every agent first).\n".as_slice()
+            } else {
+                b"activated: the new CA signs from now on; restart the server. Agents renew their certificates within about a minute of the restart; then run `kr pki rotate --ca finish` (it checks every agent first).\n".as_slice()
+            });
         }
         _ => {
             if !exists(&old_pem) {
                 return Err("nothing to finish: run prepare and activate first".into());
             }
-            if !yes {
-                return Err("this drops the old CA: a node certificate or kubelet certificate signed by it stops working. Run again with --yes once every node renewed".into());
-            }
             let first = certs_of(&read_text(&ca_pem)?)?.into_iter().next().ok_or("pki/ca.pem is empty")?;
+            if !yes {
+                let behind = agents_not_renewed(data, port, &first)?;
+                if !behind.is_empty() {
+                    return Err(format!("this drops the old CA, and these agents do not yet serve a certificate of the new one: {} (they renew within a minute of activate; is each running?). Run again later, or with --yes to drop the old CA anyway", behind.join(", ")));
+                }
+            }
             put(&ca_pem, &x509::pem_encode("CERTIFICATE", &first), 0o644)?;
             replicate_current(data, port, &["pki/ca.pem"])?;
             let aside = format!("{pki_dir}/rotated-ca-{}", pki::now());
@@ -234,7 +276,8 @@ fn rotate_ca(data: &str, port: Option<u16>, phase: &str, yes: bool) -> Result<()
             for (f, name) in [(&old_pem, "ca.pem"), (&old_key, "ca.key")] {
                 fs::renameat2(fs::AT_FDCWD, &cstr(f), fs::AT_FDCWD, &cstr(&format!("{aside}/{name}")), 0).map_err(|e| format!("move {f}: errno {}", e.0))?;
             }
-            print(format!("finished: pki/ca.pem holds only the new CA (the old CA and key are in {aside}). Copy it to the agents and restart the server.\n").as_bytes());
+            let next = if exists(&format!("{data}/raft")) { "Every server uses it now; agents fetch it within a minute" } else { "Restart the server; agents fetch it within a minute of that" };
+            print(format!("finished: pki/ca.pem holds only the new CA (the old CA and key are in {aside}). {next}.\n").as_bytes());
         }
     }
     Ok(())
@@ -262,9 +305,7 @@ fn run(data: &str, port: Option<u16>, sa: bool) -> Result<(), String> {
     }
     pki::load_ca(&pki_dir)?;
     let ha = exists(&format!("{data}/raft"));
-    let port = port
-        .or_else(|| fs::read_file(&cstr(&format!("{data}/admin.kubeconfig")), 1 << 20).ok().and_then(|b| kubeconfig_port(&String::from_utf8_lossy(&b))))
-        .unwrap_or(6443);
+    let port = port_of(data, port);
     let aside = format!("{pki_dir}/rotated-{}", pki::now());
     server::mkdir_p(&aside)?;
     let mut moved: Vec<(String, String)> = Vec::new();

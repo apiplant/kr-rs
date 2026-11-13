@@ -321,6 +321,8 @@ pub struct Ctl {
     /// `namespace/name` -> IPs allocated by this kubelet that the API does not show yet.
     pending: core::cell::RefCell<alloc::collections::BTreeMap<String, Vec<String>>>,
     last: core::cell::RefCell<Option<Vec<NpChain>>>,
+    /// A failed list was reported (once until a pass succeeds).
+    warned: core::cell::Cell<bool>,
 }
 
 /// Gives pods in `pending` that have no IPs in the API yet their announced ones and forgets
@@ -355,7 +357,13 @@ impl Ctl {
             items(c.list("/api/v1/namespaces", "").await),
             items(c.list("/apis/networking.k8s.io/v1/networkpolicies", "").await),
         );
+        if got.0.is_none() || got.1.is_none() || got.2.is_none() {
+            if !self.warned.replace(true) {
+                kr_rt::eprint(b"kubelet: network policy: cannot list pods, namespaces or networkpolicies; keeping the current rules (will retry)\n");
+            }
+        }
         if let (Some(mut pods), Some(nss), Some(pols)) = got {
+            self.warned.set(false);
             overlay(&mut pods, &mut self.pending.borrow_mut());
             let chains = compute(&pods, &nss, &pols, node);
             if self.last.borrow().as_ref() != Some(&chains) && program(&chains) {
