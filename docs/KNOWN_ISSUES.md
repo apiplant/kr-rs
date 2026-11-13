@@ -165,19 +165,19 @@ Ideas that build on what kr already has and that k3s does not offer. None is pla
 303. **Server upgrade without dropping client connections** — *L*
     With the front-end TLS workers of #126 a new server binary could take over the listening sockets and the worker processes while the old one drains, so `kubectl` watches and exec sessions survive a binary swap (#134 shows the sessions end with the process today; k3s restarts the service). Needs: the worker split first, a socket-handoff protocol, and a story for Raft leadership during the swap.
 
-304. **KMS provider or envelope keys for secrets encryption** — *L, was parity (#190)*
+311. **KMS provider or envelope keys for secrets encryption** — *L, was parity (#190)*
     k3s and kr both keep the raw key in a file next to the data. A KMS-style provider (a unix-socket plugin as in upstream's KMS v2, or a key wrapped by a passphrase or TPM at start-up) would let the data dir be stolen without the key. Needs: the socket protocol, caching of the data key, a start-up path that works when the provider is down (refuse, never fall back to plaintext).
-305. **Snapshot controller and CRDs bundled** — *M, was parity (#153)*
+312. **Snapshot controller and CRDs bundled** — *M, was parity (#153)*
     Neither k3s nor kr ships VolumeSnapshot support. Bundling the external snapshot controller manifests (off by default) and testing the CSI node path against Longhorn would make `VolumeSnapshot` work on a fresh cluster. Needs: the manifests in the `manifests` directory mechanism, a test with a real driver (#136, #137).
-306. **Kubelet serving certificates through CSRs, and ClusterTrustBundles** — *M, was parity (#173)*
+313. **Kubelet serving certificates through CSRs, and ClusterTrustBundles** — *M, was parity (#173)*
     Both kr's and k3s's kubelets take their serving certificate from the join flow. With `serverTLSBootstrap` the kubelet would request a serving certificate through the CSR flow kr already implements (RESOLVED 273) and renew it before expiry without a restart; `ClusterTrustBundle` (beta, off by default upstream until 1.37) would give workloads a CA bundle object. Needs: the kubelet CSR client, rotation, an approver rule for `kubernetes.io/kubelet-serving`.
-307. **Keep decrypted values out of memory dumps** — *M, was parity (#191)*
+314. **Keep decrypted values out of memory dumps** — *M, was parity (#191)*
     kube-apiserver and kr hold decrypted Secrets in memory. kr could keep Secret values encrypted in the store map and watch history and decrypt on use (cost: an AEAD per read), and mark the pages `MADV_DONTDUMP`. Needs: a benchmark of the read path, care with the parsed-object cache (ADR-052).
-308. **Restart containers when the GPU driver changes** — *S, was parity (#163)*
+315. **Restart containers when the GPU driver changes** — *S, was parity (#163)*
     Running containers keep the driver libraries they started with. The plan in the old #163 (a hash of each allocation's resolved CDI edits, a 30 s re-check, a `DriverChanged` event and an opt-in annotation `kr.io/restart-on-driver-change`) would automate the restart. k3s and upstream leave it to the user. Needs: GPU hardware to test, the resize-restart path.
-309. **Built-in custom-metrics adapter for HPA** — *L, was parity (#196)*
+316. **Built-in custom-metrics adapter for HPA** — *L, was parity (#196)*
     HPA custom and external metrics need an adapter in k3s and kr alike. kr's own `/metrics` scrape and pod metrics could back a small `custom.metrics.k8s.io` for the metrics kr already has (event-loop, per-pod cgroup counters), so a basic setup needs no Prometheus adapter. Needs: the APIService wiring and a metric catalogue; not a replacement for prometheus-adapter.
-310. **Certificate rotation without a restart** — *M, was parity (#177)*
+317. **Certificate rotation without a restart** — *M, was parity (#177)*
     Rotating certificates needs a service restart in k3s and kr. The API and Raft TLS configurations could be reloaded on a signal or file change (the ticket keys derive from `sa.key`, ADR-051, and survive). Needs: swapping the TLS config under live connections, the same for the Raft transport; pods are unaffected today.
 
 # Accepted limitations (by design, or not planned for now)
