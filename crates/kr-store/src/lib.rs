@@ -457,6 +457,7 @@ impl Store {
         st.codec = codec;
         // A leftover temp file is an unfinished compaction; the old snapshot+log are intact.
         let _ = fs::unlinkat(dirfd.raw(), &path("snapshot.tmp"), 0);
+        let _ = fs::unlinkat(dirfd.raw(), &path("log.tmp"), 0);
 
         match fs::openat(dirfd.raw(), &path("snapshot"), fs::O_RDONLY | fs::O_CLOEXEC, 0) {
             Ok(fd) => {
@@ -875,13 +876,7 @@ impl Store {
     /// Drops history with `rev <= rev` (watch replay limit), then rewrites the log into a snapshot
     /// if the log is much larger than the live data.
     pub fn compact(&mut self, rev: u64) -> Result<(), Error> {
-        let rev = rev.min(self.rev);
-        while self.history.front().is_some_and(|e| e.rev <= rev) {
-            if let Some(e) = self.history.pop_front() {
-                self.hist_bytes = self.hist_bytes.saturating_sub(Self::event_bytes(&e));
-            }
-        }
-        self.hist_floor = self.hist_floor.max(rev);
+        self.compact_history(rev);
         if let Some(p) = &self.persist {
             let size = p.log_len + p.buf.len() as u64;
             if size > self.compact_min && size > 4 * self.live_bytes {
@@ -896,9 +891,37 @@ impl Store {
         if self.persist.is_none() {
             return Ok(());
         }
+        let prefix = self.compaction_start()?;
+        self.write_snapshot_file()?;
+        self.drop_log_prefix(prefix)
+    }
+
+    /// Drops watch history up to `rev` without touching the files.
+    pub fn compact_history(&mut self, rev: u64) {
+        let rev = rev.min(self.rev);
+        while self.history.front().is_some_and(|e| e.rev <= rev) {
+            if let Some(e) = self.history.pop_front() {
+                self.hist_bytes = self.hist_bytes.saturating_sub(Self::event_bytes(&e));
+            }
+        }
+        self.hist_floor = self.hist_floor.max(rev);
+    }
+
+    /// First step of a compaction that may run in a fork (ADR-065): makes the log durable up to
+    /// the current revision and returns its length. Then [`Store::write_snapshot_file`] (in the
+    /// child, on its copy) and [`Store::drop_log_prefix`] with that length (in the parent, which
+    /// may have appended meanwhile). Every crash point loads correctly: the loader skips log
+    /// records at or below the snapshot's revision.
+    pub fn compaction_start(&mut self) -> Result<u64, Error> {
         self.sync()?;
+        Ok(self.persist.as_ref().map_or(0, |p| p.log_len))
+    }
+
+    /// Writes the image to `snapshot` atomically and durably. Plain syscalls only, so it can run
+    /// in a forked child.
+    pub fn write_snapshot_file(&self) -> Result<(), Error> {
+        let Some(p) = &self.persist else { return Ok(()) };
         let snap = self.image();
-        let Some(p) = &mut self.persist else { return Ok(()) };
         let d = p.dir.raw();
         {
             let tmp = fs::openat(d, &path("snapshot.tmp"), fs::O_WRONLY | fs::O_CREAT | fs::O_TRUNC | fs::O_CLOEXEC, 0o644)?;
@@ -907,9 +930,39 @@ impl Store {
         }
         fs::renameat2(d, &path("snapshot.tmp"), d, &path("snapshot"), 0)?;
         fs::fsync(d)?;
-        fs::ftruncate(p.log.raw(), 0)?;
-        fs::fsync(p.log.raw())?;
-        p.log_len = 0;
+        Ok(())
+    }
+
+    /// Removes the first `prefix` bytes of the log (covered by the snapshot just written). The
+    /// records after them (written while the snapshot was being made) move to a fresh log.
+    pub fn drop_log_prefix(&mut self, prefix: u64) -> Result<(), Error> {
+        self.write_out()?;
+        let Some(p) = &mut self.persist else { return Ok(()) };
+        let prefix = prefix.min(p.log_len);
+        if prefix == p.log_len {
+            fs::ftruncate(p.log.raw(), 0)?;
+            fs::fsync(p.log.raw())?;
+            p.log_len = 0;
+            return Ok(());
+        }
+        let mut tail = alloc::vec![0u8; (p.log_len - prefix) as usize];
+        let mut off = 0;
+        while off < tail.len() {
+            match fs::pread(p.log.raw(), &mut tail[off..], prefix + off as u64)? {
+                0 => return Err(Error::Corrupt("log shorter than written")),
+                n => off += n,
+            }
+        }
+        let d = p.dir.raw();
+        let fresh = fs::openat(d, &path("log.tmp"), fs::O_RDWR | fs::O_CREAT | fs::O_TRUNC | O_APPEND | fs::O_CLOEXEC, 0o644)?;
+        fs::write_all(fresh.raw(), &tail)?;
+        fs::fsync(fresh.raw())?;
+        fs::renameat2(d, &path("log.tmp"), d, &path("log"), 0)?;
+        fs::fsync(d)?;
+        // The same fd number now names the new log: callers holding `log_fd()` across an await
+        // (the committer's fsync) keep pointing at the live log.
+        kr_sys::ns::dup3(fresh.raw(), p.log.raw(), fs::O_CLOEXEC as u32)?;
+        p.log_len = tail.len() as u64;
         Ok(())
     }
 }

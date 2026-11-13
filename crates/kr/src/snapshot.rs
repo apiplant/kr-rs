@@ -513,16 +513,18 @@ pub async fn schedule(data: String, interval_s: u64, keep: usize, s3: Option<S3S
     let dir = format!("{data}/snapshots");
     loop {
         kr_rt::exec::sleep(interval_s.saturating_mul(1000)).await;
-        let built = build(&data, false);
         let name = snapshot_name(pki::now());
+        let f = format!("{dir}/{name}");
+        // Reading the datastore, replaying it, building and writing the archive is all disk
+        // and CPU work: a copy-on-write fork does it (ADR-065), inline if the fork fails.
+        let want_bytes = s3.is_some();
+        let job = || encode_built(build_and_write(&data, &dir, &f), want_bytes);
+        let built = match kr_rt::offload::fork(job) {
+            Some(child) => child.result().await.map_or_else(|| Err(String::from("snapshot process died")), |b| decode_built(&b)),
+            None => decode_built(&job()),
+        };
         match &built {
-            Ok((b, rev)) => {
-                let f = format!("{dir}/{name}");
-                match server::mkdir_p(&dir).and_then(|_| write_file(&f, b)) {
-                    Ok(()) => print(format!("kr server: wrote snapshot {f} (revision {rev})\n").as_bytes()),
-                    Err(e) => eprint(format!("kr server: scheduled snapshot failed: {e}\n").as_bytes()),
-                }
-            }
+            Ok((_, rev)) => print(format!("kr server: wrote snapshot {f} (revision {rev})\n").as_bytes()),
             Err(e) => eprint(format!("kr server: scheduled snapshot failed: {e}\n").as_bytes()),
         }
         prune(&dir, keep);
@@ -532,6 +534,39 @@ pub async fn schedule(data: String, interval_s: u64, keep: usize, s3: Option<S3S
                 Err(e) => eprint(format!("kr server: snapshot upload to S3 failed: {e}\n").as_bytes()),
             }
         }
+    }
+}
+
+fn build_and_write(data: &str, dir: &str, f: &str) -> Result<(Vec<u8>, u64), String> {
+    let (b, rev) = build(data, false)?;
+    server::mkdir_p(dir).and_then(|_| write_file(f, &b))?;
+    Ok((b, rev))
+}
+
+/// `1 | rev | archive (only when wanted)` or `0 | error message`.
+fn encode_built(r: Result<(Vec<u8>, u64), String>, with_bytes: bool) -> Vec<u8> {
+    match r {
+        Ok((b, rev)) => {
+            let mut out = alloc::vec![1u8];
+            out.extend_from_slice(&rev.to_le_bytes());
+            if with_bytes {
+                out.extend_from_slice(&b);
+            }
+            out
+        }
+        Err(e) => {
+            let mut out = alloc::vec![0u8];
+            out.extend_from_slice(e.as_bytes());
+            out
+        }
+    }
+}
+
+fn decode_built(b: &[u8]) -> Result<(Vec<u8>, u64), String> {
+    match b.split_first() {
+        Some((1, rest)) if rest.len() >= 8 => Ok((rest[8..].to_vec(), u64::from_le_bytes(rest[..8].try_into().unwrap()))),
+        Some((0, msg)) => Err(String::from_utf8_lossy(msg).into_owned()),
+        _ => Err(String::from("bad snapshot result")),
     }
 }
 

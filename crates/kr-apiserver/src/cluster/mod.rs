@@ -110,9 +110,25 @@ pub struct Cluster {
     saved_peers: RefCell<String>,
     join_secrets: RefCell<Option<join::JoinSecrets>>,
     forwarder: RefCell<Option<Rc<kr_net::http1::client::Client<kr_net::tls::TlsConnector>>>>,
+    /// Itself, for the task that finishes a forked snapshot.
+    me: RefCell<alloc::rc::Weak<Cluster>>,
+    /// A forked child is writing a Raft snapshot (ADR-065).
+    snapshotting: Cell<bool>,
+    /// Applied entries between Raft snapshots ([`SNAPSHOT_EVERY`]; tests lower it).
+    snapshot_every: Cell<u64>,
 }
 
 impl Cluster {
+    /// Sets how many applied entries trigger a Raft snapshot (tests).
+    pub fn set_snapshot_every(&self, n: u64) {
+        self.snapshot_every.set(n.max(1));
+    }
+
+    /// Index of the last Raft snapshot (0: none yet).
+    pub fn snapshot_index(&self) -> u64 {
+        self.raft.borrow().snapshot_index()
+    }
+
     /// Swaps the TLS identity and trust for outbound server-to-server connections (after a CA
     /// step or re-issued certificates): peer connections and the forwarder are rebuilt.
     pub fn set_client_tls(&self, tls: Rc<ClientConfig>) {
@@ -156,6 +172,9 @@ impl Cluster {
             saved_peers: RefCell::new(String::new()),
             join_secrets: RefCell::new(None),
             forwarder: RefCell::new(None),
+            me: RefCell::new(alloc::rc::Weak::new()),
+            snapshotting: Cell::new(false),
+            snapshot_every: Cell::new(SNAPSHOT_EVERY),
         };
         api.store.borrow_mut().set_visible(c.committed_rev.get());
         if let Ok(Some(b)) = c.storage.borrow().load_extra("peers") {
@@ -168,7 +187,9 @@ impl Cluster {
                 }
             }
         }
-        Ok(Rc::new(c))
+        let c = Rc::new(c);
+        *c.me.borrow_mut() = Rc::downgrade(&c);
+        Ok(c)
     }
 
     pub fn is_leader(&self) -> bool {
@@ -541,26 +562,71 @@ impl Cluster {
         }
     }
 
-    /// Snapshot at a quiescent moment (the leader's store holds no uncommitted writes).
+    /// Snapshot at a quiescent moment (the leader's store holds no uncommitted writes). A
+    /// copy-on-write fork builds the image, encodes and checksums it and writes it durably
+    /// (ADR-065); the loop then reads the image back from the child, installs the file and
+    /// compacts. Inline when the fork fails.
     fn maybe_snapshot(&self, api: &ApiServer) {
+        if self.snapshotting.get() {
+            return;
+        }
         let (applied, snap) = {
             let r = self.raft.borrow();
             (r.applied(), r.snapshot_index())
         };
-        if applied < snap + SNAPSHOT_EVERY {
+        if applied < snap + self.snapshot_every.get() {
             return;
         }
         let store = api.store.borrow();
         if store.revision() != self.committed_rev.get() {
             return;
         }
-        let data: Rc<[u8]> = Rc::from(store.image());
+        let Some(meta) = self.raft.borrow().meta_at(applied) else { return };
+        let me = self.me.borrow().upgrade();
+        let child = me.as_ref().and_then(|_| {
+            let storage = self.storage.borrow();
+            let (st, storage, meta) = (&*store, &*storage, meta.clone());
+            kr_rt::offload::fork(move || {
+                let mut img = st.image();
+                let snap = Snapshot { meta, data: Rc::from(&img[..]) };
+                if storage.write_forked_snapshot(&snap).is_err() {
+                    img.clear(); // an empty answer means failure (an image is never empty)
+                }
+                img
+            })
+        });
+        let (Some(me), Some(child)) = (me, child) else {
+            let data: Rc<[u8]> = Rc::from(store.image());
+            drop(store);
+            self.raft.borrow_mut().compact(applied, data);
+            let s = self.raft.borrow().snapshot().cloned();
+            if let Some(s) = s {
+                let _ = self.storage.borrow_mut().save_snapshot(&s);
+            }
+            return;
+        };
         drop(store);
-        self.raft.borrow_mut().compact(applied, data);
-        let s = self.raft.borrow().snapshot().cloned();
-        if let Some(s) = s {
-            let _ = self.storage.borrow_mut().save_snapshot(&s);
-        }
+        self.snapshotting.set(true);
+        // Detached: the task runs to completion without its handle.
+        let _ = kr_rt::exec::spawn(async move {
+            let img = child.result().await.filter(|i| !i.is_empty());
+            me.snapshotting.set(false);
+            let Some(img) = img else {
+                me.storage.borrow().discard_forked_snapshot();
+                return;
+            };
+            // A newer snapshot (installed from the leader meanwhile) wins.
+            if me.raft.borrow().snapshot_index() >= applied {
+                me.storage.borrow().discard_forked_snapshot();
+                return;
+            }
+            me.raft.borrow_mut().compact(applied, Rc::from(img));
+            if me.raft.borrow().snapshot_index() == applied {
+                let _ = me.storage.borrow_mut().install_forked_snapshot(applied);
+            } else {
+                me.storage.borrow().discard_forked_snapshot();
+            }
+        });
     }
 
     /// On becoming a ready leader: bootstrap. On losing leadership: fail waiting writes and

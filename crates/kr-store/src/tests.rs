@@ -769,3 +769,36 @@ fn index_with_several_values_per_key() {
     assert_eq!(names("y", &s), ["/pods/b"]);
     assert_eq!(s.index_count("node", "x"), Some(1));
 }
+
+#[test]
+fn compaction_in_steps_keeps_writes_made_meanwhile() {
+    let d = tmpdir("steps");
+    let snap_at;
+    {
+        let mut s = Store::open(&d).unwrap();
+        s.create("/a", v("1")).unwrap();
+        s.create("/b", v("2")).unwrap();
+        let prefix = s.compaction_start().unwrap();
+        // What a forked child sees: the store as of now. The parent keeps writing.
+        s.write_snapshot_file().unwrap();
+        snap_at = std::fs::read(format!("{d}/snapshot")).unwrap();
+        s.update("/a", v("11"), None).unwrap();
+        s.create("/c", v("3")).unwrap();
+        s.sync().unwrap();
+        // Crash here: new snapshot + whole log (prefix skipped by revision).
+        let mid = Store::from_files(Some(&snap_at), &std::fs::read(log_path(&d)).unwrap()).unwrap();
+        assert_eq!((mid.revision(), &*mid.get("/a").unwrap().value), (4, &b"11"[..]));
+        s.drop_log_prefix(prefix).unwrap();
+        s.delete("/b", None).unwrap();
+        s.sync().unwrap();
+    }
+    assert!(std::fs::metadata(format!("{d}/log.tmp")).is_err());
+    let s = Store::open(&d).unwrap();
+    assert_eq!(s.revision(), 5);
+    assert_eq!(&*s.get("/a").unwrap().value, b"11");
+    assert_eq!(s.get("/a").unwrap().create_rev, 1);
+    assert!(s.get("/b").is_none());
+    assert_eq!(s.get("/c").unwrap().mod_rev, 4);
+    // The log holds only what came after the snapshot.
+    assert!(std::fs::metadata(log_path(&d)).unwrap().len() < 200);
+}

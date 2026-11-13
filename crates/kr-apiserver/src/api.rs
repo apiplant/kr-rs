@@ -123,6 +123,8 @@ const PARSE_CACHE_BYTES: usize = 24 << 20;
 
 pub struct ApiServer {
     pub(crate) store: RefCell<Store>,
+    /// A forked compaction is writing the snapshot (ADR-065).
+    compacting: core::cell::Cell<bool>,
     now: fn() -> i64,
     rng: fn(&mut [u8]),
     server_address: String,
@@ -314,7 +316,7 @@ impl ApiServer {
         store.add_index(POD_NODE_INDEX, &pods, |b| json::string_at(b, &["spec", "nodeName"]).into_iter().collect());
         // Controllers list pods by label (endpoints, daemonsets, statefulsets, jobs, HPA).
         store.add_index(POD_LABEL_INDEX, &pods, |b| json::strings_under(b, &["metadata", "labels"]).into_iter().map(|(k, v)| alloc::format!("{k}={v}")).collect());
-        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), enc_reload: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), oa_cache: RefCell::new(alloc::collections::BTreeMap::new()), parsed: RefCell::new(ParseCache::default()), defer_lists: core::cell::Cell::new(false), list_job: RefCell::new(None), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), agg_http: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default(), disabled: Default::default() };
+        let api = ApiServer { store: RefCell::new(store), now, rng, server_address, version: String::from("v1.37.0-kr"), sa: RefCell::new(None), enc_reload: RefCell::new(None), node_proxy: RefCell::new(None), pod_dialer: RefCell::new(None), ca: RefCell::new(None), node_cert_secs: core::cell::Cell::new(365 * 86400), custom: RefCell::new(Vec::new()), oa_cache: RefCell::new(alloc::collections::BTreeMap::new()), parsed: RefCell::new(ParseCache::default()), defer_lists: core::cell::Cell::new(false), list_job: RefCell::new(None), committer: crate::durable::Committer::new(), cluster: RefCell::new(None), boot_token: RefCell::new(None), boot_services: core::cell::Cell::new(None), apf: crate::apf::Apf::default(), pod_families: core::cell::Cell::new(kr_net::tcp::Families::DUAL), families_explicit: core::cell::Cell::new(false), fv_mode: core::cell::Cell::new(crate::fieldval::Mode::Ignore), warnings: RefCell::new(Vec::new()), defer_schema: core::cell::Cell::new(false), wh_cache: RefCell::new(None), conv_cache: RefCell::new(VecDeque::new()), front: RefCell::new(None), agg: RefCell::new(Vec::new()), agg_http: RefCell::new(Vec::new()), metrics: Default::default(), audit: Default::default(), disabled: Default::default(), compacting: Default::default() };
         if let Some(r) = resources::find(crate::crd::GROUP, "v1", "customresourcedefinitions") {
             let (crds, _) = api.store.borrow().list(&r.prefix(), None, 0);
             for kv in crds {
@@ -2260,15 +2262,32 @@ impl ApiServer {
         self.committer.wait(rev, fd, written).await
     }
 
-    /// Rewrites the log into a snapshot when it has grown far beyond the live data. Blocking
-    /// (snapshot write + fsyncs); call it rarely, from a background task.
-    pub fn maybe_compact(&self) {
-        if self.cluster.borrow().is_some() {
+    /// Rewrites the log into a snapshot when it has grown far beyond the live data. The image is
+    /// built and written (with its fsyncs) by a copy-on-write fork (ADR-065); the loop only drops
+    /// the covered log prefix afterwards. Inline when the fork fails. Call from a background task.
+    pub async fn maybe_compact(&self) {
+        if self.cluster.borrow().is_some() || self.compacting.get() {
             return; // HA: Raft snapshots replace store compaction
         }
-        let mut s = self.store.borrow_mut();
-        if s.log_oversized() {
-            let _ = s.compact(0);
+        let child = {
+            let mut s = self.store.borrow_mut();
+            if !s.log_oversized() {
+                return;
+            }
+            s.compact_history(0);
+            let Ok(prefix) = s.compaction_start() else { return };
+            let st: &kr_store::Store = &s;
+            kr_rt::offload::fork(|| alloc::vec![st.write_snapshot_file().is_ok() as u8]).map(|c| (c, prefix))
+        };
+        let Some((child, prefix)) = child else {
+            let _ = self.store.borrow_mut().rewrite_log();
+            return;
+        };
+        self.compacting.set(true);
+        let ok = child.result().await.is_some_and(|r| r == [1]);
+        self.compacting.set(false);
+        if ok {
+            let _ = self.store.borrow_mut().drop_log_prefix(prefix);
         }
     }
 

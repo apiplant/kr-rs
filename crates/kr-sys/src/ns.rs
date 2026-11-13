@@ -696,12 +696,17 @@ pub fn close_from(first: u32) {
 
 /// dup3(old, new, 0): makes `new` refer to `old` (used for container stdio).
 pub fn dup_to(old: i32, new: i32) -> Result<()> {
+    dup3(old, new, 0)
+}
+
+/// `dup3(old, new, flags)`; `flags` may be `O_CLOEXEC` (0o2000000).
+pub fn dup3(old: i32, new: i32, flags: u32) -> Result<()> {
     // SAFETY: plain integer arguments. x86_64 dup3 = 292, aarch64 dup3 = 24.
     #[cfg(target_arch = "x86_64")]
     const DUP3: usize = 292;
     #[cfg(target_arch = "aarch64")]
     const DUP3: usize = 24;
-    check(unsafe { syscall3(DUP3, old as usize, new as usize, 0) }).map(|_| ())
+    check(unsafe { syscall3(DUP3, old as usize, new as usize, flags as usize) }).map(|_| ())
 }
 
 /// Mount flags (ST_*) of the filesystem containing `fd` (fstatfs `f_flags`).

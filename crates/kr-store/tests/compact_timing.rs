@@ -23,3 +23,20 @@ fn rewrite_log_time() {
     drop(s);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// image() and its SHA-256 (the store digest) for a large store: 20,000 objects of 4 KB.
+#[test]
+#[ignore]
+fn image_and_digest_time() {
+    let mut s = kr_store::Store::in_memory();
+    let body = vec![b'x'; 4000];
+    for i in 0..20_000 {
+        s.create(&format!("/registry/pods/default/p{i}"), body.clone()).unwrap();
+    }
+    let t = Instant::now();
+    let img = s.image();
+    let a = t.elapsed();
+    let t = Instant::now();
+    let d = kr_crypto::sha2::sha256(&img);
+    eprintln!("image(): {a:?}, sha256: {:?} ({} bytes, {:02x})", t.elapsed(), img.len(), d[0]);
+}

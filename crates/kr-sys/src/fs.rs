@@ -78,6 +78,7 @@ pub const DT_LNK: u8 = 10;
 mod nr {
     pub const FSTAT: usize = 5;
     pub const FTRUNCATE: usize = 77;
+    pub const PREAD64: usize = 17;
     pub const FSYNC: usize = 74;
     pub const FCHMOD: usize = 91;
     pub const FCHMODAT: usize = 268;
@@ -104,6 +105,7 @@ mod nr {
 mod nr {
     pub const FSTAT: usize = 80;
     pub const FTRUNCATE: usize = 46;
+    pub const PREAD64: usize = 67;
     pub const FSYNC: usize = 82;
     pub const FCHMOD: usize = 52;
     pub const FCHMODAT: usize = 53;
@@ -258,6 +260,17 @@ pub fn fsetxattr(fd: i32, name: &[u8], value: &[u8], flags: i32) -> Result<()> {
 pub fn ftruncate(fd: i32, len: u64) -> Result<()> {
     // SAFETY: integer-only arguments.
     check(unsafe { syscall2(nr::FTRUNCATE, fd as usize, len as usize) }).map(|_| ())
+}
+
+/// Reads at `off` without moving the file offset (works on `O_APPEND` files).
+pub fn pread(fd: i32, buf: &mut [u8], off: u64) -> Result<usize> {
+    loop {
+        // SAFETY: buf is valid for writes of buf.len() bytes.
+        match check(unsafe { crate::syscall4(nr::PREAD64, fd as usize, buf.as_mut_ptr() as usize, buf.len(), off as usize) }) {
+            Err(crate::Errno(4)) => continue,
+            r => return r,
+        }
+    }
 }
 
 pub fn fsync(fd: i32) -> Result<()> {

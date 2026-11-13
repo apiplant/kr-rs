@@ -260,6 +260,89 @@ fn child(parent: u32, parent_end: Fd, child_end: Fd, handler: Handler) -> ! {
     }
 }
 
+/// A copy-on-write fork running one closure (ADR-065): [`fork`] starts it, [`Forked::result`]
+/// awaits what it returned. Unlike the pool workers, the child sees the parent's live state as
+/// of the fork (a consistent snapshot, as Redis's BGSAVE), so it can serialise a large structure
+/// and write it to disk without the event loop doing either. Dropping a `Forked` kills the child.
+pub struct Forked {
+    sock: Async<Fd>,
+    pid: i32,
+    reaped: Cell<bool>,
+}
+
+/// Forks; the child runs `f`, sends its result to the parent and exits. The child keeps the
+/// parent's file descriptors (it may write through the parent's directory fds) but must only
+/// make plain syscalls: no executor, no fsync helper, no offload pool. `None` when the fork
+/// fails (the caller runs the work inline).
+pub fn fork<F: FnOnce() -> Vec<u8>>(f: F) -> Option<Forked> {
+    let (parent_end, child_end) = ns::socketpair().ok()?;
+    let parent = kr_sys::fs::getpid();
+    let mut args = ns::CloneArgs { exit_signal: ns::SIGCHLD as u64, ..Default::default() };
+    // SAFETY: fork-style clone (no CLONE_VM): the child runs on a private copy of the process
+    // and exits without returning to the caller's code.
+    match unsafe { ns::clone3(&mut args) } {
+        Ok(0) => {
+            let _ = ns::prctl(ns::PR_SET_PDEATHSIG, ns::SIGKILL as usize);
+            if kr_sys::fs::getppid() != parent {
+                kr_sys::exit_group(0);
+            }
+            drop(parent_end);
+            let out = f();
+            let ok = blocking_write(child_end.raw(), &(out.len() as u64).to_le_bytes()) && blocking_write(child_end.raw(), &out);
+            kr_sys::exit_group(if ok { 0 } else { 1 })
+        }
+        Ok(pid) => {
+            drop(child_end);
+            let r = ns::set_nonblocking(parent_end.raw()).ok().and_then(|_| Async::new(parent_end).ok());
+            match r {
+                Some(sock) => Some(Forked { sock, pid, reaped: Cell::new(false) }),
+                None => {
+                    let _ = ns::kill(pid, ns::SIGKILL);
+                    let _ = ns::wait4(pid);
+                    None
+                }
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+impl Forked {
+    /// What the closure returned; `None` if the child died first. The loop keeps running while
+    /// the child works and while its result is read.
+    pub async fn result(self) -> Option<Vec<u8>> {
+        let mut len = [0u8; 8];
+        let out = if read_exact(&self.sock, &mut len).await {
+            let n = u64::from_le_bytes(len) as usize;
+            let mut buf = Vec::new();
+            if buf.try_reserve_exact(n).is_ok() {
+                buf.resize(n, 0);
+                read_exact(&self.sock, &mut buf).await.then_some(buf)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // The child exits right after writing; reaping it blocks at most for that.
+        if out.is_none() {
+            let _ = ns::kill(self.pid, ns::SIGKILL);
+        }
+        let _ = ns::wait4(self.pid);
+        self.reaped.set(true);
+        out
+    }
+}
+
+impl Drop for Forked {
+    fn drop(&mut self) {
+        if !self.reaped.get() {
+            let _ = ns::kill(self.pid, ns::SIGKILL);
+            let _ = ns::wait4(self.pid);
+        }
+    }
+}
+
 fn blocking_read(fd: i32, buf: &mut [u8]) -> bool {
     let mut n = 0;
     while n < buf.len() {

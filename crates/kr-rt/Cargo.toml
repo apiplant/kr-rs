@@ -12,3 +12,7 @@ kr-sys = { path = "../kr-sys" }
 # intrinsics so crates depending on kr-rt can be unit-tested under the std test harness
 # (which provides all of those). Never enable this for the shipped binary.
 host = []
+
+[dev-dependencies]
+# Integration tests link the std harness (see `host`).
+kr-rt = { path = ".", features = ["host"] }

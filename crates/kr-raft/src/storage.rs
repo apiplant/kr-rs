@@ -153,7 +153,7 @@ impl Storage {
     pub fn open(dir: &str) -> Result<(Storage, Loaded)> {
         mkdir_p(dir)?;
         let dfd = fs::openat(AT_FDCWD, &cname(dir), fs::O_RDONLY | fs::O_DIRECTORY | fs::O_CLOEXEC, 0)?;
-        for t in ["hardstate.tmp", "snapshot.tmp", "peers.tmp", "log.tmp.w", "log.tmp.w.tmp"] {
+        for t in ["hardstate.tmp", "snapshot.tmp", "snapshot.fork", "peers.tmp", "log.tmp.w", "log.tmp.w.tmp"] {
             let _ = fs::unlinkat(dfd.raw(), &cname(t), 0);
         }
         let hs = match read_all(&dfd, "hardstate")? {
@@ -285,6 +285,28 @@ impl Storage {
 
     pub fn load_extra(&self, name: &'static str) -> Result<Option<Vec<u8>>> {
         read_all(&self.dir, name)
+    }
+
+    /// Writes `s` to `snapshot.fork` durably without installing it: run by a forked child
+    /// (ADR-065), plain syscalls only. [`Storage::install_forked_snapshot`] installs it.
+    pub fn write_forked_snapshot(&self, s: &Snapshot) -> Result<()> {
+        let fd = fs::openat(self.dir.raw(), &cname("snapshot.fork"), fs::O_WRONLY | fs::O_CREAT | fs::O_TRUNC | fs::O_CLOEXEC, 0o600)?;
+        fs::write_all(fd.raw(), &encode_snapshot(s))?;
+        fs::fsync(fd.raw())?;
+        Ok(())
+    }
+
+    /// Installs the file [`Storage::write_forked_snapshot`] wrote for `index` and compacts the
+    /// log up to it. The caller checks that no newer snapshot was saved meanwhile.
+    pub fn install_forked_snapshot(&mut self, index: u64) -> Result<()> {
+        fs::renameat2(self.dir.raw(), &cname("snapshot.fork"), self.dir.raw(), &cname("snapshot"), 0)?;
+        fs::fsync(self.dir.raw())?;
+        self.compact_log(index)
+    }
+
+    /// Removes an unused `snapshot.fork` (superseded by a newer snapshot).
+    pub fn discard_forked_snapshot(&self) {
+        let _ = fs::unlinkat(self.dir.raw(), &cname("snapshot.fork"), 0);
     }
 
     pub fn save_snapshot(&mut self, s: &Snapshot) -> Result<()> {

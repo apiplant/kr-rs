@@ -444,7 +444,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                                     Err(e) => kr_rt::eprint(alloc::format!("kubelet: rootless egress unavailable (errno {}); pods have no outbound connectivity\n", e.0).as_bytes()),
                                 }
                                 if let (Some((ep, es)), Some(st)) = (egress, network::proc_start(infra.pid as u32)) {
-                                    let _ = kr_runtime::store::write_file_atomic(&self.infra_file(), alloc::format!("{} {st} {ep} {es}\n", infra.pid).as_bytes());
+                                    let _ = kr_runtime::store::write_file_atomic_async(&self.infra_file(), alloc::format!("{} {st} {ep} {es}\n", infra.pid).as_bytes()).await;
                                 }
                                 *self.infra.borrow_mut() = Some(infra);
                                 self.announce_rootless().await;

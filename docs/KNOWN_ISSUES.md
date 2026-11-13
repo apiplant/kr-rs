@@ -1,6 +1,6 @@
 # Known Issues & Potential Problems
 
-Only work still to do lives here. Numbers are stable (other docs cite them); new items get the next free number (next: **360**). When something is fixed, move it to `RESOLVED_ISSUES.md` with the commit. When items are merged, the surviving item lists the absorbed numbers in its title so a search for either finds it.
+Only work still to do lives here. Numbers are stable (other docs cite them); new items get the next free number (next: **361**). When something is fixed, move it to `RESOLVED_ISSUES.md` with the commit. When items are merged, the surviving item lists the absorbed numbers in its title so a search for either finds it.
 
 Goal order: **(A) parity with k3s** (needed to call kr production ready) → **(B) verification** of code that exists but has not run on real systems → **(C) performance** beyond k3s → *Nice to have* (beyond k3s) → *Accepted limitations* (nothing to do unless a trigger happens).
 
@@ -8,9 +8,6 @@ Goal order: **(A) parity with k3s** (needed to call kr production ready) → **(
 Ordered by impact. Size: S days, M a week or two, L more.
 
 Nothing left: every parity item is closed (RESOLVED 342-345).
-
-358. **Garbage collection of custom resources** — *S*
-    The collector (`kr-controllers/src/gc.rs`) lists a fixed set of built-in dependent kinds (`DEPENDENTS`) and resolves owners only among built-in resources, so a custom resource is never collected and a reference to a custom-resource owner counts as alive (its dependents stay after the owner is deleted). Upstream collects every resource, including CRs, through discovery. Operators that set a CR as owner of their ConfigMaps, Secrets or Deployments rely on it. Fix: walk the served CRDs (and the remaining built-ins) as dependents and owners, with a watch-driven graph instead of listing every kind each sweep once that gets expensive.
 
 # B. Verification backlog (code exists, not run on real systems)
 Each is a test run, not new code, unless the run finds a bug. Left: what needs hardware, credentials or a host decision.
@@ -22,15 +19,6 @@ Each is a test run, not new code, unless the run finds a bug. Left: what needs h
 # C. Performance (beyond k3s)
 126. **Single-threaded control plane: one core** — *ADR-004, ADR-005, ADR-050*, L
     API server, kubelet, controllers, scheduler, userspace proxy and DNS share one executor thread (plus the fsync helper and offload workers). Measured (`kr-apiserver/tests/throughput.rs`, release, 2000 pods): GET 51,000/s, create 16,000/s, status merge-patch 10,000/s, delete 40,000/s, list of 2000 pods 3,200/s, labelSelector list 270/s (3.7 ms). Over the network TLS records and HTTP parsing bring a warm request to ~0.5 ms, roughly 2,000 requests/s per core. Fine for a server plus tens of nodes (stall watchdog and `/metrics` show when not), not for large clusters where k3s spreads over all cores. Next step if needed: front-end worker processes that terminate TLS and parse HTTP and pass requests over socketpairs, forwarding the identity (not threads: state is `Rc`/`RefCell`). Needs streaming (watch, logs, exec, upgrades) designed first.
-208. **Remaining CPU and disk work on the event loop** (+209, +210, +212, +213, +215) — *ADR-050, ADR-052*, M
-    The offload facility (RESOLVED 237, 238) covers big list renderings, audit bodies and image unpack/verify/fsync. Still inline:
-    - #209 full TLS handshakes (resumption covers restarts: RESOLVED 234): a worker would need the private key and session state — design question. Also the variable-base multiplications (P-256 ECDH, `u2 * Q`).
-    - #210 selection scan of `labelSelector`/`fieldSelector` lists on kinds other than pods (pods are indexed by node and by label: RESOLVED 350), splice of plain lists, copying to/from workers (~3 ms per 4 MB). The parsed-object cache holds up to 24 MB of JSON (3–4x in memory); a list of hundreds of thousands of objects is one allocation.
-    - #212 store digest/`plain_image`, `kr snapshot` and Raft snapshot creation, Raft segment checksums, the AEAD per Secret write (token checks: RESOLVED 350; a token never seen before still costs one P-256 verification). Plan: copy-on-write fork for snapshot images (as Redis; see #295), batched AEAD for re-encryption.
-    - #215 rootless infra file and CNI/IPAM/state files written with fsync inline; single start-up sweep steps (one cgroup walk, one pod dir removal) are synchronous.
-    - Limits of the facility: 2 workers per class, the 17th concurrent caller runs inline, workers are copy-on-write forks taken at start-up.
-    #213 (Raft sharing the loop) is the sum of these: watchdog, heartbeat priority and election timeout are in (RESOLVED 213a, 248).
-
 # Nice to have later (beyond k3s)
 Ideas that build on what kr already has and that k3s does not offer. None is planned; do these after A–C. "Not checked" means k3s is believed to lack it but this was not verified. 
 
@@ -70,13 +58,14 @@ Ideas that build on what kr already has and that k3s does not offer. None is pla
     A small `custom.metrics.k8s.io` backed by kr's own metrics; not a replacement for prometheus-adapter.
 317. **Certificate and SA-key rotation without a restart** — *M* (RESOLVED 288)
     Reload API and Raft TLS configs and the SA verification keys on a signal or file change.
-295. **Snapshot without a stall (copy-on-write fork)** — *M*
-    `kr snapshot`, scheduled backups and Raft snapshot creation hash and copy the store on the event loop (#178, #212). A forked child holds a consistent copy-on-write image and writes the archive while the parent keeps serving, as Redis does. Needs a fork helper safe in the single-threaded `no_std` process (the offload facility already forks workers) and care with disk write bandwidth.
 296. **Online secrets re-encryption in background batches** — *S* (remaining part; the reload and online re-encrypt are RESOLVED 309, 311)
     Re-encrypt in small batches through the offload workers with progress in `kr secrets-encrypt status`. The HA replication is #189.
 
 # Accepted limitations (by design, or not planned for now)
 Nothing to do unless the stated trigger happens.
+
+360. **What stays on the event loop after #208** (+209, +210, +212, +215) — *ADR-050, ADR-052, ADR-068*
+    Measured small or proportional to one request, so not moved: full TLS handshakes (~1.2 ms, #60; offloading needs the key and session state in a worker); `labelSelector`/`fieldSelector` scans of kinds other than pods (pods are indexed: RESOLVED 350), splicing plain lists and copying to/from workers (~3 ms per 4 MB); the AEAD of one Secret write and the first P-256 check of an unseen token; one-time start-up steps (cgroup record, one cgroup walk, one pod dir removal). Offload facility limits: 2 workers per class, the 17th concurrent caller runs inline, workers are forks taken at start-up. A fork (ADR-068) copies the page tables (about 2 ms per GB of resident memory) and pages the parent writes while the child runs are copied (worst case: memory doubles). Trigger: one of these named by the stall report.
 
 127. **Durability limits of in-process writers and watches** — *ADR-024*
     Writes by the controllers and the server's own kubelet are flushed every second (a crash can lose ~1 s of them; they re-derive state). Watch events are delivered when written, not when durable. Revisit if a controller keeps state that cannot be re-derived.
@@ -99,7 +88,7 @@ Nothing to do unless the stated trigger happens.
 176. **Air-gap import needs staging space** — *ADR-044*
     Archives are extracted to `<store>/import.tmp-*` first (free disk of one archive size); partial-platform multi-image archives import the rest with a warning; import repoints refs without replacing an image by id; zstd dictionaries and the optional content checksum are not used (layers are verified by digest).
 178. **Backup is a point-in-time copy of one server's files, with caveats** — *ADR-043, ADR-024, ADR-026*
-    Read on the event loop when scheduled (a very large store stalls it, #208). In HA `--committed-only` can lag (commit index persisted only on term/vote change); by default a follower's archive may hold a few uncommitted entries. Archives are uncompressed and unencrypted (hold `ca.key`, `sa.key`, tokens; mode 0600). Restore yields a single-server data dir; agents must reach the new server at the old address. The `kr` crate has no unit tests (`tools/test/tooling.sh` covers `snapshot.rs`, `rotate.rs`, `manifests.rs`).
+    Built by a copy-on-write fork when scheduled (ADR-068); the manual `kr snapshot` reads the files in its own process. In HA `--committed-only` can lag (commit index persisted only on term/vote change); by default a follower's archive may hold a few uncommitted entries. Archives are uncompressed and unencrypted (hold `ca.key`, `sa.key`, tokens; mode 0600). Restore yields a single-server data dir; agents must reach the new server at the old address. The `kr` crate has no unit tests (`tools/test/tooling.sh` covers `snapshot.rs`, `rotate.rs`, `manifests.rs`).
 192. **Nonce limit and no automatic rotation** — *ADR-047*
     Random 96-bit nonces: 2^32 encryptions per key. No counter warns when it is approached.
 195. **`kr snapshot` of an encrypted store keeps ciphertext; store digests ignore encryption** — *info*
@@ -121,7 +110,7 @@ Nothing to do unless the stated trigger happens.
 220. **TLS resumption: what ADR-051 leaves out** — *ADR-051*
     No TLS 1.2 resumption (client side, opt-in); agents and servers with different `sa.key` use per-process ticket keys; no 0-RTT; a client certificate whose CA was replaced keeps resumed sessions up to an hour; clocks more than an hour apart cannot share tickets. `KR_TLS_RESUMPTION=off` disables it.
 223. **A `write()` to a log file can block the event loop** — *ADR-050, #208*
-    Not seen again in the stall log. Still inline: store log append, compaction (`rewrite_log`: 21 ms for a 9.2 MB image on NVMe, mostly four fsyncs), pod log files. Hand the fsyncs to the helper if a compaction shows in the stall report.
+    Not seen again in the stall log. Still inline: store log append and pod log files. A compaction now writes its snapshot in a fork (ADR-068); the loop only copies the log tail written meanwhile into a fresh log (one small write and two fsyncs).
 226. **Start-up latency after a restart (up to ~190 ms, no event-loop stall in the last run)** — *ADR-050, #208*
     First `report_status` after a restart ~150 ms (wall time across awaits; the patch itself is 70–100 us, `tests/patch_timing.rs`), `sync_pod` 77–129 ms for GPU-operator pods, `refresh_volumes` 43 ms. Aggregated `projectcalico.org/v3` requests: 50–86 ms steady, 320–380 ms for the first after a restart (cold connection to the extension server; the rest is Calico's API server). A 116 ms NFD stall did not recur; the connection-loop labels (`http: handled`/`send response`/`next request`) will place it if it does.
 227. **Starting a container forks the kubelet twice (~8 ms of the loop)** — *ADR-050*
@@ -129,7 +118,7 @@ Nothing to do unless the stated trigger happens.
 53. **Binary size** — *watch*
     4.93 MB on x86_64 after RSA client keys (#175, ADR-063) and snapshots to S3 (#320, ADR-064): master was 4.86 MB (measured) before the two, so about +61 KB together. 4.75 MB on x86_64 after the WireGuard backend (#319, ADR-062; about 5 KB of it is the backend itself, the rest other work merged since); 4.54 MB on x86_64 (2026-11-13; 3.10 MB on 2026-11-01, 2.87 MB on 2026-10-27); the 2 MB agent budget in PLAN.md is exceeded. Measure before adding large features; avoid `{:?}` on large types; keep `opt-level = "z"` + LTO + strip.
 60. **TLS handshake cost** (+125) — *watch*
-    P-256 is a constant-time fixed 4-bit window: ~0.5 ms sign, ~0.95 ms verify. A full kr TLS 1.3 handshake is ~2.3 ms vs k3s ~1.6 ms (crypto tuned for size); warm requests are faster (0.5 vs 1.1 ms), and resumption (ADR-051) makes reconnect storms cheap. Revisit if the full-handshake rate matters (#208).
+    P-256 is a constant-time fixed 4-bit window: ~0.5 ms sign, ~0.95 ms verify. A full kr TLS 1.3 handshake is ~2.3 ms vs k3s ~1.6 ms (crypto tuned for size); warm requests are faster (0.5 vs 1.1 ms), and resumption (ADR-051) makes reconnect storms cheap. Not offloaded (#209, RESOLVED 208): a worker would need the private key and session state, and a full handshake (~1.2 ms of loop time) is far below the stall threshold. Revisit if the full-handshake rate matters.
 97. **HA (kr-raft, ADR-026) design limits**
     One-server-at-a-time membership changes; a server whose IP changes needs a restart. Linearizable reads use a leader lease (bounded clock drift); reads with an explicit `resourceVersion` and watches are served locally. Snapshots are one message (512 MB frame limit; chunked InstallSnapshot if images grow).
 115. **Leftovers of resolved items (not planned)**

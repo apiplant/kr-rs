@@ -987,3 +987,31 @@ fn gc_collects_claims_and_configmaps_of_deleted_owners() {
         .await;
     });
 }
+
+#[test]
+fn gc_collects_custom_resources_and_their_dependents() {
+    scenario(|c| async move {
+        let j = |s: &str| kr_fmt::json::parse_str(s).unwrap();
+        c.create("/apis/apiextensions.k8s.io/v1/customresourcedefinitions", &j(r#"{"metadata":{"name":"widgets.x.io"},"spec":{"group":"x.io","scope":"Namespaced","names":{"plural":"widgets","singular":"widget","kind":"Widget"},
+            "versions":[{"name":"v1","served":true,"storage":true,"schema":{"openAPIV3Schema":{"type":"object","x-kubernetes-preserve-unknown-fields":true}}}]}}"#)).await.unwrap();
+        const WIDGETS: &str = "/apis/x.io/v1/namespaces/default/widgets";
+        const CMS: &str = "/api/v1/namespaces/default/configmaps";
+        wait_until("CRD served", || async { c.list(WIDGETS, "").await.is_ok() }).await;
+        let w = c.create(WIDGETS, &j(r#"{"apiVersion":"x.io/v1","kind":"Widget","metadata":{"name":"w"}}"#)).await.unwrap();
+        let wuid = str_at(&w, &["metadata", "uid"]).to_string();
+        c.create(CMS, &j(&alloc::format!(r#"{{"metadata":{{"name":"w-cm","ownerReferences":[{{"apiVersion":"x.io/v1","kind":"Widget","name":"w","uid":"{wuid}"}}]}}}}"#))).await.unwrap();
+        let p = c.create(PODS, &j(r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"wowner","namespace":"default"},"spec":{"containers":[{"name":"c","image":"x"}]}}"#)).await.unwrap();
+        let puid = str_at(&p, &["metadata", "uid"]).to_string();
+        c.create(WIDGETS, &j(&alloc::format!(r#"{{"apiVersion":"x.io/v1","kind":"Widget","metadata":{{"name":"child","ownerReferences":[{{"apiVersion":"v1","kind":"Pod","name":"wowner","uid":"{puid}"}}]}}}}"#))).await.unwrap();
+        kr_rt::exec::sleep(300).await;
+        assert!(c.get(&alloc::format!("{CMS}/w-cm")).await.is_ok(), "owner alive");
+        assert!(c.get(&alloc::format!("{WIDGETS}/child")).await.is_ok(), "owner alive");
+        c.delete(&alloc::format!("{WIDGETS}/w")).await.unwrap();
+        c.delete(&alloc::format!("{PODS}/wowner")).await.unwrap();
+        wait_until("CR owner's configmap and pod-owned CR collected", || async {
+            let gone = |o: Result<Value, _>| o.is_err() || o.is_ok_and(|v: Value| !str_at(&v, &["metadata", "deletionTimestamp"]).is_empty());
+            gone(c.get(&alloc::format!("{CMS}/w-cm")).await) && gone(c.get(&alloc::format!("{WIDGETS}/child")).await)
+        })
+        .await;
+    });
+}

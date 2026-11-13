@@ -275,7 +275,7 @@ pub async fn run_reloadable(api: Rc<ApiServer>, addr: [u8; 4], port: u16, tls: R
             }
             n += 1;
             if n % 60 == 0 {
-                a.maybe_compact();
+                a.maybe_compact().await;
             }
         }
     });

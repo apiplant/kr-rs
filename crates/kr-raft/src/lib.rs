@@ -1074,11 +1074,13 @@ impl Raft {
     }
 
     /// The state machine was snapshotted at `index` (≤ applied): drop the log before it.
-    pub fn compact(&mut self, index: u64, data: Rc<[u8]>) {
+    /// The snapshot metadata `compact(index, ..)` would record (term and membership as of
+    /// `index`); `None` when `index` cannot be compacted.
+    pub fn meta_at(&self, index: u64) -> Option<SnapshotMeta> {
         if index <= self.snap_index || index > self.applied {
-            return;
+            return None;
         }
-        let term = self.term_at(index).unwrap();
+        let term = self.term_at(index)?;
         // Voters as of `index`: snapshot voters + config entries up to index.
         let mut v = self.snap_voters.clone();
         let mut l = self.snap_learners.clone();
@@ -1087,13 +1089,18 @@ impl Raft {
         }
         v.sort_unstable();
         l.sort_unstable();
+        Some(SnapshotMeta { index, term, voters: v, learners: l })
+    }
+
+    pub fn compact(&mut self, index: u64, data: Rc<[u8]>) {
+        let Some(meta) = self.meta_at(index) else { return };
         let drop = (index - self.snap_index) as usize;
         self.log.drain(..drop);
         self.snap_index = index;
-        self.snap_term = term;
-        self.snap_voters = v.clone();
-        self.snap_learners = l.clone();
-        self.snap = Some(Snapshot { meta: SnapshotMeta { index, term, voters: v, learners: l }, data });
+        self.snap_term = meta.term;
+        self.snap_voters = meta.voters.clone();
+        self.snap_learners = meta.learners.clone();
+        self.snap = Some(Snapshot { meta, data });
     }
 }
 

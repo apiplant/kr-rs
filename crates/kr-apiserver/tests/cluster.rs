@@ -124,6 +124,9 @@ fn three_servers_replicate_and_fail_over() {
             let api = Rc::new(ApiServer::new(kr_store::Store::replicated(), now, rng, "127.0.0.1".into()).unwrap());
             let dir = base.join(format!("n{id}"));
             let cluster = Cluster::open(&api, id, dir.to_str().unwrap(), ids.to_vec(), cli_tls, id * 7919).unwrap();
+            // Snapshots (forked, ADR-065) during bootstrap: the restarted server below then
+            // recovers from a snapshot file plus the log tail.
+            cluster.set_snapshot_every(40);
             for (j, other) in ids.iter().enumerate() {
                 if *other != id {
                     cluster.add_seed(*other, ServerAddr { ip: kr_sys::map4([127, 0, 0, 1]), raft_port: ports[j], api_port: api_ports[j] });
@@ -199,6 +202,18 @@ fn three_servers_replicate_and_fail_over() {
         let e = nobody.create("/api/v1/namespaces/default/configmaps", &obj).await.unwrap_err();
         assert_eq!(e.code, 403, "{e:?}");
 
+        // Enough entries for forked snapshots on every server (every 40, set above).
+        for i in 0..60 {
+            let (c, v) = write(&srvs[li], "POST", "/api/v1/namespaces/default/configmaps", &format!(r#"{{"metadata":{{"name":"s{i}"}}}}"#)).await;
+            assert_eq!(c, 201, "{v:?}");
+        }
+        for _ in 0..100 {
+            if srvs.iter().all(|s| s.cluster.snapshot_index() > 0) {
+                break;
+            }
+            sleep(50).await;
+        }
+        assert!(srvs.iter().all(|s| s.cluster.snapshot_index() > 0), "forked snapshots taken");
         // The leader dies: the other two elect a new leader and keep accepting writes.
         let dead = srvs[li].id;
         for t in &srvs[li].tasks {
@@ -262,6 +277,9 @@ fn three_servers_replicate_and_fail_over() {
             sleep(50).await;
         }
         assert_eq!(get(&back, "/api/v1/namespaces/default/configmaps/a").0, 200, "recovered from its own log");
+        assert!(back.cluster.snapshot_index() > 0, "restarted from a forked snapshot");
+        assert!(base.join(format!("n{dead}/snapshot")).exists());
+        assert!(!base.join(format!("n{dead}/snapshot.fork")).exists());
         assert_eq!(get(&back, "/api/v1/namespaces/default/configmaps/c").0, 200, "caught up on the missed write");
         assert_eq!(back.api.revision(), srvs[ni].api.revision());
         assert!(!back.cluster.is_leader() || back.cluster.term() > srvs[ni].cluster.term());

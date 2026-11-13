@@ -96,6 +96,7 @@ dependencies = [
 name = "kr-rt"
 version = "0.3.0"
 dependencies = [
+ "kr-rt",
  "kr-sys",
 ]
 
@@ -115,6 +116,7 @@ name = "kr-store"
 version = "0.3.0"
 dependencies = [
  "kr-archive",
+ "kr-crypto",
  "kr-rt",
  "kr-sys",
 ]

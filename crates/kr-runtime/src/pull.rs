@@ -165,7 +165,7 @@ async fn finish(store: &Store, mut reg: Registry<RegConnector>, r: Reference, im
     let cfg_desc = &image.manifest.config;
     let id = ImageId(cfg_desc.digest.as_str().strip_prefix("sha256:").ok_or(kr_net::Error::UnsupportedDigest)?.to_string());
     if store.has_image(&id) {
-        store.set_ref(image_ref, &id)?;
+        store.set_ref_async(image_ref, &id).await?;
         return Ok(id);
     }
     if cfg_desc.size > MAX_CONFIG {
@@ -192,7 +192,7 @@ async fn finish(store: &Store, mut reg: Registry<RegConnector>, r: Reference, im
     }
 
     crate::offload::install_image(store, &id, &image.raw, &cfg_json, &image.manifest.layers, &gz, &icfg.diff_ids, limits).await?;
-    store.set_ref(image_ref, &id)?;
+    store.set_ref_async(image_ref, &id).await?;
     Ok(id)
 }
 

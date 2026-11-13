@@ -407,6 +407,26 @@ pub fn write_file_atomic_nosync(path: &str, data: &[u8]) -> Result<()> {
     write_atomic(path, data, false)
 }
 
+/// [`write_file_atomic`] for the event loop: the fsync runs in an offload worker
+/// ([`crate::offload::fsync_file`], inline when none is available).
+pub async fn write_file_atomic_async(path: &str, data: &[u8]) -> Result<()> {
+    let tmp = format!("{}{}", path, tmp_suffix());
+    let ct = cpath(&tmp)?;
+    let r = async {
+        {
+            let fd = fs::openat(AT_FDCWD, &ct, fs::O_WRONLY | fs::O_CREAT | fs::O_EXCL | fs::O_CLOEXEC, 0o644).ctx("create tmp")?;
+            fs::write_all(fd.raw(), data).ctx("write")?;
+        }
+        crate::offload::fsync_file(&tmp).await?;
+        fs::renameat2(AT_FDCWD, &ct, AT_FDCWD, &cpath(path)?, 0).ctx("rename")
+    }
+    .await;
+    if r.is_err() {
+        let _ = fs::unlinkat(AT_FDCWD, &ct, 0);
+    }
+    r
+}
+
 fn write_atomic(path: &str, data: &[u8], sync: bool) -> Result<()> {
     let tmp = format!("{}{}", path, tmp_suffix());
     let ct = cpath(&tmp)?;
@@ -691,6 +711,14 @@ impl Store {
 
     fn ref_path(&self, r: &str) -> String {
         self.join(&format!("refs/{}", escape_ref(&Self::ref_key(r))))
+    }
+
+    /// [`Store::set_ref`] with the fsync in an offload worker (pulls run on the event loop).
+    pub async fn set_ref_async(&self, r: &str, id: &ImageId) -> Result<()> {
+        if !id.valid() {
+            return Err(Error::Image("bad image id"));
+        }
+        write_file_atomic_async(&self.ref_path(r), format!("{}\n", id.0).as_bytes()).await
     }
 
     pub fn set_ref(&self, r: &str, id: &ImageId) -> Result<()> {
