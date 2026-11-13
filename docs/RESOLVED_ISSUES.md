@@ -622,3 +622,6 @@
 
 315. **Air-gap import details** — *fixed* (part of #176)
     An agent started with `--data DIR` imports `DIR/images` too; an OCI archive whose index has no image for the node's platform is an error (`an_archive_without_this_platform_is_reported`), and a partial miss is reported on stderr.
+
+316. **Operators fought the server over defaulted fields (20 writes a second, stalls of 1 to 2 s)** — *fixed*
+    `update_ex` computed the generation (`prepare_update`) before it applied the defaults, so a PUT that left out defaulted fields (`strategy`, `dnsPolicy`, `terminationGracePeriodSeconds`, ...) looked like a spec change: the generation moved, the object was written, and the next writer saw a new resourceVersion. The tigera operator's whisker, goldmane and apiserver controllers did that to each other in a loop (the `calico-apiserver` Deployment was at generation 802,000 and the event loop stalled for 1.4 to 2.4 s on the large CRD and Deployment PUTs). Defaults are now applied first, so such a PUT is a no-op as upstream. `tests/update_defaults.rs`.

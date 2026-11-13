@@ -613,7 +613,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             }
         }
         let Some(running) = self.store.images_in_use() else {
-            kr_rt::eprint(alloc::format!("kubelet: image store is {before}% full but a container of an older release or `kr run` is present; image garbage collection waits\n").as_bytes());
+            // Said once, not at every check.
+            static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                kr_rt::eprint(alloc::format!("kubelet: image store is {before}% full but a container of an older release or `kr run` is present; image garbage collection waits (said once)\n").as_bytes());
+            }
             return;
         };
         in_use.extend(running);

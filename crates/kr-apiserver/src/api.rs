@@ -2369,10 +2369,13 @@ impl ApiServer {
             }
         }
         let has_status = rt.res.subresources.contains(&"status");
-        object::prepare_update(&old, &mut new, &t, rev, has_status, status)?;
+        // Defaults first (upstream defaults on decode): a client that leaves out defaulted fields
+        // sends the same object as the stored one, and must not move the generation or the
+        // resourceVersion.
         if !status {
             crate::defaults::apply(rt.res.group, rt.res.plural, &mut new);
         }
+        object::prepare_update(&old, &mut new, &t, rev, has_status, status)?;
         if crate::crd::is_crd(rt.res) {
             crate::crd::admit(&mut new, Some(&old), (self.now)())?;
         }
