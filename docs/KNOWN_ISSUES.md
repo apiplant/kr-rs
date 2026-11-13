@@ -13,10 +13,6 @@ Every earlier parity item is closed (RESOLVED 342-345, 358). Found in the re-aud
     k3s users reach these through component arguments; kr has none of them: OIDC login (`oidc-issuer-url`, `oidc-client-id`, claims; or `--authentication-config` AuthenticationConfiguration with JWT authenticators), webhook token authentication, `--authorization-config`/webhook authorization, and opt-in admission plugins (`AlwaysPullImages`, `EventRateLimit`, `PodNodeSelector`). Needs JWT verification against a JWKS (RS256/ES256; kr-crypto has both), claim mapping.
 363. **Kubelet resource managers and graceful node shutdown** — *M*
     No CPU manager (`static` policy: exclusive cores for Guaranteed pods with integer CPU), memory manager, topology manager, and no graceful node shutdown (`shutdownGracePeriod`: a systemd inhibitor lock, pods terminated in priority order before poweroff). Users enable these with `kubelet-arg` in k3s; latency-sensitive and GPU workloads rely on the CPU/topology managers.
-364. **Kubelet image credential provider plugins** — *S*
-    `--image-credential-provider-config`/`-bin-dir` (k3s flags; ECR, GCR/Artifact Registry and ACR plugins exec'd per image with a `CredentialProviderRequest`). kr pulls only with `registries.yaml` credentials and pull secrets, so nodes on a cloud cannot pull from the cloud's private registry with the node identity.
-365. **`kr token` lacks list, delete, generate and rotate** — *S*
-    Only `kr token create` exists. k3s: `token list`/`delete`/`generate` for bootstrap tokens and `token rotate` for the server token (with `--new-token`), which agents and other servers must then use.
 # B. Verification backlog (code exists, not run on real systems)
 Each is a test run, not new code, unless the run finds a bug. Left: what needs hardware, credentials or a host decision.
 
