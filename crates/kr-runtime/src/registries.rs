@@ -122,7 +122,9 @@ impl Registries {
                         insecure: t.get("insecure_skip_verify").and_then(Value::as_bool).unwrap_or(false),
                     };
                 }
-                out.configs.push((registry_key(host), cfg));
+                // `*` is the default for every registry that has no entry of its own.
+                let key = if host == "*" { "*".to_string() } else { registry_key(host) };
+                out.configs.push((key, cfg));
             }
         }
         Ok(out)
@@ -190,7 +192,7 @@ impl Registries {
 
     pub fn host_cfg(&self, host: &str) -> Option<&HostCfg> {
         let k = registry_key(host);
-        self.configs.iter().find(|(h, _)| *h == k).map(|(_, c)| c)
+        self.configs.iter().find(|(h, _)| *h == k).or_else(|| self.configs.iter().find(|(h, _)| h == "*")).map(|(_, c)| c)
     }
 
     /// Mirrors for `registry` in order, then the upstream itself.
@@ -514,6 +516,10 @@ configs:
         assert_eq!(c.tls.ca_file.as_deref(), Some("/etc/ca.pem"));
         assert_eq!(r.host_cfg("10.0.0.4:5000").unwrap().auth.as_ref().unwrap().token.as_deref(), Some("tok"));
         assert!(r.host_cfg("other").is_none());
+        // a `*` entry is the default for registries without their own entry
+        let w = Registries::parse("configs:\n  \"*\":\n    auth:\n      username: all\n  cache.local:\n    auth:\n      username: own\n").unwrap();
+        assert_eq!(w.host_cfg("anything.io").unwrap().auth.as_ref().unwrap().username, "all");
+        assert_eq!(w.host_cfg("cache.local").unwrap().auth.as_ref().unwrap().username, "own");
         assert!(Registries::parse("").unwrap().mirrors.is_empty());
         assert!(Registries::parse("mirrors:\n  a:\n    rewrite:\n      \"(?i)x\": y\n").is_err());
     }

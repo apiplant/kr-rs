@@ -211,6 +211,19 @@ mod tests {
     }
 
     #[test]
+    fn a_resource_removed_from_the_list_still_reads_back() {
+        let mut cfg = Config::generate(rng, 1);
+        cfg.resources.push("configmaps".into());
+        let cm = "/registry/core/configmaps/default/c";
+        let stored = Encryptor::new(&cfg, rng).encode(cm, b"{\"data\":{}}").unwrap();
+        // Later the list names only secrets: new writes stay plaintext, the old ciphertext decrypts.
+        cfg.resources.retain(|r| r != "configmaps");
+        let later = Encryptor::new(&cfg, rng);
+        assert!(later.encode(cm, b"x").is_none());
+        assert_eq!(later.decode(cm, &stored).unwrap().unwrap(), b"{\"data\":{}}");
+    }
+
+    #[test]
     fn wrong_key_tamper_and_moved_fail_closed() {
         let e = Encryptor::new(&Config::generate(rng, 1), rng);
         let other = Encryptor::new(&Config::generate(rng, 1), rng); // same name, other secret
