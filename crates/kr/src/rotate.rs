@@ -21,8 +21,8 @@ const USAGE: &[u8] = b"usage: kr pki rotate [--data DIR] [--port 6443] [--servic
                          pki/sa-old.pem, so tokens issued so far keep verifying until you delete that
                          file and restart; new tokens are signed with the new key
   --ca prepare           (server stopped, single server) creates a new CA and puts both in ca.pem (old
-                         first, signing unchanged). Then copy pki/ca.pem to every agent's pki/ca.pem and
-                         restart the server and the agents.
+                         first, signing unchanged). Restart the server; running agents fetch the bundle
+                         from it within a minute (an agent from an older release needs ca.pem copied).
   --ca activate          signs with the new CA from now on: re-issues the server certificates and
                          admin.kubeconfig and updates node-token. Old client certificates stay valid.
                          Restart the server; nodes renew their certificates with the new CA.
@@ -142,7 +142,7 @@ fn rotate_ca(data: &str, port: Option<u16>, phase: &str, yes: bool) -> Result<()
             let _ = fs::unlinkat(fs::AT_FDCWD, &cstr(&tmp), fs::AT_REMOVEDIR);
             let old = read_text(&ca_pem)?;
             put(&ca_pem, &format!("{old}{new_cert}"), 0o644)?;
-            print(format!("prepared: pki/ca.pem now holds the old and the new CA (the old one still signs).\n1. copy {ca_pem} to pki/ca.pem on every agent\n2. restart the server, then the agents (rolling)\n3. run `kr pki rotate --ca activate`\n").as_bytes());
+            print(format!("prepared: pki/ca.pem now holds the old and the new CA (the old one still signs).\n1. restart the server; running agents fetch the bundle from /kr/ca-bundle within a minute and trust it (copy {ca_pem} to pki/ca.pem of agents from an older release and restart them)\n2. when every node trusts the bundle (its pki/ca.pem has two certificates), run `kr pki rotate --ca activate`\n").as_bytes());
         }
         "activate" => {
             if !exists(&next_pem) {
