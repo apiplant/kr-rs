@@ -50,9 +50,11 @@ export function DocsOverview() {
         <H2>What it asks of the host</H2>
         <P>
           Linux 5.10 or newer on x86_64 or aarch64, cgroup v2 and overlayfs, and root for the full feature set (pod
-          networking, cgroup limits). A <a class="text-accent hover:text-accent-dim" href="/docs/rootless">rootless mode</a>{" "}
-          exists, with reduced networking. Pods survive restarts of <IC>kr</IC> on Linux 5.9 and newer. Nothing else
-          is needed on the host: not even <IC>/bin/sh</IC>.
+          networking, cgroup limits). The root nftables Service datapath needs the <IC>br_netfilter</IC> module with{" "}
+          <IC>net.bridge.bridge-nf-call-iptables=1</IC>, so replies from same-node pods reach conntrack; most
+          distributions and container runtimes load it. A <a class="text-accent hover:text-accent-dim" href="/docs/rootless">rootless mode</a>{" "}
+          exists, with reduced networking. Pods survive restarts of <IC>kr</IC> on Linux 5.9 and newer. Beyond that,
+          nothing else is needed on the host: not even <IC>/bin/sh</IC>.
         </P>
         <P>
           "No dependencies" means no crates.io crates and no libc. The Linux kernel ABI is still a dependency: raw

@@ -22,7 +22,7 @@ $ kubectl get pods
 
 ## Quick start
 
-Requirements: Linux 5.10 or newer on x86_64 or aarch64, cgroup v2, overlayfs, and root for the full feature set (pod networking, cgroup limits). A rootless mode exists with reduced networking. Building needs a Rust nightly toolchain.
+Requirements: Linux 5.10 or newer on x86_64 or aarch64, cgroup v2, overlayfs, and root for the full feature set (pod networking, cgroup limits). The root nftables Service datapath also needs the `br_netfilter` module loaded with `net.bridge.bridge-nf-call-iptables=1` (and `net.bridge.bridge-nf-call-ip6tables=1` for IPv6), so replies from same-node pods reach conntrack; most distributions and container runtimes load it. A rootless mode exists with reduced networking. Building needs a Rust nightly toolchain.
 
 ```sh
 cargo build --release          # produces target/release/kr (about 5.5 MB)

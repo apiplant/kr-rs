@@ -13,6 +13,7 @@ export function DocsQuickstart() {
         <UL>
           <LI>Linux 5.10 or newer, x86_64 or aarch64.</LI>
           <LI>cgroup v2 and overlayfs.</LI>
+          <LI>For the root nftables Service datapath: the <IC>br_netfilter</IC> module loaded with <IC>net.bridge.bridge-nf-call-iptables=1</IC> (and <IC>net.bridge.bridge-nf-call-ip6tables=1</IC> for IPv6), so replies from same-node pods reach conntrack. Most distributions and container runtimes load it.</LI>
           <LI>Root, for pod networking and cgroup limits. Without it, see <a class="text-accent hover:text-accent-dim" href="/docs/rootless">rootless mode</a>.</LI>
           <LI>To build: a Rust nightly toolchain. There are no other build dependencies.</LI>
         </UL>
