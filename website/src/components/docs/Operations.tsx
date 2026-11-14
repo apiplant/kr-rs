@@ -55,7 +55,7 @@ OOMScoreAdjust=-999`}
         <P>
           A one-minute crash loop, a <IC>kill -9</IC> of the agent, a binary swap with SIGTERM, a crash in the middle
           of creating twelve pods and a second agent started on the same root were all tested. Adopting 200 pods after
-          a <IC>kill -9</IC> takes about 9 seconds, and each shim is about 1 MB resident.
+          a <IC>kill -9</IC> takes about 2 seconds, and each shim is about 1.9 MB resident (only about 0.1 MB private).
         </P>
         <H3>Guard rails</H3>
         <UL>

@@ -1,8 +1,8 @@
 # kr
 
-A Kubernetes distribution in a single static binary of about 4.9 MB, written in Rust with no libc and no third-party crates.
+A Kubernetes distribution in a single static binary of about 5.5 MB, written in Rust with no libc and no third-party crates.
 
-`kr` is the API server, datastore, scheduler, controllers, kubelet, container runtime, pod network, service proxy and cluster DNS in one executable. It is built to idle in single-digit megabytes, start in well under a second, and run unmodified `kubectl` and standard workloads. It passes the Kubernetes v1.37 conformance suite (460 of 460 specs on a two-node cluster, 458 of 460 on one node; see [Conformance](#conformance)).
+`kr` is the API server, datastore, scheduler, controllers, kubelet, container runtime, pod network, service proxy and cluster DNS in one executable. It is built to idle in about 14 MB of memory (6 MB for an agent), start in well under a second, and run unmodified `kubectl` and standard workloads. It passes the Kubernetes v1.37 conformance suite (460 of 460 specs on a two-node cluster, 458 of 460 on one node; see [Conformance](#conformance)).
 
 ```
 $ sudo kr server &
@@ -25,7 +25,7 @@ $ kubectl get pods
 Requirements: Linux 5.10 or newer on x86_64 or aarch64, cgroup v2, overlayfs, and root for the full feature set (pod networking, cgroup limits). A rootless mode exists with reduced networking. Building needs a Rust nightly toolchain.
 
 ```sh
-cargo build --release          # produces target/release/kr (about 4.9 MB)
+cargo build --release          # produces target/release/kr (about 5.5 MB)
 ```
 
 ### Single node
@@ -120,15 +120,15 @@ Variables with no k3s counterpart (`KR_WIREGUARD_PORT`, `KR_POD_FAMILIES`, `KR_P
 
 ## Benchmarks
 
-Measured on one 32-core x86_64 Linux machine, each node in a privileged Docker container, with cached images (`pause` and `agnhost`). Memory is the resident set size (RSS) of the `kr` processes; "PSS" is memory divided between processes that share pages.
+Measured on one 32-core x86_64 Linux machine, each node in a privileged Docker container, with cached images (`pause` and `agnhost`). Memory is the resident set size (RSS) of the main `kr` process; "PSS" is memory divided between processes that share pages.
 
 ### Size
 
 | | x86_64 | aarch64 |
 |---|---|---|
-| `kr` binary (stripped, `opt-level=z`, LTO, `panic=abort`) | **4.98 MB** | **3.96 MB** |
+| `kr` binary (stripped, `opt-level=z`, LTO, `panic=abort`) | **5.46 MB** | **4.34 MB** |
 | Third-party crates | 0 | 0 |
-| Rust source (13 workspace crates) | about 119,000 lines | |
+| Rust source (13 workspace crates) | about 126,000 lines | |
 
 For scale: the binary contains the TLS 1.3 stack (and a TLS 1.2 client), X.509, the HTTP/1.1, HTTP/2, gRPC and WebSocket stacks, gzip and zstd, the Raft and storage engines, the OCI runtime, the API server with its generated protobuf tables, and the controllers.
 
@@ -136,26 +136,31 @@ For scale: the binary contains the TLS 1.3 stack (and a TLS 1.2 client), X.509, 
 
 | State | `kr server` | `kr agent` |
 |---|---|---|
-| Idle, no pods | **13.3 MB** RSS (+1.3 MB helper) | **5.3 MB** RSS |
-| 10 pods | 15.3 MB | 7.1 MB |
-| 50 pods | 21.4 MB | 11.3 MB |
-| 100 pods | **28.4 MB** | **15.5 MB** |
+| Idle, no pods | **14.0 MB** RSS | **6.2 MB** RSS |
+| 10 pods | 15.3 MB | 7.8 MB |
+| 50 pods | 19.0 MB | 11.8 MB |
+| 100 pods | 23.5 MB | 16.1 MB |
+| 200 pods | **32.9 MB** | **24.7 MB** |
 
-The watch history (the recent writes kept so a watch can resume) is limited to 32 MiB, so memory under sustained writes levels off instead of growing: 62,000 updates of a 1 KB object (with the 100 pods above still running) leave the server at about 60 MB, the same as after 40,000.
+The table is the main process; kr also forks a few small helpers: four offload workers (about 0.5 MB each) and an fsync helper (about 1.4 MB) on a server, and two offload workers on an agent.
 
-Each pod also has a sandbox holder process that keeps its namespaces alive: about 0.4 MB RSS, of which only 80 KB is private (the rest is shared with the main process).
+The watch history (the recent writes kept so a watch can resume) is limited to 32 MiB, so memory under sustained writes levels off instead of growing: 62,000 updates of a 1 KB object (with the 200 pods above still running) leave the server at about 57 MB, the same as after 40,000.
+
+Each pod also has a sandbox holder process that keeps its namespaces alive: about 0.65 MB RSS, of which only 80 KB is private (the rest is shared with the main process). Each running container has a shim: about 1.9 MB RSS, again only about 0.1 MB private, so 200 shims add about 23 MB (PSS) in total.
 
 ### Latency and throughput
 
 | Operation | Result |
 |---|---|
 | `kr server` to node Ready (server and one agent) | about 2 s |
-| 100 `pause` pods Deployment, cached image, on one agent | about 8.6 s to all Running |
-| `GET /version`, new TLS 1.3 connection each time | p50 1.9 ms, p99 5.5 ms |
-| `GET /api/v1/namespaces/default/pods` (100 pods, 436 KB) | p50 5.0 ms, p99 8.3 ms |
-| New TLS connections under 40 parallel clients | about 650 per second (client-bound), no failures |
+| 100 `pause` pods, cached image, on one agent | about 8.6 s to all Running |
+| 200 `pause` pods, cached image, on one agent | about 19 s to all Running |
+| Adopting 200 pods after a `kill -9` of the agent | about 2 s |
+| `GET /version`, new TLS 1.3 connection each time | p50 1.9 ms, p99 3.0 ms |
+| `GET /api/v1/namespaces/default/pods` (200 pods, 857 KB) | p50 8.2 ms, p99 25 ms |
+| New TLS connections under 40 parallel clients | about 630 per second (client-bound), no failures |
 
-Numbers will vary with hardware; the commands to reproduce them are in `tools/test/` (`two-node.sh`, `conformance.sh`) and the measurements above used `/proc/<pid>/status` (`VmRSS`) and `smaps_rollup` (`Pss`).
+Numbers will vary with hardware; the commands to reproduce them are in `tools/test/` (`two-node.sh`, `soak.sh`, `conformance.sh`) and the measurements above used `/proc/<pid>/status` (`VmRSS`) and `smaps_rollup` (`Pss`).
 
 ## Features
 

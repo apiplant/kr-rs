@@ -49,7 +49,7 @@ brew tap apiplant/tap && brew install apiplant/tap/kr-rs`}
 
       <Section>
         <H2>Or build from source</H2>
-        <CopyBlock command={`cargo build --release          # produces target/release/kr (about 5.0 MB)`} />
+        <CopyBlock command={`cargo build --release          # produces target/release/kr (about 5.5 MB)`} />
       </Section>
 
       <Section>
@@ -84,7 +84,7 @@ kubectl scale deployment web --replicas=10
 kubectl rollout status deployment web`}
         />
         <P>
-          With images already pulled, a 100-pod Deployment reaches Running in about two seconds on one node. The first
+          With images already pulled, a 100-pod Deployment reaches Running in about nine seconds on one node. The first
           use of an image pulls it from its registry; see{" "}
           <a class="text-accent hover:text-accent-dim" href="/docs/runtime#images">images and mirrors</a>.
         </P>

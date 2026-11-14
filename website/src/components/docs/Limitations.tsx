@@ -45,9 +45,9 @@ export function DocsLimitations() {
       <Section>
         <H2>Footprint</H2>
         <UL>
-          <LI>The binary is about 5.0 MB on x86_64; size is measured before large features are added.</LI>
+          <LI>The binary is about 5.5 MB on x86_64; size is measured before large features are added.</LI>
           <LI>With very small pods the 32 MiB watch history keeps about 4,000 events; a client that falls behind gets <IC>410 Expired</IC>.</LI>
-          <LI>Each running container has a shim of about 1 MB.</LI>
+          <LI>Each running container has a shim of about 1.9 MB RSS, most of it shared with the main process.</LI>
         </UL>
       </Section>
     </DocsLayout>
