@@ -38,6 +38,15 @@ pub fn arch() -> &'static str {
     if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" }
 }
 
+/// A graceful node shutdown is in progress (#363): the node reports NotReady.
+pub(crate) static SHUTTING_DOWN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// CPUs kept out of allocatable: `reserved-cpus` (upstream: it replaces the kube- and
+/// system-reserved CPU).
+fn reserved_cpus() -> usize {
+    kr_runtime::store::env_var("KR_RESERVED_CPUS").and_then(|l| kr_runtime::cpuset::CpuSet::parse(&l)).map_or(0, |s| s.len())
+}
+
 fn status(cfg: &Config, dp: &crate::deviceplugin::Plugins) -> String {
     let (mut ext_cap, mut ext_alloc) = (String::new(), String::new());
     for (k, cap, healthy) in dp.node_resources() {
@@ -46,13 +55,15 @@ fn status(cfg: &Config, dp: &crate::deviceplugin::Plugins) -> String {
     }
     let t = rfc3339(now());
     let (cpu, mem) = (cpus(), memory_ki());
+    let cpu_alloc = cpu.saturating_sub(reserved_cpus()).max(1);
+    let (ready, ready_reason, ready_msg) = if SHUTTING_DOWN.load(core::sync::atomic::Ordering::Relaxed) { ("False", "KubeletNotReady", "node is shutting down") } else { ("True", "KubeletReady", "kr kubelet is posting ready status") };
     let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
     let (mp, mp_reason) = if crate::evict::under_pressure(memory_available_ki(), cfg.eviction_memory_bytes) { ("True", "KubeletHasInsufficientMemory") } else { ("False", "KubeletHasSufficientMemory") };
     let kernel = read(b"/proc/sys/kernel/osrelease\0");
     let pods = max_pods();
     alloc::format!(
-        r#"{{"capacity":{{"cpu":"{cpu}","memory":"{mem}Ki","pods":"{pods}"{ext_cap}}},"allocatable":{{"cpu":"{cpu}","memory":"{mem}Ki","pods":"{pods}"{ext_alloc}}},
-"conditions":[{{"type":"Ready","status":"True","reason":"KubeletReady","message":"kr kubelet is posting ready status","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}},
+        r#"{{"capacity":{{"cpu":"{cpu}","memory":"{mem}Ki","pods":"{pods}"{ext_cap}}},"allocatable":{{"cpu":"{cpu_alloc}","memory":"{mem}Ki","pods":"{pods}"{ext_alloc}}},
+"conditions":[{{"type":"Ready","status":"{ready}","reason":"{ready_reason}","message":"{ready_msg}","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}},
 {{"type":"MemoryPressure","status":"{mp}","reason":"{mp_reason}","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}},
 {{"type":"DiskPressure","status":"False","reason":"KubeletHasNoDiskPressure","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}},
 {{"type":"PIDPressure","status":"False","reason":"KubeletHasSufficientPID","lastHeartbeatTime":"{t}","lastTransitionTime":"{t}"}}],
@@ -102,7 +113,7 @@ pub async fn register<C: Client>(c: &C, cfg: &Config, dp: &crate::deviceplugin::
     renew_lease(c, cfg).await;
 }
 
-async fn update_status<C: Client>(c: &C, cfg: &Config, dp: &crate::deviceplugin::Plugins) {
+pub(crate) async fn update_status<C: Client>(c: &C, cfg: &Config, dp: &crate::deviceplugin::Plugins) {
     let patch = alloc::format!(r#"{{"status":{}}}"#, status(cfg, dp));
     if let Ok(p) = json::parse(patch.as_bytes()) {
         let _ = c.patch(&alloc::format!("/api/v1/nodes/{}/status", cfg.node_name), "application/merge-patch+json", &p).await;

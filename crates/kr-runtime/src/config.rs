@@ -78,6 +78,17 @@ const SETTINGS: &[(&str, &str, Translate)] = &[
     ("authorization-webhook-version", "KR_AUTHZ_WEBHOOK_VERSION", plain),
     ("enable-admission-plugins", "KR_ADMISSION_PLUGINS", plain),
     ("admission-control-config-file", "KR_ADMISSION_CONFIG", plain),
+    // Kubelet resource managers and graceful node shutdown (#363).
+    ("cpu-manager-policy", "KR_CPU_MANAGER_POLICY", cpu_manager_policy),
+    ("cpu-manager-policy-options", "KR_CPU_MANAGER_POLICY_OPTIONS", cpu_manager_options),
+    ("reserved-cpus", "KR_RESERVED_CPUS", cpu_list),
+    ("memory-manager-policy", "KR_MEMORY_MANAGER_POLICY", memory_manager_policy),
+    ("reserved-memory", "KR_RESERVED_MEMORY", reserved_memory),
+    ("topology-manager-policy", "KR_TOPOLOGY_MANAGER_POLICY", topology_manager_policy),
+    ("topology-manager-scope", "KR_TOPOLOGY_MANAGER_SCOPE", topology_manager_scope),
+    ("shutdown-grace-period", "KR_SHUTDOWN_GRACE_PERIOD", duration_secs),
+    ("shutdown-grace-period-critical-pods", "KR_SHUTDOWN_GRACE_PERIOD_CRITICAL_PODS", duration_secs),
+    ("shutdown-grace-period-by-pod-priority", "KR_SHUTDOWN_GRACE_PERIOD_BY_POD_PRIORITY", priority_periods),
 ];
 
 /// `644`, `0644` or `0o644`; at most 0o777.
@@ -129,6 +140,74 @@ fn registry_prefix(v: &str) -> Result<Option<String>, String> {
     Ok(Some(t.to_string()))
 }
 
+/// Settings given more than once that accumulate (with this separator) instead of replacing.
+const ACCUMULATE: &[(&str, &str)] = &[("KR_RESERVED_MEMORY", ";"), ("KR_SHUTDOWN_GRACE_PERIOD_BY_POD_PRIORITY", ",")];
+
+fn cpu_manager_policy(v: &str) -> Result<Option<String>, String> {
+    match v.trim() {
+        "none" | "static" => Ok(Some(v.trim().to_string())),
+        _ => Err(alloc::format!("{v:?} is not a CPU manager policy (none, static)")),
+    }
+}
+
+/// `full-pcpus-only=true` (k=v pairs, comma separated); other options are not implemented.
+fn cpu_manager_options(v: &str) -> Result<Option<String>, String> {
+    let mut out = Vec::new();
+    for kv in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match kv.split_once('=').map(|(k, v)| (k.trim(), v.trim())) {
+            Some(("full-pcpus-only", b @ ("true" | "false"))) => out.push(alloc::format!("full-pcpus-only={b}")),
+            _ => return Err(alloc::format!("{kv:?} is not a supported CPU manager policy option (full-pcpus-only=true)")),
+        }
+    }
+    Ok(Some(out.join(",")))
+}
+
+fn cpu_list(v: &str) -> Result<Option<String>, String> {
+    crate::cpuset::CpuSet::parse(v).map(|s| Some(s.to_list())).ok_or_else(|| alloc::format!("{v:?} is not a CPU list (e.g. 0-1,6)"))
+}
+
+fn memory_manager_policy(v: &str) -> Result<Option<String>, String> {
+    match v.trim() {
+        "None" | "Static" => Ok(Some(v.trim().to_string())),
+        _ => Err(alloc::format!("{v:?} is not a memory manager policy (None, Static)")),
+    }
+}
+
+/// `<numa>:memory=<quantity>[,hugepages-..=..]` as the kubelet flag; only `memory` is used, the
+/// entry is validated and kept as given.
+fn reserved_memory(v: &str) -> Result<Option<String>, String> {
+    let v = v.trim();
+    let ok = v.split_once(':').is_some_and(|(n, rest)| n.trim().parse::<u32>().is_ok() && rest.split(',').all(|kv| kv.split_once('=').is_some_and(|(k, q)| !k.trim().is_empty() && kr_fmt::quantity::Quantity::parse(q.trim()).is_ok())));
+    if ok { Ok(Some(v.to_string())) } else { Err(alloc::format!("{v:?} is not <numa node>:memory=<quantity>")) }
+}
+
+fn topology_manager_policy(v: &str) -> Result<Option<String>, String> {
+    match v.trim() {
+        "none" | "best-effort" | "restricted" | "single-numa-node" => Ok(Some(v.trim().to_string())),
+        _ => Err(alloc::format!("{v:?} is not a topology manager policy (none, best-effort, restricted, single-numa-node)")),
+    }
+}
+
+fn topology_manager_scope(v: &str) -> Result<Option<String>, String> {
+    match v.trim() {
+        "container" => Ok(Some("container".to_string())),
+        _ => Err(alloc::format!("{v:?}: only the container topology manager scope is implemented")),
+    }
+}
+
+/// `<priority>=<duration>` pairs (the kubelet's `shutdownGracePeriodByPodPriority`), as
+/// `priority=seconds` joined by commas.
+fn priority_periods(v: &str) -> Result<Option<String>, String> {
+    let mut out = Vec::new();
+    for e in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (p, d) = e.split_once('=').ok_or_else(|| alloc::format!("{e:?} is not <priority>=<duration>"))?;
+        let p: i64 = p.trim().parse().map_err(|_| alloc::format!("{p:?} is not a priority"))?;
+        let d = duration_secs(d)?.unwrap_or_default();
+        out.push(alloc::format!("{p}={d}"));
+    }
+    Ok(Some(out.join(",")))
+}
+
 fn plain(v: &str) -> Result<Option<String>, String> {
     Ok(Some(v.to_string()))
 }
@@ -172,7 +251,7 @@ fn eviction_hard(v: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// `120`, `90s`, `2m`, `1h` as seconds.
+/// `120`, `90s`, `2m`, `1h`, `1m30s` as seconds.
 fn duration_secs(v: &str) -> Result<Option<String>, String> {
     let t = v.trim();
     let bad = || alloc::format!("{v:?} is not a duration");
@@ -401,15 +480,33 @@ impl Install {
             b"--kube-apiserver-arg" => {
                 let (k, v) = value.trim_start_matches("--").split_once('=').unwrap_or((value, ""));
                 let flag = alloc::format!("--{k}");
-                let known = SETTINGS.iter().skip_while(|(n, _, _)| *n != "authentication-config").any(|(n, _, _)| *n == k);
+                let known = SETTINGS.iter().skip_while(|(n, _, _)| *n != "authentication-config").take_while(|(n, _, _)| *n != "cpu-manager-policy").any(|(n, _, _)| *n == k);
                 if !known || !self.take(flag.as_bytes(), v) {
                     self.errors.push(alloc::format!("kube-apiserver-arg: unsupported argument {k:?}"));
+                }
+            }
+            // k3s passes these to its kubelet: the ones kr has as settings are taken, the rest
+            // fail the start instead of being ignored.
+            b"--kubelet-arg" => {
+                let (k, v) = value.trim_start_matches('-').split_once('=').unwrap_or((value, ""));
+                let flag = alloc::format!("--{k}");
+                if k == "kubelet-arg" || !SETTINGS.iter().any(|(n, _, _)| *n == k) || !self.take(flag.as_bytes(), v) {
+                    self.errors.push(alloc::format!("--kubelet-arg: {k:?} is not supported by kr"));
                 }
             }
             _ => {
                 let Some((_, var, f)) = SETTINGS.iter().find(|(n, _, _)| flag.strip_prefix(b"--") == Some(n.as_bytes())) else { return false };
                 match f(value) {
-                    Ok(Some(v)) => self.settings.push((var, v)),
+                    Ok(Some(v)) => {
+                        let sep = ACCUMULATE.iter().find(|(k, _)| k == var).map(|(_, s)| *s);
+                        match (sep, self.settings.iter_mut().find(|(k, _)| k == var)) {
+                            (Some(sep), Some(prev)) => {
+                                prev.1.push_str(sep);
+                                prev.1.push_str(&v);
+                            }
+                            _ => self.settings.push((var, v)),
+                        }
+                    }
                     Ok(None) => {}
                     Err(e) => self.errors.push(alloc::format!("{}: {e}", String::from_utf8_lossy(flag))),
                 }
@@ -586,6 +683,37 @@ mod tests {
         i.take(b"--kube-apiserver-arg", "max-pods=3");
         i.take(b"--kube-apiserver-arg", "feature-gates=X=true");
         assert_eq!(i.errors.len(), 2);
+    }
+
+    #[test]
+    fn resource_manager_and_shutdown_settings() {
+        let ok = |f: &str, v: &str| setting(f, v).0;
+        assert_eq!(ok("--cpu-manager-policy", "static"), [("KR_CPU_MANAGER_POLICY", "static".to_string())]);
+        assert!(!setting("--cpu-manager-policy", "dynamic").1.is_empty());
+        assert_eq!(ok("--cpu-manager-policy-options", "full-pcpus-only=true"), [("KR_CPU_MANAGER_POLICY_OPTIONS", "full-pcpus-only=true".to_string())]);
+        assert!(!setting("--cpu-manager-policy-options", "distribute-cpus-across-numa=true").1.is_empty());
+        assert_eq!(ok("--reserved-cpus", "0,1, 4"), [("KR_RESERVED_CPUS", "0-1,4".to_string())]);
+        assert!(!setting("--memory-manager-policy", "static").1.is_empty());
+        assert!(!setting("--topology-manager-scope", "pod").1.is_empty());
+        assert!(!setting("--reserved-memory", "0:memory=lots").1.is_empty());
+        assert_eq!(ok("--shutdown-grace-period", "1m30s"), [("KR_SHUTDOWN_GRACE_PERIOD", "90".to_string())]);
+        assert!(!setting("--shutdown-grace-period", "1d").1.is_empty());
+        let mut i = Install::default();
+        i.take(b"--reserved-memory", "0:memory=1Gi");
+        i.take(b"--reserved-memory", "1:memory=512Mi,hugepages-2Mi=0");
+        i.take(b"--shutdown-grace-period-by-pod-priority", "100000=10s");
+        i.take(b"--shutdown-grace-period-by-pod-priority", "0=1m");
+        assert!(i.vars().contains(&("KR_RESERVED_MEMORY", "0:memory=1Gi;1:memory=512Mi,hugepages-2Mi=0".into())));
+        assert!(i.vars().contains(&("KR_SHUTDOWN_GRACE_PERIOD_BY_POD_PRIORITY", "100000=10,0=60".into())));
+        // k3s's kubelet-arg pass-through: known keys are taken, unknown ones are errors.
+        let mut i = Install::default();
+        assert!(i.take(b"--kubelet-arg", "cpu-manager-policy=static"));
+        assert!(i.take(b"--kubelet-arg", "--topology-manager-policy=single-numa-node"));
+        assert!(i.errors.is_empty());
+        assert!(i.take(b"--kubelet-arg", "feature-gates=X=true"));
+        assert!(i.take(b"--kubelet-arg", "kubelet-arg=x"));
+        assert_eq!(i.errors.len(), 2);
+        assert!(i.vars().contains(&("KR_TOPOLOGY_MANAGER_POLICY", "single-numa-node".into())));
     }
 
     #[test]

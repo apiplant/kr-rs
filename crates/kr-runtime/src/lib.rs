@@ -7,6 +7,7 @@ pub mod auth;
 pub mod cgroup;
 pub mod config;
 pub mod cron;
+pub mod cpuset;
 pub mod container;
 pub mod credprovider;
 pub mod devfilter;

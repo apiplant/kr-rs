@@ -22,6 +22,9 @@ pub mod imagegc;
 pub mod node;
 pub mod mirror;
 mod adopt;
+pub mod cm;
+mod dbus;
+pub mod shutdown;
 pub mod cni;
 mod csi;
 pub mod deviceplugin;
@@ -259,6 +262,10 @@ struct PodRt {
     conds: Vec<(String, bool, i64)>,
     /// PVC volumes as (volume, claim, host directory), for volume statistics; None until looked up.
     pvcs: Option<Vec<(String, String, String)>>,
+    /// Stopped by the graceful node shutdown (#363): Failed, reason Terminated.
+    node_shutdown: bool,
+    /// Admitted by the resource managers (CPU, memory, topology).
+    cm_admitted: bool,
 }
 
 struct Exit {
@@ -321,6 +328,13 @@ pub struct Kubelet<C: Client> {
     /// Probe results by (namespace, pod, container, probe type, success), for `/metrics/probes`.
     probe_counts: RefCell<BTreeMap<(String, String, String, &'static str, bool), u64>>,
     started_s: i64,
+    /// CPU, memory and topology managers (#363); None when no policy is configured.
+    cm: RefCell<Option<cm::Manager>>,
+    /// cpuset.cpus last written per container id (the reconcile writes only changes).
+    cpusets: RefCell<BTreeMap<String, kr_runtime::cpuset::CpuSet>>,
+    cpuset_warned: Cell<bool>,
+    /// A graceful node shutdown is in progress: no new pods are admitted.
+    shutting_down: Cell<bool>,
 }
 
 enum PullGate {
@@ -346,7 +360,27 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     pub fn new(c: C, cfg: Config, store: Store) -> Rc<Self> {
         let devices = deviceplugin::Plugins::new(&deviceplugin::default_dir(&cfg.root));
         let csi = csi::Csi::new(&cfg.node_name);
-        Rc::new(Kubelet { c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), starting: RefCell::new(alloc::collections::BTreeSet::new()), notify: Notify::default(), devices, csi, vol_cache: RefCell::new(BTreeMap::new()), vol_abnormal: RefCell::new(alloc::collections::BTreeSet::new()), fs_cache: RefCell::new(BTreeMap::new()), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()), adopted: Cell::new((0, 0)), survive: Cell::new(false), netpol: Rc::new(netpol::Ctl::default()), mirror: RefCell::new(None), probe_counts: RefCell::new(BTreeMap::new()), started_s: now_ms() as i64 / 1000 })
+        let settings = cm::Settings::from_env();
+        let cm = if !settings.active() {
+            None
+        } else if let Some(topo) = cm::topo::Topology::read() {
+            let (m, warnings) = cm::Manager::new(settings, topo, &cfg.root);
+            for w in warnings {
+                kr_rt::eprint(alloc::format!("kubelet: {w}\n").as_bytes());
+            }
+            if m.s.cpu_static || m.s.mem_static {
+                kr_runtime::cgroup::enable_cpuset();
+            }
+            Some(m)
+        } else {
+            kr_rt::eprint(b"kubelet: cannot read the CPU topology from /sys; the CPU, memory and topology managers are off\n");
+            None
+        };
+        Rc::new(Kubelet {
+            cm: RefCell::new(cm),
+            cpusets: RefCell::new(BTreeMap::new()),
+            cpuset_warned: Cell::new(false),
+            shutting_down: Cell::new(false), c, cfg, store, maps: IdMaps::for_current_user(), pods: RefCell::new(BTreeMap::new()), exits: RefCell::new(Vec::new()), starting: RefCell::new(alloc::collections::BTreeSet::new()), notify: Notify::default(), devices, csi, vol_cache: RefCell::new(BTreeMap::new()), vol_abnormal: RefCell::new(alloc::collections::BTreeSet::new()), fs_cache: RefCell::new(BTreeMap::new()), pulls: RefCell::new(BTreeMap::new()), done_pulls: RefCell::new(Vec::new()), infra: RefCell::new(None), podnet: Cell::new(network::PodNet::default()), fam: Cell::new(network::Families::DUAL), warned_families: Cell::new(false), warned_backend: RefCell::new(alloc::collections::BTreeSet::new()), log_marks: RefCell::new(BTreeMap::new()), stdin_keep: RefCell::new(BTreeMap::new()), adopted: Cell::new((0, 0)), survive: Cell::new(false), netpol: Rc::new(netpol::Ctl::default()), mirror: RefCell::new(None), probe_counts: RefCell::new(BTreeMap::new()), started_s: now_ms() as i64 / 1000 })
     }
 
     /// Runs registration, heartbeats, the pod watch and the sync loop (never returns).
@@ -497,6 +531,14 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         kr_rt::exec::spawn(async move { vs.volume_stats_loop().await });
         let gc = self.clone();
         kr_rt::exec::spawn(async move { gc.image_gc_loop().await });
+        let (sd_cfg, warnings) = shutdown::Config::from_env();
+        for w in warnings {
+            kr_rt::eprint(alloc::format!("kubelet: {w}\n").as_bytes());
+        }
+        if sd_cfg.enabled() {
+            let sd = self.clone();
+            kr_rt::exec::spawn(async move { sd.shutdown_loop(sd_cfg).await });
+        }
         let mut swept = false;
         loop {
             let listed = self.sync_all().await;
@@ -518,6 +560,10 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let mut live: Vec<String> = self.pods.borrow().keys().cloned().collect();
         live.extend(self.starting.borrow().iter().filter(|u| !live.contains(u)).cloned().collect::<Vec<_>>());
         self.devices.retain_pods(&live);
+        // Allocations of pods deleted while the kubelet was down (upstream: removeStaleState).
+        if self.cm.borrow_mut().as_mut().is_some_and(|m| m.retain(&|u| live.iter().any(|l| l.as_str() == u))) {
+            self.apply_cpusets();
+        }
         for u in self.csi.pod_uids().into_iter().filter(|u| !live.contains(u)) {
             let csi = self.csi.clone();
             kr_rt::exec::spawn(async move { csi.unmount_pod(&u).await });
@@ -1163,6 +1209,8 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             LAST_STORAGE_GC.store(t, core::sync::atomic::Ordering::Relaxed);
             spec::gc_storage(&self.c).await;
         }
+        kr_rt::exec::phase("sync_all: cpusets");
+        self.apply_cpusets();
         kr_rt::exec::phase("sync_all: gone pods");
         // Pods deleted from the API: stop immediately (the object is already gone).
         let gone: Vec<String> = self.pods.borrow().keys().filter(|k| !seen.contains(k)).cloned().collect();
@@ -1253,6 +1301,28 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 self.pods.borrow_mut().get_mut(uid).unwrap().failed_setup = Some("Pod was rejected: node(s) didn't have free ports for the requested pod ports".into());
                 return;
             }
+            if self.shutting_down.get() {
+                self.pods.borrow_mut().get_mut(uid).unwrap().failed_setup = Some(shutdown::REJECTED.into());
+                return;
+            }
+            // CPU, memory and topology managers: allocations and NUMA alignment (#363).
+            if !self.pods.borrow()[uid].cm_admitted {
+                if let Err(e) = self.cm_admit(uid, pod) {
+                    kr_rt::eprint(alloc::format!("kubelet: pod {}/{} rejected: {e}\n", meta(pod, "namespace"), meta(pod, "name")).as_bytes());
+                    self.pods.borrow_mut().get_mut(uid).unwrap().failed_setup = Some(e);
+                    return;
+                }
+                self.pods.borrow_mut().get_mut(uid).unwrap().cm_admitted = true;
+            }
+        }
+        if self.pods.borrow()[uid].node_shutdown {
+            // Stopped by the node shutdown: never restarted; SIGKILL once its grace period ends.
+            if self.pods.borrow()[uid].kill_at.is_some_and(|t| now_ms() >= t) {
+                self.kill_now(uid);
+            } else {
+                self.stop_sidecars_last(uid);
+            }
+            return;
         }
         if self.pods.borrow()[uid].evicted.is_some() {
             self.kill_now(uid);
@@ -1391,6 +1461,169 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
                 self.maybe_start(uid, pod, idx).await;
             }
         }
+    }
+
+    /// Pod admission by the resource managers: exclusive CPUs, pinned memory, the NUMA affinity
+    /// for the devices allocated at container start. Err is the rejection message.
+    fn cm_admit(&self, uid: &str, pod: &Value) -> Result<(), String> {
+        {
+            let mut cm = self.cm.borrow_mut();
+            let Some(m) = cm.as_mut() else { return Ok(()) };
+            let needs = cm::needs(pod, &m.s, &|r| self.devices.manages(r));
+            m.admit(uid, &needs, &|res, ctr| self.devices.topology(res, uid, ctr))?;
+            for n in &needs {
+                self.devices.set_affinity(uid, &n.name, m.affinity.get(&(uid.to_string(), n.name.clone())).copied());
+            }
+        }
+        self.apply_cpusets();
+        Ok(())
+    }
+
+    /// Brings every running container's cpuset.cpus in line with the CPU manager: exclusive CPUs
+    /// or the shared pool (which shrinks and grows as exclusive allocations come and go). Also
+    /// frees what finished init containers and finished pods held.
+    fn apply_cpusets(&self) {
+        let mut cm = self.cm.borrow_mut();
+        let Some(m) = cm.as_mut() else { return };
+        // Exclusive CPUs of init containers that completed, and of pods that are done.
+        let mut done_ctrs = Vec::new();
+        let mut done_pods = Vec::new();
+        for (uid, p) in self.pods.borrow().iter() {
+            let finished = p.failed_setup.is_some() || p.evicted.is_some() || p.deadline_exceeded || p.node_shutdown;
+            if finished && p.ctrs.iter().all(|c| c.signaller.is_none()) {
+                done_pods.push(uid.clone());
+                continue;
+            }
+            for c in p.ctrs.iter().filter(|c| c.init && !c.sidecar && matches!(&c.state, CState::Terminated(t) if t.exit_code == 0)) {
+                done_ctrs.push((uid.clone(), c.name.clone()));
+            }
+        }
+        for u in &done_pods {
+            m.release_pod(u);
+        }
+        for (u, c) in &done_ctrs {
+            if m.exclusive(u, c).is_some() && self.pods.borrow()[u].ctrs.iter().filter(|x| !x.init).all(|x| !matches!(x.state, CState::Waiting(..))) {
+                m.release_ctr(u, c);
+            }
+        }
+        if !m.s.cpu_static {
+            return;
+        }
+        let mut applied = self.cpusets.borrow_mut();
+        let mut live = Vec::new();
+        for (uid, p) in self.pods.borrow().iter() {
+            let Some(rel) = p.cg.as_ref().map(|c| c.rel().to_vec()) else { continue };
+            for c in &p.ctrs {
+                let CState::Running { id, .. } = &c.state else { continue };
+                live.push(id.clone());
+                let Some(want) = m.cpus_for(uid, &c.name) else { continue };
+                if applied.get(id) == Some(&want) {
+                    continue;
+                }
+                match kr_runtime::cgroup::set_cpuset(&rel, id.as_bytes(), &want, m.mems_for(uid, &c.name).as_ref()) {
+                    Ok(()) => drop(applied.insert(id.clone(), want)),
+                    Err(e) if !self.cpuset_warned.replace(true) => kr_rt::eprint(alloc::format!("kubelet: cannot set cpuset.cpus of container {id} (errno {}); is the cpuset controller delegated to kr?\n", e.0).as_bytes()),
+                    Err(_) => {}
+                }
+            }
+        }
+        applied.retain(|k, _| live.contains(k));
+    }
+
+    /// Graceful node shutdown: holds a logind delay inhibitor lock and stops the pods when logind
+    /// announces a shutdown. Reconnects after a bus failure.
+    async fn shutdown_loop(self: Rc<Self>, cfg: shutdown::Config) {
+        loop {
+            if let Err(e) = self.shutdown_session(&cfg).await {
+                kr_rt::eprint(alloc::format!("kubelet: node shutdown manager: {e}; retrying in 30s\n").as_bytes());
+            }
+            kr_rt::exec::sleep(30_000).await;
+        }
+    }
+
+    async fn shutdown_session(&self, cfg: &shutdown::Config) -> Result<(), String> {
+        let mut bus = dbus::Bus::system().await?;
+        // logind must let the lock delay the shutdown for the whole budget (upstream raises
+        // InhibitDelayMaxSec with a drop-in and reloads logind).
+        let want = cfg.total();
+        let have = dbus::inhibit_delay_max(&mut bus).await?;
+        if have < want {
+            let _ = kr_runtime::store::mkdir_p("/etc/systemd/logind.conf.d", 0o755);
+            let wrote = kr_runtime::store::write_file_atomic(dbus::LOGIND_DROPIN, dbus::logind_dropin(want).as_bytes()).is_ok();
+            if wrote {
+                let _ = dbus::reload_logind(&mut bus).await;
+                kr_rt::exec::sleep(1000).await;
+            }
+            let now = dbus::inhibit_delay_max(&mut bus).await.unwrap_or(have);
+            if now < want {
+                kr_rt::eprint(alloc::format!("kubelet: node shutdown manager was unable to update logind InhibitDelayMaxSec to {want}s (ShutdownGracePeriod), current value of InhibitDelayMaxSec ({now}s) is less than requested ShutdownGracePeriod\n").as_bytes());
+            }
+        }
+        dbus::watch_shutdown(&mut bus).await?;
+        let why = "Kubelet needs time to handle node shutdown";
+        let mut lock = Some(dbus::inhibit(&mut bus, "kubelet", why).await?);
+        kr_rt::eprint(alloc::format!("kubelet: node shutdown manager holds a delay inhibitor lock ({want}s)\n").as_bytes());
+        loop {
+            let sig = bus.next_signal().await?;
+            match dbus::prepare_for_shutdown(&sig) {
+                Some(true) => {
+                    kr_rt::eprint(b"kubelet: node is shutting down; stopping pods\n");
+                    self.node_shutdown(cfg).await;
+                    // Releasing the lock lets the shutdown go on.
+                    drop(lock.take());
+                }
+                Some(false) => {
+                    // The shutdown was cancelled: ready again, and a new lock for the next one.
+                    self.shutting_down.set(false);
+                    node::SHUTTING_DOWN.store(false, core::sync::atomic::Ordering::Relaxed);
+                    node::update_status(&self.c, &self.cfg, &self.devices).await;
+                    if lock.is_none() {
+                        lock = Some(dbus::inhibit(&mut bus, "kubelet", why).await?);
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Stops the running pods group by group (lowest priority first), each pod with its own
+    /// grace period capped by its group's, and waits for each group up to that period.
+    async fn node_shutdown(&self, cfg: &shutdown::Config) {
+        self.shutting_down.set(true);
+        node::SHUTTING_DOWN.store(true, core::sync::atomic::Ordering::Relaxed);
+        node::update_status(&self.c, &self.cfg, &self.devices).await;
+        let q = alloc::format!("fieldSelector=spec.nodeName%3D{}", self.cfg.node_name);
+        let specs: Vec<Value> = self.c.list("/api/v1/pods", &q).await.ok().and_then(|l| l.get("items").and_then(Value::as_array).map(|a| a.to_vec())).unwrap_or_default();
+        let spec_of = |uid: &str| specs.iter().find(|p| meta(p, "uid") == uid).cloned().unwrap_or(Value::Null);
+        for g in 0..cfg.groups.len() {
+            let members: Vec<(String, Value)> = self
+                .pods
+                .borrow()
+                .iter()
+                .filter(|(_, p)| !p.node_shutdown && p.ctrs.iter().any(|c| c.signaller.is_some()))
+                .map(|(u, _)| (u.clone(), spec_of(u)))
+                .filter(|(_, v)| cfg.group_of(v.pointer(&["spec", "priority"]).and_then(Value::as_i64).unwrap_or(0)) == g)
+                .collect();
+            let budget = cfg.groups[g].1;
+            for (uid, pod) in &members {
+                let own = pod.pointer(&["spec", "terminationGracePeriodSeconds"]).and_then(Value::as_u64).unwrap_or(30);
+                if let Some(p) = self.pods.borrow_mut().get_mut(uid) {
+                    p.node_shutdown = true;
+                }
+                self.begin_stop(uid, pod, cfg.grace(g, own));
+            }
+            self.notify.notify();
+            let deadline = now_ms() + budget * 1000;
+            while !members.iter().all(|(u, _)| self.all_stopped(u)) && now_ms() < deadline {
+                kr_rt::exec::sleep(500).await;
+            }
+            for (u, _) in &members {
+                self.kill_now(u);
+            }
+        }
+        // Give the sync loop a moment to report the final statuses.
+        self.notify.notify();
+        kr_rt::exec::sleep(1500).await;
     }
 
     /// Lets another node's API server know pod proxy must go through this kubelet.
@@ -1623,7 +1856,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         }
         let prio = pod.pointer(&["spec", "priorityClassName"]).and_then(Value::as_str).unwrap_or("");
         let critical = prio.starts_with("system-") && prio.ends_with("-critical") || pod.pointer(&["metadata", "annotations", "kubernetes.io/config.mirror"]).is_some();
-        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ip6: None, node_ip: self.cfg.node_ip, ctrs, start_time: now(), kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, cpu_request: spec::cpu_request(pod), resize_pending: None, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod), sandbox_retry_at: 0, pvcs: None }
+        PodRt { ns: meta(pod, "namespace").into(), name: meta(pod, "name").into(), dir, sandbox: None, lease: None, ip: None, ip6: None, node_ip: self.cfg.node_ip, ctrs, start_time: now(), kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: now_ms(), cg: None, qos: spec::qos_class(pod), mem_request: spec::pod_resources(pod).1, cpu_request: spec::cpu_request(pod), resize_pending: None, critical, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: host_ports(pod), sandbox_retry_at: 0, pvcs: None, node_shutdown: false, cm_admitted: false }
     }
 
     async fn start_sandbox(&self, uid: &str, pod: &Value) -> Result<(), String> {
@@ -1911,7 +2144,14 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let tty_pair = if want_tty { kr_sys::ns::openpty().ok() } else { None };
         let stdin_pair = if !want_tty && cspec.and_then(|c| c.get("stdin")).and_then(Value::as_bool) == Some(true) { kr_sys::ns::socketpair().ok() } else { None };
         let stdin_read = stdin_pair.as_ref().map(|(_, c)| c);
-        let limits = if self.cfg.cgroups { built.limits } else { Default::default() };
+        let mut limits = if self.cfg.cgroups { built.limits } else { Default::default() };
+        if self.cfg.cgroups {
+            // CPU manager: exclusive CPUs or the shared pool; memory manager: NUMA nodes.
+            if let Some(m) = self.cm.borrow().as_ref() {
+                limits.cpus = m.cpus_for(uid, &name);
+                limits.mems = m.mems_for(uid, &name);
+            }
+        }
         let pods = self.pods.borrow();
         let p = &pods[uid];
         let run = container::RunSpec {
@@ -2365,45 +2605,11 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             return;
         }
         let grace = pod.pointer(&["metadata", "deletionGracePeriodSeconds"]).and_then(Value::as_u64).or_else(|| pod.pointer(&["spec", "terminationGracePeriodSeconds"]).and_then(Value::as_u64)).unwrap_or(30);
-        let deadline = {
-            let mut pods = self.pods.borrow_mut();
-            let p = pods.get_mut(uid).unwrap();
-            if p.kill_at.is_none() {
-                p.kill_at = Some(now_ms() + grace * 1000);
-                let pod_target = p.sandbox.as_ref().and_then(|s| s.target().ok());
-                for c in &p.ctrs {
-                    // Sidecars outlive the app containers (their hooks may need them): see below.
-                    if c.sidecar {
-                        continue;
-                    }
-                    let Some(s) = c.signaller.clone() else { continue };
-                    let cspec = ["containers", "initContainers"].iter().flat_map(|k| pod.pointer(&["spec", k]).and_then(Value::as_array).unwrap_or(&[]).iter()).find(|cs| cs.get("name").and_then(Value::as_str) == Some(c.name.as_str())).cloned();
-                    let hook = cspec.as_ref().and_then(|cs| cs.pointer(&["lifecycle", "preStop"])).cloned();
-                    match (hook, c.target.clone()) {
-                        // preStop runs first (bounded by the grace period), then SIGTERM.
-                        (Some(hook), Some(target)) => {
-                            let (ctr, pod_target, maps, pod_v) = (cspec.unwrap_or(Value::Null), pod_target.clone(), self.maps.clone(), pod.clone());
-                            kr_rt::exec::spawn(async move {
-                                let _ = probe::run_handler(&hook, &pod_v, &ctr, &target, pod_target.as_ref(), &maps, grace * 1000).await;
-                                let _ = s.send(kr_sys::ns::SIGTERM);
-                            });
-                        }
-                        _ => {
-                            let _ = s.send(kr_sys::ns::SIGTERM);
-                        }
-                    }
-                }
-            }
-            // Sidecars stop once every other container has.
-            if p.ctrs.iter().filter(|c| !c.sidecar).all(|c| c.signaller.is_none()) {
-                for c in p.ctrs.iter().filter(|c| c.sidecar) {
-                    if let Some(s) = &c.signaller {
-                        let _ = s.send(kr_sys::ns::SIGTERM);
-                    }
-                }
-            }
-            p.kill_at.unwrap()
-        };
+        if self.pods.borrow()[uid].kill_at.is_none() {
+            self.begin_stop(uid, pod, grace);
+        }
+        self.stop_sidecars_last(uid);
+        let deadline = self.pods.borrow()[uid].kill_at.unwrap_or(0);
         if now_ms() >= deadline {
             self.kill_now(uid);
         }
@@ -2419,6 +2625,50 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             // Finish the deletion: the API object is removed once nothing runs.
             let path = alloc::format!("/api/v1/namespaces/{}/pods/{}", meta(pod, "namespace"), meta(pod, "name"));
             let _ = self.c.delete(&alloc::format!("{path}?gracePeriodSeconds=0")).await;
+        }
+    }
+
+    /// Starts stopping a pod: preStop hooks then SIGTERM for every container but the sidecars,
+    /// SIGKILL due after `grace` seconds (`kill_at`).
+    fn begin_stop(&self, uid: &str, pod: &Value, grace: u64) {
+        let mut pods = self.pods.borrow_mut();
+        let Some(p) = pods.get_mut(uid) else { return };
+        p.kill_at = Some(now_ms() + grace * 1000);
+        let pod_target = p.sandbox.as_ref().and_then(|s| s.target().ok());
+        for c in &p.ctrs {
+            // Sidecars outlive the app containers (their hooks may need them): see below.
+            if c.sidecar {
+                continue;
+            }
+            let Some(s) = c.signaller.clone() else { continue };
+            let cspec = ["containers", "initContainers"].iter().flat_map(|k| pod.pointer(&["spec", k]).and_then(Value::as_array).unwrap_or(&[]).iter()).find(|cs| cs.get("name").and_then(Value::as_str) == Some(c.name.as_str())).cloned();
+            let hook = cspec.as_ref().and_then(|cs| cs.pointer(&["lifecycle", "preStop"])).cloned();
+            match (hook, c.target.clone()) {
+                // preStop runs first (bounded by the grace period), then SIGTERM.
+                (Some(hook), Some(target)) => {
+                    let (ctr, pod_target, maps, pod_v) = (cspec.unwrap_or(Value::Null), pod_target.clone(), self.maps.clone(), pod.clone());
+                    kr_rt::exec::spawn(async move {
+                        let _ = probe::run_handler(&hook, &pod_v, &ctr, &target, pod_target.as_ref(), &maps, grace * 1000).await;
+                        let _ = s.send(kr_sys::ns::SIGTERM);
+                    });
+                }
+                _ => {
+                    let _ = s.send(kr_sys::ns::SIGTERM);
+                }
+            }
+        }
+    }
+
+    /// Sidecars of a stopping pod get SIGTERM once every other container has stopped.
+    fn stop_sidecars_last(&self, uid: &str) {
+        let pods = self.pods.borrow();
+        let Some(p) = pods.get(uid) else { return };
+        if p.ctrs.iter().filter(|c| !c.sidecar).all(|c| c.signaller.is_none()) {
+            for c in p.ctrs.iter().filter(|c| c.sidecar) {
+                if let Some(s) = &c.signaller {
+                    let _ = s.send(kr_sys::ns::SIGTERM);
+                }
+            }
         }
     }
 
@@ -2439,6 +2689,9 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
     fn cleanup(&self, uid: &str) {
         let Some(p) = self.pods.borrow_mut().remove(uid) else { return };
         self.devices.release_pod(uid);
+        if self.cm.borrow_mut().as_mut().is_some_and(|m| m.release_pod(uid)) {
+            self.apply_cpusets();
+        }
         let (csi, u) = (self.csi.clone(), uid.to_string());
         kr_rt::exec::spawn(async move { csi.unmount_pod(&u).await });
         self.stdin_keep.borrow_mut().retain(|k, _| !k.starts_with(&alloc::format!("{}/", p.dir)));
@@ -2468,7 +2721,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
 
     /// Builds the pod status and patches it if it changed.
     async fn report_status(&self, uid: &str, pod: &Value) {
-        let (status, path) = {
+        let (status, path, terminal) = {
             let mut pods = self.pods.borrow_mut();
             let Some(p) = pods.get_mut(uid) else { return };
             let policy = pod.pointer(&["spec", "restartPolicy"]).and_then(Value::as_str).unwrap_or("Always");
@@ -2479,8 +2732,13 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             }
             stamp_conditions(p, &mut status, pod.pointer(&["metadata", "generation"]).and_then(Value::as_i64).unwrap_or(0));
             keep_foreign_conditions(pod, &mut status);
-            (status, alloc::format!("/api/v1/namespaces/{}/pods/{}/status", p.ns, p.name))
+            let terminal = matches!(status.get("phase").and_then(Value::as_str), Some("Succeeded" | "Failed")) && p.ctrs.iter().all(|c| c.signaller.is_none());
+            (status, alloc::format!("/api/v1/namespaces/{}/pods/{}/status", p.ns, p.name), terminal)
         };
+        // A finished pod gives its exclusive CPUs and pinned memory back.
+        if terminal && self.cm.borrow_mut().as_mut().is_some_and(|m| m.release_pod(uid)) {
+            self.apply_cpusets();
+        }
         kr_rt::exec::phase("report_status: serialise");
         let text = json::to_string(&status);
         // The node controller marks pods of an unreachable node not Ready; when this kubelet is
@@ -2489,7 +2747,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
         let api_agrees = ready_of(pod) == ready_of(&status);
         // Leftovers of an earlier status (see below) must be cleared even when nothing changed.
         let has_key = |k: &str| status.get(k).is_some();
-        let leftovers = (matches!(pod.pointer(&["status", "reason"]).and_then(Value::as_str), Some("SandboxFailed" | "HostPortConflict" | "SysctlForbidden")) && !has_key("reason"))
+        let leftovers = (matches!(pod.pointer(&["status", "reason"]).and_then(Value::as_str), Some("SandboxFailed" | "HostPortConflict" | "SysctlForbidden" | "TopologyAffinityError" | "SMTAlignmentError" | "UnexpectedAdmissionError" | "NodeShutdown")) && !has_key("reason"))
             || (!has_key("containerStatuses") && pod.pointer(&["status", "containerStatuses"]).is_some_and(|v| !v.is_null()))
             || (!has_key("initContainerStatuses") && pod.pointer(&["status", "initContainerStatuses"]).is_some_and(|v| !v.is_null()));
         if api_agrees && !leftovers && self.pods.borrow().get(uid).is_some_and(|p| p.last_status == text) {
@@ -2502,7 +2760,7 @@ impl<C: Client + Clone + 'static> Kubelet<C> {
             // left behind (a failed sandbox's reason/message once the pod runs, the
             // ContainerCreating statuses of a pod that was rejected).
             let (h_reason, h_msg, h_cs, h_ics) = (f.iter().any(|(n, _)| n == "reason"), f.iter().any(|(n, _)| n == "message"), f.iter().any(|(n, _)| n == "containerStatuses"), f.iter().any(|(n, _)| n == "initContainerStatuses"));
-            let stale = matches!(pod.pointer(&["status", "reason"]).and_then(Value::as_str), Some("SandboxFailed" | "HostPortConflict" | "SysctlForbidden"));
+            let stale = matches!(pod.pointer(&["status", "reason"]).and_then(Value::as_str), Some("SandboxFailed" | "HostPortConflict" | "SysctlForbidden" | "TopologyAffinityError" | "SMTAlignmentError" | "UnexpectedAdmissionError" | "NodeShutdown"));
             if stale && !h_reason {
                 f.push((String::from("reason"), Value::Null));
                 if !h_msg {
@@ -2654,7 +2912,7 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
     let all_running = !apps.is_empty() && apps.iter().all(|c| matches!(c.state, CState::Running { .. }) && c.started && c.ready);
     let all_done = !apps.is_empty() && apps.iter().all(|c| matches!(c.state, CState::Terminated(_)));
     let failed = apps.iter().any(|c| matches!(&c.state, CState::Terminated(t) if t.exit_code != 0)) || p.ctrs.iter().any(|c| c.init && !c.sidecar && matches!(&c.state, CState::Terminated(t) if t.exit_code != 0) && policy == "Never");
-    let phase = if p.failed_setup.is_some() || p.evicted.is_some() || p.deadline_exceeded {
+    let phase = if p.failed_setup.is_some() || p.evicted.is_some() || p.deadline_exceeded || p.node_shutdown {
         "Failed"
     } else if all_done && policy != "Always" && (policy == "Never" || !failed) {
         if failed { "Failed" } else { "Succeeded" }
@@ -2689,6 +2947,10 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
     } else if p.ctrs.iter().any(|c| c.resize_restart) {
         conditions.push(o(alloc::vec![("type", Value::from("PodResizeInProgress")), ("status", Value::from("True")), ("lastTransitionTime", t(p.start_time))]));
     }
+    if p.node_shutdown {
+        // As upstream's shutdown manager: the pod is a disruption target.
+        conditions.push(o(alloc::vec![("type", Value::from("DisruptionTarget")), ("status", Value::from("True")), ("lastTransitionTime", t(p.start_time)), ("reason", Value::from("TerminationByKubelet")), ("message", Value::from(shutdown::MESSAGE))]));
+    }
     let mut f = alloc::vec![
         ("phase", Value::from(phase)),
         ("conditions", Value::Array(conditions)),
@@ -2720,16 +2982,39 @@ fn status_json(p: &PodRt, policy: &str) -> Value {
         f.push(("message", Value::from(msg.as_str())));
         f.push(("reason", Value::from("Evicted")));
     }
+    if p.node_shutdown && p.evicted.is_none() {
+        f.push(("message", Value::from(shutdown::MESSAGE)));
+        f.push(("reason", Value::from(shutdown::REASON)));
+    }
     if p.deadline_exceeded {
         f.push(("message", Value::from("Pod was active on the node longer than the specified deadline")));
         f.push(("reason", Value::from("DeadlineExceeded")));
     }
     if let Some(msg) = &p.failed_setup {
         f.push(("message", Value::from(msg.as_str())));
-        f.push(("reason", Value::from(if msg.contains("forbidden sysctl") { "SysctlForbidden" } else if msg.starts_with("Pod was rejected") { "HostPortConflict" } else { "SandboxFailed" })));
+        f.push(("reason", Value::from(failed_setup_reason(msg))));
     }
     o(f)
 }
+/// The pod status reason of a pod that was rejected or whose sandbox failed.
+fn failed_setup_reason(msg: &str) -> &'static str {
+    if msg.contains("forbidden sysctl") {
+        "SysctlForbidden"
+    } else if msg == shutdown::REJECTED {
+        "NodeShutdown"
+    } else if msg == cm::TOPOLOGY_ERROR {
+        "TopologyAffinityError"
+    } else if msg.starts_with("SMT Alignment Error") {
+        "SMTAlignmentError"
+    } else if msg.starts_with("Allocate failed") {
+        "UnexpectedAdmissionError"
+    } else if msg.starts_with("Pod was rejected") {
+        "HostPortConflict"
+    } else {
+        "SandboxFailed"
+    }
+}
+
 /// (hostIP, protocol, hostPort) of every container port that asks for a host port.
 fn host_ports(pod: &Value) -> Vec<(String, String, u64)> {
     let mut out = Vec::new();
@@ -2767,7 +3052,7 @@ mod status_tests {
         CState::Waiting("ContainerCreating", String::new())
     }
     fn pod(ctrs: Vec<Ctr>) -> PodRt {
-        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ip6: None, node_ip: kr_sys::map4([10, 0, 0, 1]), ctrs, start_time: 0, kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, cpu_request: 0, resize_pending: None, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new(), sandbox_retry_at: 0, pvcs: None }
+        PodRt { ns: "d".into(), name: "p".into(), dir: String::new(), sandbox: None, lease: None, ip: None, ip6: None, node_ip: kr_sys::map4([10, 0, 0, 1]), ctrs, start_time: 0, kill_at: None, stopped_at: None, last_status: String::new(), failed_setup: None, volumes_synced: 0, cg: None, qos: "BestEffort", mem_request: 0, cpu_request: 0, resize_pending: None, critical: false, evicted: None, deadline_exceeded: false, conds: Vec::new(), host_ports: Vec::new(), sandbox_retry_at: 0, pvcs: None, node_shutdown: false, cm_admitted: false }
     }
     fn at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a Value> {
         path.iter().try_fold(v, |v, k| match k.parse::<usize>() {
