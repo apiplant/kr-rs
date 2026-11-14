@@ -7,15 +7,15 @@ Goal order: **(A) parity with k3s** (needed to call kr production ready) → **(
 # A. Parity with k3s (blocks "production ready")
 Ordered by impact. Size: S days, M a week or two, L more.
 
-Every earlier parity item is closed (RESOLVED 342-345, 358). Found in the re-audit of 2026-11-14 (functionality compared with k3s; kr's own flag names are fine and kubectl is not bundled):
+Nothing left: the 2026-11-14 re-audit items are closed too (RESOLVED 358, 361-365; parity means functionality, not k3s flag names, and kubectl is not bundled).
 
-363. **Kubelet resource managers and graceful node shutdown** — *M*
-    No CPU manager (`static` policy: exclusive cores for Guaranteed pods with integer CPU), memory manager, topology manager, and no graceful node shutdown (`shutdownGracePeriod`: a systemd inhibitor lock, pods terminated in priority order before poweroff). Users enable these with `kubelet-arg` in k3s; latency-sensitive and GPU workloads rely on the CPU/topology managers.
 # B. Verification backlog (code exists, not run on real systems)
 Each is a test run, not new code, unless the run finds a bug. Left: what needs hardware, credentials or a host decision.
 
 - **#131 SELinux**: AppArmor ran on an Ubuntu 24.04 VM (`tools/test/apparmor-vm.sh`, RESOLVED 357). SELinux is still unrun: on Fedora/RHEL (enforcing, container-selinux), a pod with `seLinuxOptions.level` (`ps -Z`, `ls -Z` of the rootfs and `/dev/shm`) and the `context=` mounts.
 - **#320 S3 against AWS itself**: the S3 client ran against MinIO (HTTP and HTTPS, `tools/test/snapshot-s3.sh`; multipart with `KR_S3_TEST_*`, `crates/kr-net/tests/s3.rs`) and its signatures match AWS's published SigV4 examples, but never against AWS S3: virtual-hosted addressing (`<bucket>.s3.<region>.amazonaws.com`), `--snapshot-s3-session-token` (STS) and a bucket in a region other than the one in `--snapshot-s3-region` (AWS answers 301/400, which is reported, not followed) are untested. Other providers (R2, Ceph, Backblaze) likewise.
+- **#362 OIDC and webhooks against real services**: tested only with in-process HTTPS issuers and webhooks. Run against a real IdP (Dex or Keycloak: discovery, key rotation, groups) and a real authorization webhook.
+- **#363 resource managers and graceful shutdown on a host**: unit-tested only. Rootful on systemd: static CPU manager (`cpuset.cpus` of a Guaranteed pod, shared pool shrinks/grows, survives a restart), memory manager with `numa=fake=2`, `full-pcpus-only` SMT refusal, topology refusal with a topology-advertising device plugin, `systemctl poweroff` in a VM (delay lock, NotReady, pods Failed/Terminated in order, preStop), `shutdown -c` back to Ready.
 - **GPU, what an RTX 4090 cannot show** (#160, #167): time-slicing, MPS, CDI hooks, restarts and PodResources ran (`tools/test/gpu.sh`, RESOLVED 356). Left: MIG (`mixed`/`single`, `/dev/nvidia-caps/*`; needs an A100/H100-class GPU) and a real unhealthy GPU (XID) evicting its pods within ~10 s (#167; only a fake device plugin did).
 
 # C. Performance (beyond k3s)
@@ -118,7 +118,7 @@ Nothing to do unless the stated trigger happens.
 227. **Starting a container forks the kubelet twice (~8 ms of the loop)** — *ADR-050*
     Below the stall threshold and never named by a stall report; the fix (fork-server helper or `kr shim` with the spec on a pipe) rewrites the container-start path. Revisit only if a stall report names a container start.
 53. **Binary size** — *watch*
-    4.93 MB on x86_64 after RSA client keys (#175, ADR-063) and snapshots to S3 (#320, ADR-064): master was 4.86 MB (measured) before the two, so about +61 KB together. 4.75 MB on x86_64 after the WireGuard backend (#319, ADR-062; about 5 KB of it is the backend itself, the rest other work merged since); 4.54 MB on x86_64 (2026-11-13; 3.10 MB on 2026-11-01, 2.87 MB on 2026-10-27); the 2 MB agent budget in PLAN.md is exceeded. Measure before adding large features; avoid `{:?}` on large types; keep `opt-level = "z"` + LTO + strip.
+    5.46 MB on x86_64 (2026-11-14) after OIDC/webhooks (#362, +107 KB), resource managers and graceful shutdown (#363, +175 KB), credential providers, token commands and settings (#361, #364, #365). 4.93 MB on x86_64 after RSA client keys (#175, ADR-063) and snapshots to S3 (#320, ADR-064): master was 4.86 MB (measured) before the two, so about +61 KB together. 4.75 MB on x86_64 after the WireGuard backend (#319, ADR-062; about 5 KB of it is the backend itself, the rest other work merged since); 4.54 MB on x86_64 (2026-11-13; 3.10 MB on 2026-11-01, 2.87 MB on 2026-10-27); the 2 MB agent budget in PLAN.md is exceeded. Measure before adding large features; avoid `{:?}` on large types; keep `opt-level = "z"` + LTO + strip.
 60. **TLS handshake cost** (+125) — *watch*
     P-256 is a constant-time fixed 4-bit window: ~0.5 ms sign, ~0.95 ms verify. A full kr TLS 1.3 handshake is ~2.3 ms vs k3s ~1.6 ms (crypto tuned for size); warm requests are faster (0.5 vs 1.1 ms), and resumption (ADR-051) makes reconnect storms cheap. Not offloaded (#209, RESOLVED 208): a worker would need the private key and session state, and a full handshake (~1.2 ms of loop time) is far below the stall threshold. Revisit if the full-handshake rate matters.
 97. **HA (kr-raft, ADR-026) design limits**
