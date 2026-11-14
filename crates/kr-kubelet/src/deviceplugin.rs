@@ -468,6 +468,8 @@ pub struct Plugins {
     seq: Cell<u64>,
     /// Open plugin connections by socket name, reused across `Allocate` calls.
     conns: RefCell<BTreeMap<String, Rc<Client>>>,
+    /// (pod uid, container) -> NUMA mask chosen by the topology manager (#363).
+    affinity: RefCell<BTreeMap<(String, String), u64>>,
 }
 
 fn valid_resource(n: &str) -> bool {
@@ -482,7 +484,7 @@ fn valid_endpoint(e: &str) -> bool {
 
 impl Plugins {
     pub fn new(dir: &str) -> Rc<Plugins> {
-        let p = Plugins { dir: dir.to_string(), enabled: Cell::new(false), st: RefCell::new(State::default()), gen: Cell::new(1), seq: Cell::new(0), conns: RefCell::new(BTreeMap::new()) };
+        let p = Plugins { dir: dir.to_string(), enabled: Cell::new(false), st: RefCell::new(State::default()), gen: Cell::new(1), seq: Cell::new(0), conns: RefCell::new(BTreeMap::new()), affinity: RefCell::new(BTreeMap::new()) };
         p.load();
         Rc::new(p)
     }
@@ -698,6 +700,7 @@ impl Plugins {
     /// Frees the devices of every container of a pod.
     pub fn release_pod(&self, uid: &str) {
         let n = self.st.borrow().allocs.len();
+        self.affinity.borrow_mut().retain(|k, _| k.0 != uid);
         self.st.borrow_mut().allocs.retain(|a| a.uid != uid);
         if self.st.borrow().allocs.len() != n {
             self.persist();
@@ -707,6 +710,7 @@ impl Plugins {
     /// Frees the devices of pods that are not in `live`.
     pub fn retain_pods(&self, live: &[String]) {
         let n = self.st.borrow().allocs.len();
+        self.affinity.borrow_mut().retain(|k, _| live.contains(&k.0));
         self.st.borrow_mut().allocs.retain(|a| live.contains(&a.uid));
         if self.st.borrow().allocs.len() != n {
             self.persist();
@@ -745,9 +749,16 @@ impl Plugins {
             st.allocs.retain(|a| !(a.uid == uid && a.ctr == ctr && a.res == resource));
             let used: BTreeSet<&String> = st.allocs.iter().filter(|a| a.res == resource && !(a.uid == uid && reusable.contains(&a.ctr))).flat_map(|a| a.ids.iter()).collect();
             let r = &st.res[resource];
-            let free: Vec<(String, i64)> = r.devices.iter().filter(|d| d.1 && !used.contains(&d.0)).map(|d| (d.0.clone(), r.numa.get(&d.0).copied().unwrap_or(-1))).collect();
+            let mut free: Vec<(String, i64)> = r.devices.iter().filter(|d| d.1 && !used.contains(&d.0)).map(|d| (d.0.clone(), r.numa.get(&d.0).copied().unwrap_or(-1))).collect();
             if free.len() < n {
                 return Err(format!("insufficient {resource}: requested {n}, {} healthy and unallocated", free.len()));
+            }
+            // The topology manager's NUMA affinity: only aligned devices when there are enough.
+            if let Some(m) = self.affinity.borrow().get(&(uid.to_string(), ctr.to_string())) {
+                let aligned: Vec<(String, i64)> = free.iter().filter(|f| (0..64).contains(&f.1) && m & (1 << f.1) != 0).cloned().collect();
+                if aligned.len() >= n {
+                    free = aligned;
+                }
             }
             let mut must: Vec<String> = st.allocs.iter().filter(|a| a.uid == uid && a.res == resource && reusable.contains(&a.ctr)).flat_map(|a| a.ids.iter()).filter(|i| free.iter().any(|f| f.0 == **i)).cloned().collect();
             must.dedup();
@@ -952,6 +963,30 @@ impl Plugins {
     }
 
     /// NUMA node of a device, -1 if unknown.
+    /// NUMA nodes of `resource`'s healthy devices, of the free ones and of those (uid, ctr)
+    /// holds: the topology manager's device hints. None for a resource no plugin serves.
+    pub fn topology(&self, resource: &str, uid: &str, ctr: &str) -> Option<crate::cm::DevTopo> {
+        let st = self.st.borrow();
+        let r = st.res.get(resource)?;
+        let node = |id: &String| r.numa.get(id).copied().unwrap_or(-1);
+        let used: BTreeSet<&String> = st.allocs.iter().filter(|a| a.res == resource && !(a.uid == uid && a.ctr == ctr)).flat_map(|a| a.ids.iter()).collect();
+        let healthy = r.devices.iter().filter(|d| d.1);
+        Some(crate::cm::DevTopo {
+            all: healthy.clone().map(|d| node(&d.0)).collect(),
+            free: healthy.filter(|d| !used.contains(&d.0)).map(|d| node(&d.0)).collect(),
+            held: st.allocs.iter().filter(|a| a.res == resource && a.uid == uid && a.ctr == ctr).flat_map(|a| a.ids.iter()).map(node).collect(),
+        })
+    }
+
+    /// The topology manager's NUMA affinity (mask) for a container's devices.
+    pub fn set_affinity(&self, uid: &str, ctr: &str, mask: Option<u64>) {
+        let mut a = self.affinity.borrow_mut();
+        match mask {
+            Some(m) => drop(a.insert((uid.to_string(), ctr.to_string()), m)),
+            None => drop(a.remove(&(uid.to_string(), ctr.to_string()))),
+        }
+    }
+
     pub fn numa_of(&self, resource: &str, id: &str) -> i64 {
         self.st.borrow().res.get(resource).and_then(|r| r.numa.get(id).copied()).unwrap_or(-1)
     }
@@ -1140,6 +1175,22 @@ pub(crate) mod tests {
         assert_eq!(p.reserve_with("u", "init", "x.com/gpu", 1, None, &[]).unwrap().0, ["a"]);
         let (ids, _, _, _) = p.reserve_with("u", "app", "x.com/gpu", 2, None, &["init".to_string()]).unwrap();
         assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn topology_hints_and_affinity() {
+        let _g = lock();
+        let (p, _dir) = plugins_with("x.com/gpu", &[("g0", true, 0), ("g1", true, 1), ("g2", true, 1), ("g3", false, 0)], &[("other", "c", &["g1"])]);
+        let t = p.topology("x.com/gpu", "u", "c").unwrap();
+        assert_eq!((t.all, t.free, t.held), (alloc::vec![0, 1, 1], alloc::vec![0, 1], Vec::new()));
+        assert!(p.topology("x.com/none", "u", "c").is_none());
+        // Without affinity the single-node choice is the smallest fitting node (0); with the
+        // topology manager's choice of node 1, the device comes from node 1.
+        p.set_affinity("u", "c", Some(0b10));
+        assert_eq!(p.reserve("u", "c", "x.com/gpu", 1).unwrap().0, ["g2".to_string()]);
+        assert_eq!(p.topology("x.com/gpu", "u", "c").unwrap().held, [1]);
+        p.release_pod("u");
+        assert!(p.affinity.borrow().is_empty());
     }
 
     #[test]

@@ -6,7 +6,9 @@
 //! and creates one sibling cgroup per container. The child is born inside it via CLONE_INTO_CGROUP,
 //! so it is never briefly unlimited.
 
+use crate::cpuset::CpuSet;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use kr_sys::ns;
 use kr_sys::{Errno, Fd};
 
@@ -24,6 +26,10 @@ pub struct Limits {
     pub memory_request_bytes: Option<u64>,
     /// The pod is QoS Guaranteed, so its request is a hard reservation (memory.min).
     pub memory_guaranteed: bool,
+    /// cpuset.cpus (the kubelet's CPU manager); written best effort, see [`enable_cpuset`].
+    pub cpus: Option<CpuSet>,
+    /// cpuset.mems (the kubelet's memory manager).
+    pub mems: Option<CpuSet>,
 }
 
 impl Limits {
@@ -35,13 +41,29 @@ impl Limits {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.memory_bytes.is_none() && self.pids.is_none() && self.cpu_milli.is_none() && self.cpu_request_milli.is_none() && self.memory_request_bytes.is_none()
+        self.memory_bytes.is_none() && self.pids.is_none() && self.cpu_milli.is_none() && self.cpu_request_milli.is_none() && self.memory_request_bytes.is_none() && self.cpus.is_none() && self.mems.is_none()
     }
 }
 
 const ROOT: &[u8] = b"/sys/fs/cgroup";
 const SUPERVISOR: &[u8] = b"kr-supervisor";
 const CPU_PERIOD_US: u64 = 100_000;
+
+/// The cpuset controller is wanted (a CPU or memory manager policy is active).
+static CPUSET: AtomicBool = AtomicBool::new(false);
+
+/// Turns the cpuset controller on for the cgroups kr creates or touches from now on (best
+/// effort: without it delegated, e.g. rootless, [`set_cpuset`] fails and the caller reports it).
+pub fn enable_cpuset() {
+    CPUSET.store(true, Ordering::Relaxed);
+}
+
+/// `+cpuset` in `dir`'s subtree_control when wanted; errors are ignored (not delegated).
+fn cpuset_subtree(dir: &[u8]) {
+    if CPUSET.load(Ordering::Relaxed) {
+        let _ = ns::write_file(&nul(&[dir, b"/cgroup.subtree_control"]), b"+cpuset");
+    }
+}
 
 pub struct Cgroup {
     path: Vec<u8>,
@@ -104,12 +126,13 @@ fn own_path() -> Result<Vec<u8>, Errno> {
 fn enable_in_ancestors(rel: &[u8]) -> Result<(), Errno> {
     let have = read_small(&nul(&[ROOT, rel, b"/cgroup.controllers"]))?;
     let has = |c: &[u8]| have.split(|b| b.is_ascii_whitespace()).any(|w| w == c);
-    if has(b"cpu") && has(b"memory") && has(b"pids") {
+    if has(b"cpu") && has(b"memory") && has(b"pids") && (has(b"cpuset") || !CPUSET.load(Ordering::Relaxed)) {
         return Ok(());
     }
     let mut dir = ROOT.to_vec();
     for comp in rel.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
         ns::write_file(&nul(&[&dir, b"/cgroup.subtree_control"]), b"+cpu +memory +pids")?;
+        cpuset_subtree(&dir);
         dir.push(b'/');
         dir.extend_from_slice(comp);
     }
@@ -151,6 +174,7 @@ fn base() -> Result<Vec<u8>, Errno> {
     }
     // Enabling controllers that are already enabled is a no-op.
     ns::write_file(&nul(&[&base, b"/cgroup.subtree_control"]), b"+cpu +memory +pids")?;
+    cpuset_subtree(&base);
     Ok(base)
 }
 
@@ -236,6 +260,14 @@ impl Cgroup {
         // Without a request a container gets the minimum share, not the cgroup default (100).
         let shares = l.cpu_request_milli.map_or(2, |r| (r.saturating_mul(1024) / 1000).clamp(2, 262_144));
         self.set(b"cpu.weight", &dec(1 + (shares - 2) * 9999 / 262_142))?;
+        // cpuset: best effort (the controller may not be delegated); the kubelet's reconcile
+        // writes it again through [`set_cpuset`] and reports a failure.
+        if let Some(m) = l.mems.filter(|m| !m.is_empty()) {
+            let _ = self.set(b"cpuset.mems", m.to_list().as_bytes());
+        }
+        if let Some(c) = l.cpus.filter(|c| !c.is_empty()) {
+            let _ = self.set(b"cpuset.cpus", c.to_list().as_bytes());
+        }
         if let Some((file, v)) = l.memory_protection() {
             // Best effort: without the memory controller delegated (rootless) the file is missing
             // or not writable, which only means no reservation.
@@ -323,6 +355,7 @@ impl PodCgroup {
                 Err(e) => return Err(e),
             }
             ns::write_file(&nul(&[&path, b"/cgroup.subtree_control"]), b"+cpu +memory +pids")?;
+            cpuset_subtree(&path);
         }
         let pod = PodCgroup { rel, path };
         let cg = Cgroup { path: pod.path.clone(), dir: ns::open(&nul(&[&pod.path]), ns::O_RDONLY | ns::O_DIRECTORY, 0)? };
@@ -377,6 +410,24 @@ pub fn update_container(parent: &[u8], name: &[u8], limits: &Limits) -> Result<(
     path.extend_from_slice(name);
     let cg = Cgroup { dir: ns::open(&nul(&[&path]), ns::O_RDONLY | ns::O_DIRECTORY, 0)?, path };
     cg.reapply(limits)
+}
+
+/// Sets cpuset.cpus (and cpuset.mems when given) of a running container's cgroup, turning the
+/// cpuset controller on along the way from the base (pods created before it was wanted).
+pub fn set_cpuset(parent: &[u8], name: &[u8], cpus: &CpuSet, mems: Option<&CpuSet>) -> Result<(), Errno> {
+    let mut path = base()?;
+    for comp in parent.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
+        cpuset_subtree(&path);
+        path.push(b'/');
+        path.extend_from_slice(comp);
+    }
+    cpuset_subtree(&path);
+    path.push(b'/');
+    path.extend_from_slice(name);
+    if let Some(m) = mems.filter(|m| !m.is_empty()) {
+        ns::write_file(&nul(&[&path, b"/cpuset.mems"]), m.to_list().as_bytes())?;
+    }
+    ns::write_file(&nul(&[&path, b"/cpuset.cpus"]), cpus.to_list().as_bytes())
 }
 
 /// Directories of the tree under `root`, children before their parent. `list` returns the

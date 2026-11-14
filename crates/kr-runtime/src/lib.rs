@@ -6,6 +6,7 @@ extern crate alloc;
 pub mod auth;
 pub mod cgroup;
 pub mod config;
+pub mod cpuset;
 pub mod container;
 pub mod devfilter;
 pub mod gc;
