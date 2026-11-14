@@ -28,6 +28,13 @@ fn hash_of(j: &Value) -> alloc::string::String {
     str_at(j, &["metadata", "annotations", "helmcharts.helm.cattle.io/configHash"]).to_string()
 }
 
+/// Whether `p` is a pod of `job`. Select by the owner's uid, not by the chart label or Job name:
+/// after a Job is deleted (upgrade, uninstall) its pod can stay around for a GC cycle, carrying the
+/// same label, and a replacement Job can reuse the name.
+fn pod_of_job(p: &Value, job: &Value) -> bool {
+    controller_ref(p).is_some_and(|r| str_at(r, &["kind"]) == "Job" && str_at(r, &["uid"]) == str_at(job, &["metadata", "uid"]))
+}
+
 #[test]
 fn install_upgrade_and_uninstall() {
     scenario(|c| async move {
@@ -80,9 +87,9 @@ fn install_upgrade_and_uninstall() {
         assert_eq!(args[0].as_str(), Some("delete"));
         assert!(get_ok(&c, &cp).await.is_some(), "chart waits for the uninstall");
         // Let the Job's pod succeed.
-        wait_until("uninstall pod", || async { sys_pods(&c).await.iter().any(|p| str_at(p, &["metadata", "labels", CHART_LABEL]) == "web") }).await;
+        wait_until("uninstall pod", || async { sys_pods(&c).await.iter().any(|p| pod_of_job(p, &del)) }).await;
         let pods = sys_pods(&c).await;
-        let pod = pods.iter().find(|p| str_at(p, &["metadata", "labels", CHART_LABEL]) == "web").unwrap();
+        let pod = pods.iter().find(|p| pod_of_job(p, &del)).unwrap();
         c.patch(&alloc::format!("/api/v1/namespaces/{NS}/pods/{}", name(pod)), "application/merge-patch+json", &v(r#"{"metadata":{"annotations":{"test/outcome":"succeed"}}}"#)).await.unwrap();
         FINISH.store(true, Ordering::SeqCst);
         wait_until("chart gone", || async { get_ok(&c, &cp).await.is_none() }).await;

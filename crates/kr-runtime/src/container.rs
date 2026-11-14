@@ -177,6 +177,10 @@ pub struct ExecTarget {
     host_net: bool,
     /// Whether the pod runs in a user namespace.
     pub userns: bool,
+    /// Open handle to the container's root directory in the host mount namespace, so an
+    /// exec'd process can chroot into it after joining the container's mount namespace.
+    /// `None` for a sandbox (pause), whose root is the host root.
+    root: Option<Rc<Fd>>,
 }
 
 impl ExecTarget {
@@ -291,6 +295,13 @@ pub fn exec_in(target: &ExecTarget, spec: &ExecSpec) -> Result<Running, RunError
             let _ = ns::setsid();
             let _ = ns::set_ctty(0);
         }
+        // Joining the container's mount namespace does not change this process's root directory,
+        // so chroot into the container's root (kept open in the target) before exec'ing.
+        if let Some(root) = &target.root {
+            let path = alloc::format!("/proc/self/fd/{}\0", root.raw());
+            let _ = ns::chroot(path.as_bytes());
+            let _ = ns::chdir(b"/\0");
+        }
         // An empty user or group list means the container's own (see [`ExecCtx`]).
         let ctx = &target.ctx;
         let user = if spec.user.is_empty() { &ctx.user[..] } else { spec.user };
@@ -343,7 +354,7 @@ impl Sandbox {
 
     /// A target for joining the pod's network (probes); the sandbox owns the netns.
     pub fn target(&self) -> Result<ExecTarget, Errno> {
-        Ok(ExecTarget { ctx: Rc::default(), pidfd: Rc::new(ns::pidfd_open(self.pid)?), cgroup: None, host_net: self.host_net, userns: self.userns })
+        Ok(ExecTarget { ctx: Rc::default(), pidfd: Rc::new(ns::pidfd_open(self.pid)?), cgroup: None, host_net: self.host_net, userns: self.userns, root: None })
     }
 
     /// Kills and reaps the sandbox (its namespaces disappear with the last member).
@@ -756,7 +767,10 @@ impl Running {
 
     /// A handle for running more processes inside this container (exec, probes).
     pub fn target(&self) -> ExecTarget {
-        ExecTarget { ctx: Rc::default(), pidfd: self.pidfd.clone(), cgroup: self.cgroup_fd(), host_net: self.host_net, userns: self.userns }
+        // Keep an open handle to the container's root directory so exec'd processes can chroot
+        // into it after joining the container's mount namespace.
+        let root = ns::open(alloc::format!("/proc/{}/root\0", self.pid).as_bytes(), kr_sys::fs::O_PATH | ns::O_DIRECTORY, 0).ok().map(Rc::new);
+        ExecTarget { ctx: Rc::default(), pidfd: self.pidfd.clone(), cgroup: self.cgroup_fd(), host_net: self.host_net, userns: self.userns, root }
     }
 
     /// A container run by a shim of a previous run of this process, or `None` when `pid` is gone

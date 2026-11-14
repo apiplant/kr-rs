@@ -15,6 +15,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use kr_net::registry::{Digest, Reference};
 use kr_net::sha256::{hex, Sha256};
 use kr_sys::fs::{self, AT_FDCWD};
+use kr_sys::ns;
 use kr_sys::{Errno, Fd};
 
 /// Every failure in the runtime's store/unpack/pull path.
@@ -789,6 +790,9 @@ impl Store {
         }
         // OCI poststop hooks run once the container has ended, before its directory goes.
         crate::hooks::run_poststop(self.join(&format!("containers/{id}")).as_bytes());
+        // Detach a stale overlay mount left by a crashed run before removing the tree.
+        let merged = self.join(&format!("containers/{id}/merged"));
+        let _ = ns::umount2(&cpath(&merged)?, ns::MNT_DETACH);
         let dir = cpath(&self.join("containers"))?;
         let fd = fs::openat(AT_FDCWD, &dir, fs::O_PATH | fs::O_DIRECTORY | fs::O_CLOEXEC, 0).ctx("open containers")?;
         fs::remove_all(fd.raw(), &cpath(id)?).ctx("remove container")
